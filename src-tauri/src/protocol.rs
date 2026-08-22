@@ -191,6 +191,10 @@ pub fn text_of(pkt: &Packet) -> String {
 #[derive(Debug, Clone, Serialize)]
 pub struct FileEntry {
     pub id: u32,
+    /// 对端公告中的原始 ID 字符串。各客户端进制约定不一（官方十六进制、
+    /// 飞秋等十进制），回传 GETFILEDATA 请求时必须原样使用，禁止重新编码。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub raw_id: String,
     pub name: String,
     pub size: u64,
     pub mtime: u64,
@@ -257,7 +261,8 @@ pub fn parse_file_entries(extra: &[u8]) -> Vec<FileEntry> {
         .filter(|seg| !seg.is_empty())
         .filter_map(|seg| {
             let mut it = seg.splitn(6, |&b| b == b':');
-            let id = num_hex_first(&String::from_utf8_lossy(it.next()?))?;
+            let raw_id = String::from_utf8_lossy(it.next()?).trim().to_string();
+            let id = num_hex_first(&raw_id)?;
             let name = decode_bytes(it.next()?);
             if name.is_empty() {
                 return None;
@@ -268,6 +273,7 @@ pub fn parse_file_entries(extra: &[u8]) -> Vec<FileEntry> {
                 num_hex_first(&String::from_utf8_lossy(it.next()?)).map(|v| v as u32).unwrap_or(fileattr::REGULAR);
             Some(FileEntry {
                 id: id as u32,
+                raw_id,
                 name,
                 size,
                 mtime,
@@ -342,6 +348,7 @@ mod tests {
     fn file_entries_roundtrip() {
         let e1 = FileEntry {
             id: 1,
+            raw_id: String::new(),
             name: "报告 最终版.pdf".into(),
             size: 20480,
             mtime: 1700000000,
@@ -349,6 +356,7 @@ mod tests {
         };
         let e2 = FileEntry {
             id: 2,
+            raw_id: String::new(),
             name: "photo.jpg".into(),
             size: 999999,
             mtime: 1700000001,
@@ -387,6 +395,19 @@ mod tests {
         assert_eq!(fs[1].id, 0xb);
         assert_eq!(fs[1].size, 200);
         assert_eq!(fs[1].mtime, 222);
+    }
+
+    #[test]
+    fn file_entries_feiq_real_capture() {
+        // 真实抓包（飞秋类客户端）：ID 十进制、size/mtime 十六进制、attr 后带空扩展段
+        let raw = b"\x00 89000344:Microsoft Edge.lnk:8d4:6a894407:1:\x07";
+        let fs = parse_file_entries(raw);
+        assert_eq!(fs.len(), 1);
+        // raw_id 必须原样保留，回传 GETFILEDATA 时按原字符串回显
+        assert_eq!(fs[0].raw_id, "89000344");
+        assert_eq!(fs[0].name, "Microsoft Edge.lnk");
+        assert_eq!(fs[0].size, 0x8d4); // 2260 字节
+        assert_eq!(fs[0].mtime, 0x6a894407);
     }
 
     #[test]

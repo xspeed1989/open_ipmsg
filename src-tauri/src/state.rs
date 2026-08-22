@@ -128,6 +128,8 @@ impl AppState {
     /// 记录入站报文摘要与文件传输失败原因，用于远程定位互通问题。
     pub fn diag(&self, line: &str) {
         use std::io::Write;
+        static DIAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = DIAG_LOCK.lock().unwrap();
         let path = self.data_dir.join("diag.log");
         let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             Ok(f) => f,
@@ -382,6 +384,20 @@ impl AppState {
                 rec["read"] = true.into();
             },
         )
+    }
+
+    /// 该会话是否已有同包号的入站记录（对端延迟重发去重）
+    pub fn has_in_record(&self, key: &str, pkt: u32) -> bool {
+        let path = self.log_path(key);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        content.lines().any(|l| {
+            serde_json::from_str::<serde_json::Value>(l).is_ok_and(|rec| {
+                rec.get("dir").and_then(|v| v.as_str()) == Some("in")
+                    && rec.get("pkt").and_then(|v| v.as_u64()) == Some(pkt as u64)
+            })
+        })
     }
 }
 

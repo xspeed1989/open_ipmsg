@@ -145,11 +145,15 @@ async fn download_file(
     pkt_no: u32,
     file_id: u32,
     name: String,
+    rid: Option<String>,
 ) -> Result<(), String> {
     // 后台执行；进度与结果通过 file-progress 事件推送
     let ctx = ctx.inner().clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = net::download_file_task(&ctx, &key, pkt_no, file_id, &name).await {
+        if let Err(e) =
+            net::download_file_task(&ctx, &key, pkt_no, file_id, &name, rid.as_deref().unwrap_or(""))
+                .await
+        {
             eprintln!("[download] {key} #{file_id} {name}: {e}");
         }
     });

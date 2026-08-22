@@ -27,9 +27,9 @@ export const sendText = (key, text) => invoke('send_text', { key, text })
 /** 发送附件（多个文件路径），返回消息记录 */
 export const sendFiles = (key, paths) => invoke('send_files', { key, paths })
 
-/** 下载对端文件（后台任务，进度走 file-progress 事件） */
-export const downloadFile = (key, pktNo, fileId, name) =>
-  invoke('download_file', { key, pktNo, fileId, name })
+/** 下载对端文件（后台任务，进度走 file-progress 事件）；rid 为对端公告的原始 ID 串 */
+export const downloadFile = (key, pktNo, fileId, name, rid) =>
+  invoke('download_file', { key, pktNo, fileId, name, rid })
 
 /** 标记入站消息已读，并对要求回执的消息发送 READMSG；返回发出的回执数 */
 export const markRead = (key, pkts) => invoke('mark_read', { key, pkts })

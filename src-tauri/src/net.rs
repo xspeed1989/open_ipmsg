@@ -360,12 +360,19 @@ async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key
     };
 
     let kind = if files.is_empty() { "text" } else { "file" };
+
+    // 对端延迟重发会以相同包号重复投递（尤其跨应用重启后内存去重失效），
+    // 同会话同包号的入站消息只入一次库
+    if ctx.st.has_in_record(key, pkt.pkt_no) {
+        return;
+    }
+
     let rec = json!({
         "dir": "in",
         "kind": kind,
         "text": proto::text_of(pkt),
         "files": files.iter().map(|f| json!({
-            "id": f.id, "name": f.name, "size": f.size, "state": "pending",
+            "id": f.id, "rid": f.raw_id, "name": f.name, "size": f.size, "state": "pending",
         })).collect::<Vec<_>>(),
         "ts": now_secs(),
         "pkt": pkt.pkt_no,
@@ -423,6 +430,7 @@ pub async fn send_message(
             .unwrap_or(0);
         entries.push(proto::FileEntry {
             id,
+            raw_id: String::new(),
             name: name.clone(),
             size: meta.len(),
             mtime,
@@ -704,13 +712,16 @@ fn id_candidates(s: &str) -> Vec<u32> {
     out
 }
 
-/// 客户端：从对端下载一个附件到配置的接收目录（后台任务，进度走事件）
+/// 客户端：从对端下载一个附件到配置的接收目录（后台任务，进度走事件）。
+/// `rid` 为对端公告中的原始 ID 字符串（进制不明，必须原样回传）；
+/// 为空时回退用 file_id 的十六进制形式（兼容旧记录）。
 pub async fn download_file_task(
     ctx: &NetCtx,
     key: &str,
     pkt_no: u32,
     file_id: u32,
     name: &str,
+    rid: &str,
 ) -> Result<PathBuf, String> {
     let peer = ctx
         .st
@@ -740,7 +751,7 @@ pub async fn download_file_task(
         DL_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
 
-    let result = fetch_to_file(ctx, key, target, pkt_no, file_id, &tmp_path).await;
+    let result = fetch_to_file(ctx, key, target, pkt_no, file_id, rid, &tmp_path).await;
     match result {
         Ok(total) => {
             std::fs::rename(&tmp_path, &final_path)
@@ -785,6 +796,7 @@ async fn fetch_to_file(
     target: SocketAddr,
     pkt_no: u32,
     file_id: u32,
+    rid: &str,
     tmp: &std::path::Path,
 ) -> Result<u64, String> {
     let cfg = ctx.st.config();
@@ -793,17 +805,22 @@ async fn fetch_to_file(
         .map_err(|_| "连接超时".to_string())?
         .map_err(|e| format!("连接失败: {e}"))?;
 
-    // 官方约定：包编号回显十进制，文件 ID 按公告时的十六进制书写
+    // 官方约定：包编号回显十进制；文件 ID 原样回传对端公告字符串（进制不明）
+    let id_field = if rid.trim().is_empty() {
+        format!("{file_id:x}")
+    } else {
+        rid.trim().to_string()
+    };
     let req = format!(
-        "1:{}:{}:{}:{}:{}:{:x}:0\n",
+        "1:{}:{}:{}:{}:{}:{}:0\n",
         proto::next_packet_no(),
         my_user(&cfg),
         my_host(),
         cmd::GETFILEDATA,
         pkt_no,
-        file_id
+        id_field
     );
-    eprintln!("[download] 连接 {target} 请求 pkt={pkt_no} id={file_id:x}");
+    eprintln!("[download] 连接 {target} 请求 pkt={pkt_no} id={id_field}");
     stream
         .write_all(req.as_bytes())
         .await

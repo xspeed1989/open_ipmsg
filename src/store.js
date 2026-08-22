@@ -226,7 +226,7 @@ export async function downloadFile(msg, file) {
   file.state = 'downloading'
   file.transferred = 0
   try {
-    await ipc.downloadFile(key, msg.pkt, file.id, file.name)
+    await ipc.downloadFile(key, msg.pkt, file.id, file.name, file.rid || '')
   } catch (e) {
     file.state = 'failed'
     file.error = String(e)

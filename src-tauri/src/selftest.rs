@@ -189,7 +189,8 @@ async fn async_run() -> bool {
     .await;
     log.check("收到带附件的入站消息", offered);
     if offered {
-        match net::download_file_task(&ctx, &peer_key, offer_pkt_no, 9, "假对端文件.bin").await {
+        match net::download_file_task(&ctx, &peer_key, offer_pkt_no, 9, "假对端文件.bin", "").await
+        {
             Ok(path) => {
                 let saved = std::fs::read(&path).unwrap_or_default();
                 log.check("下载完成且逐字节一致", saved == fake_content);
@@ -301,6 +302,7 @@ fn spawn_fake_peer(
             let target: SocketAddr = format!("127.0.0.1:{port_app}").parse().unwrap();
             let entry = proto::FileEntry {
                 id: 9,
+                raw_id: String::new(),
                 name: "假对端文件.bin".into(),
                 size: content_len,
                 mtime: 123,
