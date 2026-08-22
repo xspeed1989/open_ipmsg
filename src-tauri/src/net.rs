@@ -510,6 +510,30 @@ pub async fn mark_read_and_receipt(
     Ok(sent)
 }
 
+/* ================= 单元测试 ================= */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_candidates_both_bases() {
+        assert_eq!(id_candidates("10"), vec![10, 16]); // 十进制优先，十六进制兜底
+        assert_eq!(id_candidates("a"), vec![10]); // 纯十六进制
+        assert_eq!(id_candidates("1"), vec![1]); // 两进制同值去重
+        assert_eq!(id_candidates("0x1f"), vec![31]);
+        assert!(id_candidates("").is_empty());
+        assert!(id_candidates("zz").is_empty());
+    }
+
+    #[test]
+    fn num_flex_dec_first_prefers_decimal() {
+        assert_eq!(num_flex_dec_first("10"), Some(10));
+        assert_eq!(num_flex_dec_first("0x1f"), Some(31));
+        assert_eq!(num_flex_dec_first("ff"), Some(255));
+    }
+}
+
 /* ================= TCP 文件传输 ================= */
 
 fn spawn_tcp_server(ctx: Arc<NetCtx>) {
@@ -523,10 +547,10 @@ fn spawn_tcp_server(ctx: Arc<NetCtx>) {
         };
         loop {
             match listener.accept().await {
-                Ok((stream, _addr)) => {
+                Ok((stream, peer)) => {
                     let ctx2 = ctx.clone();
                     tokio::spawn(async move {
-                        serve_getfile(&ctx2, stream).await;
+                        serve_getfile(&ctx2, stream, peer).await;
                     });
                 }
                 Err(e) => {
@@ -539,7 +563,7 @@ fn spawn_tcp_server(ctx: Arc<NetCtx>) {
 }
 
 /// 服务端：解析 GETFILEDATA 请求并回传文件字节流
-async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream) {
+async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::SocketAddr) {
     // 读请求行：容忍有无结尾换行
     let mut buf = Vec::with_capacity(256);
     let mut chunk = [0u8; 256];
@@ -570,12 +594,34 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream) {
     if parts.len() < 3 {
         return;
     }
-    let offer_pkt = num_flex_dec_first(&parts[0]).unwrap_or(0) as u32;
-    let file_id = num_flex_dec_first(&parts[1]).unwrap_or(0) as u32;
     let offset = num_flex_dec_first(&parts[2]).unwrap_or(0);
 
-    let slot = ctx.st.offered.lock().unwrap().get(&(offer_pkt, file_id)).map(|o| (o.path.clone(), o.size));
-    let Some((path, _size)) = slot else { return };
+    // 各客户端对 ID 字段的进制约定不一（官方十六进制、部分实现十进制），
+    // 对两种解释都尝试匹配，最大化兼容
+    let pkt_cands = id_candidates(&parts[0]);
+    let fid_cands = id_candidates(&parts[1]);
+    let mut slot: Option<(PathBuf, u64)> = None;
+    {
+        let offered = ctx.st.offered.lock().unwrap();
+        'outer: for p in &pkt_cands {
+            for f in &fid_cands {
+                if let Some(o) = offered.get(&(*p, *f)) {
+                    slot = Some((o.path.clone(), o.size));
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let Some((path, _size)) = slot else {
+        eprintln!(
+            "[tcp] GETFILEDATA 未命中: from={peer} extra={:?} 候选pkt={pkt_cands:?} 候选id={fid_cands:?} 已提供={:?}",
+            req.extra,
+            ctx.st.offered.lock().unwrap().keys().take(8).collect::<Vec<_>>()
+        );
+        return;
+    };
+    let fname = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    eprintln!("[tcp] {peer} 请求文件 {fname} (offset {offset})");
 
     let mut file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
@@ -587,6 +633,7 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream) {
         }
     }
     let mut chunk = vec![0u8; 64 * 1024];
+    let mut sent: u64 = 0;
     loop {
         match file.read(&mut chunk).await {
             Ok(0) => break,
@@ -594,11 +641,13 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream) {
                 if stream.write_all(&chunk[..n]).await.is_err() {
                     break;
                 }
+                sent += n as u64;
             }
             Err(_) => break,
         }
     }
     let _ = stream.flush().await;
+    eprintln!("[tcp] 已向 {peer} 发送 {fname}: {sent} 字节");
 }
 
 fn num_flex_dec_first(t: &str) -> Option<u64> {
@@ -607,6 +656,24 @@ fn num_flex_dec_first(t: &str) -> Option<u64> {
         return Some(v);
     }
     u64::from_str_radix(t.trim_start_matches("0x"), 16).ok()
+}
+
+/// ID 字段的所有可能数值解释：十进制与十六进制（去重）
+fn id_candidates(s: &str) -> Vec<u32> {
+    let t = s.trim();
+    let mut out = Vec::new();
+    if t.is_empty() {
+        return out;
+    }
+    if let Ok(d) = t.parse::<u32>() {
+        out.push(d);
+    }
+    if let Ok(h) = u32::from_str_radix(t.trim_start_matches("0x").trim_start_matches("0X"), 16) {
+        if !out.contains(&h) {
+            out.push(h);
+        }
+    }
+    out
 }
 
 /// 客户端：从对端下载一个附件到配置的接收目录（后台任务，进度走事件）
@@ -691,8 +758,9 @@ async fn fetch_to_file(
         .map_err(|_| "连接超时".to_string())?
         .map_err(|e| format!("连接失败: {e}"))?;
 
+    // 官方约定：包编号回显十进制，文件 ID 按公告时的十六进制书写
     let req = format!(
-        "1:{}:{}:{}:{}:{}:{}:0\n",
+        "1:{}:{}:{}:{}:{}:{:x}:0\n",
         proto::next_packet_no(),
         my_user(&cfg),
         my_host(),
@@ -700,6 +768,7 @@ async fn fetch_to_file(
         pkt_no,
         file_id
     );
+    eprintln!("[download] 连接 {target} 请求 pkt={pkt_no} id={file_id:x}");
     stream
         .write_all(req.as_bytes())
         .await
@@ -734,6 +803,7 @@ async fn fetch_to_file(
     }
     file.flush().await.map_err(|e| format!("写入失败: {e}"))?;
     drop(file);
+    eprintln!("[download] 从 {target} 接收完成: {total} 字节");
     Ok(total)
 }
 
