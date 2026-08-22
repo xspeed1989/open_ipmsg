@@ -202,9 +202,11 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
+    /// 线上格式：全部字段十六进制书写（与本环境真实客户端抓包一致，
+    /// 见 diag.log 样本 `id:name:size(hex):mtime(hex):attr(hex)`）
     pub fn serialize(&self) -> String {
         format!(
-            "{:x}:{}:{}:{}:{:x}",
+            "{:x}:{}:{:x}:{:x}:{:x}",
             self.id,
             clean_filename(&self.name),
             self.size,
@@ -267,8 +269,10 @@ pub fn parse_file_entries(extra: &[u8]) -> Vec<FileEntry> {
             if name.is_empty() {
                 return None;
             }
-            let size = num_dec_first(&String::from_utf8_lossy(it.next()?))?;
-            let mtime = num_dec_first(&String::from_utf8_lossy(it.next()?)).unwrap_or(0);
+            // 本环境真实客户端（见 diag.log 抓包）size/mtime 均为十六进制，
+            // 与我方序列化保持一致：十六进制优先，纯字母串自动回退
+            let size = num_hex_first(&String::from_utf8_lossy(it.next()?))?;
+            let mtime = num_hex_first(&String::from_utf8_lossy(it.next()?)).unwrap_or(0);
             let attr =
                 num_hex_first(&String::from_utf8_lossy(it.next()?)).map(|v| v as u32).unwrap_or(fileattr::REGULAR);
             Some(FileEntry {
@@ -382,19 +386,26 @@ mod tests {
         assert_eq!(fs[0].size, 20480);
         assert_eq!(fs[1].id, 2);
         assert_eq!(fs[1].size, 999999);
+
+        // 线上格式与本环境真实客户端一致：全字段十六进制
+        assert_eq!(
+            e1.serialize(),
+            format!("1:报告 最终版.pdf:{:x}:{:x}:1", 20480, 1700000000)
+        );
     }
 
     #[test]
     fn file_entries_compat_styles() {
-        // 兼容官方十六进制 ID / 十进制大小的混合风格，以及带偏移的写法
+        // 官方/本环境风格：全字段十六进制（含纯数字串也按十六进制解释）
         let raw = b"text\x00a:name_a:100:111:1:xx\x07b:name_b:200:222:1";
         let fs = parse_file_entries(raw);
         assert_eq!(fs.len(), 2);
         assert_eq!(fs[0].id, 0xa);
-        assert_eq!(fs[0].size, 100);
+        assert_eq!(fs[0].size, 0x100);
+        assert_eq!(fs[0].mtime, 0x111);
         assert_eq!(fs[1].id, 0xb);
-        assert_eq!(fs[1].size, 200);
-        assert_eq!(fs[1].mtime, 222);
+        assert_eq!(fs[1].size, 0x200);
+        assert_eq!(fs[1].mtime, 0x222);
     }
 
     #[test]

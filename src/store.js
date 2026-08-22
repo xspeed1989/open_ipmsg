@@ -134,7 +134,27 @@ export async function ensureChat(key) {
 
 export function pushMsg(key, msg) {
   ensureChat(key).then((c) => {
-    c.msgs.push(msg)
+    // 对端"延迟发送"会以相同包号反复重发：原地替换，并保留本地运行时状态
+    // （下载进度/保存路径/已读），既不刷屏也不丢已完成的状态
+    const idx = c.msgs.findIndex((m) => m.dir === msg.dir && m.pkt === msg.pkt)
+    if (idx >= 0) {
+      const old = c.msgs[idx]
+      for (const f of msg.files || []) {
+        const prev = (old.files || []).find(
+          (x) => x.id === f.id && (x.state === 'done' || x.state === 'downloading')
+        )
+        if (prev) {
+          f.state = prev.state
+          f.path = prev.path
+          f.transferred = prev.transferred
+          f.error = prev.error
+        }
+      }
+      if (old.read && msg.dir === 'in') msg.read = true
+      c.msgs.splice(idx, 1, msg)
+    } else {
+      c.msgs.push(msg)
+    }
     if (msg.ts) store.lastTs[key] = Math.max(store.lastTs[key] || 0, msg.ts)
     if (msg.peer) store.peerMeta[key] = msg.peer
   })
@@ -275,10 +295,14 @@ export async function boot() {
   await ipc.listenEvent(ipc.EVT.usersUpdated, () => loadUsers())
   await ipc.listenEvent(ipc.EVT.msgIn, ({ key, msg }) => {
     if (!key || !msg) return
+    // 对端延迟重发（同包号重复投递）不重复计未读、不重复通知
+    const isRebroadcast = (store.chats[key]?.msgs || []).some(
+      (m) => m.dir === 'in' && m.pkt === msg.pkt
+    )
     pushMsg(key, msg)
     if (isChatVisible(key)) {
       markReadFor(key)
-    } else {
+    } else if (!isRebroadcast) {
       store.unread[key] = (store.unread[key] || 0) + 1
       notify(displayName(key), previewText(msg))
     }

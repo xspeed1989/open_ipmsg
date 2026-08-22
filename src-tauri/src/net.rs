@@ -361,11 +361,9 @@ async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key
 
     let kind = if files.is_empty() { "text" } else { "file" };
 
-    // 对端延迟重发会以相同包号重复投递（尤其跨应用重启后内存去重失效），
-    // 同会话同包号的入站消息只入一次库
-    if ctx.st.has_in_record(key, pkt.pkt_no) {
-        return;
-    }
+    // 注意：对端"延迟发送"会以相同包号跨会话永久重发，
+    // 不能按包号查历史去重（会把新会话里合法的附件公告误杀）。
+    // 前端对连续重复的同包号消息做原地替换，保证既不刷屏也不丢文件。
 
     let rec = json!({
         "dir": "in",

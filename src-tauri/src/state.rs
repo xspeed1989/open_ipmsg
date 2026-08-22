@@ -385,20 +385,6 @@ impl AppState {
             },
         )
     }
-
-    /// 该会话是否已有同包号的入站记录（对端延迟重发去重）
-    pub fn has_in_record(&self, key: &str, pkt: u32) -> bool {
-        let path = self.log_path(key);
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            return false;
-        };
-        content.lines().any(|l| {
-            serde_json::from_str::<serde_json::Value>(l).is_ok_and(|rec| {
-                rec.get("dir").and_then(|v| v.as_str()) == Some("in")
-                    && rec.get("pkt").and_then(|v| v.as_u64()) == Some(pkt as u64)
-            })
-        })
-    }
 }
 
 /* ---------------- 单元测试 ---------------- */
