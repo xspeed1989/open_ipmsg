@@ -829,6 +829,13 @@ pub async fn download_file_task(
 
     let result = fetch_to_file(ctx, key, target, pkt_no, file_id, rid, &tmp_path).await;
     match result {
+        Ok(0) => {
+            // 对端接受了连接但没有回数据（部分私有实现的前置校验未通过）
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            ctx.st
+                .diag(&format!("dl-empty {key} pkt={pkt_no} id={file_id:x}: 对端未返回数据"));
+            Err("对方未提供文件数据（可能不兼容该客户端的传输方式）".into())
+        }
         Ok(total) => {
             std::fs::rename(&tmp_path, &final_path)
                 .map_err(|e| format!("保存文件失败: {e}"))?;
