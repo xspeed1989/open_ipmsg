@@ -31,7 +31,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "category": "Communication",
+    "category": "SocialNetworking",
     "shortDescription": "局域网即时通讯（IPMsg 协议）",
     "longDescription": "基于 Tauri v2 的跨平台 IP Messenger 客户端：局域网用户发现、文本消息与文件传输（UDP/TCP 2425），界面参考微信 PC 版。",
     "icon": [

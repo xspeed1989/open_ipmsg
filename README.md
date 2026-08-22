@@ -87,6 +87,27 @@ sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
 Windows 需 WebView2（Win11 自带）；macOS 需 Xcode Command Line Tools。
 详见 [Tauri v2 先决条件](https://tauri.app/start/prerequisites/)。
 
+### 打包故障排查（Arch / Manjaro）
+
+滚动发行版上 AppImage 打包有两个已知坑（deb/rpm 不受影响），已提供一键修复：
+
+```bash
+pnpm tauri build            # 先跑一次，让 tauri 下载打包工具
+./scripts/fix-linuxdeploy.sh  # 应用修复
+pnpm tauri build            # 重新打包
+```
+
+脚本做两件事：
+1. 将 `~/.cache/tauri/linuxdeploy-x86_64.AppImage` 升级到最新 continuous 构建
+   （旧版自带的 strip 不识别新工具链的 DT_RELR/`.relr.dyn` 段，报
+   `unknown type [0x13]`）；
+2. 给 `linuxdeploy-plugin-gtk.sh` 打补丁：兼容 gdk-pixbuf ≥ 2.44 的内置 loaders
+   （目录不存在时跳过复制并确保缓存目录存在）、find 时剪枝 `/usr/lib/vmware`
+   等厂商目录中的陈旧 GTK 库副本。
+
+另外 `bundle.category` 必须使用 Tauri 预定义分类（如 `SocialNetworking`），
+自定义字符串会报 `invalid category`。
+
 ## 测试与自检
 
 ```bash
