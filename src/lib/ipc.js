@@ -30,9 +30,13 @@ export const sendFiles = (key, paths) => invoke('send_files', { key, paths })
 export const downloadFile = (key, pktNo, fileId, name) =>
   invoke('download_file', { key, pktNo, fileId, name })
 
+/** 标记入站消息已读，并对要求回执的消息发送 READMSG；返回发出的回执数 */
+export const markRead = (key, pkts) => invoke('mark_read', { key, pkts })
+
 /** 事件常量 */
 export const EVT = {
   usersUpdated: 'users-updated',
   msgIn: 'msg-in',
   fileProgress: 'file-progress',
+  msgRead: 'msg-read',
 }

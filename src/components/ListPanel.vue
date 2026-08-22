@@ -107,7 +107,7 @@ function openContact(u) {
       >
         <div class="ava">
           <Avatar :name="s.name" :seed="s.key" :size="40" />
-          <i v-if="!s.online" class="off-dot" title="离线"></i>
+          <i class="status-dot" :class="s.online ? 'on' : 'off'" :title="s.online ? '在线' : '离线'"></i>
         </div>
         <div class="mid">
           <div class="r1 ellipsis">{{ s.name }}</div>
@@ -130,7 +130,10 @@ function openContact(u) {
       <template v-for="g in contactGroups" :key="g.group">
         <div class="group-head">{{ g.group }}（{{ g.users.length }}）</div>
         <div v-for="u in g.users" :key="u.key" class="row contact" @click="openContact(u)">
-          <Avatar :name="u.nickname || u.user" :seed="u.key" :size="36" />
+          <div class="ava">
+            <Avatar :name="u.nickname || u.user" :seed="u.key" :size="36" />
+            <i class="status-dot on" title="在线"></i>
+          </div>
           <div class="mid">
             <div class="r1 ellipsis">{{ u.nickname || u.user }}</div>
             <div class="r2 ellipsis">{{ u.host }} · {{ u.ip }}</div>
@@ -230,15 +233,23 @@ function openContact(u) {
 .ava {
   position: relative;
 }
-.off-dot {
+.status-dot {
   position: absolute;
   right: -1px;
   bottom: -1px;
-  width: 9px;
-  height: 9px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
+  border: 2px solid var(--c-list);
+}
+.row.active .status-dot {
+  border-color: var(--c-list-active);
+}
+.status-dot.on {
+  background: var(--c-accent);
+}
+.status-dot.off {
   background: #c0c0c0;
-  border: 1.5px solid var(--c-list);
 }
 .group-head {
   padding: 8px 12px 4px;

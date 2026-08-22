@@ -212,7 +212,8 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
     if !ctx.st.mark_seen(from.ip(), pkt.pkt_no) {
         return; // 重复包
     }
-    let base = pkt.command & 0xFFFF;
+    // 基本命令取低 8 位（官方规范：所有选项标志位于 bit8 以上）
+    let base = pkt.command & 0xFF;
     let key = from.to_string();
 
     match base {
@@ -262,8 +263,26 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
         }
         cmd::SENDMSG => handle_sendmsg(ctx, from, &pkt, &key).await,
         cmd::READMSG => {
-            // 对端已读；暂不做已读回执 UI
-            let _ = &pkt;
+            // 对端已读回执：extra = 原消息包编号，把对应出站消息标记为已读
+            let no = String::from_utf8_lossy(&pkt.extra)
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse::<u32>()
+                .ok();
+            #[cfg(feature = "net_debug")]
+            eprintln!("[read] READMSG from {from} no={no:?}");
+            if let Some(no) = no {
+                if let Some(key) = resolve_session_key(ctx, from.ip()) {
+                    let changed = ctx.st.mark_out_read(&key, no);
+                    #[cfg(feature = "net_debug")]
+                    eprintln!("[read] key={key} changed={changed}");
+                    if changed {
+                        ctx.st.emit("msg-read", json!({"key": key, "pkt": no}));
+                    }
+                }
+            }
         }
         cmd::GETINFO => {
             let cfg = ctx.st.config();
@@ -333,18 +352,12 @@ async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key
         "ts": now_secs(),
         "pkt": pkt.pkt_no,
         "peer": {"key": key, "nickname": display, "host": pkt.host},
+        // 对端要求已读回执：待用户查看后由 mark_read 发送 READMSG
+        "need_read": pkt.command & opt::READCHECKOPT != 0,
+        "read": false,
     });
     ctx.st.log_record(key, &rec);
     ctx.st.emit("msg-in", json!({"key": key, "msg": rec}));
-
-    // 对端要求已读回执
-    if pkt.command & opt::READCHECKOPT != 0 {
-        let cfg = ctx.st.config();
-        let mut r = proto::Packet::new(cmd::READMSG | opt::AUTORETOPT);
-        r.extra = pkt.pkt_no.to_string().into_bytes();
-        let bytes = r.encode(&my_user(&cfg), &my_host());
-        let _ = ctx.sock.send_to(&bytes, from).await;
-    }
 }
 
 /* ================= 出站消息 ================= */
@@ -414,8 +427,10 @@ pub async fn send_message(
         extra.extend_from_slice(joined.join("\u{7}").as_bytes());
     }
 
-    let command =
-        cmd::SENDMSG | if entries.is_empty() { 0 } else { opt::FILEATTACHOPT };
+    // 请求已读回执：对端查看后应回复 READMSG
+    let command = cmd::SENDMSG
+        | opt::READCHECKOPT
+        | if entries.is_empty() { 0 } else { opt::FILEATTACHOPT };
     let mut pkt = proto::Packet::new(command).with_pkt_no(pkt_no);
     pkt.extra = extra;
     let bytes = pkt.encode(&my_user(&cfg), &my_host());
@@ -440,9 +455,59 @@ pub async fn send_message(
         "ts": now_secs(),
         "pkt": pkt_no,
         "peer": {"key": peer.key, "nickname": peer.nickname, "host": peer.host, "group": peer.group},
+        "rcpt": true,
+        "read": false,
     });
     ctx.st.log_record(key, &rec);
     Ok(rec)
+}
+
+/* ================= 已读回执 ================= */
+
+/// 解析 READMSG 来源对应的会话 key：优先精确匹配，其次按 IP 匹配
+fn resolve_session_key(ctx: &NetCtx, ip: IpAddr) -> Option<String> {
+    let peers = ctx.st.peers.lock().unwrap();
+    let exact = format!("{}:{}", ip, ctx.port);
+    if peers.contains_key(&exact) {
+        return Some(exact);
+    }
+    peers
+        .values()
+        .find(|p| p.ip == ip.to_string())
+        .map(|p| p.key.clone())
+}
+
+/// 标记入站消息为已读，并对要求回执的消息向对端发送 READMSG。
+/// 返回成功发出的回执数（对方离线时本地仍然标记为已读）。
+pub async fn mark_read_and_receipt(
+    ctx: &NetCtx,
+    key: &str,
+    pkts: &[u32],
+) -> Result<usize, String> {
+    if pkts.is_empty() {
+        return Ok(0);
+    }
+    ctx.st.mark_in_read(key, pkts);
+
+    let peer = ctx.st.peers.lock().unwrap().get(key).cloned();
+    let Some(peer) = peer else {
+        return Ok(0); // 对方不在线：仅本地标记
+    };
+    let Some(target) = parse_peer_key(&peer.key, ctx.port) else {
+        return Ok(0);
+    };
+
+    let cfg = ctx.st.config();
+    let mut sent = 0;
+    for p in pkts {
+        let mut r = proto::Packet::new(cmd::READMSG | opt::AUTORETOPT);
+        r.extra = p.to_string().into_bytes();
+        let bytes = r.encode(&my_user(&cfg), &my_host());
+        if ctx.sock.send_to(&bytes, target).await.is_ok() {
+            sent += 1;
+        }
+    }
+    Ok(sent)
 }
 
 /* ================= TCP 文件传输 ================= */
@@ -494,7 +559,7 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream) {
         }
     }
     let Some(req) = req_pkt else { return };
-    if req.command & 0xFFFF != cmd::GETFILEDATA {
+    if req.command & 0xFF != cmd::GETFILEDATA {
         return;
     }
     // extra: pkt_id:file_id:offset

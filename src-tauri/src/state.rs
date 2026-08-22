@@ -254,17 +254,16 @@ impl AppState {
         all[skip..].to_vec()
     }
 
-    /// 更新某条消息中指定文件的状态（下载完成等）
-    pub fn update_history_file(
+    /// 通用历史重写：对满足条件的记录执行 mutate，有变更才回写
+    fn rewrite_history(
         &self,
         key: &str,
-        pkt: u32,
-        file_id: u32,
+        mut pred: impl FnMut(&serde_json::Value) -> bool,
         mutate: impl Fn(&mut serde_json::Value),
-    ) {
+    ) -> bool {
         let path = self.log_path(key);
         let Ok(content) = std::fs::read_to_string(&path) else {
-            return;
+            return false;
         };
         let mut changed = false;
         let mut lines: Vec<String> = Vec::new();
@@ -276,21 +275,83 @@ impl AppState {
                     continue;
                 }
             };
-            if rec.get("pkt").and_then(|v| v.as_u64()) == Some(pkt as u64) {
-                if let Some(files) = rec.get_mut("files").and_then(|f| f.as_array_mut()) {
-                    for f in files.iter_mut() {
-                        if f.get("id").and_then(|v| v.as_u64()) == Some(file_id as u64) {
-                            mutate(f);
-                            changed = true;
-                        }
-                    }
-                }
+            if pred(&rec) {
+                mutate(&mut rec);
+                changed = true;
             }
             lines.push(rec.to_string());
         }
         if changed {
             let _ = std::fs::write(path, lines.join("\n") + "\n");
         }
+        changed
+    }
+
+    /// 更新某条消息中指定文件的状态（下载完成等）
+    pub fn update_history_file(
+        &self,
+        key: &str,
+        pkt: u32,
+        file_id: u32,
+        mutate: impl Fn(&mut serde_json::Value),
+    ) {
+        self.rewrite_history(
+            key,
+            |rec| {
+                rec.get("pkt").and_then(|v| v.as_u64()) == Some(pkt as u64)
+                    && rec
+                        .get("files")
+                        .and_then(|f| f.as_array())
+                        .map(|files| {
+                            files
+                                .iter()
+                                .any(|f| f.get("id").and_then(|v| v.as_u64()) == Some(file_id as u64))
+                        })
+                        .unwrap_or(false)
+            },
+            move |rec| {
+                if let Some(files) = rec.get_mut("files").and_then(|f| f.as_array_mut()) {
+                    for f in files.iter_mut() {
+                        if f.get("id").and_then(|v| v.as_u64()) == Some(file_id as u64) {
+                            mutate(f);
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    /// 标记入站消息为已读（本地状态）
+    pub fn mark_in_read(&self, key: &str, pkts: &[u32]) {
+        let set: std::collections::HashSet<u32> = pkts.iter().copied().collect();
+        self.rewrite_history(
+            key,
+            |rec| {
+                rec.get("dir").and_then(|v| v.as_str()) == Some("in")
+                    && rec
+                        .get("pkt")
+                        .and_then(|v| v.as_u64())
+                        .map(|p| set.contains(&(p as u32)))
+                        .unwrap_or(false)
+            },
+            |rec| {
+                rec["read"] = true.into();
+            },
+        );
+    }
+
+    /// 标记出站消息已被对端已读（收到 READMSG 回执），返回是否有变更
+    pub fn mark_out_read(&self, key: &str, pkt: u32) -> bool {
+        self.rewrite_history(
+            key,
+            |rec| {
+                rec.get("dir").and_then(|v| v.as_str()) == Some("out")
+                    && rec.get("pkt").and_then(|v| v.as_u64()) == Some(pkt as u64)
+            },
+            |rec| {
+                rec["read"] = true.into();
+            },
+        )
     }
 }
 

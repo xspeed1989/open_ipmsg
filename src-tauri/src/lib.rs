@@ -1,4 +1,4 @@
-//! Tauri 应用层：命令注册、事件桥接、生命周期。
+//! Tauri 应用层：命令注册、事件桥接、托盘、通知与生命周期。
 
 mod net;
 mod protocol;
@@ -10,13 +10,28 @@ pub use state::{AppState, Config, PeerInfo};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use tauri::{Manager, RunEvent, State};
+use tauri::{
+    menu::{MenuBuilder, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Manager, RunEvent, State, WindowEvent,
+};
 
 type SharedState = Arc<AppState>;
 type SharedCtx = Arc<net::NetCtx>;
 
 static EXIT_INFO: OnceLock<(Arc<AppState>, u16)> = OnceLock::new();
+/// 首次隐藏到托盘时提示一次
+static HIDE_NOTIFIED: AtomicBool = AtomicBool::new(false);
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
 
 /* ================= 命令 ================= */
 
@@ -141,6 +156,13 @@ async fn download_file(
     Ok(())
 }
 
+/// 标记入站消息已读，并对要求回执的消息向对端发送 READMSG
+#[tauri::command]
+async fn mark_read(ctx: State<'_, SharedCtx>, key: String, pkts: Vec<u32>) -> Result<usize, String> {
+    let ctx = ctx.inner().clone();
+    net::mark_read_and_receipt(&ctx, &key, &pkts).await
+}
+
 /* ================= 启动 ================= */
 
 pub fn run() {
@@ -152,6 +174,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let handle = app.handle().clone();
             let data_dir = handle.path().app_data_dir()?;
@@ -176,10 +199,69 @@ pub fn run() {
                 protocol::DEFAULT_PORT,
             ))?;
 
+            // 退出前广播 BR_EXIT（托盘退出 / 进程退出都会走到这里）
             let _ = EXIT_INFO.set((st.clone(), protocol::DEFAULT_PORT));
+
             app.manage(st);
-            app.manage(ctx);
+            app.manage(ctx.clone());
+
+            /* ---------- 系统托盘 ---------- */
+            let show_item =
+                MenuItem::with_id(&handle, "show", "显示主窗口", true, None::<&str>)?;
+            let refresh_item =
+                MenuItem::with_id(&handle, "refresh", "刷新在线用户", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(&handle, "quit", "退出", true, None::<&str>)?;
+            let menu = MenuBuilder::new(&handle)
+                .items(&[&show_item, &refresh_item, &quit_item])
+                .build()?;
+
+            let refresh_ctx = ctx.clone();
+            TrayIconBuilder::with_id("main-tray")
+                .icon(handle.default_window_icon().expect("missing icon").clone())
+                .tooltip("Open IPMsg")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(move |app, event| match event.id.as_ref() {
+                    "show" => show_main_window(app),
+                    "refresh" => {
+                        let c = refresh_ctx.clone();
+                        tauri::async_runtime::spawn(async move {
+                            net::announce(&c).await;
+                        });
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    // Windows/macOS：左键单击显示主窗口
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
+                    }
+                })
+                .build(&handle)?;
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // 关闭窗口 → 最小化到托盘（微信式）；真正退出走托盘菜单
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+                if !HIDE_NOTIFIED.swap(true, Ordering::Relaxed) {
+                    use tauri_plugin_notification::NotificationExt;
+                    let _ = window
+                        .notification()
+                        .builder()
+                        .title("Open IPMsg")
+                        .body("已最小化到托盘，右键托盘图标可退出")
+                        .show();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_config,
@@ -189,7 +271,8 @@ pub fn run() {
             get_history,
             send_text,
             send_files,
-            download_file
+            download_file,
+            mark_read
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

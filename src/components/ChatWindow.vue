@@ -13,6 +13,7 @@ import EmojiPicker from './EmojiPicker.vue'
 const activeUser = computed(
   () => store.userMap[store.activeKey] || store.peerMeta[store.activeKey] || null
 )
+const isOnline = computed(() => !!store.userMap[store.activeKey])
 const msgs = computed(() => store.chats[store.activeKey]?.msgs || [])
 
 /* ---------- 渲染列表：插入日期分隔 + 连续消息聚合 ---------- */
@@ -128,9 +129,9 @@ async function revealFile(path) {
       <div class="peer">
         <div class="name">{{ displayName(store.activeKey) }}</div>
         <div class="sub">
+          <i class="stat" :class="isOnline ? 'on' : 'off'">{{ isOnline ? '● 在线' : '● 离线' }}</i>
           {{ activeUser.host || '' }}<template v-if="activeUser.ip"> · {{ activeUser.ip }}</template>
           <template v-if="activeUser.group"> · {{ activeUser.group }}</template>
-          <i v-if="!store.userMap[store.activeKey]" class="off-tag">离线</i>
         </div>
       </div>
       <button class="mini-btn" title="重新广播上线，刷新在线用户" @click="refreshUsers">
@@ -190,7 +191,12 @@ async function revealFile(path) {
                 </div>
               </div>
             </div>
-            <div class="m-time" :class="{ self: v.m.dir === 'out' }">{{ fmtTime(v.m.ts) }}</div>
+            <div class="m-time" :class="{ self: v.m.dir === 'out' }">
+              <span v-if="v.m.dir === 'out' && v.m.rcpt" class="read-tag" :class="{ done: v.m.read }">
+                {{ v.m.read ? '已读' : '未读' }}
+              </span>
+              {{ fmtTime(v.m.ts) }}
+            </div>
           </div>
         </div>
       </div>
@@ -282,14 +288,16 @@ async function revealFile(path) {
   font-size: 11.5px;
   color: var(--c-sub);
 }
-.off-tag {
-  margin-left: 6px;
+.stat {
   font-style: normal;
-  background: #c9c9c9;
-  color: #fff;
-  border-radius: 3px;
-  font-size: 10px;
-  padding: 0 4px;
+  font-size: 11px;
+  margin-right: 6px;
+}
+.stat.on {
+  color: var(--c-accent);
+}
+.stat.off {
+  color: #b5b5b5;
 }
 .mini-btn {
   width: 28px;
@@ -383,6 +391,13 @@ async function revealFile(path) {
   font-size: 10.5px;
   color: #ababab;
   margin-top: 3px;
+}
+.read-tag {
+  margin-right: 6px;
+  color: #b8b8b8;
+}
+.read-tag.done {
+  color: var(--c-accent);
 }
 
 /* 文件卡片 */

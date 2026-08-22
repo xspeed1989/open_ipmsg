@@ -1,6 +1,10 @@
 // 全局响应式状态 + 后端事件桥接
 import { reactive } from 'vue'
 import { listen } from '@tauri-apps/api/event'
+import { getCurrentWindow } from '@tauri-apps/api/window'
+import {
+  isPermissionGranted, requestPermission, sendNotification,
+} from '@tauri-apps/plugin-notification'
 import * as ipc from './lib/ipc'
 
 export const store = reactive({
@@ -25,6 +29,7 @@ export const store = reactive({
   activeKey: null,
   unread: {}, // key -> 未读数
   lastTs: {}, // key -> 最后消息时间戳
+  windowFocused: true, // 主窗口是否聚焦（决定是否弹通知/自动已读）
 })
 
 /* ---------------- 工具函数 ---------------- */
@@ -142,6 +147,64 @@ export async function openChat(key) {
   if (store.unread[key]) {
     delete store.unread[key]
   }
+  markReadFor(key)
+}
+
+/* ---------------- 已读回执 ---------------- */
+
+/**
+ * 把某会话中"需要回执且未读"的入站消息标记为已读：
+ * 本地立即置位 + 通知后端（后端持久化并向对端发送 READMSG）
+ */
+export async function markReadFor(key) {
+  const chat = store.chats[key]
+  if (!chat) return
+  const pkts = chat.msgs
+    .filter((m) => m.dir === 'in' && m.need_read && !m.read)
+    .map((m) => m.pkt)
+  if (!pkts.length) return
+  for (const m of chat.msgs) {
+    if (pkts.includes(m.pkt)) m.read = true // 乐观置位，避免连发时重复回执
+  }
+  try {
+    await ipc.markRead(key, pkts)
+  } catch (e) {
+    console.error('mark_read failed', e)
+  }
+}
+
+function onMsgRead({ key, pkt }) {
+  const chat = store.chats[key]
+  if (!chat) return
+  const msg = chat.msgs.find((m) => m.pkt === pkt)
+  if (msg) msg.read = true
+}
+
+/* ---------------- 系统通知 ---------------- */
+
+async function notify(title, body) {
+  try {
+    let granted = await isPermissionGranted()
+    if (!granted) granted = (await requestPermission()) === 'granted'
+    if (granted) sendNotification({ title, body })
+  } catch (e) {
+    console.error('notify failed', e)
+  }
+}
+
+/** 消息预览文本（通知用） */
+export function previewText(msg) {
+  if (msg.kind === 'file') {
+    const n = (msg.files || []).length
+    return `[文件] ${msg.files?.[0]?.name || ''}${n > 1 ? ` 等${n}个` : ''}`
+  }
+  const t = (msg.text || '').replace(/\s+/g, ' ')
+  return t.length > 48 ? t.slice(0, 48) + '…' : t
+}
+
+/** 消息可见（聊天打开 + 窗口聚焦）时视为已读 */
+function isChatVisible(key) {
+  return store.windowFocused && store.page === 'chat' && store.activeKey === key
 }
 
 export async function sendText(text) {
@@ -202,13 +265,25 @@ export async function boot() {
 
   await refreshConfig()
 
+  // 窗口焦点跟踪：失焦时来消息弹通知；重新聚焦自动标记已读
+  getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+    store.windowFocused = focused
+    if (focused && store.page === 'chat' && store.activeKey) {
+      markReadFor(store.activeKey)
+    }
+  })
+
   await ipc.listenEvent(ipc.EVT.usersUpdated, () => loadUsers())
   await ipc.listenEvent(ipc.EVT.msgIn, ({ key, msg }) => {
     pushMsg(key, msg)
-    if (!(store.page === 'chat' && store.activeKey === key)) {
+    if (isChatVisible(key)) {
+      markReadFor(key)
+    } else {
       store.unread[key] = (store.unread[key] || 0) + 1
+      notify(displayName(key), previewText(msg))
     }
   })
+  await ipc.listenEvent(ipc.EVT.msgRead, onMsgRead)
   await ipc.listenEvent(ipc.EVT.fileProgress, onFileProgress)
 
   await loadUsers()

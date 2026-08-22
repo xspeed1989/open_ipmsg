@@ -35,6 +35,7 @@ impl Log {
 struct PeerShared {
     texts: Vec<String>,
     fetched: Vec<Vec<u8>>,
+    receipts: Vec<u32>,
     exit_received: bool,
 }
 
@@ -209,7 +210,44 @@ async fn async_run() -> bool {
         }
     }
 
-    /* ---- 5. 下线广播 ---- */
+    /* ---- 5. 已读回执 ---- */
+    // 出站方向：我们发的消息带 READCHECKOPT，假对端回复 READMSG 后应标记为已读
+    let out_read = wait_for(3000, || {
+        st.read_history(&peer_key, 10)
+            .iter()
+            .find(|r| r["dir"] == "out" && r["text"] == "你好，假对端！")
+            .and_then(|r| r.get("read"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    })
+    .await;
+    log.check("收到 READMSG 回执后出站消息标记已读", out_read);
+
+    // 入站方向：标记已读 → 向假对端发出 READMSG；本地历史同步标记
+    let sent = net::mark_read_and_receipt(&ctx, &peer_key, &[777123])
+        .await
+        .expect("mark_read");
+    log.check(
+        "标记入站消息已读并回执（need_read 才发）",
+        sent == 1,
+    );
+    let receipt_seen = wait_for(2500, || {
+        shared.lock().unwrap().receipts.contains(&777123)
+    })
+    .await;
+    log.check("假对端收到 READMSG 回执", receipt_seen);
+    let in_marked = wait_for(1500, || {
+        st.read_history(&peer_key, 20)
+            .iter()
+            .find(|r| r["pkt"].as_u64() == Some(777123))
+            .and_then(|r| r.get("read"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    })
+    .await;
+    log.check("历史记录中入站消息已标记已读", in_marked);
+
+    /* ---- 6. 下线广播 ---- */
     net::announce_exit_blocking(&st, port_app);
     let exit_seen = wait_for(1500, || shared.lock().unwrap().exit_received).await;
     log.check("BR_EXIT 广播送达对端", exit_seen);
@@ -282,7 +320,24 @@ fn spawn_fake_peer(
         }
     }));
 
-    /* -- UDP 循环：应答发现、收消息、取附件、记下线 -- */
+    /* -- 主动发送需要已读回执的消息（SENDMSG + READCHECKOPT） -- */
+    tasks.push(tokio::spawn({
+        let ps = ps.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let target: SocketAddr = format!("127.0.0.1:{port_app}").parse().unwrap();
+            let pkt = proto::Packet {
+                pkt_no: 777123,
+                user: "假对端".into(),
+                host: "fake-host".into(),
+                command: cmd::SENDMSG | opt::READCHECKOPT,
+                extra: "带回执的消息".as_bytes().to_vec(),
+            };
+            let _ = ps.send_to(&pkt.encode("假对端", "fake-host"), target).await;
+        }
+    }));
+
+    /* -- UDP 循环：应答发现、收消息、取附件、记下线与回执 -- */
     tasks.push(tokio::spawn({
         let ps = ps.clone();
         let shared = shared.clone();
@@ -294,7 +349,7 @@ fn spawn_fake_peer(
                     Err(_) => continue,
                 };
                 let Some(pkt) = proto::parse(&buf[..n]) else { continue };
-                match pkt.command & 0xFFFF {
+                match pkt.command & 0xFF {
                     cmd::BR_ENTRY => {
                         let mut a = proto::Packet::new(cmd::ANSENTRY);
                         a.extra = proto::build_entry_extra("假对端", "测试组", "utf8");
@@ -320,6 +375,18 @@ fn spawn_fake_peer(
                     }
                     cmd::BR_EXIT => {
                         shared.lock().unwrap().exit_received = true;
+                    }
+                    cmd::READMSG => {
+                        let no = String::from_utf8_lossy(&pkt.extra)
+                            .split(':')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .parse::<u32>()
+                            .ok();
+                        if let Some(no) = no {
+                            shared.lock().unwrap().receipts.push(no);
+                        }
                     }
                     _ => {}
                 }
