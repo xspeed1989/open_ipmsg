@@ -235,10 +235,39 @@ pub fn run() {
             }
 
             // 启动网络栈（UDP 发现/消息 + TCP 文件服务）
-            let ctx = tauri::async_runtime::block_on(net::start_network(
+            // 端口被占用（多半是托盘里还挂着旧实例）时明确报错退出，避免静默失败
+            let ctx = match tauri::async_runtime::block_on(net::start_network(
                 st.clone(),
                 protocol::DEFAULT_PORT,
-            ))?;
+            )) {
+                Ok(c) => c,
+                Err(e) => {
+                    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                    app.dialog()
+                        .message(format!(
+                            "端口 {} 被占用（{}）。\n很可能是旧的 Open IPMsg 还在托盘中运行，\
+                             请从托盘菜单退出后再启动。",
+                            protocol::DEFAULT_PORT, e
+                        ))
+                        .kind(MessageDialogKind::Error)
+                        .title("Open IPMsg 启动失败")
+                        .blocking_show();
+                    std::process::exit(1);
+                }
+            };
+
+            // 窗口标题与托盘提示带上版本号和编码模式，便于确认当前运行的构建
+            let run_title = {
+                let cfg = st.config();
+                format!(
+                    "Open IPMsg v{} · {}",
+                    env!("CARGO_PKG_VERSION"),
+                    if crate::protocol::is_utf8_mode(&cfg.encoding) { "UTF-8" } else { "GBK" }
+                )
+            };
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.set_title(&run_title);
+            }
 
             // 退出前广播 BR_EXIT（托盘退出 / 进程退出都会走到这里）
             let _ = EXIT_INFO.set((st.clone(), protocol::DEFAULT_PORT));
@@ -259,7 +288,7 @@ pub fn run() {
             let refresh_ctx = ctx.clone();
             TrayIconBuilder::with_id("main-tray")
                 .icon(handle.default_window_icon().expect("missing icon").clone())
-                .tooltip("Open IPMsg")
+                .tooltip(&run_title)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| match event.id.as_ref() {
