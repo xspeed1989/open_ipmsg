@@ -285,15 +285,20 @@ pub fn build_entry_extra(nickname: &str, group: &str, encoding: &str) -> Vec<u8>
     extra
 }
 
-/// 解析上线类附加数据：(昵称, 群组)
+/// 解析上线类附加数据：(昵称, 群组)。
+///
+/// 官方格式为 `昵称\0群组`；部分客户端（飞秋等）会追加第三段及以后的能力信息，
+/// 如 `Admin\0\0\nVS:00010002:5:8:6:1001` —— 只取前两段，其余忽略。
 pub fn parse_entry_extra(extra: &[u8]) -> (String, String) {
-    match extra.iter().position(|&b| b == 0) {
-        Some(p) => (
-            decode_bytes(&extra[..p]),
-            decode_bytes(&extra[p + 1..]),
-        ),
-        None => (decode_bytes(extra), String::new()),
-    }
+    let mut segs = extra.split(|&b| b == 0);
+    let nick = decode_bytes(segs.next().unwrap_or(&[]));
+    let group = decode_bytes(segs.next().unwrap_or(&[]));
+    (nick, group)
+}
+
+/// 去除解码文本中的控制字符，避免污染界面与日志
+pub fn strip_control(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 /* ---------------- 单元测试 ---------------- */
@@ -390,6 +395,28 @@ mod tests {
         let (nick, group) = parse_entry_extra(&extra);
         assert_eq!(nick, "小明");
         assert_eq!(group, "研发部");
+    }
+
+    #[test]
+    fn entry_extra_feiq_capability_suffix() {
+        // 飞秋等客户端：昵称\0群组\0能力串（VS=版本信息），能力串必须被忽略
+        let extra = b"Admin\x00\x00\nVS:00010002:5:8:6:1001";
+        let (nick, group) = parse_entry_extra(extra);
+        assert_eq!(nick, "Admin");
+        assert_eq!(group, "");
+    }
+
+    #[test]
+    fn entry_extra_no_group() {
+        let (nick, group) = parse_entry_extra("李四".as_bytes());
+        assert_eq!(nick, "李四");
+        assert_eq!(group, "");
+    }
+
+    #[test]
+    fn strip_control_removes_nul_and_newlines() {
+        assert_eq!(strip_control("A\u{0}\nVS:1"), "AVS:1");
+        assert_eq!(strip_control("正常名字"), "正常名字");
     }
 
     #[test]

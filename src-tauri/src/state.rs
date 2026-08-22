@@ -140,8 +140,13 @@ impl AppState {
 
     /* ---------- 用户表 ---------- */
 
-    /// 插入或刷新用户；返回是否为新增
+    /// 插入或刷新用户；返回是否为新增。所有文本字段先清洗控制字符。
     pub fn upsert_peer(&self, mut info: PeerInfo) -> bool {
+        use crate::protocol::strip_control;
+        info.nickname = strip_control(&info.nickname);
+        info.group = strip_control(&info.group);
+        info.host = strip_control(&info.host);
+        info.user = strip_control(&info.user);
         info.last_seen = now_secs();
         let mut peers = self.peers.lock().unwrap();
         match peers.get_mut(&info.key) {

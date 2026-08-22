@@ -91,17 +91,30 @@ export async function refreshConfig() {
   store.config = await ipc.getConfig()
 }
 
+/** 清洗后端文本中的控制字符，避免污染界面 */
+function clean(s) {
+  return typeof s === 'string' ? s.replace(/[\u0000-\u001f\u007f]/g, '') : ''
+}
+
 export async function loadUsers() {
   try {
     store.users = await ipc.getUsers()
     const map = {}
-    for (const u of store.users) map[u.key] = u
+    for (const u of store.users) {
+      map[u.key] = {
+        ...u,
+        nickname: clean(u.nickname) || clean(u.user),
+        host: clean(u.host),
+        group: clean(u.group),
+        user: clean(u.user),
+      }
+    }
     store.userMap = map
     for (const u of store.users) {
       store.peerMeta[u.key] = {
-        nickname: u.nickname,
-        host: u.host,
-        group: u.group,
+        nickname: clean(u.nickname) || clean(u.user),
+        host: clean(u.host),
+        group: clean(u.group),
       }
     }
   } catch (e) {

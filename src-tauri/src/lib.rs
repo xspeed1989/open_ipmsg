@@ -171,6 +171,43 @@ pub fn run() {
         std::process::exit(if ok { 0 } else { 1 });
     }
 
+    // 诊断模式：--dump-peers [秒数] 启动网络栈等待后打印用户表（不写用户数据目录）
+    if std::env::args().any(|a| a == "--dump-peers") {
+        let secs: u64 = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async move {
+            let dir = std::env::temp_dir()
+                .join(format!("open-ipmsg-dumppeers-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let st = Arc::new(AppState::new(dir));
+            st.set_config(Config {
+                nickname: "诊断节点".into(),
+                group: "诊断组".into(),
+                encoding: "utf8".into(),
+                download_dir: String::new(),
+            });
+            let _ctx = net::start_network(st.clone(), protocol::DEFAULT_PORT)
+                .await
+                .expect("start network");
+            println!(
+                "listening on udp/{}, waiting {secs}s ...",
+                protocol::DEFAULT_PORT
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            let mut users: Vec<PeerInfo> = st.peers.lock().unwrap().values().cloned().collect();
+            users.sort_by(|a, b| a.key.cmp(&b.key));
+            println!("{}", serde_json::to_string_pretty(&users).unwrap());
+        });
+        std::process::exit(0);
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())

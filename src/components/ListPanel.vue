@@ -131,12 +131,12 @@ function openContact(u) {
         <div class="group-head">{{ g.group }}（{{ g.users.length }}）</div>
         <div v-for="u in g.users" :key="u.key" class="row contact" @click="openContact(u)">
           <div class="ava">
-            <Avatar :name="u.nickname || u.user" :seed="u.key" :size="36" />
+            <Avatar :name="u.nickname || u.user || '?'" :seed="u.key" :size="36" />
             <i class="status-dot on" title="在线"></i>
           </div>
           <div class="mid">
-            <div class="r1 ellipsis">{{ u.nickname || u.user }}</div>
-            <div class="r2 ellipsis">{{ u.host }} · {{ u.ip }}</div>
+            <div class="r1 ellipsis">{{ u.nickname || u.user || '未知用户' }}</div>
+            <div class="r2 ellipsis">{{ u.host }} · {{ u.ip }}{{ u.group ? ' · ' + u.group : '' }}</div>
           </div>
         </div>
       </template>
