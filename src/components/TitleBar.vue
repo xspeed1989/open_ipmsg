@@ -2,6 +2,7 @@
 // 自定义标题栏：可拖拽 + 最小化/最大化/关闭（仿微信PC窗口控制）
 import { ref, onMounted, onUnmounted } from 'vue'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { store } from '../store'
 
 const appWindow = getCurrentWindow()
 const maximized = ref(false)
@@ -34,7 +35,10 @@ function close() {
   <div class="titlebar" data-tauri-drag-region @dblclick="toggleMax">
     <div class="tb-left" data-tauri-drag-region>
       <span class="logo" data-tauri-drag-region></span>
-      <span class="app-name" data-tauri-drag-region>Open IPMsg</span>
+      <span class="app-name" data-tauri-drag-region>
+        Open IPMsg v{{ store.config?.version || '?' }} ·
+        {{ (store.config?.encoding || 'utf8').toLowerCase() === 'gbk' ? 'GBK' : 'UTF-8' }}
+      </span>
     </div>
     <div class="tb-controls">
       <button class="tb-btn" title="最小化" @click="minimize">

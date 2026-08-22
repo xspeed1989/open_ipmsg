@@ -35,30 +35,34 @@ pub mod cmd {
     pub const GETFILEDATA: u32 = 0x0000_0060;
     pub const RELEASEFILES: u32 = 0x0000_0061;
     pub const GETDIRFILES: u32 = 0x0000_0062;
-    pub const GETPUBKEY: u32 = 0x0000_0070;
-    pub const ANSPUBKEY: u32 = 0x0000_0071;
+    pub const GETPUBKEY: u32 = 0x0000_0072;
+    pub const ANSPUBKEY: u32 = 0x0000_0073;
 }
 
-/// 选项标志（高位）
+/// 选项标志（高位）—— 数值逐项对照官方 ipmsg.h Ver 4.50
+/// （github.com/shirouzu/ipmsg），勿凭记忆修改
 pub mod opt {
     #![allow(dead_code)]
     pub const ABSENCEOPT: u32 = 0x0000_0100;
-    pub const SECRETOPT: u32 = 0x0000_0200;
+    pub const SERVEROPT: u32 = 0x0000_0200;
+    pub const SECRETOPT: u32 = 0x0000_0200; // 与 SERVEROPT 同值（官方历史兼容）
     pub const BROADCASTOPT: u32 = 0x0000_0400;
-    pub const AUTORETOPT: u32 = 0x0000_0800;
-    pub const PASSWORDOPT: u32 = 0x0000_1000;
-    pub const NOLOGOPT: u32 = 0x0000_2000;
-    pub const NEWMEMBERSOPT: u32 = 0x0000_4000;
-    pub const NOADDLISTOPT: u32 = 0x0000_8000;
+    pub const MULTICASTOPT: u32 = 0x0000_0800;
+    pub const AUTORETOPT: u32 = 0x0000_2000;
+    pub const RETRYOPT: u32 = 0x0000_4000;
+    pub const PASSWORDOPT: u32 = 0x0000_8000;
+    pub const NOLOGOPT: u32 = 0x0002_0000;
+    pub const NOADDLISTOPT: u32 = 0x0008_0000;
     pub const DIALUPOPT: u32 = 0x0001_0000;
     pub const READCHECKOPT: u32 = 0x0010_0000;
-    pub const SECRETEXOPT: u32 = 0x0020_0000;
+    pub const SECRETEXOPT: u32 = 0x0030_0000; // READCHECK|SECRET
     pub const ENCRYPTOPT: u32 = 0x0040_0000;
-    pub const CLIPBOARDOPT: u32 = 0x0100_0000;
+    pub const CAPUTF8OPT: u32 = 0x0100_0000;
     /// 官方编码协商标志（ipmsg.h）：置位表示报文文本为 UTF-8，
     /// 未置位表示本地代码页（中文系统为 GBK）
     pub const UTF8OPT: u32 = 0x0080_0000;
-    pub const FILEATTACHOPT: u32 = 0x0200_0000;
+    pub const CLIPBOARDOPT: u32 = 0x0800_0000;
+    pub const FILEATTACHOPT: u32 = 0x0020_0000;
 }
 
 /// 文件类型属性
@@ -66,8 +70,8 @@ pub mod fileattr {
     #![allow(dead_code)]
     pub const REGULAR: u32 = 0x0000_0001;
     pub const PERM: u32 = 0x0000_0004;
-    /// 目录 = REGULAR|PERM
-    pub const DIR: u32 = REGULAR | PERM;
+    /// 官方值：目录为 2（非 REGULAR|PERM）
+    pub const DIR: u32 = 0x0000_0002;
 }
 
 static PKT_SEQ: AtomicU32 = AtomicU32::new(0);

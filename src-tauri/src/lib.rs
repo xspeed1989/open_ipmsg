@@ -67,6 +67,7 @@ async fn get_config(st: State<'_, SharedState>) -> Result<Value, String> {
         "encoding": cfg.encoding,
         "hostname": hostname,
         "ips": ips,
+        "version": env!("CARGO_PKG_VERSION"),
     }))
 }
 
