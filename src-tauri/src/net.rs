@@ -24,6 +24,10 @@ pub struct NetCtx {
 
 static DL_SEQ: AtomicU32 = AtomicU32::new(1);
 
+/// 全局递增的公告文件 ID（模拟真实客户端的全局大数风格，
+/// 避免每条消息从 1 重计被对端按 ID 追踪时忽略）
+static FILE_ID_SEQ: AtomicU32 = AtomicU32::new(0x1000_0000);
+
 fn my_host() -> String {
     static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     CACHE
@@ -144,9 +148,12 @@ fn spawn_ticker(ctx: Arc<NetCtx>) {
 /// 向所有广播地址发送上线/下线通告
 pub async fn announce(ctx: &NetCtx) {
     let cfg = ctx.st.config();
+    let utf8 = proto::is_utf8_mode(&cfg.encoding);
     let pkt = proto::Packet {
         extra: proto::build_entry_extra(&cfg.nickname, &cfg.group, &cfg.encoding),
-        ..proto::Packet::new(cmd::BR_ENTRY)
+        command: cmd::BR_ENTRY
+            | if utf8 { opt::UTF8OPT } else { 0 },
+        ..proto::Packet::new(0)
     };
     let bytes = pkt.encode(&my_user(&cfg), &my_host());
     let targets: Vec<SocketAddr> = broadcast_targets()
@@ -161,9 +168,12 @@ pub async fn announce(ctx: &NetCtx) {
 /// 向指定地址单播上线通告（自检/定向刷新用）
 pub async fn announce_unicast(ctx: &NetCtx, addrs: &[SocketAddr]) {
     let cfg = ctx.st.config();
+    let utf8 = proto::is_utf8_mode(&cfg.encoding);
     let pkt = proto::Packet {
         extra: proto::build_entry_extra(&cfg.nickname, &cfg.group, &cfg.encoding),
-        ..proto::Packet::new(cmd::BR_ENTRY)
+        command: cmd::BR_ENTRY
+            | if utf8 { opt::UTF8OPT } else { 0 },
+        ..proto::Packet::new(0)
     };
     let bytes = pkt.encode(&my_user(&cfg), &my_host());
     for a in addrs {
@@ -236,7 +246,8 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
 
     match base {
         cmd::BR_ENTRY => {
-            let (nick, group) = proto::parse_entry_extra(&pkt.extra);
+            let (nick, group) =
+                proto::parse_entry_extra(&pkt.extra, pkt.command & opt::UTF8OPT != 0);
             let added = ctx.st.upsert_peer(PeerInfo {
                 key: key.clone(),
                 ip: from.ip().to_string(),
@@ -249,9 +260,11 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             });
             // 回应 ANSENTRY（单播），携带自己的昵称\0群组
             let cfg = ctx.st.config();
+            let utf8 = proto::is_utf8_mode(&cfg.encoding);
             let ans = proto::Packet {
                 extra: proto::build_entry_extra(&cfg.nickname, &cfg.group, &cfg.encoding),
-                ..proto::Packet::new(cmd::ANSENTRY)
+                command: cmd::ANSENTRY | if utf8 { opt::UTF8OPT } else { 0 },
+                ..proto::Packet::new(0)
             };
             let bytes = ans.encode(&my_user(&cfg), &my_host());
             let _ = ctx.sock.send_to(&bytes, from).await;
@@ -260,7 +273,8 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             }
         }
         cmd::ANSENTRY | cmd::BR_ABSENCE => {
-            let (nick, group) = proto::parse_entry_extra(&pkt.extra);
+            let (nick, group) =
+                proto::parse_entry_extra(&pkt.extra, pkt.command & opt::UTF8OPT != 0);
             let added = ctx.st.upsert_peer(PeerInfo {
                 key: key.clone(),
                 ip: from.ip().to_string(),
@@ -304,7 +318,8 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
         }
         cmd::GETINFO => {
             let cfg = ctx.st.config();
-            let reply = proto::Packet::new(cmd::SENDINFO | opt::AUTORETOPT);
+            let utf8 = proto::is_utf8_mode(&cfg.encoding);
+            let reply = proto::Packet::new(cmd::SENDINFO | opt::AUTORETOPT | if utf8 { opt::UTF8OPT } else { 0 });
             let mut r = reply;
             r.extra = proto::encode_out(concat!("OpenIPMsg v", env!("CARGO_PKG_VERSION")), &cfg.encoding);
             let bytes = r.encode(&my_user(&cfg), &my_host());
@@ -365,10 +380,12 @@ async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key
     // 不能按包号查历史去重（会把新会话里合法的附件公告误杀）。
     // 前端对连续重复的同包号消息做原地替换，保证既不刷屏也不丢文件。
 
+    let text_end = pkt.extra.iter().position(|&b| b == 0).unwrap_or(pkt.extra.len());
+    let text = proto::decode_for_command(&pkt.extra[..text_end], pkt.command);
     let rec = json!({
         "dir": "in",
         "kind": kind,
-        "text": proto::text_of(pkt),
+        "text": text,
         "files": files.iter().map(|f| json!({
             "id": f.id, "rid": f.raw_id, "name": f.name, "size": f.size, "state": "pending",
         })).collect::<Vec<_>>(),
@@ -419,7 +436,7 @@ pub async fn send_message(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file".into());
-        let id = (i + 1) as u32;
+        let id = FILE_ID_SEQ.fetch_add(1, Ordering::Relaxed).max(1);
         let mtime = meta
             .modified()
             .ok()
@@ -456,9 +473,11 @@ pub async fn send_message(
     // 文件消息不请求已读回执（减少未知标志组合被对端丢弃的风险）；
     // 纯文本消息保留回执
     let want_rcpt = entries.is_empty();
+    let utf8 = proto::is_utf8_mode(&cfg.encoding);
     let command = cmd::SENDMSG
         | if want_rcpt { opt::READCHECKOPT } else { 0 }
-        | if entries.is_empty() { 0 } else { opt::FILEATTACHOPT };
+        | if entries.is_empty() { 0 } else { opt::FILEATTACHOPT }
+        | if utf8 { opt::UTF8OPT } else { 0 };
     let mut pkt = proto::Packet::new(command).with_pkt_no(pkt_no);
     pkt.extra = extra.clone();
     let bytes = pkt.encode(&my_user(&cfg), &my_host());

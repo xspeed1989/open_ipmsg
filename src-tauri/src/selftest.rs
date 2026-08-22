@@ -427,7 +427,7 @@ async fn fetch_file(port_app: u16, pkt_no: u32, file_id: u32) -> Result<Vec<u8>,
             .map_err(|_| "连接超时".to_string())?
             .map_err(|e| format!("connect: {e}"))?;
     let req = format!(
-        "1:{}:fake:fake-host:{}:{}:{:x}:0\n",
+        "1:{}:fake:fake-host:{}:{}:{}:0\n",
         proto::next_packet_no(),
         cmd::GETFILEDATA,
         pkt_no,

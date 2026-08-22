@@ -55,6 +55,9 @@ pub mod opt {
     pub const SECRETEXOPT: u32 = 0x0020_0000;
     pub const ENCRYPTOPT: u32 = 0x0040_0000;
     pub const CLIPBOARDOPT: u32 = 0x0100_0000;
+    /// 官方编码协商标志（ipmsg.h）：置位表示报文文本为 UTF-8，
+    /// 未置位表示本地代码页（中文系统为 GBK）
+    pub const UTF8OPT: u32 = 0x0080_0000;
     pub const FILEATTACHOPT: u32 = 0x0200_0000;
 }
 
@@ -266,7 +269,8 @@ pub fn parse_file_entries(extra: &[u8]) -> Vec<FileEntry> {
         .filter_map(|seg| {
             let mut it = seg.splitn(6, |&b| b == b':');
             let raw_id = String::from_utf8_lossy(it.next()?).trim().to_string();
-            let id = num_hex_first(&raw_id)?;
+            // 本环境对端（飞秋）ID 为十进制书写；含字母时自动按十六进制兜底
+            let id = num_dec_first(&raw_id)?;
             let name = decode_bytes(it.next()?);
             if name.is_empty() {
                 return None;
@@ -301,16 +305,34 @@ pub fn build_entry_extra(nickname: &str, group: &str, encoding: &str) -> Vec<u8>
 ///
 /// 官方格式为 `昵称\0群组`；部分客户端（飞秋等）会追加第三段及以后的能力信息，
 /// 如 `Admin\0\0\nVS:00010002:5:8:6:1001` —— 只取前两段，其余忽略。
-pub fn parse_entry_extra(extra: &[u8]) -> (String, String) {
+pub fn parse_entry_extra(extra: &[u8], utf8: bool) -> (String, String) {
     let mut segs = extra.split(|&b| b == 0);
-    let nick = decode_bytes(segs.next().unwrap_or(&[]));
-    let group = decode_bytes(segs.next().unwrap_or(&[]));
+    let nick = decode_for_command(segs.next().unwrap_or(&[]), if utf8 { opt::UTF8OPT } else { 0 });
+    let group = decode_for_command(segs.next().unwrap_or(&[]), if utf8 { opt::UTF8OPT } else { 0 });
     (nick, group)
 }
 
 /// 去除解码文本中的控制字符，避免污染界面与日志
 pub fn strip_control(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// 按报文的 UTF8OPT 标志解码文本：
+/// - 置位：强制 UTF-8（官方协商语义）
+/// - 未置位：先严格校验 UTF-8（部分实现置位习惯漏标时仍可正确解码），
+///   校验失败再按本地代码页 GBK 解码
+pub fn decode_for_command(b: &[u8], command: u32) -> String {
+    if command & opt::UTF8OPT != 0 || std::str::from_utf8(b).is_ok() {
+        String::from_utf8_lossy(b).into_owned()
+    } else {
+        let (decoded, _, _) = encoding_rs::GBK.decode(b);
+        decoded.into_owned()
+    }
+}
+
+/// 是否按 UTF-8 编码出站文本
+pub fn is_utf8_mode(encoding: &str) -> bool {
+    !encoding.eq_ignore_ascii_case("gbk")
 }
 
 /* ---------------- 单元测试 ---------------- */
@@ -427,7 +449,7 @@ mod tests {
     #[test]
     fn entry_extra_roundtrip() {
         let extra = build_entry_extra("小明", "研发部", "utf8");
-        let (nick, group) = parse_entry_extra(&extra);
+        let (nick, group) = parse_entry_extra(&extra, true);
         assert_eq!(nick, "小明");
         assert_eq!(group, "研发部");
     }
@@ -436,14 +458,14 @@ mod tests {
     fn entry_extra_feiq_capability_suffix() {
         // 飞秋等客户端：昵称\0群组\0能力串（VS=版本信息），能力串必须被忽略
         let extra = b"Admin\x00\x00\nVS:00010002:5:8:6:1001";
-        let (nick, group) = parse_entry_extra(extra);
+        let (nick, group) = parse_entry_extra(extra, false);
         assert_eq!(nick, "Admin");
         assert_eq!(group, "");
     }
 
     #[test]
     fn entry_extra_no_group() {
-        let (nick, group) = parse_entry_extra("李四".as_bytes());
+        let (nick, group) = parse_entry_extra("李四".as_bytes(), true);
         assert_eq!(nick, "李四");
         assert_eq!(group, "");
     }

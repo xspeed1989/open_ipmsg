@@ -20,6 +20,8 @@ pub struct Config {
 }
 
 fn default_encoding() -> String {
+    // 默认 UTF-8，出站报文自动携带官方 IPMSG_UTF8OPT 编码协商标志；
+    // 与 GBK 方言老客户端互通时可在设置中切换
     "utf8".into()
 }
 
@@ -62,6 +64,8 @@ pub struct AppState {
     pub offered: Mutex<HashMap<(u32, u32), OfferedFile>>,
     seen_queue: Mutex<VecDeque<(IpAddr, u32)>>,
     seen_set: Mutex<HashSet<(IpAddr, u32)>>,
+    /// 聊天记录文件的读-改-写互斥（防止并发追加与重写互相覆盖）
+    hist_lock: Mutex<()>,
     on_event: Mutex<Option<EventFn>>,
     pub data_dir: PathBuf,
     pub logs_dir: PathBuf,
@@ -85,6 +89,7 @@ impl AppState {
             offered: Mutex::new(HashMap::new()),
             seen_queue: Mutex::new(VecDeque::new()),
             seen_set: Mutex::new(HashSet::new()),
+            hist_lock: Mutex::new(()),
             on_event: Mutex::new(None),
             data_dir,
             logs_dir,
@@ -261,6 +266,7 @@ impl AppState {
 
     /// 追加一条消息记录
     pub fn log_record(&self, key: &str, rec: &serde_json::Value) {
+        let _g = self.hist_lock.lock().unwrap();
         let path = self.log_path(key);
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -273,6 +279,7 @@ impl AppState {
 
     /// 读取某会话最近 limit 条记录（按时间升序返回）
     pub fn read_history(&self, key: &str, limit: usize) -> Vec<serde_json::Value> {
+        let _g = self.hist_lock.lock().unwrap();
         let path = self.log_path(key);
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
@@ -293,6 +300,7 @@ impl AppState {
         mut pred: impl FnMut(&serde_json::Value) -> bool,
         mutate: impl Fn(&mut serde_json::Value),
     ) -> bool {
+        let _g = self.hist_lock.lock().unwrap();
         let path = self.log_path(key);
         let Ok(content) = std::fs::read_to_string(&path) else {
             return false;
