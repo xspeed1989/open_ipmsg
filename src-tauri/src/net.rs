@@ -449,15 +449,34 @@ pub async fn send_message(
         extra.push(0);
         let joined: Vec<String> = entries.iter().map(|e| e.serialize()).collect();
         extra.extend_from_slice(joined.join("\u{7}").as_bytes());
+        // 与真实客户端样本一致：公告末尾保留一个尾部 \a 分隔符
+        extra.push(0x07);
     }
 
-    // 请求已读回执：对端查看后应回复 READMSG
+    // 文件消息不请求已读回执（减少未知标志组合被对端丢弃的风险）；
+    // 纯文本消息保留回执
+    let want_rcpt = entries.is_empty();
     let command = cmd::SENDMSG
-        | opt::READCHECKOPT
+        | if want_rcpt { opt::READCHECKOPT } else { 0 }
         | if entries.is_empty() { 0 } else { opt::FILEATTACHOPT };
     let mut pkt = proto::Packet::new(command).with_pkt_no(pkt_no);
-    pkt.extra = extra;
+    pkt.extra = extra.clone();
     let bytes = pkt.encode(&my_user(&cfg), &my_host());
+
+    // 线路诊断：记录我方出站公告原始字节（与 diag.log 入站样本对照用）
+    {
+        use std::fmt::Write as _;
+        let raw = &pkt.extra[..pkt.extra.len().min(160)];
+        let mut hexs = String::with_capacity(raw.len() * 3);
+        for b in raw {
+            let _ = write!(hexs, "{b:02x} ");
+        }
+        ctx.st.diag(&format!(
+            "-> {target} cmd={command:#010x} len={} extra[0..{}]={hexs}",
+            bytes.len(),
+            raw.len()
+        ));
+    }
 
     if let Err(e) = ctx.sock.send_to(&bytes, target).await {
         // 发送失败：回滚文件槽
@@ -479,7 +498,7 @@ pub async fn send_message(
         "ts": now_secs(),
         "pkt": pkt_no,
         "peer": {"key": peer.key, "nickname": peer.nickname, "host": peer.host, "group": peer.group},
-        "rcpt": true,
+        "rcpt": want_rcpt,
         "read": false,
     });
     ctx.st.log_record(key, &rec);

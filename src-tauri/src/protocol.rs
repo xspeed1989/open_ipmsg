@@ -202,11 +202,13 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
-    /// 线上格式：全部字段十六进制书写（与本环境真实客户端抓包一致，
-    /// 见 diag.log 样本 `id:name:size(hex):mtime(hex):attr(hex)`）
+    /// 线上格式：与真实客户端抓包方言逐字段对齐（见 diag.log 样本）：
+    /// - 文件 ID 用十进制（对方方言；size/mtime/attr 用十六进制）
+    /// - attr 后保留 `:` 空扩展段
+    /// 注意调用方需在整条公告末尾追加一个 `\a` 分隔符（样本含尾部分隔符）
     pub fn serialize(&self) -> String {
         format!(
-            "{:x}:{}:{:x}:{:x}:{:x}",
+            "{}:{}:{:x}:{:x}:{:x}:",
             self.id,
             clean_filename(&self.name),
             self.size,
@@ -387,10 +389,11 @@ mod tests {
         assert_eq!(fs[1].id, 2);
         assert_eq!(fs[1].size, 999999);
 
-        // 线上格式与本环境真实客户端一致：全字段十六进制
+        // 线上格式与真实客户端方言一致：ID 十进制，size/mtime/attr 十六进制，
+        // attr 后保留空扩展段（尾部冒号）
         assert_eq!(
             e1.serialize(),
-            format!("1:报告 最终版.pdf:{:x}:{:x}:1", 20480, 1700000000)
+            format!("1:报告 最终版.pdf:{:x}:{:x}:1:", 20480, 1700000000)
         );
     }
 
