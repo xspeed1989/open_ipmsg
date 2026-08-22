@@ -2,8 +2,9 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
-/** 注册后端事件监听（返回 unlisten 函数） */
-export const listenEvent = (event, handler) => listen(event, handler)
+/** 注册后端事件监听（自动解包 Tauri 事件对象的 payload；返回 unlisten 函数） */
+export const listenEvent = (event, handler) =>
+  listen(event, (e) => handler(e.payload))
 
 /** 获取配置（含本机信息 hostname / ips） */
 export const getConfig = () => invoke('get_config')

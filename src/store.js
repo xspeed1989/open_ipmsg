@@ -288,6 +288,7 @@ export async function boot() {
 
   await ipc.listenEvent(ipc.EVT.usersUpdated, () => loadUsers())
   await ipc.listenEvent(ipc.EVT.msgIn, ({ key, msg }) => {
+    if (!key || !msg) return
     pushMsg(key, msg)
     if (isChatVisible(key)) {
       markReadFor(key)
