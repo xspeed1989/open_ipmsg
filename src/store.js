@@ -9,8 +9,6 @@ import * as ipc from './lib/ipc'
 
 export const store = reactive({
   booted: false,
-  /** 页面模式：chat 会话 | contacts 通讯录 */
-  page: 'chat',
   settingsOpen: false,
   firstRun: false,
   search: '',
@@ -51,17 +49,6 @@ export function fmtTime(ts) {
   if (!ts) return ''
   const d = new Date(ts * 1000)
   return `${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-
-/** 会话列表右上角时间：今天 HH:mm / 昨天 / 更早 MM-DD */
-export function fmtListTime(ts) {
-  if (!ts) return ''
-  const d = new Date(ts * 1000)
-  const now = new Date()
-  const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() / 1000
-  if (ts >= midnight) return fmtTime(ts)
-  if (ts >= midnight - DAY) return '昨天'
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
 }
 
 /** 消息流中的日期分隔标签 */
@@ -154,7 +141,6 @@ export function pushMsg(key, msg) {
 }
 
 export async function openChat(key) {
-  store.page = 'chat'
   await ensureChat(key)
   store.activeKey = key
   if (store.unread[key]) {
@@ -215,9 +201,9 @@ export function previewText(msg) {
   return t.length > 48 ? t.slice(0, 48) + '…' : t
 }
 
-/** 消息可见（聊天打开 + 窗口聚焦）时视为已读 */
+/** 消息可见（聊天已打开且窗口聚焦）时视为已读 */
 function isChatVisible(key) {
-  return store.windowFocused && store.page === 'chat' && store.activeKey === key
+  return store.windowFocused && store.activeKey === key
 }
 
 export async function sendText(text) {
@@ -281,7 +267,7 @@ export async function boot() {
   // 窗口焦点跟踪：失焦时来消息弹通知；重新聚焦自动标记已读
   getCurrentWindow().onFocusChanged(({ payload: focused }) => {
     store.windowFocused = focused
-    if (focused && store.page === 'chat' && store.activeKey) {
+    if (focused && store.activeKey) {
       markReadFor(store.activeKey)
     }
   })

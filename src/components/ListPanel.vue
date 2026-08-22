@@ -1,84 +1,38 @@
 <script setup>
-// 中栏：会话列表（消息页）/ 按群组分组的联系人（通讯录页）
+// 中栏：联系人列表（按群组分组，固定显示，未读角标提示新消息）
 import { computed } from 'vue'
-import { store, displayName, fmtListTime, openChat, dayLabel } from '../store'
+import { store, openChat } from '../store'
 import Avatar from './Avatar.vue'
 
-function matchUser(key, name) {
+function matchUser(u) {
   const q = store.search.trim().toLowerCase()
   if (!q) return true
-  const u = store.userMap[key]
-  const hay = [
-    name,
-    key,
-    u?.host,
-    u?.group,
-    u?.user,
-  ]
-    .filter(Boolean)
-    .join(' ')
+  const hay = `${u.nickname} ${u.host} ${u.ip} ${u.group} ${u.user}`
     .toLowerCase()
   return hay.includes(q)
 }
 
-function previewOf(last) {
-  if (!last) return ''
-  if (last.kind === 'file') {
-    const n = (last.files || []).length
-    const firstName = last.files?.[0]?.name || '文件'
-    return `[文件] ${firstName}${n > 1 ? ` 等${n}个` : ''}`
-  }
-  return (last.text || '').replace(/\s+/g, ' ')
-}
-
-const sessions = computed(() => {
-  const keys = new Set()
-  for (const k of Object.keys(store.chats)) {
-    if (store.chats[k].msgs.length) keys.add(k)
-  }
-  for (const k of Object.keys(store.unread)) keys.add(k)
-
-  const arr = []
-  for (const k of keys) {
-    const msgs = store.chats[k]?.msgs || []
-    const last = msgs[msgs.length - 1]
-    const name = displayName(k)
-    if (!matchUser(k, name)) continue
-    arr.push({
-      key: k,
-      name,
-      preview: previewOf(last),
-      time: store.lastTs[k] || last?.ts || 0,
-      unread: store.unread[k] || 0,
-      online: !!store.userMap[k],
-      group: store.userMap[k]?.group || store.peerMeta[k]?.group || '',
-    })
-  }
-  arr.sort((a, b) => b.time - a.time)
-  return arr
-})
-
-/** 通讯录：按群组分组 */
+/** 按群组分组的联系人；组内未读优先，其余按昵称排序 */
 const contactGroups = computed(() => {
-  const q = store.search.trim().toLowerCase()
   const groups = {}
   for (const u of store.users) {
-    const hay = `${u.nickname} ${u.host} ${u.ip} ${u.group} ${u.user}`.toLowerCase()
-    if (q && !hay.includes(q)) continue
+    if (!matchUser(u)) continue
     const g = u.group || '未分组'
     ;(groups[g] ||= []).push(u)
   }
+  const unreadOf = (u) => store.unread[u.key] || 0
   return Object.entries(groups)
     .sort(([a], [b]) => a.localeCompare(b, 'zh'))
     .map(([g, list]) => ({
       group: g,
-      users: list.sort((x, y) => (x.nickname || '').localeCompare(y.nickname || '', 'zh')),
+      users: list.sort(
+        (x, y) =>
+          unreadOf(y) - unreadOf(x) ||
+          (x.nickname || '').localeCompare(y.nickname || '', 'zh')
+      ),
     }))
 })
 
-function openSession(s) {
-  openChat(s.key)
-}
 function openContact(u) {
   openChat(u.key)
 }
@@ -96,40 +50,16 @@ function openContact(u) {
       </div>
     </div>
 
-    <!-- 会话列表 -->
-    <div v-if="store.page === 'chat'" class="rows">
-      <div
-        v-for="s in sessions"
-        :key="s.key"
-        class="row"
-        :class="{ active: store.activeKey === s.key }"
-        @click="openSession(s)"
-      >
-        <div class="ava">
-          <Avatar :name="s.name" :seed="s.key" :size="40" />
-          <i class="status-dot" :class="s.online ? 'on' : 'off'" :title="s.online ? '在线' : '离线'"></i>
-        </div>
-        <div class="mid">
-          <div class="r1 ellipsis">{{ s.name }}</div>
-          <div class="r2 ellipsis">{{ s.preview }}</div>
-        </div>
-        <div class="right">
-          <div class="time">{{ fmtListTime(s.time) }}</div>
-          <i v-if="s.unread" class="badge">{{ s.unread > 99 ? '99+' : s.unread }}</i>
-        </div>
-      </div>
-
-      <div v-if="!sessions.length" class="empty-tip">
-        <p>暂无会话</p>
-        <p class="sub">同一局域网内打开对方也会出现在通讯录，发消息后即建立会话</p>
-      </div>
-    </div>
-
-    <!-- 通讯录 -->
-    <div v-else class="rows">
+    <div class="rows">
       <template v-for="g in contactGroups" :key="g.group">
         <div class="group-head">{{ g.group }}（{{ g.users.length }}）</div>
-        <div v-for="u in g.users" :key="u.key" class="row contact" @click="openContact(u)">
+        <div
+          v-for="u in g.users"
+          :key="u.key"
+          class="row contact"
+          :class="{ active: store.activeKey === u.key }"
+          @click="openContact(u)"
+        >
           <div class="ava">
             <Avatar :name="u.nickname || u.user || '?'" :seed="u.key" :size="36" />
             <i class="status-dot on" title="在线"></i>
@@ -138,8 +68,14 @@ function openContact(u) {
             <div class="r1 ellipsis">{{ u.nickname || u.user || '未知用户' }}</div>
             <div class="r2 ellipsis">{{ u.host }} · {{ u.ip }}{{ u.group ? ' · ' + u.group : '' }}</div>
           </div>
+          <div class="right">
+            <i v-if="store.unread[u.key]" class="badge">
+              {{ store.unread[u.key] > 99 ? '99+' : store.unread[u.key] }}
+            </i>
+          </div>
         </div>
       </template>
+
       <div v-if="!contactGroups.length" class="empty-tip">
         <p>局域网内暂无其他用户</p>
         <p class="sub">请确认对方已运行 IPMsg 客户端（UDP 端口 2425），或点击聊天窗口右上角「刷新」重新广播</p>
@@ -210,13 +146,7 @@ function openContact(u) {
 }
 .right {
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 5px;
-}
-.time {
-  font-size: 11px;
-  color: var(--c-sub);
+  align-items: center;
 }
 .badge {
   min-width: 16px;
@@ -247,9 +177,6 @@ function openContact(u) {
 }
 .status-dot.on {
   background: var(--c-accent);
-}
-.status-dot.off {
-  background: #c0c0c0;
 }
 .group-head {
   padding: 8px 12px 4px;
