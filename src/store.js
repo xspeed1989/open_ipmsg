@@ -140,14 +140,16 @@ export function pushMsg(key, msg) {
     if (idx >= 0) {
       const old = c.msgs[idx]
       for (const f of msg.files || []) {
+        // 保留旧卡片的非 pending 状态（下载中/已完成/失败）与本地路径、原因
         const prev = (old.files || []).find(
-          (x) => x.id === f.id && (x.state === 'done' || x.state === 'downloading')
+          (x) => x.id === f.id && x.state && x.state !== 'pending'
         )
         if (prev) {
           f.state = prev.state
-          f.path = prev.path
+          f.path = prev.path ?? f.path
           f.transferred = prev.transferred
           f.error = prev.error
+          if (prev.src) f.src = prev.src
         }
       }
       if (old.read && msg.dir === 'in') msg.read = true

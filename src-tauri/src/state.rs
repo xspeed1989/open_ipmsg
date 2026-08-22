@@ -380,6 +380,23 @@ impl AppState {
         );
     }
 
+    /// 查找该会话中指定包号的最近一条入站记录（用于状态继承）
+    pub fn find_in_record(&self, key: &str, pkt: u32) -> Option<serde_json::Value> {
+        use std::io::BufRead;
+        let path = self.log_path(key);
+        let f = std::fs::File::open(&path).ok()?;
+        let last = std::io::BufReader::new(f)
+            .lines()
+            .filter_map(|l| l.ok())
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+            .filter(|rec| {
+                rec.get("dir").and_then(|v| v.as_str()) == Some("in")
+                    && rec.get("pkt").and_then(|v| v.as_u64()) == Some(pkt as u64)
+            })
+            .last()?;
+        Some(last)
+    }
+
     /// 标记出站消息已被对端已读（收到 READMSG 回执），返回是否有变更
     pub fn mark_out_read(&self, key: &str, pkt: u32) -> bool {
         self.rewrite_history(

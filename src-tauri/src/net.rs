@@ -380,12 +380,50 @@ async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key
     // 不能按包号查历史去重（会把新会话里合法的附件公告误杀）。
     // 前端对连续重复的同包号消息做原地替换，保证既不刷屏也不丢文件。
 
-    // 图片类小文件自动接收（聊天内直接预览），其余仍需手动下载
-    let auto_ids: Vec<u32> = files
-        .iter()
-        .filter(|f| is_image_name(&f.name) && f.size <= 30 * 1024 * 1024)
-        .map(|f| f.id)
-        .collect();
+    // 图片类小文件自动接收（聊天内直接预览）。对端延迟重发会反复投递同一包号，
+    // 已有历史记录的文件继承其状态（failed 不自动重试，避免无意义循环；
+    // 用户可在卡片上手动点重试），仅首次遇到时触发自动下载。
+    let prev_rec = ctx.st.find_in_record(key, pkt.pkt_no);
+    let prev_files: Vec<serde_json::Value> = prev_rec
+        .as_ref()
+        .and_then(|r| r.get("files").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default();
+    let prev_file = |id: u32| -> Option<serde_json::Value> {
+        prev_files
+            .iter()
+            .find(|f| f.get("id").and_then(|v| v.as_u64()) == Some(id as u64))
+            .cloned()
+    };
+
+    let mut auto_ids: Vec<u32> = Vec::new();
+    let mut file_jsons: Vec<serde_json::Value> = Vec::new();
+    for f in files.iter().filter(|f| f.size <= 30 * 1024 * 1024 && is_image_name(&f.name)) {
+        let prev = prev_file(f.id);
+        let inherited = prev
+            .as_ref()
+            .and_then(|p| p.get("state"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        match inherited.as_deref() {
+            None | Some("pending") => auto_ids.push(f.id),
+            _ => {}
+        }
+        let mut obj = json!({
+            "id": f.id, "rid": f.raw_id, "name": f.name, "size": f.size,
+            "state": inherited.unwrap_or_else(|| "downloading".into()),
+        });
+        if let Some(p) = prev.as_ref() {
+            if p.get("state").and_then(|v| v.as_str()) == Some("done") {
+                if let Some(path) = p.get("path") {
+                    obj["path"] = path.clone();
+                }
+            }
+            if let Some(err) = p.get("error") {
+                obj["error"] = err.clone();
+            }
+        }
+        file_jsons.push(obj);
+    }
 
     let text_end = pkt.extra.iter().position(|&b| b == 0).unwrap_or(pkt.extra.len());
     let text = proto::decode_for_command(&pkt.extra[..text_end], pkt.command);
@@ -393,10 +431,6 @@ async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key
         "dir": "in",
         "kind": kind,
         "text": text,
-        "files": files.iter().map(|f| json!({
-            "id": f.id, "rid": f.raw_id, "name": f.name, "size": f.size,
-            "state": if auto_ids.contains(&f.id) { "downloading" } else { "pending" },
-        })).collect::<Vec<_>>(),
         "ts": now_secs(),
         "pkt": pkt.pkt_no,
         "peer": {"key": key, "nickname": display, "host": pkt.host},
