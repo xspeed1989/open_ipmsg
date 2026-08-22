@@ -124,6 +124,31 @@ impl AppState {
         std::fs::write(self.data_dir.join("config.json"), bytes)
     }
 
+    /// 线路诊断日志（数据目录/diag.log，超过 512KB 自动截断）。
+    /// 记录入站报文摘要与文件传输失败原因，用于远程定位互通问题。
+    pub fn diag(&self, line: &str) {
+        use std::io::Write;
+        let path = self.data_dir.join("diag.log");
+        let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        if let Ok(meta) = f.metadata() {
+            if meta.len() > 512 * 1024 {
+                // 截断重开
+                drop(f);
+                if std::fs::write(&path, b"").is_err() {
+                    return;
+                }
+                f = match std::fs::OpenOptions::new().append(true).open(&path) {
+                    Ok(f) => f,
+                    Err(_) => return,
+                };
+            }
+        }
+        let _ = writeln!(f, "{} {}", now_secs(), line.trim_end());
+    }
+
     /* ---------- 事件桥接 ---------- */
 
     pub fn set_event(&self, f: EventFn) {

@@ -216,6 +216,24 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
     let base = pkt.command & 0xFF;
     let key = from.to_string();
 
+    // 线路诊断：记录入站报文摘要（含原始附加数据十六进制，便于定位互通格式差异）
+    {
+        use std::fmt::Write as _;
+        let raw = &pkt.extra[..pkt.extra.len().min(120)];
+        let mut hexs = String::with_capacity(raw.len() * 3);
+        for b in raw {
+            let _ = write!(hexs, "{b:02x} ");
+        }
+        ctx.st.diag(&format!(
+            "<- {from} cmd={:#010x} len={} user={:?} host={:?} extra[0..{}]={hexs}",
+            pkt.command,
+            data.len(),
+            pkt.user,
+            pkt.host,
+            raw.len()
+        ));
+    }
+
     match base {
         cmd::BR_ENTRY => {
             let (nick, group) = proto::parse_entry_extra(&pkt.extra);
@@ -618,14 +636,23 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
             req.extra,
             ctx.st.offered.lock().unwrap().keys().take(8).collect::<Vec<_>>()
         );
+        ctx.st.diag(&format!(
+            "tcp-miss {peer} extra={:?} pkt候选={pkt_cands:?} id候选={fid_cands:?}",
+            String::from_utf8_lossy(&req.extra)
+        ));
         return;
     };
     let fname = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     eprintln!("[tcp] {peer} 请求文件 {fname} (offset {offset})");
+    ctx.st.diag(&format!("tcp-hit {peer} file={fname} offset={offset}"));
 
     let mut file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
-        Err(_) => return,
+        Err(e) => {
+            ctx.st
+                .diag(&format!("tcp-open-fail {}: {e}", path.display()));
+            return;
+        }
     };
     if offset > 0 {
         if file.seek(io::SeekFrom::Start(offset)).await.is_err() {
@@ -648,6 +675,7 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
     }
     let _ = stream.flush().await;
     eprintln!("[tcp] 已向 {peer} 发送 {fname}: {sent} 字节");
+    ctx.st.diag(&format!("tcp-sent {peer} file={fname} bytes={sent}"));
 }
 
 fn num_flex_dec_first(t: &str) -> Option<u64> {
@@ -717,6 +745,10 @@ pub async fn download_file_task(
         Ok(total) => {
             std::fs::rename(&tmp_path, &final_path)
                 .map_err(|e| format!("保存文件失败: {e}"))?;
+            ctx.st.diag(&format!(
+                "dl-done {key} pkt={pkt_no} id={file_id:x} -> {} ({total}B)",
+                final_path.display()
+            ));
             ctx.st.emit(
                 "file-progress",
                 json!({"key": key, "pkt": pkt_no, "file_id": file_id,
@@ -731,6 +763,8 @@ pub async fn download_file_task(
         }
         Err(e) => {
             let _ = tokio::fs::remove_file(&tmp_path).await;
+            ctx.st
+                .diag(&format!("dl-fail {key} pkt={pkt_no} id={file_id:x}: {e}"));
             ctx.st.emit(
                 "file-progress",
                 json!({"key": key, "pkt": pkt_no, "file_id": file_id,
@@ -738,6 +772,7 @@ pub async fn download_file_task(
             );
             ctx.st.update_history_file(key, pkt_no, file_id, |f| {
                 f["state"] = "failed".into();
+                f["error"] = Value::String(e.clone());
             });
             Err(e)
         }
