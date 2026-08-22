@@ -1,0 +1,401 @@
+//! IPMsg 协议报文编解码。
+//!
+//! 参考 H.Shirouzu《IP Messenger 通信协议规范》(protocol.txt, v0.9.x)：
+//! 报文格式：`版本:包编号:发送者名:主机名:命令字:附加数据`
+//! - 命令字 = 低 16 位基本命令 + 高位选项标志，十进制表示
+//! - 附加数据中消息体与其后的文件列表以 `\0` 分隔，多个文件项以 `\a`(0x07) 分隔
+//! - 文件项：`ID:文件名:大小:mtime:属性[:扩展属性...]`
+
+use serde::Serialize;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// 协议默认端口
+pub const DEFAULT_PORT: u16 = 2425;
+
+/// 基本命令（低 16 位）
+pub mod cmd {
+    #![allow(dead_code)]
+    pub const NOOPERATION: u32 = 0x0000_0000;
+    pub const BR_ENTRY: u32 = 0x0000_0001;
+    pub const BR_EXIT: u32 = 0x0000_0002;
+    pub const ANSENTRY: u32 = 0x0000_0003;
+    pub const BR_ABSENCE: u32 = 0x0000_0004;
+    pub const BR_ISGETLIST: u32 = 0x0000_0010;
+    pub const OKGETLIST: u32 = 0x0000_0011;
+    pub const GETLIST: u32 = 0x0000_0012;
+    pub const ANSLIST: u32 = 0x0000_0013;
+    pub const SENDMSG: u32 = 0x0000_0020;
+    pub const SENDCMD: u32 = 0x0000_0021;
+    pub const READMSG: u32 = 0x0000_0030;
+    pub const DELMSG: u32 = 0x0000_0031;
+    pub const ANSREADMSG: u32 = 0x0000_0032;
+    pub const GETINFO: u32 = 0x0000_0040;
+    pub const SENDINFO: u32 = 0x0000_0041;
+    pub const GETFILEDATA: u32 = 0x0000_0060;
+    pub const RELEASEFILES: u32 = 0x0000_0061;
+    pub const GETDIRFILES: u32 = 0x0000_0062;
+    pub const GETPUBKEY: u32 = 0x0000_0070;
+    pub const ANSPUBKEY: u32 = 0x0000_0071;
+}
+
+/// 选项标志（高位）
+pub mod opt {
+    #![allow(dead_code)]
+    pub const ABSENCEOPT: u32 = 0x0000_0100;
+    pub const SECRETOPT: u32 = 0x0000_0200;
+    pub const BROADCASTOPT: u32 = 0x0000_0400;
+    pub const AUTORETOPT: u32 = 0x0000_0800;
+    pub const PASSWORDOPT: u32 = 0x0000_1000;
+    pub const NOLOGOPT: u32 = 0x0000_2000;
+    pub const NEWMEMBERSOPT: u32 = 0x0000_4000;
+    pub const NOADDLISTOPT: u32 = 0x0000_8000;
+    pub const DIALUPOPT: u32 = 0x0001_0000;
+    pub const READCHECKOPT: u32 = 0x0010_0000;
+    pub const SECRETEXOPT: u32 = 0x0020_0000;
+    pub const ENCRYPTOPT: u32 = 0x0040_0000;
+    pub const CLIPBOARDOPT: u32 = 0x0100_0000;
+    pub const FILEATTACHOPT: u32 = 0x0200_0000;
+}
+
+/// 文件类型属性
+pub mod fileattr {
+    #![allow(dead_code)]
+    pub const REGULAR: u32 = 0x0000_0001;
+    pub const PERM: u32 = 0x0000_0004;
+    /// 目录 = REGULAR|PERM
+    pub const DIR: u32 = REGULAR | PERM;
+}
+
+static PKT_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// 生成唯一包编号（时间基址 + 序列扰动）
+pub fn next_packet_no() -> u32 {
+    let base = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(12345);
+    let n = PKT_SEQ.fetch_add(1, Ordering::Relaxed);
+    base.wrapping_add(n.wrapping_mul(7919)).max(1)
+}
+
+/// 报文头字段清洗：协议禁止 `:`、CR、LF、NUL 出现在头部字段
+fn clean_field(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            ':' | '\r' | '\n' | '\0' => '_',
+            _ => c,
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct Packet {
+    pub pkt_no: u32,
+    pub user: String,
+    pub host: String,
+    pub command: u32,
+    pub extra: Vec<u8>,
+}
+
+impl Packet {
+    pub fn new(command: u32) -> Self {
+        Packet {
+            pkt_no: next_packet_no(),
+            user: String::new(),
+            host: String::new(),
+            command,
+            extra: Vec::new(),
+        }
+    }
+
+    pub fn with_pkt_no(mut self, no: u32) -> Self {
+        self.pkt_no = no;
+        self
+    }
+
+    /// 编码为线上字节流（头部 ASCII，附加数据原样）
+    pub fn encode(&self, user: &str, host: &str) -> Vec<u8> {
+        let mut buf =
+            format!("1:{}:{}:{}:{}:", self.pkt_no, clean_field(user), clean_field(host), self.command)
+                .into_bytes();
+        buf.extend_from_slice(&self.extra);
+        buf
+    }
+}
+
+/// 从原始字节解析报文；头部按字节扫描前 5 个 `:`，避免 GBK 消息体破坏 UTF-8 解析
+pub fn parse(raw: &[u8]) -> Option<Packet> {
+    let mut idx = [0usize; 5];
+    let mut found = 0usize;
+    let mut i = 0usize;
+    while i < raw.len() && found < 5 {
+        if raw[i] == b':' {
+            idx[found] = i;
+            found += 1;
+        }
+        i += 1;
+    }
+    if found < 5 {
+        return None;
+    }
+    let field = |k: usize| -> String {
+        let start = if k == 0 { 0 } else { idx[k - 1] + 1 };
+        String::from_utf8_lossy(&raw[start..idx[k]]).trim().to_string()
+    };
+    let _ver = field(0);
+    let pkt_no: u32 = field(1).parse().ok()?;
+    let user = field(2);
+    let host = field(3);
+    let command: u32 = field(4).parse().ok()?;
+    Some(Packet {
+        pkt_no,
+        user,
+        host,
+        command,
+        extra: raw[idx[4] + 1..].to_vec(),
+    })
+}
+
+/* ---------------- 编码 / 解码 ---------------- */
+
+/// 收到字节 → 文本：优先 UTF-8，失败则按 GBK 解码（兼容老版中文飞鸽传书）
+pub fn decode_bytes(b: &[u8]) -> String {
+    match std::str::from_utf8(b) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            let (decoded, _, _) = encoding_rs::GBK.decode(b);
+            decoded.into_owned()
+        }
+    }
+}
+
+/// 发送文本 → 字节：按配置编码（utf8 / gbk）
+pub fn encode_out(s: &str, encoding: &str) -> Vec<u8> {
+    if encoding.eq_ignore_ascii_case("gbk") {
+        let (bytes, _, _) = encoding_rs::GBK.encode(s);
+        bytes.into_owned()
+    } else {
+        s.as_bytes().to_vec()
+    }
+}
+
+/// 取报文中的消息体（第一个 NUL 之前的部分）并解码
+pub fn text_of(pkt: &Packet) -> String {
+    let end = pkt.extra.iter().position(|&b| b == 0).unwrap_or(pkt.extra.len());
+    decode_bytes(&pkt.extra[..end])
+}
+
+/* ---------------- 文件项 ---------------- */
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileEntry {
+    pub id: u32,
+    pub name: String,
+    pub size: u64,
+    pub mtime: u64,
+    pub attr: u32,
+}
+
+impl FileEntry {
+    pub fn serialize(&self) -> String {
+        format!(
+            "{:x}:{}:{}:{}:{:x}",
+            self.id,
+            clean_filename(&self.name),
+            self.size,
+            self.mtime,
+            self.attr
+        )
+    }
+}
+
+fn clean_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            ':' | '\u{7}' | '\0' | '\r' | '\n' => '_',
+            _ => c,
+        })
+        .collect()
+}
+
+/// 数字字段宽容解析。官方客户端 ID 与属性用十六进制书写、大小与时间用十进制，
+/// 这里对两种进制都做尝试：`hex_first` 用于 ID/属性，`dec_first` 用于大小/时间。
+fn num_hex_first(t: &str) -> Option<u64> {
+    let t = t.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        return u64::from_str_radix(h, 16).ok();
+    }
+    if let Ok(v) = u64::from_str_radix(t, 16) {
+        return Some(v);
+    }
+    t.parse::<u64>().ok()
+}
+
+fn num_dec_first(t: &str) -> Option<u64> {
+    let t = t.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Ok(v) = t.parse::<u64>() {
+        return Some(v);
+    }
+    u64::from_str_radix(t.trim_start_matches("0x"), 16).ok()
+}
+
+/// 解析附加数据中 `\0` 之后的文件项列表（以 `\a` 分隔）
+pub fn parse_file_entries(extra: &[u8]) -> Vec<FileEntry> {
+    let start = match extra.iter().position(|&b| b == 0) {
+        Some(p) => p + 1,
+        None => return Vec::new(),
+    };
+    extra[start..]
+        .split(|&b| b == 0x07)
+        .filter(|seg| !seg.is_empty())
+        .filter_map(|seg| {
+            let mut it = seg.splitn(6, |&b| b == b':');
+            let id = num_hex_first(&String::from_utf8_lossy(it.next()?))?;
+            let name = decode_bytes(it.next()?);
+            if name.is_empty() {
+                return None;
+            }
+            let size = num_dec_first(&String::from_utf8_lossy(it.next()?))?;
+            let mtime = num_dec_first(&String::from_utf8_lossy(it.next()?)).unwrap_or(0);
+            let attr =
+                num_hex_first(&String::from_utf8_lossy(it.next()?)).map(|v| v as u32).unwrap_or(fileattr::REGULAR);
+            Some(FileEntry {
+                id: id as u32,
+                name,
+                size,
+                mtime,
+                attr,
+            })
+        })
+        .collect()
+}
+
+/// 构造上线类附加数据：昵称\0群组
+pub fn build_entry_extra(nickname: &str, group: &str, encoding: &str) -> Vec<u8> {
+    let mut extra = encode_out(nickname, encoding);
+    extra.push(0);
+    extra.extend_from_slice(&encode_out(group, encoding));
+    extra
+}
+
+/// 解析上线类附加数据：(昵称, 群组)
+pub fn parse_entry_extra(extra: &[u8]) -> (String, String) {
+    match extra.iter().position(|&b| b == 0) {
+        Some(p) => (
+            decode_bytes(&extra[..p]),
+            decode_bytes(&extra[p + 1..]),
+        ),
+        None => (decode_bytes(extra), String::new()),
+    }
+}
+
+/* ---------------- 单元测试 ---------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_roundtrip() {
+        let mut p = Packet::new(cmd::SENDMSG | opt::FILEATTACHOPT).with_pkt_no(42);
+        p.extra = b"hello world".to_vec();
+        let user = "张三:san";
+        let host = "pc\n01";
+        let bytes = p.encode(user, host);
+        let q = parse(&bytes).expect("parse ok");
+        assert_eq!(q.pkt_no, 42);
+        assert_eq!(q.user, "张三_san");
+        assert_eq!(q.host, "pc_01");
+        assert_eq!(q.command, cmd::SENDMSG | opt::FILEATTACHOPT);
+        assert_eq!(q.extra, b"hello world");
+        assert_eq!(text_of(&q), "hello world");
+    }
+
+    #[test]
+    fn gbk_decode() {
+        // “你好” 的 GBK 编码字节
+        let gbk = [0xC4u8, 0xE3, 0xBA, 0xC3];
+        assert_eq!(decode_bytes(&gbk), "你好");
+    }
+
+    #[test]
+    fn gbk_encode_roundtrip() {
+        let bytes = encode_out("你好世界", "gbk");
+        assert_eq!(decode_bytes(&bytes), "你好世界");
+        let utf8 = encode_out("你好", "utf8");
+        assert_eq!(utf8, "你好".as_bytes());
+    }
+
+    #[test]
+    fn file_entries_roundtrip() {
+        let e1 = FileEntry {
+            id: 1,
+            name: "报告 最终版.pdf".into(),
+            size: 20480,
+            mtime: 1700000000,
+            attr: fileattr::REGULAR,
+        };
+        let e2 = FileEntry {
+            id: 2,
+            name: "photo.jpg".into(),
+            size: 999999,
+            mtime: 1700000001,
+            attr: fileattr::REGULAR,
+        };
+        let mut extra = "看看这两个文件".as_bytes().to_vec();
+        extra.push(0);
+        extra.extend_from_slice(e1.serialize().as_bytes());
+        extra.push(0x07);
+        extra.extend_from_slice(e2.serialize().as_bytes());
+
+        let pkt = Packet {
+            pkt_no: 7,
+            user: "a".into(),
+            host: "h".into(),
+            command: cmd::SENDMSG | opt::FILEATTACHOPT,
+            extra,
+        };
+        assert_eq!(text_of(&pkt), "看看这两个文件");
+        let fs = parse_file_entries(&pkt.extra);
+        assert_eq!(fs.len(), 2);
+        assert_eq!(fs[0].name, "报告 最终版.pdf");
+        assert_eq!(fs[0].size, 20480);
+        assert_eq!(fs[1].id, 2);
+        assert_eq!(fs[1].size, 999999);
+    }
+
+    #[test]
+    fn file_entries_compat_styles() {
+        // 兼容官方十六进制 ID / 十进制大小的混合风格，以及带偏移的写法
+        let raw = b"text\x00a:name_a:100:111:1:xx\x07b:name_b:200:222:1";
+        let fs = parse_file_entries(raw);
+        assert_eq!(fs.len(), 2);
+        assert_eq!(fs[0].id, 0xa);
+        assert_eq!(fs[0].size, 100);
+        assert_eq!(fs[1].id, 0xb);
+        assert_eq!(fs[1].size, 200);
+        assert_eq!(fs[1].mtime, 222);
+    }
+
+    #[test]
+    fn entry_extra_roundtrip() {
+        let extra = build_entry_extra("小明", "研发部", "utf8");
+        let (nick, group) = parse_entry_extra(&extra);
+        assert_eq!(nick, "小明");
+        assert_eq!(group, "研发部");
+    }
+
+    #[test]
+    fn parse_rejects_garbage() {
+        assert!(parse(b"not a packet").is_none());
+        assert!(parse(b"1:x:y:z:abc:def").is_none());
+        assert!(parse(b"").is_none());
+    }
+}

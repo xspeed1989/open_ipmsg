@@ -1,0 +1,25 @@
+{
+  "name": "open-ipmsg",
+  "private": true,
+  "version": "0.1.0",
+  "description": "跨平台 IP Messenger(IPMsg) 客户端 —— Tauri v2 + Vue 3，仿微信PC版界面",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "selftest": "node scripts/selftest.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-dialog": "^2.7.2",
+    "@tauri-apps/plugin-opener": "^2.5.4",
+    "vue": "^3.5.41"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "vite": "^7.1.0"
+  }
+}

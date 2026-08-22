@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "OpenIPMsg",
+  "version": "0.1.0",
+  "identifier": "io.github.open-ipmsg.app",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Open IPMsg",
+        "width": 980,
+        "height": 660,
+        "minWidth": 780,
+        "minHeight": 520,
+        "center": true,
+        "resizable": true,
+        "decorations": false,
+        "transparent": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Communication",
+    "shortDescription": "局域网即时通讯（IPMsg 协议）",
+    "longDescription": "基于 Tauri v2 的跨平台 IP Messenger 客户端：局域网用户发现、文本消息与文件传输（UDP/TCP 2425），界面参考微信 PC 版。",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ]
+  }
+}
