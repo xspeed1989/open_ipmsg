@@ -380,6 +380,13 @@ async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key
     // 不能按包号查历史去重（会把新会话里合法的附件公告误杀）。
     // 前端对连续重复的同包号消息做原地替换，保证既不刷屏也不丢文件。
 
+    // 图片类小文件自动接收（聊天内直接预览），其余仍需手动下载
+    let auto_ids: Vec<u32> = files
+        .iter()
+        .filter(|f| is_image_name(&f.name) && f.size <= 30 * 1024 * 1024)
+        .map(|f| f.id)
+        .collect();
+
     let text_end = pkt.extra.iter().position(|&b| b == 0).unwrap_or(pkt.extra.len());
     let text = proto::decode_for_command(&pkt.extra[..text_end], pkt.command);
     let rec = json!({
@@ -387,7 +394,8 @@ async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key
         "kind": kind,
         "text": text,
         "files": files.iter().map(|f| json!({
-            "id": f.id, "rid": f.raw_id, "name": f.name, "size": f.size, "state": "pending",
+            "id": f.id, "rid": f.raw_id, "name": f.name, "size": f.size,
+            "state": if auto_ids.contains(&f.id) { "downloading" } else { "pending" },
         })).collect::<Vec<_>>(),
         "ts": now_secs(),
         "pkt": pkt.pkt_no,
@@ -398,6 +406,38 @@ async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key
     });
     ctx.st.log_record(key, &rec);
     ctx.st.emit("msg-in", json!({"key": key, "msg": rec}));
+
+    // 自动接收图片
+    for f in files.iter().filter(|f| auto_ids.contains(&f.id)) {
+        let st2 = ctx.st.clone();
+        let sock2 = ctx.sock.clone();
+        let port2 = ctx.port;
+        let k2 = key.to_string();
+        let name = f.name.clone();
+        let rid = f.raw_id.clone();
+        let id = f.id;
+        let pno = pkt.pkt_no;
+        tokio::spawn(async move {
+            let tmp = NetCtx {
+                st: st2,
+                sock: sock2,
+                port: port2,
+            };
+            if let Err(e) =
+                download_file_task(&tmp, &k2, pno, id, &name, &rid).await
+            {
+                eprintln!("[auto-dl] {k2} #{id} {name}: {e}");
+            }
+        });
+    }
+}
+
+/// 常见图片扩展名判断（用于聊天内联预览与自动接收）
+fn is_image_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
 }
 
 /* ================= 出站消息 ================= */

@@ -1,6 +1,7 @@
 <script setup>
 // 右侧聊天窗口：头部 / 消息流（日期分隔+气泡）/ 工具栏 / 输入区
 import { ref, computed, watch, nextTick } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
 import {
   store, sendText, sendFiles, downloadFile,
   displayName, dayLabel, fmtTime, fmtSize, refreshUsers,
@@ -120,6 +121,40 @@ async function openFile(path) {
 async function revealFile(path) {
   try { await revealItemInDir(path) } catch (e) { alert('打开文件夹失败：' + e) }
 }
+
+/* ---------- 图片内联预览 ---------- */
+const IMG_RE = /\.(png|jpe?g|gif|bmp|webp)$/i
+function isImg(name) {
+  return IMG_RE.test(name || '')
+}
+
+/** 本地已有图片内容时加载 base64 预览（发出即显；接收在下载完成后显） */
+async function ensureImg(m, f) {
+  if (!isImg(f.name) || f.src || f._imgLoading) return
+  if (f.size > 32 * 1024 * 1024) return // 超大图不做内联预览
+  const path = f.path
+  if (!path) return
+  if (m.dir === 'in' && f.state !== 'done') return
+  f._imgLoading = true
+  try {
+    const r = await invoke('read_image_data', { path })
+    f.mime = r.mime
+    f.src = `data:${r.mime};base64,${r.b64}`
+    scrollBottom(true)
+  } catch {
+    /* 预览失败静默降级为文件卡片 */
+  } finally {
+    f._imgLoading = false
+  }
+}
+
+watch(
+  msgs,
+  (list) => {
+    for (const m of list) for (const f of m.files || []) ensureImg(m, f)
+  },
+  { deep: true, immediate: true }
+)
 </script>
 
 <template>
@@ -152,7 +187,13 @@ async function revealFile(path) {
           <div class="bubble-wrap">
             <div class="bubble" :class="{ file: v.m.kind === 'file' }">
               <div v-if="v.m.text" class="b-text">{{ v.m.text }}</div>
-              <div v-for="f in v.m.files || []" :key="f.id" class="file-card">
+              <template v-for="f in v.m.files || []" :key="f.id">
+                <!-- 图片：本地已有内容时直接内联预览，点击查看原图 -->
+                <div v-if="isImg(f.name) && f.src" class="img-wrap">
+                  <img :src="f.src" class="chat-img" title="点击查看原图" @click="openFile(f.path)" />
+                </div>
+                <!-- 无预览时显示文件卡片（下载中/失败/非图片/超大图） -->
+                <div v-else class="file-card">
                 <div class="fc-icon">
                   <svg width="26" height="26" viewBox="0 0 24 24" fill="none">
                     <path d="M6 3h8l4 4v14H6V3z" stroke="#7a7a7a" stroke-width="1.6" stroke-linejoin="round" />
@@ -189,7 +230,8 @@ async function revealFile(path) {
                     </template>
                   </div>
                 </div>
-              </div>
+                </div>
+              </template>
             </div>
             <div class="m-time" :class="{ self: v.m.dir === 'out' }">
               <span v-if="v.m.dir === 'out' && v.m.rcpt" class="read-tag" :class="{ done: v.m.read }">
@@ -398,6 +440,21 @@ async function revealFile(path) {
 }
 .read-tag.done {
   color: var(--c-accent);
+}
+
+/* 图片内联预览 */
+.img-wrap {
+  margin-top: 6px;
+  background: #fff;
+  border-radius: 6px;
+  padding: 3px;
+}
+.chat-img {
+  display: block;
+  max-width: min(260px, 100%);
+  max-height: 200px;
+  border-radius: 4px;
+  cursor: zoom-in;
 }
 
 /* 文件卡片 */

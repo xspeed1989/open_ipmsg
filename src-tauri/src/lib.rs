@@ -161,6 +161,39 @@ async fn download_file(
     Ok(())
 }
 
+/// 读取本地图片并转为 base64 数据（供聊天内联预览）。
+/// 仅允许常见位图扩展名，超过 32MB 拒绝预览。
+#[tauri::command]
+async fn read_image_data(path: String) -> Result<Value, String> {
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "webp" => "image/webp",
+        _ => return Err("不支持的图片类型".into()),
+    };
+    let meta = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| format!("读取失败: {e}"))?;
+    if meta.len() > 32 * 1024 * 1024 {
+        return Err("图片过大，不做内联预览".into());
+    }
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("读取失败: {e}"))?;
+    use base64::Engine as _;
+    Ok(json!({
+        "mime": mime,
+        "b64": base64::engine::general_purpose::STANDARD.encode(bytes),
+    }))
+}
+
 /// 标记入站消息已读，并对要求回执的消息向对端发送 READMSG
 #[tauri::command]
 async fn mark_read(ctx: State<'_, SharedCtx>, key: String, pkts: Vec<u32>) -> Result<usize, String> {
@@ -343,6 +376,7 @@ pub fn run() {
             send_text,
             send_files,
             download_file,
+            read_image_data,
             mark_read
         ])
         .build(tauri::generate_context!())
