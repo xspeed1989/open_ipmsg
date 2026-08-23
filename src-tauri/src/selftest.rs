@@ -198,6 +198,7 @@ async fn async_run() -> bool {
     /* ---- 3b. 发送目录（对端经 GETDIRFILES 取回整棵树） ---- */
     let send_dir = data_dir.join("upload_dir");
     std::fs::create_dir_all(send_dir.join("sub")).unwrap();
+    std::fs::create_dir_all(send_dir.join("空子目录")).unwrap(); // 空目录也要能传过去
     std::fs::write(send_dir.join("root.txt"), "根目录文件".as_bytes()).unwrap();
     std::fs::write(send_dir.join("sub/inner.bin"), (0..9000u32).map(|i| (i % 253) as u8).collect::<Vec<u8>>()).unwrap();
     let rec = net::send_message(
@@ -216,10 +217,26 @@ async fn async_run() -> bool {
     let want_tree = read_tree(&send_dir);
     let dir_fetch_ok = wait_for(8000, || {
         let p = shared.lock().unwrap();
-        p.fetched_dirs.last().map(|t| *t == want_tree).unwrap_or(false)
+        p.fetched_dirs
+            .last()
+            .map(|t| {
+                let files: Vec<_> = t.iter().filter(|(n, _)| !n.ends_with('/')).cloned().collect();
+                files == want_tree
+            })
+            .unwrap_or(false)
     })
     .await;
     log.check("假对端经 GETDIRFILES 取回整棵目录树且逐字节一致", dir_fetch_ok);
+    log.check(
+        "发送目录：空子目录也在流里（对端能原样重建）",
+        shared
+            .lock()
+            .unwrap()
+            .fetched_dirs
+            .last()
+            .map(|t| t.iter().any(|(n, _)| n == "空子目录/"))
+            .unwrap_or(false),
+    );
 
     /* ---- 4. 接收附件（对端提供 TCP 服务） ---- */
     let offered = wait_for(3000, || {
@@ -311,6 +328,14 @@ async fn async_run() -> bool {
             let mut want = want;
             want.sort();
             log.check("接收目录：目录树重建完整且逐字节一致", got == want);
+            log.check(
+                "接收目录：空子目录也被建出来",
+                path.join("空目录").is_dir(),
+            );
+            log.check(
+                "接收目录：符号链接等非常规条目不落盘（内容被正确跳过）",
+                !path.join("链接").exists(),
+            );
             log.check(
                 "接收目录：落盘目录名与公告一致",
                 path.file_name().map(|n| n == "假对端目录").unwrap_or(false),
@@ -914,6 +939,17 @@ fn fake_dir_stream() -> Vec<u8> {
     let (_, ref f0) = files[0];
     out.extend_from_slice(&dir_head("hello.txt", f0.len() as u64, 1));
     out.extend_from_slice(f0);
+
+    // 符号链接条目（官方类型 4）：不该落盘，但其内容必须被跳过，
+    // 否则后面的条目会全部错位
+    let link_target = b"/etc/passwd";
+    out.extend_from_slice(&dir_head("链接", link_target.len() as u64, 4));
+    out.extend_from_slice(link_target);
+
+    // 空子目录：进入后立刻返回，接收端也应该把它建出来
+    out.extend_from_slice(&dir_head("空目录", 0, 2));
+    out.extend_from_slice(&dir_head(".", 0, 3));
+
     out.extend_from_slice(&dir_head("sub", 0, 2));
     let (_, ref f1) = files[1];
     out.extend_from_slice(&dir_head("data.bin", f1.len() as u64, 1));
@@ -971,7 +1007,13 @@ async fn fetch_dir(
         let size = u64::from_str_radix(fields[2], 16).map_err(|e| e.to_string())? as usize;
         let attr = u32::from_str_radix(fields[3], 16).map_err(|e| e.to_string())?;
         match attr {
-            2 => stack.push(name),
+            2 => {
+                stack.push(name);
+                // 根目录之外的每一层都记一笔（空目录只能靠这个验证）
+                if stack.len() > 1 {
+                    out.push((stack[1..].join("/") + "/", Vec::new()));
+                }
+            }
             3 => {
                 if stack.pop().is_none() {
                     return Err("多余的返回上级".into());

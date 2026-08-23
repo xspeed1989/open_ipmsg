@@ -339,6 +339,11 @@ function pct(f) {
   if (!f.total) return 0
   return Math.min(100, Math.round(((f.transferred || 0) / f.total) * 100))
 }
+/** 对端公告的体积可能是 0（官方客户端对文件夹就这么发），
+ *  这时百分比没有意义，改显示已接收的字节数 */
+function progressLabel(f) {
+  return f.total ? `${pct(f)}%` : fmtSize(f.transferred || 0)
+}
 /** 单击聊天里的图片 → 在独立窗口打开（仿微信） */
 async function viewImage(f) {
   if (!f.path) return
@@ -619,8 +624,8 @@ watch(
                         <a @click.prevent="downloadFile(v.m, f)">下载</a>
                       </template>
                       <template v-else-if="f.state === 'downloading'">
-                        <span>{{ pct(f) }}%</span>
-                        <i class="bar"><i :style="{ width: pct(f) + '%' }"></i></i>
+                        <span>{{ progressLabel(f) }}</span>
+                        <i v-if="f.total" class="bar"><i :style="{ width: pct(f) + '%' }"></i></i>
                       </template>
                       <template v-else-if="f.state === 'done'">
                         <span class="ok">{{ f.dir_entry ? '文件夹已保存' : '已保存' }}</span>

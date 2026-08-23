@@ -1128,10 +1128,21 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
 
 /// 目录流内的条目属性
 mod dirattr {
+    #![allow(dead_code)]
     pub const REGULAR: u32 = 1;
     pub const ENTER: u32 = 2;
     pub const RETPARENT: u32 = 3;
+    // 官方 ipmsg.h 还定义了这些类型；我们不落盘，但必须把内容读掉，
+    // 否则流会错位，后面的条目全部解析失败
+    pub const SYMLINK: u32 = 4;
+    pub const CDEV: u32 = 5;
+    pub const BDEV: u32 = 6;
+    pub const FIFO: u32 = 7;
+    pub const RESFORK: u32 = 0x10;
 }
+
+/// 一次目录传输最多接收的条目数，防御异常/恶意对端把磁盘写满
+const DIR_MAX_ENTRIES: usize = 50_000;
 
 /// 目录递归遍历上限，防御符号链接环与超深目录
 const DIR_MAX_DEPTH: usize = 64;
@@ -1556,6 +1567,7 @@ async fn fetch_dir_tree(
     let mut depth: usize = 0;
     let mut total = 0u64;
     let mut got_root = false;
+    let mut entries = 0usize;
     let mut last_emit = Instant::now();
 
     loop {
@@ -1563,7 +1575,12 @@ async fn fetch_dir_tree(
             break; // 流正常结束
         };
         let (name, size, attr) = head;
-        match attr {
+        entries += 1;
+        if entries > DIR_MAX_ENTRIES {
+            return Err(format!("目录条目超过 {DIR_MAX_ENTRIES} 个，已中止"));
+        }
+        // 扩展位不参与类型判断（官方类型值在低 8 位）
+        match attr & 0xFF {
             dirattr::ENTER => {
                 if depth > DIR_MAX_DEPTH {
                     return Err("目录层级过深，已中止".into());
@@ -1595,7 +1612,7 @@ async fn fetch_dir_tree(
                     return Err("目录流试图越出接收目录".into());
                 }
             }
-            _ => {
+            dirattr::REGULAR => {
                 if !got_root {
                     return Err("目录流未以目录条目开始".into());
                 }
@@ -1616,6 +1633,16 @@ async fn fetch_dir_tree(
                         json!({"key": key, "pkt": pkt_no, "file_id": file_id,
                                "transferred": total, "total": expect_size, "done": false}),
                     );
+                }
+            }
+            // 符号链接/设备文件/资源分支等：不落盘，但内容必须读掉以免流错位
+            other => {
+                let skipped = rd.skip_exact(&mut stream, size).await?;
+                ctx.st.diag(&format!(
+                    "dl-dir-skip {key} 跳过非常规条目 {name}（类型 {other}，{skipped} 字节）"
+                ));
+                if skipped < size {
+                    return Err(format!("传输中断：{name} 只收到 {skipped}/{size} 字节"));
                 }
             }
         }
@@ -1741,6 +1768,20 @@ impl StreamReader {
             .ok_or("目录流大小字段无法解析")?;
         let name = proto::decode_bytes(&fields[..fields.len() - 2].join(&b':'));
         Ok(Some((proto::strip_control(&name), size, attr)))
+    }
+
+    /// 丢弃接下来的 want 字节（用于跳过不落盘的条目），返回实际跳过量
+    async fn skip_exact(&mut self, stream: &mut TcpStream, want: u64) -> Result<u64, String> {
+        let mut left = want;
+        while left > 0 {
+            if self.avail() == 0 && !self.fill(stream).await? {
+                break;
+            }
+            let take = (left as usize).min(self.avail());
+            self.pos += take;
+            left -= take as u64;
+        }
+        Ok(want - left)
     }
 
     /// 把接下来的 want 字节写入文件，返回实际写入量（不足即为对端提前断流）
