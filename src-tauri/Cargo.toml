@@ -12,6 +12,17 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2.6", features = [] }
 
+# Linux：WebKitGTK 不把文件类剪贴板内容暴露给网页（复制文件后 clipboardData 是空的），
+# 只能直接读 GTK 剪贴板拿 text/uri-list。版本跟随 tauri already-vendored 的传递依赖。
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+gdk = "0.18"
+# ksni：Linux 下自实现 StatusNotifierItem（libappindicator 收不到点击事件）。
+# 必须用 async-io 而非默认的 tokio 特性：Cargo 会做特性合并，一旦 zbus 打开 tokio，
+# notify-rust 的 show() 就会走「新建多线程运行时再 block_on」的实现，
+# 从 Tauri 命令所在的 tokio worker 上调用会 panic（Cannot start a runtime from within a runtime）
+ksni = { version = "0.3.6", default-features = false, features = ["async-io"] }
+
 [dependencies]
 tauri = { version = "2.11", features = ["tray-icon"] }
 tauri-plugin-dialog = "2.7"
@@ -33,6 +44,7 @@ tokio = { version = "1", features = [
 encoding_rs = "0.8"
 local-ip-address = "0.6"
 hostname = "0.4"
+tauri-plugin-single-instance = "2.4.3"
 
 [features]
 net_debug = []

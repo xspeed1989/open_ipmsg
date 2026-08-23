@@ -26,7 +26,9 @@ pub mod cmd {
     pub const GETLIST: u32 = 0x0000_0012;
     pub const ANSLIST: u32 = 0x0000_0013;
     pub const SENDMSG: u32 = 0x0000_0020;
-    pub const SENDCMD: u32 = 0x0000_0021;
+    /// 送达确认：收到带 SENDCHECKOPT 的 SENDMSG 后立即回，附加数据为原包编号。
+    /// 发送方据此把消息从「待发/重投队列」里删除；不回的话它会一直重发。
+    pub const RECVMSG: u32 = 0x0000_0021;
     pub const READMSG: u32 = 0x0000_0030;
     pub const DELMSG: u32 = 0x0000_0031;
     pub const ANSREADMSG: u32 = 0x0000_0032;
@@ -43,7 +45,10 @@ pub mod cmd {
 /// （github.com/shirouzu/ipmsg），勿凭记忆修改
 pub mod opt {
     #![allow(dead_code)]
+    /// 0x100 在上线类报文里表示「离开模式」，在 SENDMSG 里表示
+    /// 「请回送达确认」(IPMSG_SENDCHECKOPT)，同值不同义，按命令区分
     pub const ABSENCEOPT: u32 = 0x0000_0100;
+    pub const SENDCHECKOPT: u32 = 0x0000_0100;
     pub const SERVEROPT: u32 = 0x0000_0200;
     pub const SECRETOPT: u32 = 0x0000_0200; // 与 SERVEROPT 同值（官方历史兼容）
     pub const BROADCASTOPT: u32 = 0x0000_0400;

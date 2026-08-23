@@ -28,10 +28,10 @@ function pick(e) {
   right: 12px;
   width: 264px;
   padding: 8px;
-  background: #fff;
+  background: var(--c-card);
   border: 1px solid var(--c-hairline);
   border-radius: 8px;
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.12);
+  box-shadow: 0 6px 24px var(--c-shadow);
   display: grid;
   grid-template-columns: repeat(10, 1fr);
   gap: 2px;
@@ -43,6 +43,6 @@ function pick(e) {
   border-radius: 4px;
 }
 .emoji:hover {
-  background: #f0f0f0;
+  background: var(--c-list-hover);
 }
 </style>

@@ -36,8 +36,7 @@ function close() {
     <div class="tb-left" data-tauri-drag-region>
       <span class="logo" data-tauri-drag-region></span>
       <span class="app-name" data-tauri-drag-region>
-        Open IPMsg v{{ store.config?.version || '?' }} ·
-        {{ (store.config?.encoding || 'utf8').toLowerCase() === 'gbk' ? 'GBK' : 'UTF-8' }}
+        Open IPMsg v{{ store.config?.version || '?' }}
       </span>
     </div>
     <div class="tb-controls">
@@ -97,14 +96,14 @@ function close() {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #555;
+  color: var(--c-text);
 }
 .tb-btn:hover {
-  background: rgba(0, 0, 0, 0.08);
-  color: #222;
+  background: var(--c-hover);
+  color: var(--c-text);
 }
 .tb-close:hover {
   background: var(--c-danger);
-  color: #fff;
+  color: var(--c-card);
 }
 </style>

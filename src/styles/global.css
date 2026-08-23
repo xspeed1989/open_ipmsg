@@ -1,21 +1,120 @@
-/* ===== Open IPMsg 全局样式（微信 PC 风格） ===== */
+/* ===== Open IPMsg 全局样式（微信 PC 风格） =====
+ *
+ * 主题：亮色写在 :root，暗色只覆写颜色变量，分两处生效
+ *   1) [data-theme="dark"]  —— 用户在设置里显式选了深色
+ *   2) @media (prefers-color-scheme: dark) 且未显式选浅色 —— 跟随系统
+ * 组件里一律用变量，不要再写死颜色，否则切主题会漏。
+ */
 :root {
+  /* 结构面 */
   --c-titlebar: #ededed;
   --c-rail: #ededed;
   --c-list: #f2f2f2;
   --c-list-hover: #e8e8e8;
   --c-list-active: #d5d5d5;
   --c-chat: #f5f5f5;
+  --c-card: #ffffff;          /* 弹窗/输入框等卡片底 */
+  --c-card-alt: #fafafa;      /* 次级卡片底（只读输入框、按钮） */
+  --c-hairline: #dcdcdc;      /* 分隔线 */
+  --c-border: #d9d9d9;        /* 控件描边 */
+  --c-hover: rgba(0, 0, 0, 0.07); /* 通用悬停底 */
+  --c-mask: rgba(0, 0, 0, 0.35);  /* 弹窗遮罩 */
+  --c-mask-soft: rgba(255, 255, 255, 0.82); /* 拖放提示等浅遮罩 */
+  --c-tint: rgba(0, 0, 0, 0.03);  /* 极淡底纹（文件卡片等） */
+  --c-shadow: rgba(0, 0, 0, 0.25);
+
+  /* 气泡 */
   --c-bubble-peer: #ffffff;
   --c-bubble-self: #95ec69;
-  --c-hairline: #dcdcdc;
-  --c-accent: #07c160;
-  --c-danger: #fa5151;
+  --c-bubble-self-text: #191919;
+
+  /* 文字 */
   --c-text: #191919;
   --c-sub: #8a8a8a;
+  --c-weak: #b5b5b5;          /* 更弱的说明文字/图标 */
+
+  /* 强调色 */
+  --c-accent: #07c160;
+  --c-danger: #fa5151;
+  --c-link: #576b95;        /* 可点击的次要动作（下载/重试等） */
+  --c-scroll: rgba(0, 0, 0, 0.18);
+  --c-scroll-hover: rgba(0, 0, 0, 0.3);
 
   --rail-w: 60px;
   --list-w: 232px;
+
+  /* 告诉排版引擎当前配色，原生控件（下拉框、滚动条、输入光标）随之切换 */
+  color-scheme: light;
+}
+
+/* 深色：显式选择 */
+:root[data-theme='dark'] {
+  --c-titlebar: #2b2b2b;
+  --c-rail: #2b2b2b;
+  --c-list: #262626;
+  --c-list-hover: #303030;
+  --c-list-active: #3a3a3a;
+  --c-chat: #1e1e1e;
+  --c-card: #2d2d2d;
+  --c-card-alt: #343434;
+  --c-hairline: #3a3a3a;
+  --c-border: #4a4a4a;
+  --c-hover: rgba(255, 255, 255, 0.10);
+  --c-mask: rgba(0, 0, 0, 0.55);
+  --c-mask-soft: rgba(30, 30, 30, 0.86);
+  --c-tint: rgba(255, 255, 255, 0.05);
+  --c-shadow: rgba(0, 0, 0, 0.6);
+
+  --c-bubble-peer: #2f2f2f;
+  --c-bubble-self: #3e7a3a;
+  --c-bubble-self-text: #eaeaea;
+
+  --c-text: #e6e6e6;
+  --c-sub: #9a9a9a;
+  --c-weak: #767676;
+
+  --c-accent: #2aa76a;
+  --c-danger: #f06a6a;
+  --c-link: #8ab0e8;
+  --c-scroll: rgba(255, 255, 255, 0.22);
+  --c-scroll-hover: rgba(255, 255, 255, 0.36);
+  color-scheme: dark;
+}
+
+/* 深色：跟随系统（用户没有显式选浅色时才生效） */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --c-titlebar: #2b2b2b;
+    --c-rail: #2b2b2b;
+    --c-list: #262626;
+    --c-list-hover: #303030;
+    --c-list-active: #3a3a3a;
+    --c-chat: #1e1e1e;
+    --c-card: #2d2d2d;
+    --c-card-alt: #343434;
+    --c-hairline: #3a3a3a;
+    --c-border: #4a4a4a;
+    --c-hover: rgba(255, 255, 255, 0.10);
+    --c-mask: rgba(0, 0, 0, 0.55);
+    --c-mask-soft: rgba(30, 30, 30, 0.86);
+    --c-tint: rgba(255, 255, 255, 0.05);
+    --c-shadow: rgba(0, 0, 0, 0.6);
+
+    --c-bubble-peer: #2f2f2f;
+    --c-bubble-self: #3e7a3a;
+    --c-bubble-self-text: #eaeaea;
+
+    --c-text: #e6e6e6;
+    --c-sub: #9a9a9a;
+    --c-weak: #767676;
+
+    --c-accent: #2aa76a;
+    --c-danger: #f06a6a;
+    --c-link: #8ab0e8;
+    --c-scroll: rgba(255, 255, 255, 0.22);
+    --c-scroll-hover: rgba(255, 255, 255, 0.36);
+    color-scheme: dark;
+  }
 }
 
 * {
@@ -36,7 +135,7 @@ body {
     'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', sans-serif;
   font-size: 14px;
   color: var(--c-text);
-  background: #fff;
+  background: var(--c-card);
   -webkit-font-smoothing: antialiased;
   user-select: none;
   cursor: default;
@@ -69,11 +168,11 @@ li {
   height: 6px;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.18);
+  background: var(--c-scroll);
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 0, 0, 0.3);
+  background: var(--c-scroll-hover);
 }
 ::-webkit-scrollbar-track {
   background: transparent;
@@ -91,14 +190,14 @@ li {
   opacity: 0.88;
 }
 .btn-plain {
-  border: 1px solid #d1d1d1;
-  background: #fafafa;
+  border: 1px solid var(--c-border);
+  background: var(--c-card-alt);
   border-radius: 4px;
   padding: 5px 20px;
   font-size: 13px;
 }
 .btn-plain:hover {
-  background: #f0f0f0;
+  background: var(--c-list-hover);
 }
 
 .ellipsis {

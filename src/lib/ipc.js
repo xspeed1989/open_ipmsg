@@ -22,14 +22,37 @@ export const refreshUsers = () => invoke('refresh_users')
 export const getHistory = (key, limit = 300) => invoke('get_history', { key, limit })
 
 /** 发送文本消息，返回落库后的消息记录 */
+export const clearHistory = (key) => invoke('clear_history', { key })
+
+/** 全文搜索聊天记录；key 省略则搜索全部会话 */
+export const searchHistory = (query, key, limit) =>
+  invoke('search_history', { query, key, limit })
+
 export const sendText = (key, text) => invoke('send_text', { key, text })
 
 /** 发送附件（多个文件路径），返回消息记录 */
 export const sendFiles = (key, paths) => invoke('send_files', { key, paths })
 
+/** 按未读总数切换托盘图标（有未读时带红点角标） */
+export const setUnread = (total) => invoke('set_unread', { total })
+
+/** 读系统剪贴板里的文件列表（Linux 下 webview 拿不到，走原生 GTK 剪贴板） */
+export const clipboardFilePaths = () => invoke('clipboard_file_paths')
+
+/** 把粘贴进来的文件内容落盘，返回可发送的本地路径 */
+export const stagePastedFile = (name, b64) => invoke('stage_pasted_file', { name, b64 })
+
+/** 在独立窗口里打开一张本地图片（仿微信图片查看器） */
+export const openImageViewer = (path, name) =>
+  invoke('open_image_viewer', { path, name })
+
+/** 发送剪贴板图片（base64 原始数据，后端落盘后按附件公告） */
+export const sendClipboardImage = (key, text, b64, mime) =>
+  invoke('send_clipboard_image', { key, text, b64, mime })
+
 /** 下载对端文件（后台任务，进度走 file-progress 事件）；rid 为对端公告的原始 ID 串 */
-export const downloadFile = (key, pktNo, fileId, name, rid) =>
-  invoke('download_file', { key, pktNo, fileId, name, rid })
+export const downloadFile = (key, pktNo, fileId, name, rid, size, isDir) =>
+  invoke('download_file', { key, pktNo, fileId, name, rid, size, isDir })
 
 /** 标记入站消息已读，并对要求回执的消息发送 READMSG；返回发出的回执数 */
 export const markRead = (key, pkts) => invoke('mark_read', { key, pkts })
@@ -39,5 +62,7 @@ export const EVT = {
   usersUpdated: 'users-updated',
   msgIn: 'msg-in',
   fileProgress: 'file-progress',
+  /** 从托盘唤起主窗口：跳到最新的未读会话 */
+  openUnread: 'open-unread',
   msgRead: 'msg-read',
 }

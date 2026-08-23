@@ -219,12 +219,35 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
     if from.port() == ctx.port && local_ipv4_set().contains(&from.ip()) {
         return;
     }
-    if !ctx.st.mark_seen(from.ip(), pkt.pkt_no) {
-        return; // 重复包
-    }
     // 基本命令取低 8 位（官方规范：所有选项标志位于 bit8 以上）
     let base = pkt.command & 0xFF;
     let key = from.to_string();
+
+    // 送达确认：带 SENDCHECKOPT 的消息必须立刻回 RECVMSG，否则发送方会认为
+    // 没送到，把消息留在待发队列里，每次我方上线就重投一遍（离线留言反复出现
+    // 就是这么来的）。这一步要在重复包过滤之前做 —— 对端正是因为没收到确认
+    // 才重发的，重发包更需要回确认。
+    if base == cmd::SENDMSG && pkt.command & opt::SENDCHECKOPT != 0 {
+        let n = ctx.st.bump_ack(from.ip(), pkt.pkt_no);
+        // 包编号的书写进制各实现不一：首次按十进制（协议头部就是十进制），
+        // 对端若不认会重发，届时改用十六进制再确认一次
+        let body = if n % 2 == 0 {
+            pkt.pkt_no.to_string()
+        } else {
+            format!("{:x}", pkt.pkt_no)
+        };
+        let cfg = ctx.st.config();
+        let mut r = proto::Packet::new(cmd::RECVMSG | opt::AUTORETOPT);
+        r.extra = body.clone().into_bytes();
+        let bytes = r.encode(&my_user(&cfg), &my_host());
+        let _ = ctx.sock.send_to(&bytes, from).await;
+        ctx.st
+            .diag(&format!("-> {from} RECVMSG 送达确认 pkt={body}（第 {} 次）", n + 1));
+    }
+
+    if !ctx.st.mark_seen(from.ip(), pkt.pkt_no) {
+        return; // 重复包
+    }
 
     // 线路诊断：记录入站报文摘要（含原始附加数据十六进制，便于定位互通格式差异）
     {
@@ -289,7 +312,22 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             let _ = added;
         }
         cmd::BR_EXIT => {
-            if ctx.st.remove_peer(&key).is_some() {
+            // 退出广播可能来自临时端口（进程收尾时无法复用主 socket），
+            // 因此按 IP 清理该主机的所有会话条目，而不是只按 ip:port 精确匹配
+            let ip = from.ip().to_string();
+            let removed: Vec<String> = {
+                let mut peers = ctx.st.peers.lock().unwrap();
+                let hit: Vec<String> = peers
+                    .values()
+                    .filter(|p| p.ip == ip)
+                    .map(|p| p.key.clone())
+                    .collect();
+                for k in &hit {
+                    peers.remove(k);
+                }
+                hit
+            };
+            if !removed.is_empty() {
                 ctx.st.emit("users-updated", json!({}));
             }
         }
@@ -326,10 +364,15 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             let _ = ctx.sock.send_to(&bytes, from).await;
         }
         cmd::RELEASEFILES => {
-            // 对端放弃接收：释放对应的文件槽
+            // 对端放弃接收：释放对应的文件槽。包编号的进制约定各家不一，两种都试
             let first = pkt.extra.split(|&b| b == b':').next().unwrap_or(b"");
-            if let Ok(no) = String::from_utf8_lossy(first).trim().parse::<u32>() {
-                ctx.st.offered.lock().unwrap().retain(|(p, _), _| *p != no);
+            let cands = id_candidates(&String::from_utf8_lossy(first));
+            if !cands.is_empty() {
+                ctx.st
+                    .offered
+                    .lock()
+                    .unwrap()
+                    .retain(|(p, _), _| !cands.contains(p));
             }
         }
         // GETPUBKEY：不支持加密协商，忽略即可（对端会回退明文）
@@ -395,22 +438,31 @@ async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key
             .cloned()
     };
 
+    // 所有附件都要进入消息记录，前端才能展示卡片并手动下载；
+    // 其中小图片额外触发自动接收（聊天内直接预览）。
     let mut auto_ids: Vec<u32> = Vec::new();
     let mut file_jsons: Vec<serde_json::Value> = Vec::new();
-    for f in files.iter().filter(|f| f.size <= 30 * 1024 * 1024 && is_image_name(&f.name)) {
+    for f in files.iter() {
+        let is_dir = f.attr & 0xFF == fileattr::DIR;
+        let auto = !is_dir && f.size <= 30 * 1024 * 1024 && is_image_name(&f.name);
         let prev = prev_file(f.id);
         let inherited = prev
             .as_ref()
             .and_then(|p| p.get("state"))
             .and_then(|v| v.as_str())
             .map(String::from);
-        match inherited.as_deref() {
-            None | Some("pending") => auto_ids.push(f.id),
-            _ => {}
+        if auto && matches!(inherited.as_deref(), None | Some("pending")) {
+            auto_ids.push(f.id);
         }
+        let default_state = if auto {
+            "downloading"
+        } else {
+            "pending"
+        };
         let mut obj = json!({
             "id": f.id, "rid": f.raw_id, "name": f.name, "size": f.size,
-            "state": inherited.unwrap_or_else(|| "downloading".into()),
+            "dir_entry": is_dir,
+            "state": inherited.unwrap_or_else(|| default_state.into()),
         });
         if let Some(p) = prev.as_ref() {
             if p.get("state").and_then(|v| v.as_str()) == Some("done") {
@@ -425,21 +477,34 @@ async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key
         file_jsons.push(obj);
     }
 
+    // 对端"延迟发送"会用同一包号反复重投同一条消息：已读状态必须继承，
+    // 否则每次重投都被当成新的未读消息，标记已读时又回一次 READMSG，
+    // 对端就会反复弹"消息已���查看"
+    let already_read = prev_rec
+        .as_ref()
+        .and_then(|r| r.get("read").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+
     let text_end = pkt.extra.iter().position(|&b| b == 0).unwrap_or(pkt.extra.len());
     let text = proto::decode_for_command(&pkt.extra[..text_end], pkt.command);
     let rec = json!({
         "dir": "in",
         "kind": kind,
         "text": text,
+        "files": file_jsons,
         "ts": now_secs(),
         "pkt": pkt.pkt_no,
         "peer": {"key": key, "nickname": display, "host": pkt.host},
         // 对端要求已读回执：待用户查看后由 mark_read 发送 READMSG
         "need_read": pkt.command & opt::READCHECKOPT != 0,
-        "read": false,
+        "read": already_read,
     });
-    ctx.st.log_record(key, &rec);
-    ctx.st.emit("msg-in", json!({"key": key, "msg": rec}));
+    // 同包号原地更新，历史不再被重发副本撑爆
+    let first_seen = ctx.st.upsert_in_record(key, &rec);
+    ctx.st.emit(
+        "msg-in",
+        json!({"key": key, "msg": rec, "resend": !first_seen}),
+    );
 
     // 自动接收图片
     for f in files.iter().filter(|f| auto_ids.contains(&f.id)) {
@@ -450,6 +515,8 @@ async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key
         let name = f.name.clone();
         let rid = f.raw_id.clone();
         let id = f.id;
+        let size = f.size;
+        let is_dir = false; // 自动接收只针对图片文件，目录一律等用户手动确认
         let pno = pkt.pkt_no;
         tokio::spawn(async move {
             let tmp = NetCtx {
@@ -458,11 +525,133 @@ async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key
                 port: port2,
             };
             if let Err(e) =
-                download_file_task(&tmp, &k2, pno, id, &name, &rid).await
+                download_file_task(&tmp, &k2, pno, id, &name, &rid, size, is_dir).await
             {
                 eprintln!("[auto-dl] {k2} #{id} {name}: {e}");
             }
         });
+    }
+}
+
+/* ================= 剪贴板图片 ================= */
+
+/// 把剪贴板图片（base64）落盘到数据目录下的缓存目录，返回可发送的路径。
+///
+/// IPMsg 协议没有独立的"图片"报文——图片就是一个普通附件，靠扩展名识别；
+/// 对端（含官方客户端）按文件接收，本客户端会自动接收并在聊天里内联显示。
+pub fn stage_clipboard_image(
+    data_dir: &std::path::Path,
+    b64: &str,
+    mime: &str,
+) -> Result<PathBuf, String> {
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        "image/webp" => "webp",
+        other => return Err(format!("不支持的图片类型：{other}")),
+    };
+    stage_blob(
+        data_dir,
+        "剪贴板图片",
+        &format!("剪贴板图片_{}.{ext}", clipboard_stamp()),
+        b64,
+        32 * 1024 * 1024,
+    )
+}
+
+/// 把剪贴板里"只有内容没有路径"的文件落盘后再发送。
+///
+/// Windows 资源管理器复制的文件粘贴进来时，webview 只给得到文件名与内容，
+/// 拿不到原始路径，只能先写进缓存目录再按普通附件公告。
+pub fn stage_clipboard_file(
+    data_dir: &std::path::Path,
+    name: &str,
+    b64: &str,
+) -> Result<PathBuf, String> {
+    // 文件名只取最后一段并清洗，杜绝 ../ 之类的路径穿越
+    let base = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .replace(':', "_");
+    let base = base.trim();
+    let safe = if base.is_empty() || base.trim_matches('.').is_empty() {
+        format!("粘贴文件_{}", clipboard_stamp())
+    } else {
+        base.to_string()
+    };
+    stage_blob(data_dir, "剪贴板文件", &safe, b64, 256 * 1024 * 1024)
+}
+
+/// 落盘一份 base64 内容到数据目录下的缓存目录，返回可发送的路径
+fn stage_blob(
+    data_dir: &std::path::Path,
+    sub_dir: &str,
+    file_name: &str,
+    b64: &str,
+    max_bytes: usize,
+) -> Result<PathBuf, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| format!("剪贴板数据无法解码: {e}"))?;
+    if bytes.is_empty() {
+        return Err("剪贴板内容为空".into());
+    }
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "内容超过 {}MB，请改用拖放或「发送文件」",
+            max_bytes / 1024 / 1024
+        ));
+    }
+
+    // 发出的内容要一直可读（对端可能延后来取），只清理 7 天前的旧缓存
+    let dir = data_dir.join(sub_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建缓存目录失败: {e}"))?;
+    prune_clipboard_cache(&dir);
+
+    // 同名/同秒多次粘贴也不能互相覆盖
+    let path = unique_path(&dir.join(file_name));
+    std::fs::write(&path, &bytes).map_err(|e| format!("写入缓存失败: {e}"))?;
+    Ok(path)
+}
+
+/// 缓存文件名时间戳 yyyymmdd-hhmmss（UTC，避免引入日期库依赖）
+fn clipboard_stamp() -> String {
+    let secs = now_secs();
+    let tod = secs % 86_400;
+    // 民用历法换算（Howard Hinnant 的 civil_from_days）
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!(
+        "{y:04}{m:02}{d:02}-{:02}{:02}{:02}",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
+/// 清理 7 天前的剪贴板缓存图片
+fn prune_clipboard_cache(dir: &std::path::Path) {
+    let cutoff = std::time::SystemTime::now() - Duration::from_secs(7 * 86_400);
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        if e.metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t < cutoff)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(e.path());
+        }
     }
 }
 
@@ -499,12 +688,14 @@ pub async fn send_message(
     // 注册文件槽必须在发包前完成（对端可能立刻来取）
     let mut entries: Vec<proto::FileEntry> = Vec::new();
     let mut inserted: Vec<(u32, u32)> = Vec::new();
-    for (i, p) in paths.iter().enumerate() {
+    ctx.st.prune_offered();
+    for p in paths.iter() {
         let path = PathBuf::from(p);
         let meta = std::fs::metadata(&path)
             .map_err(|e| format!("无法读取文件 {}: {e}", path.display()))?;
-        if !meta.is_file() {
-            return Err(format!("暂不支持发送目录：{}", path.display()));
+        let is_dir = meta.is_dir();
+        if !meta.is_file() && !is_dir {
+            return Err(format!("不支持的文件类型：{}", path.display()));
         }
         let name = path
             .file_name()
@@ -517,20 +708,24 @@ pub async fn send_message(
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // 目录公告体积 = 递归总字节数（仅供对端展示进度，实际以流内容为准）
+        let size = if is_dir { dir_total_size(&path) } else { meta.len() };
         entries.push(proto::FileEntry {
             id,
             raw_id: String::new(),
             name: name.clone(),
-            size: meta.len(),
+            size,
             mtime,
-            attr: fileattr::REGULAR,
+            attr: if is_dir { fileattr::DIR } else { fileattr::REGULAR },
         });
         inserted.push((pkt_no, id));
         ctx.st.offered.lock().unwrap().insert(
             (pkt_no, id),
             OfferedFile {
                 path,
-                size: entries.last().unwrap().size,
+                size,
+                is_dir,
+                ts: now_secs(),
             },
         );
     }
@@ -587,6 +782,7 @@ pub async fn send_message(
         "text": text,
         "files": entries.iter().zip(paths.iter()).map(|(e, p)| json!({
             "id": e.id, "name": e.name, "size": e.size, "path": p, "state": "sent",
+            "dir_entry": e.attr & 0xFF == fileattr::DIR,
         })).collect::<Vec<_>>(),
         "ts": now_secs(),
         "pkt": pkt_no,
@@ -623,7 +819,14 @@ pub async fn mark_read_and_receipt(
     if pkts.is_empty() {
         return Ok(0);
     }
+    // 只对「要求回执且历史里仍未读」的消息发回执：前端可能因窗口焦点变化
+    // 反复请求，对端的重发副本也会再次触发，这里做最后一道去重
+    let todo = ctx.st.pending_receipts(key, pkts);
     ctx.st.mark_in_read(key, pkts);
+    if todo.is_empty() {
+        return Ok(0);
+    }
+    let pkts = &todo[..];
 
     let peer = ctx.st.peers.lock().unwrap().get(key).cloned();
     let Some(peer) = peer else {
@@ -660,6 +863,93 @@ mod tests {
         assert_eq!(id_candidates("0x1f"), vec![31]);
         assert!(id_candidates("").is_empty());
         assert!(id_candidates("zz").is_empty());
+    }
+
+    #[test]
+    fn clipboard_image_staging() {
+        use base64::Engine as _;
+        let dir = std::env::temp_dir().join(format!("oim-clip-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = b"\x89PNG\r\n\x1a\n-fake-image-bytes";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+
+        let p1 = stage_clipboard_image(&dir, &b64, "image/png").expect("stage");
+        assert_eq!(std::fs::read(&p1).unwrap(), png);
+        assert_eq!(p1.extension().unwrap(), "png");
+        // 扩展名要能被内联预览识别，否则对端收到也不会直接显示
+        assert!(is_image_name(&p1.file_name().unwrap().to_string_lossy()));
+
+        // 同一秒内连续粘贴不能互相覆盖
+        let p2 = stage_clipboard_image(&dir, &b64, "image/png").expect("stage 2");
+        assert_ne!(p1, p2);
+        assert!(p1.exists() && p2.exists());
+
+        assert!(stage_clipboard_image(&dir, &b64, "image/tiff").is_err());
+        assert!(stage_clipboard_image(&dir, "", "image/png").is_err());
+        assert!(stage_clipboard_image(&dir, "@@not-base64@@", "image/png").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clipboard_file_staging_sanitizes_name() {
+        use base64::Engine as _;
+        let dir = std::env::temp_dir().join(format!("oim-clipfile-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"hello");
+
+        let p = stage_clipboard_file(&dir, "报告.docx", &b64).expect("stage");
+        assert_eq!(p.file_name().unwrap(), "报告.docx");
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+        // 同名再粘一次不能覆盖
+        let p2 = stage_clipboard_file(&dir, "报告.docx", &b64).expect("stage 2");
+        assert_ne!(p, p2);
+        assert!(p.exists() && p2.exists());
+
+        // 路径穿越必须被挡住：只取最后一段，且不能落到缓存目录之外
+        let evil = stage_clipboard_file(&dir, "../../evil.sh", &b64).expect("stage evil");
+        assert_eq!(evil.file_name().unwrap(), "evil.sh");
+        assert!(evil.starts_with(dir.join("剪贴板文件")));
+        let evil2 = stage_clipboard_file(&dir, "..", &b64).expect("stage dots");
+        assert!(evil2.file_name().unwrap().to_string_lossy().starts_with("粘贴文件_"));
+
+        assert!(stage_clipboard_file(&dir, "a.bin", "").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clipboard_stamp_format() {
+        let s = clipboard_stamp();
+        assert_eq!(s.len(), 15, "yyyymmdd-hhmmss");
+        assert_eq!(&s[8..9], "-");
+        assert!(s.chars().filter(|c| c.is_ascii_digit()).count() == 14);
+        assert!(s.starts_with("20"));
+    }
+
+    #[test]
+    fn dir_header_length_is_self_inclusive() {
+        let h = dir_header("a.txt", 0x1234, dirattr::REGULAR);
+        assert_eq!(h, b"0012:a.txt:1234:1:".to_vec());
+        assert_eq!(
+            usize::from_str_radix(std::str::from_utf8(&h[..4]).unwrap(), 16).unwrap(),
+            h.len()
+        );
+        // 超长名字导致长度字段扩位时仍自洽
+        let long = "x".repeat(0x10000);
+        let h = dir_header(&long, 0, dirattr::ENTER);
+        let colon = h.iter().position(|&b| b == b':').unwrap();
+        let n = usize::from_str_radix(std::str::from_utf8(&h[..colon]).unwrap(), 16).unwrap();
+        assert_eq!(n, h.len());
+    }
+
+    #[test]
+    fn safe_component_blocks_traversal() {
+        assert_eq!(safe_component("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(safe_component(".."), "unnamed");
+        assert_eq!(safe_component("  "), "unnamed");
+        assert_eq!(safe_component("C:\\win\\evil"), "C__win_evil");
+        assert_eq!(safe_component("正常.txt"), "正常.txt");
     }
 
     #[test]
@@ -719,36 +1009,37 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
         }
     }
     let Some(req) = req_pkt else { return };
-    if req.command & 0xFF != cmd::GETFILEDATA {
+    let base = req.command & 0xFF;
+    if base != cmd::GETFILEDATA && base != cmd::GETDIRFILES {
         return;
     }
-    // extra: pkt_id:file_id:offset
+    // extra: pkt_id:file_id[:offset]（GETDIRFILES 无断点续传，offset 可缺省）
     let parts: Vec<String> = String::from_utf8_lossy(&req.extra)
         .split(':')
         .map(|s| s.trim().to_string())
         .collect();
-    if parts.len() < 3 {
+    if parts.len() < 2 {
         return;
     }
-    let offset = num_flex_dec_first(&parts[2]).unwrap_or(0);
+    let offset = parts.get(2).and_then(|s| num_flex_dec_first(s)).unwrap_or(0);
 
     // 各客户端对 ID 字段的进制约定不一（官方十六进制、部分实现十进制），
     // 对两种解释都尝试匹配，最大化兼容
     let pkt_cands = id_candidates(&parts[0]);
     let fid_cands = id_candidates(&parts[1]);
-    let mut slot: Option<(PathBuf, u64)> = None;
+    let mut slot: Option<(PathBuf, u64, bool)> = None;
     {
         let offered = ctx.st.offered.lock().unwrap();
         'outer: for p in &pkt_cands {
             for f in &fid_cands {
                 if let Some(o) = offered.get(&(*p, *f)) {
-                    slot = Some((o.path.clone(), o.size));
+                    slot = Some((o.path.clone(), o.size, o.is_dir));
                     break 'outer;
                 }
             }
         }
     }
-    let Some((path, _size)) = slot else {
+    let Some((path, size, is_dir)) = slot else {
         eprintln!(
             "[tcp] GETFILEDATA 未命中: from={peer} extra={:?} 候选pkt={pkt_cands:?} 候选id={fid_cands:?} 已提供={:?}",
             req.extra,
@@ -761,8 +1052,28 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
         return;
     };
     let fname = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    eprintln!("[tcp] {peer} 请求文件 {fname} (offset {offset})");
-    ctx.st.diag(&format!("tcp-hit {peer} file={fname} offset={offset}"));
+    eprintln!("[tcp] {peer} 请求{} {fname} (offset {offset})", if is_dir { "目录" } else { "文件" });
+    ctx.st.diag(&format!("tcp-hit {peer} file={fname} dir={is_dir} offset={offset}"));
+
+    if is_dir {
+        // 目录必须走 GETDIRFILES 流；对端若误用 GETFILEDATA 则无法解析，直接断开
+        if base != cmd::GETDIRFILES {
+            ctx.st
+                .diag(&format!("tcp-dir-wrong-cmd {peer} file={fname} cmd={:#x}", req.command));
+            return;
+        }
+        let sent = serve_dir_stream(&mut stream, &path, &fname).await;
+        let _ = stream.flush().await;
+        let _ = stream.shutdown().await;
+        eprintln!("[tcp] 已向 {peer} 发送目录 {fname}: {sent} 字节");
+        ctx.st.diag(&format!("tcp-sent-dir {peer} dir={fname} bytes={sent}"));
+        return;
+    }
+    if base == cmd::GETDIRFILES {
+        // 普通文件被按目录请求：拒绝，避免对端解析出乱七八糟的目录树
+        ctx.st.diag(&format!("tcp-file-wrong-cmd {peer} file={fname}"));
+        return;
+    }
 
     let mut file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
@@ -773,27 +1084,215 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
         }
     };
     if offset > 0 {
+        if offset >= size {
+            // 断点续传请求越界：直接关连接，别把整个文件重发一遍
+            ctx.st
+                .diag(&format!("tcp-bad-offset {peer} file={fname} offset={offset} size={size}"));
+            return;
+        }
         if file.seek(io::SeekFrom::Start(offset)).await.is_err() {
             return;
         }
     }
+    // 只发公告时声明的字节数：文件在公告后被追加写入时，多发的部分会让
+    // 对端按大小校验失败
+    let mut remain = size.saturating_sub(offset);
     let mut chunk = vec![0u8; 64 * 1024];
     let mut sent: u64 = 0;
-    loop {
-        match file.read(&mut chunk).await {
+    while remain > 0 {
+        let want = (remain as usize).min(chunk.len());
+        match file.read(&mut chunk[..want]).await {
             Ok(0) => break,
             Ok(n) => {
                 if stream.write_all(&chunk[..n]).await.is_err() {
                     break;
                 }
                 sent += n as u64;
+                remain -= n as u64;
             }
             Err(_) => break,
         }
     }
     let _ = stream.flush().await;
+    // 主动关闭写端：对端据此判断传输结束
+    let _ = stream.shutdown().await;
     eprintln!("[tcp] 已向 {peer} 发送 {fname}: {sent} 字节");
     ctx.st.diag(&format!("tcp-sent {peer} file={fname} bytes={sent}"));
+}
+
+/* ---------- 目录传输（GETDIRFILES 流） ----------
+
+官方格式：头部 `<头部长度16进制>:<名称>:<大小16进制>:<属性16进制>:`，
+紧跟 <大小> 字节的内容。属性取值：1=普通文件，2=进入目录，3=返回上级
+（此时名称固定为 "."，无内容）。目录树按深度优先展开。 */
+
+/// 目录流内的条目属性
+mod dirattr {
+    pub const REGULAR: u32 = 1;
+    pub const ENTER: u32 = 2;
+    pub const RETPARENT: u32 = 3;
+}
+
+/// 目录递归遍历上限，防御符号链接环与超深目录
+const DIR_MAX_DEPTH: usize = 64;
+
+/// 目录递归总字节数（用于公告体积/进度分母）
+fn dir_total_size(root: &std::path::Path) -> u64 {
+    fn walk(dir: &std::path::Path, depth: usize, acc: &mut u64) {
+        if depth > DIR_MAX_DEPTH {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for ent in rd.flatten() {
+            // 不跟随符号链接（symlink_metadata）
+            let Ok(meta) = ent.metadata() else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                walk(&ent.path(), depth + 1, acc);
+            } else if meta.is_file() {
+                *acc += meta.len();
+            }
+        }
+    }
+    let mut acc = 0;
+    walk(root, 0, &mut acc);
+    acc
+}
+
+/// 目录流的一个操作
+enum DirOp {
+    Enter(String),
+    File(PathBuf, String, u64),
+    Ret,
+}
+
+/// 深度优先展开目录树为流操作序列
+fn collect_dir_ops(root: &std::path::Path, root_name: &str) -> Vec<DirOp> {
+    fn walk(dir: &std::path::Path, depth: usize, out: &mut Vec<DirOp>) {
+        if depth > DIR_MAX_DEPTH {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let mut items: Vec<_> = rd.flatten().collect();
+        items.sort_by_key(|e| e.file_name());
+        for ent in items {
+            let Ok(meta) = ent.metadata() else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if meta.is_dir() {
+                out.push(DirOp::Enter(name));
+                walk(&ent.path(), depth + 1, out);
+                out.push(DirOp::Ret);
+            } else if meta.is_file() {
+                out.push(DirOp::File(ent.path(), name, meta.len()));
+            }
+        }
+    }
+    let mut out = vec![DirOp::Enter(root_name.to_string())];
+    walk(root, 0, &mut out);
+    out.push(DirOp::Ret);
+    out
+}
+
+/// 组装目录流头部（长度字段自身也计入总长）
+fn dir_header(name: &str, size: u64, attr: u32) -> Vec<u8> {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            ':' | '/' | '\\' | '\0' | '\r' | '\n' => '_',
+            _ => c,
+        })
+        .collect();
+    let body = format!(":{cleaned}:{size:x}:{attr:x}:");
+    // 官方用 4 位十六进制；超长文件名时自然扩展位数并迭代收敛
+    let mut width = 4usize;
+    loop {
+        let total = width + body.len();
+        let head = format!("{:0width$x}", total, width = width);
+        if head.len() == width {
+            return format!("{head}{body}").into_bytes();
+        }
+        width = head.len();
+    }
+}
+
+/// 服务端：把目录树按流发给对端，返回发出的内容字节数
+async fn serve_dir_stream(
+    stream: &mut TcpStream,
+    root: &std::path::Path,
+    root_name: &str,
+) -> u64 {
+    let mut sent = 0u64;
+    let mut chunk = vec![0u8; 64 * 1024];
+    for op in collect_dir_ops(root, root_name) {
+        match op {
+            DirOp::Enter(name) => {
+                if stream.write_all(&dir_header(&name, 0, dirattr::ENTER)).await.is_err() {
+                    return sent;
+                }
+            }
+            DirOp::Ret => {
+                if stream.write_all(&dir_header(".", 0, dirattr::RETPARENT)).await.is_err() {
+                    return sent;
+                }
+            }
+            DirOp::File(path, name, size) => {
+                // 以登记时的大小为准：发送期间文件被改写也要保证头部与内容一致
+                if stream.write_all(&dir_header(&name, size, dirattr::REGULAR)).await.is_err() {
+                    return sent;
+                }
+                let Ok(mut f) = tokio::fs::File::open(&path).await else {
+                    // 打开失败：内容按 0 字节补齐，流结构不能错位
+                    if !write_zeros(stream, size, &mut chunk).await {
+                        return sent;
+                    }
+                    sent += size;
+                    continue;
+                };
+                let mut remain = size;
+                while remain > 0 {
+                    let want = (remain as usize).min(chunk.len());
+                    match f.read(&mut chunk[..want]).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if stream.write_all(&chunk[..n]).await.is_err() {
+                                return sent;
+                            }
+                            sent += n as u64;
+                            remain -= n as u64;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // 文件变短：补零到头部声明的长度，避免对端错位解析后续条目
+                if remain > 0 {
+                    if !write_zeros(stream, remain, &mut chunk).await {
+                        return sent;
+                    }
+                    sent += remain;
+                }
+            }
+        }
+    }
+    sent
+}
+
+async fn write_zeros(stream: &mut TcpStream, mut n: u64, buf: &mut [u8]) -> bool {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    while n > 0 {
+        let w = (n as usize).min(buf.len());
+        if stream.write_all(&buf[..w]).await.is_err() {
+            return false;
+        }
+        n -= w as u64;
+    }
+    true
 }
 
 fn num_flex_dec_first(t: &str) -> Option<u64> {
@@ -825,6 +1324,8 @@ fn id_candidates(s: &str) -> Vec<u32> {
 /// 客户端：从对端下载一个附件到配置的接收目录（后台任务，进度走事件）。
 /// `rid` 为对端公告中的原始 ID 字符串（进制不明，必须原样回传）；
 /// 为空时回退用 file_id 的十六进制形式（兼容旧记录）。
+/// `expect_size` 为公告中的字节数，用于进度百分比与截断校验（0 表示未知）。
+#[allow(clippy::too_many_arguments)]
 pub async fn download_file_task(
     ctx: &NetCtx,
     key: &str,
@@ -832,6 +1333,8 @@ pub async fn download_file_task(
     file_id: u32,
     name: &str,
     rid: &str,
+    expect_size: u64,
+    is_dir: bool,
 ) -> Result<PathBuf, String> {
     let peer = ctx
         .st
@@ -851,26 +1354,79 @@ pub async fn download_file_task(
     });
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建接收目录失败: {e}"))?;
 
-    let safe_name: String = name
+    let mut safe_name: String = name
         .chars()
         .map(|c| if c == '/' || c == '\\' || c == ':' { '_' } else { c })
         .collect();
-    let final_path = unique_path(&dir.join(&safe_name));
-    let tmp_path = final_path.with_extension(format!(
-        "part{}",
+    // 防御对端构造的路径穿越/空名
+    if safe_name.trim().is_empty() || safe_name.trim_matches('.').is_empty() {
+        safe_name = format!("file-{file_id:x}");
+    }
+    // 临时文件/目录与最终目标同级、独立命名（不能用 with_extension，会吃掉真实扩展名）
+    let tmp_path = dir.join(format!(
+        ".oim-{:x}-{}.part",
+        file_id,
         DL_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
 
-    let result = fetch_to_file(ctx, key, target, pkt_no, file_id, rid, &tmp_path).await;
+    if is_dir {
+        return download_dir_task(
+            ctx, key, target, pkt_no, file_id, rid, expect_size, &dir, &safe_name, &tmp_path,
+        )
+        .await;
+    }
+
+    // 对端接受连接却不回数据，多半是请求里数字字段的进制不合它的口味：
+    // 换一种方言重试，命中后记住，后续下载不再多花往返
+    let mut result = Ok(0u64);
+    for idx in ctx.st.dialect_order(&peer.ip, DIALECTS.len()) {
+        let d = DIALECTS[idx];
+        result = fetch_to_file(
+            ctx, key, target, pkt_no, file_id, rid, expect_size, d, &tmp_path,
+        )
+        .await;
+        match &result {
+            Ok(0) => {
+                ctx.st.diag(&format!(
+                    "dl-try {key} pkt={pkt_no} id={file_id:x} 方言#{idx}({d:?}) -> 0 字节，换下一种"
+                ));
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                continue;
+            }
+            Ok(n) => {
+                ctx.st.remember_dialect(&peer.ip, idx);
+                ctx.st
+                    .diag(&format!("dl-try {key} 方言#{idx} 命中，收到 {n} 字节"));
+                break;
+            }
+            // 连接层面的失败换方言也没用，直接报错
+            Err(_) => break,
+        }
+    }
     match result {
         Ok(0) => {
             // 对端接受了连接但没有回数据（部分私有实现的前置校验未通过）
             let _ = tokio::fs::remove_file(&tmp_path).await;
             ctx.st
                 .diag(&format!("dl-empty {key} pkt={pkt_no} id={file_id:x}: 对端未返回数据"));
-            Err("对方未提供文件数据（可能不兼容该客户端的传输方式）".into())
+            let e = "对方未返回文件数据：文件可能已被对方撤回或过期，\
+                     也可能是对方客户端不兼容（已尝试全部请求方言）"
+                .to_string();
+            fail_download(ctx, key, pkt_no, file_id, &e);
+            Err(e)
+        }
+        Ok(total) if expect_size > 0 && total < expect_size => {
+            // 连接中途断开：落盘半截文件会静默损坏，按失败处理
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            let e = format!("传输中断：只收到 {total}/{expect_size} 字节");
+            ctx.st
+                .diag(&format!("dl-short {key} pkt={pkt_no} id={file_id:x}: {e}"));
+            fail_download(ctx, key, pkt_no, file_id, &e);
+            Err(e)
         }
         Ok(total) => {
+            // 重名判定推迟到落盘瞬间，避免并发下载抢同一个目标名
+            let final_path = unique_path(&dir.join(&safe_name));
             std::fs::rename(&tmp_path, &final_path)
                 .map_err(|e| format!("保存文件失败: {e}"))?;
             ctx.st.diag(&format!(
@@ -893,20 +1449,421 @@ pub async fn download_file_task(
             let _ = tokio::fs::remove_file(&tmp_path).await;
             ctx.st
                 .diag(&format!("dl-fail {key} pkt={pkt_no} id={file_id:x}: {e}"));
-            ctx.st.emit(
-                "file-progress",
-                json!({"key": key, "pkt": pkt_no, "file_id": file_id,
-                       "transferred": 0, "total": 0, "done": false, "error": e}),
-            );
-            ctx.st.update_history_file(key, pkt_no, file_id, |f| {
-                f["state"] = "failed".into();
-                f["error"] = Value::String(e.clone());
-            });
+            fail_download(ctx, key, pkt_no, file_id, &e);
             Err(e)
         }
     }
 }
 
+/// 客户端：以 GETDIRFILES 流方式接收整个目录树
+#[allow(clippy::too_many_arguments)]
+async fn download_dir_task(
+    ctx: &NetCtx,
+    key: &str,
+    target: SocketAddr,
+    pkt_no: u32,
+    file_id: u32,
+    rid: &str,
+    expect_size: u64,
+    parent: &std::path::Path,
+    safe_name: &str,
+    tmp_root: &std::path::Path,
+) -> Result<PathBuf, String> {
+    // 与取文件同理：对端不认我方请求方言时换一种重试
+    let peer_ip = target.ip().to_string();
+    let mut res: Result<Option<u64>, String> = Ok(None);
+    for idx in ctx.st.dialect_order(&peer_ip, DIALECTS.len()) {
+        res = fetch_dir_tree(
+            ctx, key, target, pkt_no, file_id, rid, expect_size, DIALECTS[idx], tmp_root,
+        )
+        .await;
+        match &res {
+            Ok(None) => {
+                ctx.st.diag(&format!(
+                    "dl-dir-try {key} pkt={pkt_no} id={file_id:x} 方言#{idx} -> 无数据，换下一种"
+                ));
+                let _ = tokio::fs::remove_dir_all(tmp_root).await;
+                continue;
+            }
+            Ok(Some(_)) => {
+                ctx.st.remember_dialect(&peer_ip, idx);
+                break;
+            }
+            // 目录流解析出错说明对端确实在回数据，只是内容有问题，换方言无益
+            Err(_) => break,
+        }
+    }
+    match res {
+        Ok(None) => {
+            let _ = tokio::fs::remove_dir_all(tmp_root).await;
+            let e = "对方未返回目录数据：可能已被撤回，或对方客户端不兼容\
+                     （已尝试全部请求方言）"
+                .to_string();
+            ctx.st
+                .diag(&format!("dl-dir-empty {key} pkt={pkt_no} id={file_id:x}"));
+            fail_download(ctx, key, pkt_no, file_id, &e);
+            Err(e)
+        }
+        Ok(Some(total)) => {
+            // 落盘瞬间才定名，避免并发接收抢同一个目录名
+            let final_path = unique_path(&parent.join(safe_name));
+            std::fs::rename(tmp_root, &final_path).map_err(|e| format!("保存目录失败: {e}"))?;
+            ctx.st.diag(&format!(
+                "dl-dir-done {key} pkt={pkt_no} id={file_id:x} -> {} ({total}B)",
+                final_path.display()
+            ));
+            ctx.st.emit(
+                "file-progress",
+                json!({"key": key, "pkt": pkt_no, "file_id": file_id,
+                       "transferred": total, "total": total, "done": true,
+                       "path": final_path.to_string_lossy()}),
+            );
+            ctx.st.update_history_file(key, pkt_no, file_id, |f| {
+                f["state"] = "done".into();
+                f["path"] = Value::String(final_path.to_string_lossy().into_owned());
+            });
+            Ok(final_path)
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_dir_all(tmp_root).await;
+            ctx.st
+                .diag(&format!("dl-dir-fail {key} pkt={pkt_no} id={file_id:x}: {e}"));
+            fail_download(ctx, key, pkt_no, file_id, &e);
+            Err(e)
+        }
+    }
+}
+
+/// 目录流接收：解析头部序列并按深度重建目录树，返回写入的内容字节数
+#[allow(clippy::too_many_arguments)]
+async fn fetch_dir_tree(
+    ctx: &NetCtx,
+    key: &str,
+    target: SocketAddr,
+    pkt_no: u32,
+    file_id: u32,
+    rid: &str,
+    expect_size: u64,
+    d: Dialect,
+    tmp_root: &std::path::Path,
+) -> Result<Option<u64>, String> {
+    let mut stream =
+        open_transfer(ctx, target, pkt_no, file_id, rid, cmd::GETDIRFILES, d).await?;
+    std::fs::create_dir_all(tmp_root).map_err(|e| format!("创建临时目录失败: {e}"))?;
+
+    let mut rd = StreamReader::new(stream_timeout());
+    let mut cur = tmp_root.to_path_buf();
+    let mut depth: usize = 0;
+    let mut total = 0u64;
+    let mut got_root = false;
+    let mut last_emit = Instant::now();
+
+    loop {
+        let Some(head) = rd.read_header(&mut stream).await? else {
+            break; // 流正常结束
+        };
+        let (name, size, attr) = head;
+        match attr {
+            dirattr::ENTER => {
+                if depth > DIR_MAX_DEPTH {
+                    return Err("目录层级过深，已中止".into());
+                }
+                if !got_root {
+                    // 首个 ENTER 是目录自身，直接落在临时根上，不再嵌套一层
+                    got_root = true;
+                    depth += 1;
+                    continue;
+                }
+                cur = cur.join(safe_component(&name));
+                depth += 1;
+                std::fs::create_dir_all(&cur).map_err(|e| format!("创建子目录失败: {e}"))?;
+            }
+            dirattr::RETPARENT => {
+                if depth == 0 {
+                    return Err("目录流结构异常（多余的返回上级）".into());
+                }
+                depth -= 1;
+                if depth == 0 {
+                    break; // 根目录结束
+                }
+                cur = cur
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| tmp_root.to_path_buf());
+                // 越界保护：任何情况下都不能爬到临时根之上
+                if !cur.starts_with(tmp_root) {
+                    return Err("目录流试图越出接收目录".into());
+                }
+            }
+            _ => {
+                if !got_root {
+                    return Err("目录流未以目录条目开始".into());
+                }
+                let path = cur.join(safe_component(&name));
+                let mut f = tokio::fs::File::create(&path)
+                    .await
+                    .map_err(|e| format!("创建文件失败: {e}"))?;
+                let written = rd.copy_exact(&mut stream, &mut f, size).await?;
+                f.flush().await.map_err(|e| format!("写入失败: {e}"))?;
+                total += written;
+                if written < size {
+                    return Err(format!("传输中断：{name} 只收到 {written}/{size} 字节"));
+                }
+                if last_emit.elapsed() >= Duration::from_millis(150) {
+                    last_emit = Instant::now();
+                    ctx.st.emit(
+                        "file-progress",
+                        json!({"key": key, "pkt": pkt_no, "file_id": file_id,
+                               "transferred": total, "total": expect_size, "done": false}),
+                    );
+                }
+            }
+        }
+    }
+    if !got_root {
+        // 一条头部都没读到：交给上层换方言重试
+        return Ok(None);
+    }
+    Ok(Some(total))
+}
+
+/// 目录名/文件名逐段清洗：拒绝路径分隔符与 `..`，防止流内容写到接收目录之外
+fn safe_component(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '\0' => '_',
+            _ => c,
+        })
+        .collect();
+    let t = cleaned.trim();
+    if t.is_empty() || t.trim_matches('.').is_empty() {
+        return "unnamed".into();
+    }
+    t.to_string()
+}
+
+fn stream_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+
+/// 带缓冲的目录流读取器（头部与内容在同一 TCP 流里交错）
+struct StreamReader {
+    buf: Vec<u8>,
+    pos: usize,
+    timeout: Duration,
+}
+
+impl StreamReader {
+    fn new(timeout: Duration) -> Self {
+        StreamReader {
+            buf: Vec::new(),
+            pos: 0,
+            timeout,
+        }
+    }
+
+    fn avail(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
+    /// 补充至少 1 字节；返回 false 表示对端已关闭
+    async fn fill(&mut self, stream: &mut TcpStream) -> Result<bool, String> {
+        if self.pos > 0 && self.pos == self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+        }
+        let mut chunk = [0u8; 64 * 1024];
+        let n = match tokio::time::timeout(self.timeout, stream.read(&mut chunk)).await {
+            Ok(r) => r.map_err(|e| format!("接收数据失败: {e}"))?,
+            Err(_) => return Err("接收超时（对方长时间无数据）".into()),
+        };
+        if n == 0 {
+            return Ok(false);
+        }
+        self.buf.extend_from_slice(&chunk[..n]);
+        Ok(true)
+    }
+
+    /// 读一个条目头部：`<总长16进制>:<名称>:<大小16进制>:<属性16进制>:`
+    async fn read_header(
+        &mut self,
+        stream: &mut TcpStream,
+    ) -> Result<Option<(String, u64, u32)>, String> {
+        // 先取长度字段（第一个冒号之前）
+        let colon;
+        loop {
+            if let Some(i) = self.buf[self.pos..].iter().position(|&b| b == b':') {
+                colon = i;
+                break;
+            }
+            if self.avail() > 64 {
+                return Err("目录流头部异常（长度字段过长）".into());
+            }
+            if !self.fill(stream).await? {
+                return if self.avail() == 0 {
+                    Ok(None) // 干净结束
+                } else {
+                    Err("目录流在头部中途中断".into())
+                };
+            }
+        }
+        let len_str = String::from_utf8_lossy(&self.buf[self.pos..self.pos + colon])
+            .trim()
+            .to_string();
+        let head_len = u64::from_str_radix(len_str.trim_start_matches("0x"), 16)
+            .map_err(|_| format!("目录流头部长度无法解析: {len_str:?}"))? as usize;
+        if head_len <= len_str.len() || head_len > 4096 {
+            return Err(format!("目录流头部长度不合理: {head_len}"));
+        }
+        while self.avail() < head_len {
+            if !self.fill(stream).await? {
+                return Err("目录流在头部中途中断".into());
+            }
+        }
+        let head = self.buf[self.pos..self.pos + head_len].to_vec();
+        self.pos += head_len;
+
+        // 名称之后的字段固定为 大小:属性[:扩展]，从右往左定位，容忍名称里的冒号
+        let body = &head[len_str.len() + 1..];
+        let body = body.strip_suffix(b":").unwrap_or(body);
+        let mut fields: Vec<&[u8]> = body.split(|&b| b == b':').collect();
+        if fields.len() < 3 {
+            return Err("目录流头部字段不足".into());
+        }
+        // 扩展属性（key=value）在尾部，剥掉后剩下 名称/大小/属性
+        while fields.len() > 3 && fields.last().map(|f| f.contains(&b'=')).unwrap_or(false) {
+            fields.pop();
+        }
+        let attr = num_flex_hex(&String::from_utf8_lossy(fields[fields.len() - 1]))
+            .ok_or("目录流属性字段无法解析")? as u32;
+        let size = num_flex_hex(&String::from_utf8_lossy(fields[fields.len() - 2]))
+            .ok_or("目录流大小字段无法解析")?;
+        let name = proto::decode_bytes(&fields[..fields.len() - 2].join(&b':'));
+        Ok(Some((proto::strip_control(&name), size, attr)))
+    }
+
+    /// 把接下来的 want 字节写入文件，返回实际写入量（不足即为对端提前断流）
+    async fn copy_exact(
+        &mut self,
+        stream: &mut TcpStream,
+        out: &mut tokio::fs::File,
+        want: u64,
+    ) -> Result<u64, String> {
+        let mut left = want;
+        while left > 0 {
+            if self.avail() == 0 && !self.fill(stream).await? {
+                break;
+            }
+            let take = (left as usize).min(self.avail());
+            out.write_all(&self.buf[self.pos..self.pos + take])
+                .await
+                .map_err(|e| format!("写入文件失败: {e}"))?;
+            self.pos += take;
+            left -= take as u64;
+        }
+        Ok(want - left)
+    }
+}
+
+fn num_flex_hex(t: &str) -> Option<u64> {
+    let t = t.trim();
+    if t.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(t.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()
+}
+
+/* ---------- 取文件请求的方言 ----------
+
+GETFILEDATA/GETDIRFILES 的附加数据是 `包编号:文件ID:偏移`，但各实现对这三个
+数字用什么进制书写并不一致：官方 IP Messenger 用十六进制，部分中文客户端沿用
+公告里的十进制。我方服务端两种都认（见 id_candidates），但请求方向只能二选一，
+之前固定发十进制 —— 对按官方约定解析的对端（飞秋等）就永远对不上号，
+表现为"连接成功但一个字节都收不到"。
+
+这里改成按方言表依次尝试：只有在对端接受连接却返回 0 字节时才换下一种，
+命中后记住该对端的方言，后续下载直接用对的那种。 */
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dialect {
+    /// 包编号用十六进制书写
+    hex_pkt: bool,
+    /// 文件 ID 用十六进制书写（否则原样回传对端公告里的字符串）
+    hex_id: bool,
+    /// 请求行以换行结尾
+    newline: bool,
+}
+
+pub const DIALECTS: [Dialect; 4] = [
+    // 1) 现状：包编号十进制 + ID 原样回显（本客户端与部分实现）
+    Dialect { hex_pkt: false, hex_id: false, newline: true },
+    // 2) 官方包编号十六进制 + ID 仍按对端公告原样
+    Dialect { hex_pkt: true, hex_id: false, newline: false },
+    // 3) 全按官方约定：包编号与 ID 都是十六进制
+    Dialect { hex_pkt: true, hex_id: true, newline: false },
+    // 4) 包编号十进制 + ID 十六进制
+    Dialect { hex_pkt: false, hex_id: true, newline: true },
+];
+
+/// 建立传输连接并发出取文件/取目录请求
+#[allow(clippy::too_many_arguments)]
+async fn open_transfer(
+    ctx: &NetCtx,
+    target: SocketAddr,
+    pkt_no: u32,
+    file_id: u32,
+    rid: &str,
+    command: u32,
+    d: Dialect,
+) -> Result<TcpStream, String> {
+    let cfg = ctx.st.config();
+    let mut stream = tokio::time::timeout(Duration::from_secs(6), TcpStream::connect(target))
+        .await
+        .map_err(|_| "连接超时".to_string())?
+        .map_err(|e| format!("连接失败: {e}"))?;
+    let pkt_field = if d.hex_pkt {
+        format!("{pkt_no:x}")
+    } else {
+        pkt_no.to_string()
+    };
+    let id_field = if d.hex_id || rid.trim().is_empty() {
+        format!("{file_id:x}")
+    } else {
+        rid.trim().to_string()
+    };
+    let req = format!(
+        "1:{}:{}:{}:{}:{}:{}:0{}",
+        proto::next_packet_no(),
+        my_user(&cfg),
+        my_host(),
+        command,
+        pkt_field,
+        id_field,
+        if d.newline { "\n" } else { "" }
+    );
+    eprintln!("[download] 连接 {target} 请求 cmd={command:#x} pkt={pkt_field} id={id_field}");
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| format!("发送请求失败: {e}"))?;
+    Ok(stream)
+}
+
+/// 下载失败的统一收尾：推事件 + 回写历史，避免卡片永远停在"下载中"
+fn fail_download(ctx: &NetCtx, key: &str, pkt_no: u32, file_id: u32, err: &str) {
+    ctx.st.emit(
+        "file-progress",
+        json!({"key": key, "pkt": pkt_no, "file_id": file_id,
+               "transferred": 0, "total": 0, "done": false, "error": err}),
+    );
+    ctx.st.update_history_file(key, pkt_no, file_id, |f| {
+        f["state"] = "failed".into();
+        f["error"] = Value::String(err.to_string());
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn fetch_to_file(
     ctx: &NetCtx,
     key: &str,
@@ -914,34 +1871,12 @@ async fn fetch_to_file(
     pkt_no: u32,
     file_id: u32,
     rid: &str,
+    expect_size: u64,
+    d: Dialect,
     tmp: &std::path::Path,
 ) -> Result<u64, String> {
-    let cfg = ctx.st.config();
-    let mut stream = tokio::time::timeout(Duration::from_secs(6), TcpStream::connect(target))
-        .await
-        .map_err(|_| "连接超时".to_string())?
-        .map_err(|e| format!("连接失败: {e}"))?;
-
-    // 官方约定：包编号回显十进制；文件 ID 原样回传对端公告字符串（进制不明）
-    let id_field = if rid.trim().is_empty() {
-        format!("{file_id:x}")
-    } else {
-        rid.trim().to_string()
-    };
-    let req = format!(
-        "1:{}:{}:{}:{}:{}:{}:0\n",
-        proto::next_packet_no(),
-        my_user(&cfg),
-        my_host(),
-        cmd::GETFILEDATA,
-        pkt_no,
-        id_field
-    );
-    eprintln!("[download] 连接 {target} 请求 pkt={pkt_no} id={id_field}");
-    stream
-        .write_all(req.as_bytes())
-        .await
-        .map_err(|e| format!("发送请求失败: {e}"))?;
+    let mut stream =
+        open_transfer(ctx, target, pkt_no, file_id, rid, cmd::GETFILEDATA, d).await?;
 
     let mut file = tokio::fs::File::create(tmp)
         .await
@@ -950,10 +1885,22 @@ async fn fetch_to_file(
     let mut last_emit = Instant::now();
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
-        let n = stream
-            .read(&mut chunk)
+        // 已收满公告字节数就停：部分实现收完不主动关连接，读到 EOF 会一直阻塞
+        if expect_size > 0 && total >= expect_size {
+            break;
+        }
+        let want = if expect_size > 0 {
+            ((expect_size - total) as usize).min(chunk.len())
+        } else {
+            chunk.len()
+        };
+        // 长时间无数据视为对端异常，避免任务永久挂起
+        let n = match tokio::time::timeout(Duration::from_secs(60), stream.read(&mut chunk[..want]))
             .await
-            .map_err(|e| format!("接收数据失败: {e}"))?;
+        {
+            Ok(r) => r.map_err(|e| format!("接收数据失败: {e}"))?,
+            Err(_) => return Err("接收超时（对方长时间无数据）".into()),
+        };
         if n == 0 {
             break;
         }
@@ -966,7 +1913,7 @@ async fn fetch_to_file(
             ctx.st.emit(
                 "file-progress",
                 json!({"key": key, "pkt": pkt_no, "file_id": file_id,
-                       "transferred": total, "total": 0, "done": false}),
+                       "transferred": total, "total": expect_size, "done": false}),
             );
         }
     }

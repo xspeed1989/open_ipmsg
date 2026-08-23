@@ -1,7 +1,7 @@
 <script setup>
-// 设置弹窗：昵称 / 群组 / 下载目录 / 发送编码 + 本机信息
+// 设置弹窗：昵称 / 群组 / 下载目录 / 主题 / 发送编码 + 本机信息
 import { reactive, watch, computed } from 'vue'
-import { store, refreshConfig, refreshUsers } from '../store'
+import { applyTheme, store, refreshConfig, refreshUsers } from '../store'
 import * as ipc from '../lib/ipc'
 import { open as pickDialog } from '@tauri-apps/plugin-dialog'
 
@@ -10,6 +10,7 @@ const form = reactive({
   group: '',
   download_dir: '',
   encoding: 'utf8',
+  theme: 'system',
 })
 
 watch(
@@ -20,6 +21,7 @@ watch(
       form.group = store.config.group || ''
       form.download_dir = store.config.download_dir || ''
       form.encoding = store.config.encoding || 'utf8'
+      form.theme = store.config.theme || 'system'
     }
   },
   { immediate: true }
@@ -27,13 +29,21 @@ watch(
 
 const canClose = computed(() => !store.firstRun)
 
+// 选中即预览：不必按保存就能看到效果；取消关闭时再还原成已保存的主题
+watch(() => form.theme, (t) => applyTheme(t))
+function restoreSavedTheme() {
+  applyTheme(store.config?.theme)
+}
+
 async function chooseDir() {
   const dir = await pickDialog({ directory: true, title: '选择接收文件的保存目录' })
   if (dir) form.download_dir = dir
 }
 
 function close() {
-  if (canClose.value) store.settingsOpen = false
+  if (!canClose.value) return
+  restoreSavedTheme() // 放弃未保存的改动，主题跟着回退
+  store.settingsOpen = false
 }
 
 async function save() {
@@ -46,6 +56,7 @@ async function save() {
     group: form.group.trim(),
     download_dir: form.download_dir.trim(),
     encoding: form.encoding,
+    theme: form.theme,
   }
   try {
     await ipc.saveConfig(patch)
@@ -84,6 +95,14 @@ async function save() {
           </div>
         </label>
         <label class="field">
+          <span class="lab">外观主题</span>
+          <select v-model="form.theme">
+            <option value="system">跟随系统</option>
+            <option value="light">浅色</option>
+            <option value="dark">深色</option>
+          </select>
+        </label>
+        <label class="field">
           <span class="lab">发送编码</span>
           <select v-model="form.encoding">
             <option value="utf8">UTF-8（推荐，客户端间互通）</option>
@@ -113,7 +132,7 @@ async function save() {
 .overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.35);
+  background: var(--c-mask);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -121,9 +140,9 @@ async function save() {
 }
 .modal {
   width: 440px;
-  background: #fff;
+  background: var(--c-card);
   border-radius: 10px;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 12px 40px var(--c-shadow);
   overflow: hidden;
 }
 header {
@@ -134,18 +153,18 @@ header {
   padding: 0 16px;
   font-size: 14px;
   font-weight: 600;
-  border-bottom: 1px solid #eee;
+  border-bottom: 1px solid var(--c-hairline);
 }
 .x {
   font-size: 13px;
-  color: #999;
+  color: var(--c-sub);
   width: 24px;
   height: 24px;
   border-radius: 4px;
 }
 .x:hover {
-  background: #f2f2f2;
-  color: #333;
+  background: var(--c-list);
+  color: var(--c-text);
 }
 .body {
   padding: 16px 20px 6px;
@@ -159,18 +178,37 @@ header {
   width: 64px;
   flex: none;
   font-size: 13px;
-  color: #555;
+  color: var(--c-text);
 }
 .field input,
 .field select {
   flex: 1;
   height: 30px;
-  border: 1px solid #ddd;
+  border: 1px solid var(--c-border);
   border-radius: 4px;
+  background: var(--c-card);
+  color: var(--c-text);
   padding: 0 8px;
   font-size: 13px;
   user-select: text;
   min-width: 0;
+}
+/* WebKitGTK 会用原生控件画 select（底色不受 CSS 控制，深色下就成了浅底浅字），
+   这里关掉原生外观并自绘箭头，保证两种主题下都受控 */
+.field select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 26px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--c-sub) 50%),
+    linear-gradient(135deg, var(--c-sub) 50%, transparent 50%);
+  background-position: right 13px center, right 8px center;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  cursor: pointer;
+}
+.field select option {
+  background: var(--c-card);
+  color: var(--c-text);
 }
 .field input:focus,
 .field select:focus {
@@ -182,11 +220,11 @@ header {
   gap: 8px;
 }
 .dir-input {
-  background: #fafafa;
-  color: #666;
+  background: var(--c-card-alt);
+  color: var(--c-sub);
 }
 .selfinfo {
-  background: #f7f9f8;
+  background: var(--c-card-alt);
   border-radius: 6px;
   padding: 10px 12px;
   margin-top: 4px;
@@ -207,7 +245,7 @@ header {
 }
 .note {
   font-size: 11.5px;
-  color: #b5b5b5;
+  color: var(--c-weak);
   margin: 10px 0 8px;
 }
 footer {

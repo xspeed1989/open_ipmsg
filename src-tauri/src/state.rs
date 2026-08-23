@@ -17,6 +17,13 @@ pub struct Config {
     pub download_dir: String,
     #[serde(default = "default_encoding")]
     pub encoding: String,
+    /// 界面主题：system（跟随系统）/ light / dark
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+fn default_theme() -> String {
+    "system".into()
 }
 
 fn default_encoding() -> String {
@@ -32,6 +39,7 @@ impl Default for Config {
             group: String::new(),
             download_dir: String::new(),
             encoding: default_encoding(),
+            theme: default_theme(),
         }
     }
 }
@@ -54,7 +62,14 @@ pub struct PeerInfo {
 pub struct OfferedFile {
     pub path: PathBuf,
     pub size: u64,
+    /// 是否为目录（走 GETDIRFILES 流式传输）
+    pub is_dir: bool,
+    /// 登记时刻，用于过期清理
+    pub ts: u64,
 }
+
+/// 文件槽保留时长：对端可能延迟很久才来取，但也不能无限累积
+pub const OFFER_TTL_SECS: u64 = 24 * 3600;
 
 type EventFn = Box<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 
@@ -62,6 +77,10 @@ pub struct AppState {
     pub config: Mutex<Config>,
     pub peers: Mutex<HashMap<String, PeerInfo>>,
     pub offered: Mutex<HashMap<(u32, u32), OfferedFile>>,
+    /// 对端 IP → 上次成功取文件用的请求方言下标（见 net::DIALECTS）
+    dialect: Mutex<HashMap<String, usize>>,
+    /// (对端IP, 包编号) → 已回送达确认的次数
+    ack_count: Mutex<HashMap<(IpAddr, u32), u32>>,
     seen_queue: Mutex<VecDeque<(IpAddr, u32)>>,
     seen_set: Mutex<HashSet<(IpAddr, u32)>>,
     /// 聊天记录文件的读-改-写互斥（防止并发追加与重写互相覆盖）
@@ -87,6 +106,8 @@ impl AppState {
             config: Mutex::new(Config::default()),
             peers: Mutex::new(HashMap::new()),
             offered: Mutex::new(HashMap::new()),
+            dialect: Mutex::new(HashMap::new()),
+            ack_count: Mutex::new(HashMap::new()),
             seen_queue: Mutex::new(VecDeque::new()),
             seen_set: Mutex::new(HashSet::new()),
             hist_lock: Mutex::new(()),
@@ -205,6 +226,41 @@ impl AppState {
         }
     }
 
+    /// 记一次送达确认，返回这是第几次（从 0 开始）。
+    /// 对端如果没认我们的确认会重发同一包号，据此可以换一种写法再确认。
+    pub fn bump_ack(&self, ip: IpAddr, pkt: u32) -> u32 {
+        let mut m = self.ack_count.lock().unwrap();
+        if m.len() > 4096 {
+            m.clear();
+        }
+        let e = m.entry((ip, pkt)).or_insert(0);
+        let n = *e;
+        *e += 1;
+        n
+    }
+
+    /// 取文件请求方言：把该对端上次成功的那种排到最前面
+    pub fn dialect_order(&self, ip: &str, total: usize) -> Vec<usize> {
+        let first = self.dialect.lock().unwrap().get(ip).copied();
+        let mut out: Vec<usize> = Vec::with_capacity(total);
+        if let Some(i) = first.filter(|i| *i < total) {
+            out.push(i);
+        }
+        out.extend((0..total).filter(|i| Some(*i) != first));
+        out
+    }
+
+    /// 记住该对端可用的请求方言
+    pub fn remember_dialect(&self, ip: &str, idx: usize) {
+        self.dialect.lock().unwrap().insert(ip.to_string(), idx);
+    }
+
+    /// 清理超过 TTL 未被领取的文件槽（每次登记新文件时顺带执行）
+    pub fn prune_offered(&self) {
+        let cutoff = now_secs().saturating_sub(OFFER_TTL_SECS);
+        self.offered.lock().unwrap().retain(|_, o| o.ts >= cutoff);
+    }
+
     pub fn remove_peer(&self, key: &str) -> Option<PeerInfo> {
         self.peers.lock().unwrap().remove(key)
     }
@@ -243,7 +299,7 @@ impl AppState {
         }
         let mut set = self.seen_set.lock().unwrap();
         let mut queue = self.seen_queue.lock().unwrap();
-        if set.insert(item.clone()) {
+        if set.insert(item) {
             queue.push_back(item);
             while queue.len() > SEEN_CAP {
                 if let Some(old) = queue.pop_front() {
@@ -273,8 +329,272 @@ impl AppState {
         }
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{}", rec);
+            // 整行一次写入：writeln! 会把 JSON 拆成多次 write 系统调用，
+            // 追加模式下与其它写入者交错就会写出无法解析的坏行
+            let line = format!("{rec}\n");
+            let _ = f.write_all(line.as_bytes());
         }
+    }
+
+    /// 落库一条入站记录：同包号的旧记录存在则原地更新，否则追加。
+    ///
+    /// 对端的"延迟发送/离线重发"会用同一包号反复投递同一条消息（飞秋等实现
+    /// 每次我方上线都会重发），逐条追加会让历史无限膨胀，更要命的是每份新副本
+    /// 都是未读状态，前端一标记已读就再回一次 READMSG，对端于是反复弹
+    /// "消息已被查看"。返回 true 表示是本会话第一次见到该包号。
+    pub fn upsert_in_record(&self, key: &str, rec: &serde_json::Value) -> bool {
+        let pkt = rec.get("pkt").and_then(|v| v.as_u64());
+        let Some(pkt) = pkt else {
+            self.log_record(key, rec);
+            return true;
+        };
+        {
+            let _g = self.hist_lock.lock().unwrap();
+            let path = self.log_path(key);
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let mut found = false;
+                let mut lines: Vec<String> = Vec::new();
+                for line in content.lines() {
+                    let old: serde_json::Value = match serde_json::from_str(line) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            lines.push(line.to_string());
+                            continue;
+                        }
+                    };
+                    let hit = old.get("dir").and_then(|v| v.as_str()) == Some("in")
+                        && old.get("pkt").and_then(|v| v.as_u64()) == Some(pkt);
+                    if hit && !found {
+                        found = true;
+                        let mut merged = rec.clone();
+                        // 保留首次收到的时间，重发不该把消息顶到列表末尾
+                        if let Some(ts) = old.get("ts") {
+                            merged["ts"] = ts.clone();
+                        }
+                        lines.push(merged.to_string());
+                    } else if hit {
+                        // 历史上已经堆积的重复副本：顺手清理掉
+                        continue;
+                    } else {
+                        lines.push(line.to_string());
+                    }
+                }
+                if found {
+                    let _ = std::fs::write(&path, lines.join("\n") + "\n");
+                    return false;
+                }
+            }
+        }
+        self.log_record(key, rec);
+        true
+    }
+
+    /// 全文搜索聊天记录。
+    ///
+    /// `key` 为 None 时搜索全部会话。匹配正文与附件文件名（大小写不敏感），
+    /// 结果按时间倒序返回，最多 `limit` 条。会话 key 取自记录里的 peer.key，
+    /// 取不到时退化用文件名（旧记录兜底）。
+    pub fn search_history(
+        &self,
+        query: &str,
+        key: Option<&str>,
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let _g = self.hist_lock.lock().unwrap();
+
+        let files: Vec<PathBuf> = match key {
+            Some(k) => vec![self.log_path(k)],
+            None => match std::fs::read_dir(&self.logs_dir) {
+                Ok(rd) => rd
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().map(|e| e == "jsonl").unwrap_or(false))
+                    .collect(),
+                Err(_) => return Vec::new(),
+            },
+        };
+
+        let mut hits: Vec<serde_json::Value> = Vec::new();
+        for path in files {
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let fallback_key = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for line in content.lines() {
+                let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let text = rec.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let file_names: Vec<String> = rec
+                    .get("files")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|f| f.get("name").and_then(|v| v.as_str()))
+                            .map(|s| s.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let in_text = text.to_lowercase().contains(&needle);
+                let in_files = file_names
+                    .iter()
+                    .any(|n| n.to_lowercase().contains(&needle));
+                if !in_text && !in_files {
+                    continue;
+                }
+
+                let peer = rec.get("peer");
+                let sess = peer
+                    .and_then(|p| p.get("key"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| fallback_key.clone());
+                let nickname = peer
+                    .and_then(|p| p.get("nickname"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                hits.push(serde_json::json!({
+                    "key": sess,
+                    "pkt": rec.get("pkt").and_then(|v| v.as_u64()),
+                    "ts": rec.get("ts").and_then(|v| v.as_u64()).unwrap_or(0),
+                    "dir": rec.get("dir").and_then(|v| v.as_str()).unwrap_or(""),
+                    "kind": rec.get("kind").and_then(|v| v.as_str()).unwrap_or("text"),
+                    "text": text,
+                    "files": file_names,
+                    "nickname": nickname,
+                    "hit": if in_text { "text" } else { "file" },
+                }));
+            }
+        }
+        // 时间倒序，最近的排前面
+        hits.sort_by(|a, b| {
+            b["ts"]
+                .as_u64()
+                .unwrap_or(0)
+                .cmp(&a["ts"].as_u64().unwrap_or(0))
+        });
+        hits.truncate(limit);
+        hits
+    }
+
+    /// 清空某会话的聊天记录（删除对应的 JSONL 文件）。
+    /// 返回被删掉的记录条数；文件本就不存在时返回 0。
+    pub fn clear_history(&self, key: &str) -> usize {
+        let _g = self.hist_lock.lock().unwrap();
+        let path = self.log_path(key);
+        let n = std::fs::read_to_string(&path)
+            .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0);
+        let _ = std::fs::remove_file(&path);
+        n
+    }
+
+    /// 启动时整理历史文件：合并同包号的入站重复记录、丢弃无法解析的坏行。
+    ///
+    /// 早期版本会把对端每次重投的消息逐条追加，且用 `writeln!` 分多次写入，
+    /// 并发追加时可能写出交错的坏行；这里做一次性修复。
+    /// 返回 (合并掉的重复记录数, 丢弃的坏行数)。
+    pub fn compact_histories(&self) -> (usize, usize) {
+        let _g = self.hist_lock.lock().unwrap();
+        let Ok(rd) = std::fs::read_dir(&self.logs_dir) else {
+            return (0, 0);
+        };
+        let (mut merged, mut dropped) = (0usize, 0usize);
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut out: Vec<serde_json::Value> = Vec::new();
+            // 入站包号 → 在 out 中的位置
+            let mut seen: HashMap<u64, usize> = HashMap::new();
+            let (mut file_merged, mut file_dropped) = (0usize, 0usize);
+            for line in content.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
+                    file_dropped += 1;
+                    continue;
+                };
+                let is_in = rec.get("dir").and_then(|v| v.as_str()) == Some("in");
+                let pkt = rec.get("pkt").and_then(|v| v.as_u64());
+                match (is_in, pkt) {
+                    (true, Some(pkt)) => match seen.get(&pkt) {
+                        Some(&idx) => {
+                            // 保留首次的时间戳与已读状态，内容用最新一份
+                            let mut merged_rec = rec;
+                            if let Some(ts) = out[idx].get("ts") {
+                                merged_rec["ts"] = ts.clone();
+                            }
+                            if out[idx].get("read").and_then(|v| v.as_bool()) == Some(true) {
+                                merged_rec["read"] = true.into();
+                            }
+                            out[idx] = merged_rec;
+                            file_merged += 1;
+                        }
+                        None => {
+                            seen.insert(pkt, out.len());
+                            out.push(rec);
+                        }
+                    },
+                    _ => out.push(rec),
+                }
+            }
+            if file_merged > 0 || file_dropped > 0 {
+                let body: String = out
+                    .iter()
+                    .map(|r| r.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if std::fs::write(&path, body + "\n").is_ok() {
+                    merged += file_merged;
+                    dropped += file_dropped;
+                }
+            }
+        }
+        (merged, dropped)
+    }
+
+    /// 过滤出「要求回执且尚未标记已读」的入站包号。
+    /// 前端可能因焦点变化重复请求，这里以历史为准，保证一条消息只回执一次。
+    pub fn pending_receipts(&self, key: &str, pkts: &[u32]) -> Vec<u32> {
+        let want: HashSet<u32> = pkts.iter().copied().collect();
+        let _g = self.hist_lock.lock().unwrap();
+        let path = self.log_path(key);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        let mut out: Vec<u32> = Vec::new();
+        for line in content.lines() {
+            let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if rec.get("dir").and_then(|v| v.as_str()) != Some("in") {
+                continue;
+            }
+            let Some(pkt) = rec.get("pkt").and_then(|v| v.as_u64()).map(|p| p as u32) else {
+                continue;
+            };
+            let need = rec.get("need_read").and_then(|v| v.as_bool()).unwrap_or(false);
+            let read = rec.get("read").and_then(|v| v.as_bool()).unwrap_or(false);
+            if want.contains(&pkt) && need && !read && !out.contains(&pkt) {
+                out.push(pkt);
+            }
+        }
+        out
     }
 
     /// 读取某会话最近 limit 条记录（按时间升序返回）
@@ -387,7 +707,7 @@ impl AppState {
         let f = std::fs::File::open(&path).ok()?;
         let last = std::io::BufReader::new(f)
             .lines()
-            .filter_map(|l| l.ok())
+            .map_while(Result::ok)
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
             .filter(|rec| {
                 rec.get("dir").and_then(|v| v.as_str()) == Some("in")
@@ -484,6 +804,125 @@ mod tests {
         assert_eq!(hist.len(), 1);
         assert_eq!(hist[0]["pkt"], 101);
 
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn search_history_matches_text_and_filenames() {
+        let st = temp_state("search");
+        let a = "10.0.0.1:2425";
+        let b = "10.0.0.2:2425";
+        st.log_record(a, &serde_json::json!({
+            "dir":"in","kind":"text","text":"明天下午开会","pkt":1,"ts":100,
+            "peer":{"key":a,"nickname":"老王"}
+        }));
+        st.log_record(a, &serde_json::json!({
+            "dir":"out","kind":"file","text":"","pkt":2,"ts":200,
+            "files":[{"id":1,"name":"会议纪要.docx","size":10}],
+            "peer":{"key":a,"nickname":"老王"}
+        }));
+        st.log_record(b, &serde_json::json!({
+            "dir":"in","kind":"text","text":"Hello World","pkt":3,"ts":300,
+            "peer":{"key":b,"nickname":"Tom"}
+        }));
+
+        // 全局搜索：命中正文
+        let r = st.search_history("开会", None, 50);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["key"], a);
+        assert_eq!(r[0]["hit"], "text");
+        assert_eq!(r[0]["nickname"], "老王");
+
+        // 命中附件名
+        let r = st.search_history("纪要", None, 50);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["hit"], "file");
+        assert_eq!(r[0]["pkt"], 2);
+
+        // 大小写不敏感
+        assert_eq!(st.search_history("hello", None, 50).len(), 1);
+        assert_eq!(st.search_history("HELLO", None, 50).len(), 1);
+
+        // 限定会话
+        assert!(st.search_history("hello", Some(a), 50).is_empty());
+        assert_eq!(st.search_history("hello", Some(b), 50).len(), 1);
+
+        // 多条命中按时间倒序 + limit 生效
+        let r = st.search_history("会", None, 50);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0]["ts"], 200, "最近的排前面");
+        assert_eq!(st.search_history("会", None, 1).len(), 1);
+
+        // 空查询不返回结果，避免把整个历史倒出来
+        assert!(st.search_history("   ", None, 50).is_empty());
+        assert!(st.search_history("找不到的词", None, 50).is_empty());
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn clear_history_removes_records() {
+        let st = temp_state("clear");
+        st.log_record("k:9", &serde_json::json!({"dir":"in","pkt":1,"ts":1,"text":"a"}));
+        st.log_record("k:9", &serde_json::json!({"dir":"out","pkt":2,"ts":2,"text":"b"}));
+        assert_eq!(st.read_history("k:9", 10).len(), 2);
+        assert_eq!(st.clear_history("k:9"), 2);
+        assert!(st.read_history("k:9", 10).is_empty());
+        // 清空后仍可继续记录新消息
+        st.log_record("k:9", &serde_json::json!({"dir":"in","pkt":3,"ts":3,"text":"c"}));
+        assert_eq!(st.read_history("k:9", 10).len(), 1);
+        // 没有历史的会话：清空是幂等的空操作
+        assert_eq!(st.clear_history("k:none"), 0);
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn in_record_upsert_dedups_resends() {
+        let st = temp_state("resend");
+        let rec = serde_json::json!({
+            "dir": "in", "kind": "text", "text": "原文", "pkt": 500, "ts": 100,
+            "need_read": true, "read": false
+        });
+        assert!(st.upsert_in_record("k:1", &rec), "首次落库");
+        assert_eq!(st.pending_receipts("k:1", &[500]), vec![500]);
+        st.mark_in_read("k:1", &[500]);
+        assert!(st.pending_receipts("k:1", &[500]).is_empty(), "已读后不再回执");
+
+        // 对端重投：正文带尾注、状态继承已读
+        let resend = serde_json::json!({
+            "dir": "in", "kind": "text", "text": "原文\n(IPMsg Delayed Send)", "pkt": 500,
+            "ts": 999, "need_read": true, "read": true
+        });
+        assert!(!st.upsert_in_record("k:1", &resend), "重投不算新消息");
+        let hist = st.read_history("k:1", 50);
+        assert_eq!(hist.len(), 1, "重投不追加新记录");
+        assert_eq!(hist[0]["ts"], 100, "保留首次收到时间");
+        assert!(hist[0]["text"].as_str().unwrap().contains("Delayed Send"));
+        assert!(st.pending_receipts("k:1", &[500]).is_empty(), "重投不再回执");
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn compact_histories_repairs_old_logs() {
+        let st = temp_state("compact");
+        std::fs::create_dir_all(&st.logs_dir).unwrap();
+        let path = st.logs_dir.join("k_1.jsonl");
+        // 旧版本遗留：同包号 3 份副本 + 一行交错坏行 + 一条正常出站记录
+        let body = concat!(
+            r#"{"dir":"in","pkt":7,"ts":1,"text":"a","read":true,"need_read":true}"#, "\n",
+            r#"{"dir":"in","pkt":7,"ts":2,"text":"a+","read":false,"need_read":true}"#, "\n",
+            r#"{"dir":"in","pkt":"#, "\n",
+            r#"{"dir":"in","pkt":7,"ts":3,"text":"a++","read":false,"need_read":true}"#, "\n",
+            r#"{"dir":"out","pkt":8,"ts":4,"text":"b"}"#, "\n",
+        );
+        std::fs::write(&path, body).unwrap();
+        let (merged, dropped) = st.compact_histories();
+        assert_eq!((merged, dropped), (2, 1));
+        let hist = st.read_history("k:1", 50);
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0]["ts"], 1, "保留首次时间戳");
+        assert_eq!(hist[0]["text"], "a++", "内容取最新一份");
+        assert_eq!(hist[0]["read"], true, "已读状态不被重投覆盖");
+        assert_eq!(hist[1]["pkt"], 8);
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 

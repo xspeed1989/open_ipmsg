@@ -56,11 +56,11 @@ function openSettings() {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #6b6b6b;
+  color: var(--c-sub);
 }
 .nav-btn:hover {
-  background: rgba(0, 0, 0, 0.06);
-  color: #333;
+  background: var(--c-hover);
+  color: var(--c-text);
 }
 .spacer {
   flex: 1;

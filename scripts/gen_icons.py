@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
-"""生成应用图标（纯标准库实现）：绿色渐变圆角方块 + 白色对话气泡。
+"""生成应用图标（纯标准库实现）：绿色渐变圆角方块 + 白色对话气泡 + 挖空的「IP」字样。
 
-输出到 src-tauri/icons/: 32x32.png / 128x128.png / 128x128@2x.png / icon.png(512) / icon.ico
+气泡表明是聊天工具（不用信封，避免被读成邮件客户端），
+字样直接点名 IP Messenger —— 24px 托盘尺寸下仍然认得出。
+字形是手绘几何（圆角矩形拼合），不依赖任何字体文件。
+
+托盘图标只出正常态 tray.png / tray.rgba；有新消息时的闪烁由 Rust 侧在
+「正常图标 ↔ 全透明帧」之间交替实现（与微信一致），透明帧无需生成文件。
+
+输出到 src-tauri/icons/: 32x32.png / 128x128.png / 128x128@2x.png / icon.png(512)
+            icon.ico / tray.png / tray.rgba
 """
 import struct
 import zlib
@@ -50,21 +58,44 @@ def in_rounded_rect(x, y, x0, y0, x1, y1, r):
 
 
 def in_bubble(x, y):
-    """白色对话气泡（圆角矩形 + 左下尾巴）"""
-    if in_rounded_rect(x, y, 0.20, 0.24, 0.80, 0.64, 0.09):
+    """对话气泡（圆角矩形 + 左下尾巴）"""
+    if in_rounded_rect(x, y, 0.11, 0.16, 0.89, 0.62, 0.11):
         return True
-    # 尾巴三角
-    ax0, ay0, ax1, ay1 = 0.26, 0.62, 0.42, 0.80
-    if ay0 <= y <= ay1 and ax0 <= x <= ax1:
-        t = (y - ay0) / (ay1 - ay0)
-        right = lerp(ax1, ax0 + 0.03, t)
-        if x <= right:
-            return True
+    tx, tw, th = 0.28, 0.15, 0.16
+    if 0.60 <= y <= 0.62 + th and tx <= x <= tx + tw:
+        t = (y - 0.60) / (th + 0.02)
+        return x <= lerp(tx + tw, tx + 0.02, t)
     return False
 
 
-def in_dot(x, y, cx, cy, r):
-    return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+# 「IP」字形参数：竖干宽度、字高、字碗尺寸（手绘几何，不依赖字体）
+GLY_TOP, GLY_BOT, GLY_W = 0.262, 0.518, 0.061
+I_X = 0.305          # I 的竖干左边缘
+P_X = 0.445          # P 的竖干左边缘
+P_BOWL_W = 0.245     # P 字碗外宽
+P_BOWL_H = 0.140     # P 字碗外高
+
+
+def in_glyph_ip(x, y):
+    """气泡里的「IP」—— IP Messenger 的身份，小尺寸下也认得出"""
+    # I：一根竖干
+    if in_rounded_rect(x, y, I_X, GLY_TOP, I_X + GLY_W, GLY_BOT, GLY_W * 0.45):
+        return True
+    # P：竖干 + 上方字碗（外框减内框）
+    if in_rounded_rect(x, y, P_X, GLY_TOP, P_X + GLY_W, GLY_BOT, GLY_W * 0.45):
+        return True
+    if in_rounded_rect(x, y, P_X, GLY_TOP, P_X + P_BOWL_W, GLY_TOP + P_BOWL_H, 0.036):
+        inner = in_rounded_rect(
+            x,
+            y,
+            P_X + GLY_W,
+            GLY_TOP + GLY_W * 0.86,
+            P_X + P_BOWL_W - GLY_W,
+            GLY_TOP + P_BOWL_H - GLY_W * 0.86,
+            0.02,
+        )
+        return not inner
+    return False
 
 
 def render(size: int) -> bytes:
@@ -82,13 +113,9 @@ def render(size: int) -> bytes:
         b = lerp(c00[2], c11[2], t)
         a = 255 if in_rounded_rect(x, y, 0.02, 0.02, 0.98, 0.98, 0.21) else 0
         if a and in_bubble(x, y):
-            r = g = b = 255
-            if (
-                in_dot(x, y, 0.37, 0.44, 0.042)
-                or in_dot(x, y, 0.50, 0.44, 0.042)
-                or in_dot(x, y, 0.63, 0.44, 0.042)
-            ):
-                r, g, b = 0x0A, 0xC4, 0x60  # 气泡上三个绿点
+            # 气泡白色，字用底色挖出来
+            if not in_glyph_ip(x, y):
+                r = g = b = 255
         return r, g, b, a
 
     k = 0
@@ -166,6 +193,14 @@ def main():
         write_png(OUT / name, size, size, rendered[size])
     print("render icon.ico ...")
     write_ico(OUT / "icon.ico", {s: rendered[s] for s in (32, 128, 256)})
+    # 托盘两态：无未读 / 有未读（右上角红点）
+    # 同时输出 .rgba 原始像素：Rust 侧直接 include_bytes! 交给 tauri::image::Image::new，
+    # 运行时不用解码 PNG，也不必为此引入图像解码依赖
+    # 托盘图标：只出正常态，闪烁用的透明帧由 Rust 侧直接生成（全 0 像素）
+    print("render tray ...")
+    rgba = render(64)
+    write_png(OUT / "tray.png", 64, 64, rgba)
+    (OUT / "tray.rgba").write_bytes(rgba)
     print("done ->", OUT)
 
 
