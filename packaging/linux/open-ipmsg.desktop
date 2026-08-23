@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Open IPMsg
+GenericName=LAN Messenger
+Comment=局域网即时通讯（IP Messenger 协议）
+Exec=open-ipmsg
+Icon=open-ipmsg
+Terminal=false
+Categories=Network;InstantMessaging;
+Keywords=IPMsg;LAN;飞鸽传书;局域网;聊天;
+StartupWMClass=open-ipmsg

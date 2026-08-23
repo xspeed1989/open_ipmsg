@@ -1,0 +1,109 @@
+name: 构建与发布
+
+# 打 v* 标签自动出包并发 Release；也可以在 Actions 页面手动触发只产出构建物
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------- Linux：deb / rpm / AppImage（Tauri 自带打包器） ----------
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libxdo-dev \
+            build-essential curl wget file patchelf
+
+      - uses: pnpm/action-setup@v4
+        with: { version: 10 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: src-tauri }
+
+      - run: pnpm install --frozen-lockfile
+
+      # 先跑测试再打包：自检覆盖协议栈收发全链路
+      - name: 测试
+        run: |
+          pnpm test
+          cd src-tauri && cargo test --locked
+
+      - name: 打包 deb / rpm / AppImage
+        run: pnpm exec tauri build --bundles deb,rpm,appimage
+
+      - name: 收集产物
+        run: |
+          mkdir -p out
+          cp src-tauri/target/release/bundle/deb/*.deb out/ 2>/dev/null || true
+          cp src-tauri/target/release/bundle/rpm/*.rpm out/ 2>/dev/null || true
+          cp src-tauri/target/release/bundle/appimage/*.AppImage out/ 2>/dev/null || true
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundles
+          path: out/*
+
+  # ---------- Arch Linux：.pkg.tar.zst（Tauri 打包器不支持，用自带脚本） ----------
+  arch:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: 安装依赖
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git sudo python nodejs pnpm rust \
+            webkit2gtk-4.1 gtk3 librsvg libayatana-appindicator
+
+      - uses: actions/checkout@v4
+
+      - name: 构建前端与二进制
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          cd src-tauri && cargo build --release --locked
+
+      - name: 测试
+        run: |
+          pnpm test
+          cd src-tauri && cargo test --release --locked
+          ./src-tauri/target/release/open-ipmsg --selftest
+
+      # 脚本会自行降权到普通用户（makepkg 拒绝以 root 运行）
+      - name: 打 Arch 包
+        run: ./scripts/build-arch.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: dist-packages/*.pkg.tar.*
+
+  # ---------- 打标签时汇总为一个 Release ----------
+  release:
+    needs: [linux, arch]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -la dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

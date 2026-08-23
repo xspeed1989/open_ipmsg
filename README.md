@@ -87,6 +87,49 @@ sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
 Windows 需 WebView2（Win11 自带）；macOS 需 Xcode Command Line Tools。
 详见 [Tauri v2 先决条件](https://tauri.app/start/prerequisites/)。
 
+### Arch Linux 包（.pkg.tar.zst）
+
+Tauri v2 的打包器只支持 `deb / rpm / appimage`，没有 Arch 目标，因此单独提供脚本：
+
+```bash
+pnpm build && (cd src-tauri && cargo build --release)   # 先有 release 二进制
+./scripts/build-arch.sh                                  # 产物在 dist-packages/
+sudo pacman -U dist-packages/open-ipmsg-*.pkg.tar.zst
+```
+
+脚本把现成二进制、desktop 文件与三种尺寸图标装进包里（不重新编译），
+以 root 运行时会自动降权到普通用户（`makepkg` 拒绝 root 执行），便于在 CI 容器里用。
+
+想从源码构建（AUR 风格，含 `check()` 跑单测与无头自检）：
+
+```bash
+makepkg -si -p packaging/arch/PKGBUILD
+```
+
+依赖按 `ldd` 实测确定：`webkit2gtk-4.1`、`gtk3`；
+`libayatana-appindicator` 是运行时 dlopen 的托盘回退，列为 optdepends
+��默认走自实现的 StatusNotifierItem）。
+
+### 自动构建（GitHub Actions）
+
+`.github/workflows/release.yml` 在推送 `v*` 标签时自动构建并发布 Release：
+
+| Job | 运行环境 | 产物 |
+|-----|----------|------|
+| `linux` | ubuntu-22.04 | `.deb` / `.rpm` / `.AppImage` |
+| `arch` | `archlinux:base-devel` 容器 | `.pkg.tar.zst` |
+| `release` | 汇总上面两个 job 的产物 | GitHub Release |
+
+两个 job 都会先跑测试（前端单测 + Rust 单测 + `--selftest` 无头自检）再打包。
+也可在 Actions 页面手动触发（`workflow_dispatch`）只产出构建物、不发 Release。
+
+发布流程：
+
+```bash
+# 改 src-tauri/tauri.conf.json 与 package.json 的 version，然后
+git tag v0.2.0 && git push origin v0.2.0
+```
+
 ### 打包故障排查（Arch / Manjaro）
 
 滚动发行版上 AppImage 打包有两个已知坑（deb/rpm 不受影响），已提供一键修复：

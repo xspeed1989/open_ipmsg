@@ -1,0 +1,42 @@
+# Maintainer: xspeed1989
+# 从源码构建的 Arch 包（AUR 风格）。若只想用现成二进制打包，见 scripts/build-arch.sh
+pkgname=open-ipmsg
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="局域网即时通讯客户端（IP Messenger 协议，UDP/TCP 2425）"
+arch=('x86_64')
+url="https://github.com/xspeed1989/open_ipmsg"
+license=('MIT')
+depends=('webkit2gtk-4.1' 'gtk3')
+makedepends=('git' 'rust' 'cargo' 'nodejs' 'pnpm')
+optdepends=('libayatana-appindicator: 无 StatusNotifier 宿主时的托盘回退')
+source=("$pkgname::git+https://github.com/xspeed1989/open_ipmsg.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/$pkgname"
+  pnpm install --frozen-lockfile
+  pnpm build                       # 前端产物 -> dist/
+  cd src-tauri
+  cargo build --release --locked
+}
+
+check() {
+  cd "$srcdir/$pkgname/src-tauri"
+  cargo test --release --locked
+  # 无头自检：完整跑一遍协议栈（发现/消息/文件/目录/回执）
+  ./target/release/open-ipmsg --selftest
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+  install -Dm755 src-tauri/target/release/open-ipmsg "$pkgdir/usr/bin/open-ipmsg"
+  install -Dm644 packaging/linux/open-ipmsg.desktop \
+    "$pkgdir/usr/share/applications/open-ipmsg.desktop"
+  install -Dm644 src-tauri/icons/32x32.png \
+    "$pkgdir/usr/share/icons/hicolor/32x32/apps/open-ipmsg.png"
+  install -Dm644 src-tauri/icons/128x128.png \
+    "$pkgdir/usr/share/icons/hicolor/128x128/apps/open-ipmsg.png"
+  install -Dm644 src-tauri/icons/icon.png \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/open-ipmsg.png"
+}
