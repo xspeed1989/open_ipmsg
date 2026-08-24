@@ -29,3 +29,30 @@ export function forwardPayload(msg) {
   if (!text) return { ok: false, reason: '没有可转发的内容' }
   return { ok: true, kind: 'text', text }
 }
+
+/**
+ * 多选合并转发：把选中的多条消息拼成一条文本（微信式，每行带发送者前缀）。
+ *
+ * 按时间升序排列；附件不传内容，只在行尾追加 `[附件] 名字, 名字` 占位；
+ * 单条消息正文与附件都为空时跳过该行；一行都拼不出来时返回 null，
+ * 由调用方提示「没有可转发的内容」。
+ *
+ * @param {{dir?:string, ts?:number, text?:string, files?:{name?:string}[]}[]} msgs
+ * @param {(dir?: string) => string} nickOf 由方向取显示昵称（'我' / 对方昵称）
+ * @returns {string|null}
+ */
+export function mergeForward(msgs, nickOf) {
+  const sorted = [...(msgs || [])].sort((a, b) => (a.ts || 0) - (b.ts || 0))
+  const lines = []
+  for (const m of sorted) {
+    const body = (m.text || '').trim()
+    const att = (m.files || [])
+      .map((f) => f.name || '')
+      .filter(Boolean)
+      .join(', ')
+    const content = body + (att ? (body ? ' ' : '') + '[附件] ' + att : '')
+    if (!content) continue
+    lines.push(`【${nickOf(m.dir)}】${content}`)
+  }
+  return lines.length ? lines.join('\n') : null
+}

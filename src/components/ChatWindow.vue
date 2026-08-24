@@ -11,7 +11,8 @@ import {
 import { parseFileUris, highlightParts } from '../lib/text'
 import { computePopupPosition } from '../lib/popup'
 import { composeReplyBody, quotePreview } from '../lib/reply'
-import { forwardPayload } from '../lib/forward'
+import { forwardPayload, mergeForward } from '../lib/forward'
+import { copyTextOf } from '../lib/copymsg'
 import { pendingImgFromB64 } from '../lib/clipimg'
 import { open as openFileDialog, confirm as confirmDialog } from '@tauri-apps/plugin-dialog'
 import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -150,6 +151,55 @@ function startBatch() {
   picker.value = { mode: 'batch', payload: null }
 }
 
+/* ---------- 复制 / 多选转发 ---------- */
+/** 多选模式：点击气泡切换选中，底部操作条合并转发 */
+const selMode = ref(false)
+const selected = ref(new Set()) // 消息对象引用集合（会话内稳定）
+
+function copyMsg() {
+  const m = ctxMenu.value?.msg
+  closeCtx()
+  if (!m) return
+  const t = copyTextOf(m)
+  if (!t) {
+    alert('这条消息没有可复制的内容')
+    return
+  }
+  ipc.copyText(t).catch((e) => alert('复制失败：' + e))
+}
+
+function enterSelMode() {
+  // 右键的那条默认选中，省一次点击
+  const m = ctxMenu.value?.msg
+  closeCtx()
+  selMode.value = true
+  selected.value = new Set(m ? [m] : [])
+}
+
+function exitSel() {
+  selMode.value = false
+  selected.value = new Set()
+}
+
+function toggleSel(m) {
+  if (!selMode.value) return
+  const s = new Set(selected.value)
+  if (s.has(m)) s.delete(m)
+  else s.add(m)
+  selected.value = s
+}
+
+function startMultiForward() {
+  const peerNick = displayName(store.activeKey) || '对方'
+  const merged = mergeForward([...selected.value], (dir) => (dir === 'out' ? '我' : peerNick))
+  if (!merged) {
+    alert('选中的消息没有可转发的内容')
+    return
+  }
+  exitSel()
+  picker.value = { mode: 'forward', payload: { kind: 'text', text: merged } }
+}
+
 async function onPickerConfirm(keys) {
   const p = picker.value
   picker.value = null
@@ -182,6 +232,8 @@ async function onPickerConfirm(keys) {
 }
 
 watch(() => store.activeKey, () => nextTick(() => ta.value?.focus()))
+// 切会话退出多选模式：选中集是按消息对象引用记的，跨会话无意义
+watch(() => store.activeKey, () => exitSel())
 
 const canSend = computed(() => !!draft.value.trim() || !!pendingImg.value)
 
@@ -787,13 +839,15 @@ watch(
           v-else
           class="msg-row"
           :data-pkt="v.m.pkt"
-          :class="[v.m.dir === 'out' ? 'self' : 'peer', { merge: !v.firstOfCluster }]"
+          :class="[v.m.dir === 'out' ? 'self' : 'peer', { merge: !v.firstOfCluster, selectable: selMode, picked: selected.has(v.m) }]"
+          @click.stop="toggleSel(v.m)"
         >
           <Avatar class="m-ava" :name="v.m.dir === 'out' ? store.config?.nickname : displayName(store.activeKey)"
             :seed="v.m.dir === 'out' ? 'self' : store.activeKey" :size="34" />
           <div class="bubble-wrap">
+            <i v-if="selMode" class="sel-check" :class="{ on: selected.has(v.m) }" @click.stop="toggleSel(v.m)"></i>
             <div class="bubble" :class="{ file: v.m.kind === 'file' }"
-              @contextmenu.prevent="openCtx(v.m, $event)">
+              @contextmenu.prevent="selMode ? null : openCtx(v.m, $event)">
               <div v-if="bodyOf(v.m)" class="b-text">
                 <template v-if="hlQuery">
                   <span v-for="(p, i) in textParts(v.m)" :key="i" :class="{ hl: p.hit }">{{ p.text }}</span>
@@ -801,9 +855,9 @@ watch(
                 <template v-else>{{ bodyOf(v.m) }}</template>
               </div>
               <template v-for="f in v.m.files || []" :key="f.id">
-                <!-- 图片：本地已有内容时直接内联预览，点击查看原图 -->
+                <!-- 图片：本地已有内容时直接内联预览，点击查看原图（多选模式下点击改为切换选中） -->
                 <div v-if="isImg(f.name) && f.src" class="img-wrap">
-                  <img :src="f.src" class="chat-img" title="点击在新窗口查看原图" @click="viewImage(f)" />
+                  <img :src="f.src" class="chat-img" title="点击在新窗口查看原图" @click="selMode ? toggleSel(v.m) : viewImage(f)" />
                 </div>
                 <!-- 无预览时显示文件卡片（下载中/失败/非图片/超大图） -->
                 <div v-else class="file-card">
@@ -883,8 +937,10 @@ watch(
     <!-- 消息右键菜单 -->
     <div v-if="ctxMenu" ref="ctxMenuRef" class="ctx-menu"
       :style="{ position: 'fixed', left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }">
+      <button class="ctx-item" @click="copyMsg">复制</button>
       <button class="ctx-item" @click="startReply">回复</button>
       <button class="ctx-item" @click="startForward">转发</button>
+      <button class="ctx-item" @click="enterSelMode">多选</button>
     </div>
 
     <!-- 转发 / 批量发送的接收人选择 -->
@@ -905,6 +961,14 @@ watch(
       </svg>
       <p>选择一个会话，开始聊天</p>
       <p class="sub">局域网内基于 IPMsg 协议（UDP/TCP 2425）</p>
+    </div>
+
+    <!-- 多选模式操作条：合并转发 / 取消 -->
+    <div v-if="selMode && activeUser" class="sel-bar">
+      <span class="sel-count">已选 {{ selected.size }} 条</span>
+      <span class="flex1"></span>
+      <button class="btn-plain" @click="exitSel">取消</button>
+      <button class="btn-primary" :disabled="!selected.size" @click="startMultiForward">合并转发</button>
     </div>
 
     <!-- 输入区 -->
@@ -1366,6 +1430,61 @@ watch(
 .placeholder .sub {
   font-size: 11.5px;
   color: var(--c-border);
+}
+
+/* ---------- 多选转发模式 ---------- */
+/* 选中态：气泡描边；行内容整体变为「点一下即切换选中」 */
+.msg-row.selectable {
+  cursor: pointer;
+}
+.msg-row.selectable .bubble * {
+  /* 内容全部惰性化：链接/图片不再各自响应，点击统一落到行上切换选中 */
+  pointer-events: none;
+  user-select: none;
+}
+.msg-row.picked .bubble {
+  outline: 2px solid var(--c-accent);
+  outline-offset: -2px;
+}
+.sel-check {
+  flex: none;
+  align-self: center;
+  width: 18px;
+  height: 18px;
+  margin: 0 4px;
+  border-radius: 50%;
+  border: 1.6px solid var(--c-border);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.sel-check.on {
+  border-color: var(--c-accent);
+  background: var(--c-accent);
+}
+.sel-check.on::after {
+  content: '';
+  width: 5px;
+  height: 9px;
+  border: solid #fff;
+  border-width: 0 1.8px 1.8px 0;
+  transform: rotate(45deg) translate(-0.5px, -0.5px);
+}
+.sel-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--c-hairline);
+  background: var(--c-card-alt);
+}
+.sel-count {
+  font-size: 12.5px;
+  color: var(--c-sub);
+}
+.flex1 {
+  flex: 1;
 }
 
 /* 输入区 */

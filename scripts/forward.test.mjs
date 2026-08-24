@@ -74,3 +74,49 @@ test('参数缺省安全', () => {
   assert.deepEqual(mergeSessions(undefined, undefined), [])
   assert.deepEqual(mergeSessions(online, undefined).length, 2)
 })
+/* ---------------- mergeForward（多选合并转发） ---------------- */
+
+import { mergeForward } from '../src/lib/forward.js'
+
+const nickOf = (dir) => (dir === 'out' ? '我' : '老王')
+
+test('合并转发：按时间升序拼行，自己与对方分别标注', () => {
+  const out = mergeForward(
+    [
+      { dir: 'in', ts: 200, text: '第二条' },
+      { dir: 'out', ts: 100, text: '第一条' },
+    ],
+    nickOf
+  )
+  assert.equal(out, '【我】第一条\n【老王】第二条')
+})
+
+test('合并转发：附件消息在行尾追加占位，有正文时空格分隔', () => {
+  const out = mergeForward(
+    [
+      { dir: 'in', ts: 1, text: '', files: [{ name: 'a.zip' }, { name: 'b.png' }] },
+      { dir: 'out', ts: 2, text: '资料', files: [{ name: 'c.pdf' }] },
+    ],
+    nickOf
+  )
+  assert.equal(out, '【老王】[附件] a.zip, b.png\n【我】资料 [附件] c.pdf')
+})
+
+test('合并转发：全空的选中项拼不出内容，返回 null 交调用方提示', () => {
+  assert.equal(
+    mergeForward(
+      [
+        { dir: 'in', ts: 1, text: '   ' },
+        { dir: 'out', ts: 2, text: '' },
+      ],
+      nickOf
+    ),
+    null
+  )
+})
+
+test('合并转发：空数组与非空混合都稳定', () => {
+  assert.equal(mergeForward([], nickOf), null)
+  const mixed = mergeForward([{ dir: 'in', ts: 5, text: 'hi' }, { dir: 'in', ts: 6 }], nickOf)
+  assert.equal(mixed, '【老王】hi')
+})

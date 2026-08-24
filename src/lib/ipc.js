@@ -1,6 +1,7 @@
 // 后端命令统一封装：避免组件里直接散落 invoke 字符串
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 
 /** 注册后端事件监听（自动解包 Tauri 事件对象的 payload；返回 unlisten 函数） */
 export const listenEvent = (event, handler) =>
@@ -69,6 +70,10 @@ export const markOutRead = (key, pkts) => invoke('mark_out_read', { key, pkts })
 /** 从官方 IP Messenger 日志库（v4.5+ 的 ipmsg.db，SQLite）导入聊天记录；
  *  paths 为所选文件路径数组，返回 { total, skipped, sessionsNew, files, failed } */
 export const importIpmsgLogs = (paths) => invoke('import_ipmsg_log', { paths })
+
+/** 写系统剪贴板（右键复制消息内容）。
+ *  WebKitGTK 的网页 navigator.clipboard 不可靠，走原生插件保证三平台一致 */
+export const copyText = (text) => writeText(text)
 
 /** 事件常量 */
 export const EVT = {
