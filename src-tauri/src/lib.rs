@@ -1,5 +1,6 @@
 //! Tauri 应用层：命令注册、事件桥接、托盘、通知与生命周期。
 
+mod ipmsg_import;
 mod net;
 mod protocol;
 mod selftest;
@@ -751,6 +752,51 @@ fn list_sessions(st: State<'_, SharedState>) -> Result<Vec<state::SessionInfo>, 
     Ok(st.inner().list_sessions())
 }
 
+/// 从官方 IP Messenger 的日志库（v4.5+ 的 ipmsg.db，SQLite）导入聊天记录。
+/// 可一次传多个文件；返回汇总与逐文件明细，前端弹结果并刷新会话列表。
+#[tauri::command]
+async fn import_ipmsg_log(
+    st: State<'_, SharedState>,
+    paths: Vec<String>,
+) -> Result<Value, String> {
+    let st = st.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut total = 0usize;
+        let mut skipped = 0usize;
+        let mut sessions_new = 0usize;
+        let mut files: Vec<Value> = Vec::new();
+        for p in &paths {
+            let path = std::path::PathBuf::from(p);
+            match ipmsg_import::import_ipmsg_db(&st, &path) {
+                Ok(rep) => {
+                    total += rep.imported;
+                    skipped += rep.skipped;
+                    sessions_new += rep.sessions_new;
+                    files.push(json!({
+                        "path": p,
+                        "ok": true,
+                        "imported": rep.imported,
+                        "skipped": rep.skipped,
+                        "sessions_new": rep.sessions_new,
+                    }));
+                }
+                Err(e) => {
+                    files.push(json!({ "path": p, "ok": false, "error": e }));
+                }
+            }
+        }
+        Ok(json!({
+            "total": total,
+            "skipped": skipped,
+            "sessionsNew": sessions_new,
+            "files": files,
+            "failed": files.iter().filter(|f| f["ok"] == json!(false)).count(),
+        }))
+    })
+    .await
+    .map_err(|e| format!("导入任务失败：{e}"))?
+}
+
 /* ================= 启动 ================= */
 
 pub fn run() {
@@ -1073,7 +1119,8 @@ pub fn run() {
             open_image_viewer,
             mark_read,
             mark_out_read,
-            list_sessions
+            list_sessions,
+            import_ipmsg_log
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

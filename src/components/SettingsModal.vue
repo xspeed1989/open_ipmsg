@@ -1,7 +1,7 @@
 <script setup>
 // 设置弹窗：昵称 / 群组 / 下载目录 / 主题 / 发送编码 + 本机信息
-import { reactive, watch, computed } from 'vue'
-import { applyTheme, store, refreshConfig, refreshUsers } from '../store'
+import { reactive, watch, computed, ref } from 'vue'
+import { applyTheme, store, refreshConfig, refreshUsers, loadSessions } from '../store'
 import * as ipc from '../lib/ipc'
 import { open as pickDialog } from '@tauri-apps/plugin-dialog'
 
@@ -38,6 +38,39 @@ function restoreSavedTheme() {
 async function chooseDir() {
   const dir = await pickDialog({ directory: true, title: '选择接收文件的保存目录' })
   if (dir) form.download_dir = dir
+}
+
+const importing = ref(false)
+// 从官方 IP Messenger 的日志库（v4.5+ 的 ipmsg.db）导入历史聊天记录。
+// 后端按 msg_id 去重，重复选择同一个文件执行也不会产生重复记录。
+async function importIpmsg() {
+  const picked = await pickDialog({
+    multiple: true,
+    title: '选择官方 IP Messenger 的日志数据库',
+    filters: [{ name: 'IPMsg 日志库（ipmsg.db）', extensions: ['db'] }],
+  })
+  const paths = (Array.isArray(picked) ? picked : picked ? [picked] : []).filter(Boolean)
+  if (!paths.length || importing.value) return
+  importing.value = true
+  try {
+    const r = await ipc.importIpmsgLogs(paths)
+    await loadSessions()
+    const lines = r.files.map((f) =>
+      f.ok ? `✔ ${f.path.split(/[\\/]/).pop()}：导入 ${f.imported} 条` : `✘ ${f.path}\n  ${f.error}`
+    )
+    let msg =
+      r.failed > 0
+        ? `${lines.join('\n')}`
+        : `导入完成：共 ${r.total} 条消息` +
+          (r.skipped ? `（跳过 ${r.skipped} 条已存在/备忘录）` : '') +
+          (r.sessionsNew ? `，新增 ${r.sessionsNew} 个会话` : '')
+    if (!r.total && !r.failed) msg += '\n没有新消息可导入。'
+    alert(msg)
+  } catch (e) {
+    alert('导入失败：' + e)
+  } finally {
+    importing.value = false
+  }
 }
 
 function close() {
@@ -111,6 +144,19 @@ async function save() {
         </label>
 
         <div class="selfinfo">
+          <div class="si-title">聊天记录</div>
+          <div class="si-row" style="display:block">
+            <button class="btn-plain" :disabled="importing" @click="importIpmsg">
+              {{ importing ? '导入中…' : '导入官方 IP Messenger 聊天记录…' }}
+            </button>
+            <div class="import-hint">
+              选择官方 IPMsg（v4.5+）的日志数据库 ipmsg.db，可多选；按对方 IP 归入对应会话，
+              附件仅记录文件名。可重复执行，不会产生重复记录。
+            </div>
+          </div>
+        </div>
+
+        <div class="selfinfo" style="margin-top:12px">
           <div class="si-title">本机信息</div>
           <div class="si-row"><span>主机名</span><b>{{ store.config?.hostname || '-' }}</b></div>
           <div class="si-row"><span>IP 地址</span><b>{{ (store.config?.ips || []).join('，') || '-' }}</b></div>
@@ -242,6 +288,12 @@ header {
 .si-row span {
   width: 64px;
   color: var(--c-sub);
+}
+.import-hint {
+  font-size: 11.5px;
+  color: var(--c-weak);
+  line-height: 1.6;
+  margin-top: 8px;
 }
 .note {
   font-size: 11.5px;

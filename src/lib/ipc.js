@@ -66,6 +66,10 @@ export const markRead = (key, pkts) => invoke('mark_read', { key, pkts })
 /** 本地标记出站消息已被对端阅读（不发包）；返回实际翻转的条数 */
 export const markOutRead = (key, pkts) => invoke('mark_out_read', { key, pkts })
 
+/** 从官方 IP Messenger 日志库（v4.5+ 的 ipmsg.db，SQLite）导入聊天记录；
+ *  paths 为所选文件路径数组，返回 { total, skipped, sessionsNew, files, failed } */
+export const importIpmsgLogs = (paths) => invoke('import_ipmsg_log', { paths })
+
 /** 事件常量 */
 export const EVT = {
   usersUpdated: 'users-updated',

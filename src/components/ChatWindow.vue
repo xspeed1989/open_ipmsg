@@ -825,30 +825,36 @@ watch(
                     <template v-else>{{ f.name }}</template>
                   </div>
                   <div class="fc-sub">
-                    <span>{{ fmtSize(f.size) }}</span>
-                    <!-- 收到的文件 -->
-                    <template v-if="v.m.dir === 'in'">
-                      <template v-if="f.state === 'pending'">
-                        <a @click.prevent="downloadFile(v.m, f)">下载</a>
+                    <!-- 历史导入的附件：官方日志库里只有文件名没有内容，不给下载/定位 -->
+                    <template v-if="f.state === 'imported'">
+                      <span class="muted">历史附件 · 仅文件名</span>
+                    </template>
+                    <template v-else>
+                      <span>{{ fmtSize(f.size) }}</span>
+                      <!-- 收到的文件 -->
+                      <template v-if="v.m.dir === 'in'">
+                        <template v-if="f.state === 'pending'">
+                          <a @click.prevent="downloadFile(v.m, f)">下载</a>
+                        </template>
+                        <template v-else-if="f.state === 'downloading'">
+                          <span>{{ progressLabel(f) }}</span>
+                          <i v-if="f.total" class="bar"><i :style="{ width: pct(f) + '%' }"></i></i>
+                        </template>
+                        <template v-else-if="f.state === 'done'">
+                          <span class="ok">{{ f.dir_entry ? '文件夹已保存' : '已保存' }}</span>
+                          <a @click.prevent="openFile(f.path)">打开</a>
+                          <a @click.prevent="revealFile(f.path)">所在文件夹</a>
+                        </template>
+                        <template v-else-if="f.state === 'failed'">
+                          <span class="err">失败</span>
+                          <a @click.prevent="downloadFile(v.m, f)">重试</a>
+                        </template>
                       </template>
-                      <template v-else-if="f.state === 'downloading'">
-                        <span>{{ progressLabel(f) }}</span>
-                        <i v-if="f.total" class="bar"><i :style="{ width: pct(f) + '%' }"></i></i>
-                      </template>
-                      <template v-else-if="f.state === 'done'">
-                        <span class="ok">{{ f.dir_entry ? '文件夹已保存' : '已保存' }}</span>
-                        <a @click.prevent="openFile(f.path)">打开</a>
+                      <!-- 发出的文件 -->
+                      <template v-else>
+                        <span class="ok">已发送</span>
                         <a @click.prevent="revealFile(f.path)">所在文件夹</a>
                       </template>
-                      <template v-else-if="f.state === 'failed'">
-                        <span class="err">失败</span>
-                        <a @click.prevent="downloadFile(v.m, f)">重试</a>
-                      </template>
-                    </template>
-                    <!-- 发出的文件 -->
-                    <template v-else>
-                      <span class="ok">已发送</span>
-                      <a @click.prevent="revealFile(f.path)">所在文件夹</a>
                     </template>
                   </div>
                 </div>
@@ -1327,6 +1333,9 @@ watch(
 }
 .err {
   color: var(--c-danger);
+}
+.muted {
+  color: var(--c-weak);
 }
 .bar {
   width: 90px;
