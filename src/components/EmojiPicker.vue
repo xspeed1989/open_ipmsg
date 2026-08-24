@@ -22,10 +22,8 @@ function pick(e) {
 </template>
 
 <style scoped>
+/* 定位（position/left/top）由父组件按触发按钮位置以 inline style 注入 */
 .emoji-panel {
-  position: absolute;
-  bottom: 118px;
-  right: 12px;
   width: 264px;
   padding: 8px;
   background: var(--c-card);

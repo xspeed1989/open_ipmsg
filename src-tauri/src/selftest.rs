@@ -125,7 +125,8 @@ async fn async_run() -> bool {
     net::announce_unicast(&ctx, &[peer_addr]).await;
 
     let mut log = Log(vec![]);
-    let peer_key = format!("127.0.0.1:{port_peer}");
+    // 会话身份 = 对端 IP（源端口不再参与去重，见 upsert_peer 注释）
+    let peer_key = "127.0.0.1".to_string();
 
     /* ---- 1. 发现 ---- */
     let discovered = wait_for(2500, || st.peers.lock().unwrap().contains_key(&peer_key)).await;

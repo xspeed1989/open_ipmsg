@@ -4,7 +4,7 @@
 //! 保证对端看到的 (ip, port) 身份稳定。
 
 use crate::protocol::{self as proto, cmd, fileattr, opt};
-use crate::state::{now_secs, AppState, Config, OfferedFile, PeerInfo};
+use crate::state::{now_secs, AppState, Config, OfferedFile, PeerInfo, PendingOut};
 use serde_json::{json, Value};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -137,12 +137,57 @@ fn spawn_ticker(ctx: Arc<NetCtx>) {
         loop {
             tick.tick().await;
             announce(&ctx).await;
+            // 离线消息复查：对方在线就重投（送达以 RECVMSG 确认为准，
+            // 这里只负责「还在线就再发一遍」，失败消息由对端按包号去重）
+            let keys: Vec<String> = {
+                let peers = ctx.st.peers.lock().unwrap();
+                peers.keys().cloned().collect()
+            };
+            for k in keys {
+                flush_pending_for(&ctx, &k).await;
+            }
             let stale = ctx.st.prune_stale_peers(30 * 60);
             if !stale.is_empty() {
                 ctx.st.emit("users-updated", json!({}));
             }
         }
     });
+}
+
+/// 把某会话的待投递离线消息重发给对方（对方已在线时）。
+/// 不删除队列：以对端 RECVMSG 送达确认为准（见 ack_pending），
+/// 否则对方离线期间的重发会静默丢包。
+async fn flush_pending_for(ctx: &NetCtx, key: &str) {
+    // 守卫只在块内存活，绝不跨 await
+    let peer = {
+        let peers = ctx.st.peers.lock().unwrap();
+        match peers.get(key) {
+            Some(p) => p.clone(),
+            None => return,
+        }
+    };
+    let Some(target) = peer_addr(&peer) else {
+        return;
+    };
+    let cfg = ctx.st.config();
+    let utf8 = proto::is_utf8_mode(&cfg.encoding);
+    for item in ctx.st.pending_for(key) {
+        let note = proto::fmt_delayed(item.ts);
+        // 官方尾注：对端（含本客户端）据此显示「离线留言 · 原发送时间」
+        let body = format!("{}\n----\n(IPMsg Delayed Send: {note} )", item.text);
+        let pkt = proto::Packet::new(
+            cmd::SENDMSG | opt::SENDCHECKOPT | opt::READCHECKOPT | if utf8 { opt::UTF8OPT } else { 0 },
+        )
+        .with_pkt_no(item.pkt);
+        let pkt = proto::Packet {
+            extra: proto::encode_out(&body, &cfg.encoding),
+            ..pkt
+        };
+        let bytes = pkt.encode(&my_user(&cfg), &my_host());
+        if ctx.sock.send_to(&bytes, target).await.is_ok() {
+            ctx.st.diag(&format!("-> {key} 离线消息重投 pkt={}（待 RECVMSG 确认）", item.pkt));
+        }
+    }
 }
 
 /// 向所有广播地址发送上线/下线通告
@@ -191,20 +236,25 @@ pub fn announce_exit_blocking(st: &AppState, port: u16) {
         for ip in broadcast_targets() {
             let _ = sock.send_to(&bytes, SocketAddr::from((ip, port)));
         }
-        let peers: Vec<String> = st.peers.lock().map(|p| p.keys().cloned().collect()).unwrap_or_default();
-        for key in peers {
-            if let Some(addr) = parse_peer_key(&key, port) {
-                let _ = sock.send_to(&bytes, addr);
-            }
+        let targets: Vec<SocketAddr> = st
+            .peers
+            .lock()
+            .map(|p| p.values().filter_map(peer_addr).collect())
+            .unwrap_or_default();
+        for addr in targets {
+            let _ = sock.send_to(&bytes, addr);
         }
     }
 }
 
-fn parse_peer_key(key: &str, default_port: u16) -> Option<SocketAddr> {
-    let (ip, p) = key.rsplit_once(':')?;
-    let ip: IpAddr = ip.parse().ok()?;
-    let port: u16 = p.parse().unwrap_or(default_port);
-    Some(SocketAddr::from((ip, port)))
+/// 对端投递地址：IP 身份 + 最近一次报文的源端口。
+/// 端口不能假定是对端监听的固定端口 —— NAT 改写/临时端口发包时
+/// 只有最新报文里的源端口保证可达。
+fn peer_addr(peer: &PeerInfo) -> Option<SocketAddr> {
+    Some(SocketAddr::from((
+        peer.ip.parse::<IpAddr>().ok()?,
+        peer.port,
+    )))
 }
 
 /* ================= 入站处理 ================= */
@@ -221,7 +271,8 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
     }
     // 基本命令取低 8 位（官方规范：所有选项标志位于 bit8 以上）
     let base = pkt.command & 0xFF;
-    let key = from.to_string();
+    // 会话身份 = 对端 IP（同 IP 不同源端口是同一台主机，见 upsert_peer 注释）
+    let key = from.ip().to_string();
 
     // 送达确认：带 SENDCHECKOPT 的消息必须立刻回 RECVMSG，否则发送方会认为
     // 没送到，把消息留在待发队列里，每次我方上线就重投一遍（离线留言反复出现
@@ -294,6 +345,8 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             if added {
                 ctx.st.emit("users-updated", json!({}));
             }
+            // 对方刚上线（BR_ENTRY）：立即重投此前的离线消息
+            flush_pending_for(ctx, &key).await;
         }
         cmd::ANSENTRY | cmd::BR_ABSENCE => {
             let (nick, group) =
@@ -310,6 +363,8 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             });
             ctx.st.emit("users-updated", json!({}));
             let _ = added;
+            // ANSENTRY 通常是对我们上线通告的应答：对方在线，重投离线消息
+            flush_pending_for(ctx, &key).await;
         }
         cmd::BR_EXIT => {
             // 退出广播可能来自临时端口（进程收尾时无法复用主 socket），
@@ -329,6 +384,19 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             };
             if !removed.is_empty() {
                 ctx.st.emit("users-updated", json!({}));
+            }
+        }
+        cmd::RECVMSG => {
+            // 对方确认送达（我们发 SENDCHECKOPT 时对方回 RECVMSG，附加数据是包号）：
+            // 把对应的待投递离线消息出队，避免对方在线时每 45s 无限重投
+            let first = pkt.extra.split(|&b| b == b':').next().unwrap_or(b"");
+            let no = String::from_utf8_lossy(first).trim().to_string();
+            if let Some(k) = resolve_session_key(ctx, from.ip()) {
+                for c in id_candidates(&no) {
+                    if ctx.st.ack_pending(&k, c) {
+                        ctx.st.diag(&format!("<- {from} RECVMSG 送达确认 pkt={c}，离线消息已送达"));
+                    }
+                }
             }
         }
         cmd::SENDMSG => handle_sendmsg(ctx, from, &pkt, &key).await,
@@ -672,18 +740,36 @@ pub async fn send_message(
     text: &str,
     paths: Vec<String>,
 ) -> Result<serde_json::Value, String> {
-    let peer = ctx
-        .st
-        .peers
-        .lock()
-        .unwrap()
-        .get(key)
-        .cloned()
-        .ok_or_else(|| "对方不在线或尚未发现".to_string())?;
-    let target = parse_peer_key(&peer.key, ctx.port).ok_or("无效的对方地址")?;
-
     let cfg = ctx.st.config();
     let pkt_no = proto::next_packet_no();
+    let ts = now_secs();
+
+    let peer = ctx.st.peers.lock().unwrap().get(key).cloned();
+    let Some(peer) = peer else {
+        // 对方不在线：纯文本进入待投递队列（官方 IPMsg 语义，上线后自动重投，
+        // 以原包号发送并带延迟尾注）。文件消息必须对方在线（要注册文件槽并发公告）。
+        if !paths.is_empty() {
+            return Err("对方不在线或尚未发现".to_string());
+        }
+        let enqueued = ctx.st.enqueue_pending(PendingOut {
+            key: key.to_string(),
+            pkt: pkt_no,
+            text: text.to_string(),
+            ts,
+        });
+        let rec = json!({
+            "dir": "out", "kind": "text", "text": text, "pkt": pkt_no, "ts": ts,
+            "peer": {"key": key, "nickname": "", "host": "", "group": ""},
+            "rcpt": true, "read": false,
+            "queued": true,
+        });
+        ctx.st.log_record(key, &rec);
+        if enqueued {
+            ctx.st.diag(&format!("-> {key} 离线消息入队 pkt={pkt_no}"));
+        }
+        return Ok(rec);
+    };
+    let target = peer_addr(&peer).ok_or("无效的对方地址")?;
 
     // 注册文件槽必须在发包前完成（对端可能立刻来取）
     let mut entries: Vec<proto::FileEntry> = Vec::new();
@@ -784,7 +870,7 @@ pub async fn send_message(
             "id": e.id, "name": e.name, "size": e.size, "path": p, "state": "sent",
             "dir_entry": e.attr & 0xFF == fileattr::DIR,
         })).collect::<Vec<_>>(),
-        "ts": now_secs(),
+        "ts": ts,
         "pkt": pkt_no,
         "peer": {"key": peer.key, "nickname": peer.nickname, "host": peer.host, "group": peer.group},
         "rcpt": want_rcpt,
@@ -796,17 +882,14 @@ pub async fn send_message(
 
 /* ================= 已读回执 ================= */
 
-/// 解析 READMSG 来源对应的会话 key：优先精确匹配，其次按 IP 匹配
+/// 解析 READMSG 来源对应的会话 key：会话身份即 IP，在线表里查得到就返回
 fn resolve_session_key(ctx: &NetCtx, ip: IpAddr) -> Option<String> {
-    let peers = ctx.st.peers.lock().unwrap();
-    let exact = format!("{}:{}", ip, ctx.port);
-    if peers.contains_key(&exact) {
-        return Some(exact);
+    let key = ip.to_string();
+    if ctx.st.peers.lock().unwrap().contains_key(&key) {
+        Some(key)
+    } else {
+        None
     }
-    peers
-        .values()
-        .find(|p| p.ip == ip.to_string())
-        .map(|p| p.key.clone())
 }
 
 /// 标记入站消息为已读，并对要求回执的消息向对端发送 READMSG。
@@ -832,7 +915,7 @@ pub async fn mark_read_and_receipt(
     let Some(peer) = peer else {
         return Ok(0); // 对方不在线：仅本地标记
     };
-    let Some(target) = parse_peer_key(&peer.key, ctx.port) else {
+    let Some(target) = peer_addr(&peer) else {
         return Ok(0);
     };
 
@@ -854,6 +937,25 @@ pub async fn mark_read_and_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_addr_uses_ip_and_latest_port() {
+        let p = PeerInfo {
+            key: "10.0.0.3".into(),
+            ip: "10.0.0.3".into(),
+            port: 50000,
+            nickname: String::new(),
+            group: String::new(),
+            host: String::new(),
+            user: String::new(),
+            last_seen: 0,
+        };
+        assert_eq!(
+            peer_addr(&p).expect("addr").to_string(),
+            "10.0.0.3:50000",
+            "投递地址 = 对端 IP + 最新一次报文的源端口，而不是假定对端监听固定端口"
+        );
+    }
 
     #[test]
     fn id_candidates_both_bases() {
@@ -1355,7 +1457,7 @@ pub async fn download_file_task(
         .get(key)
         .cloned()
         .ok_or_else(|| "对方不在线".to_string())?;
-    let target = parse_peer_key(&peer.key, ctx.port).ok_or("无效的对方地址")?;
+    let target = peer_addr(&peer).ok_or("无效的对方地址")?;
 
     let cfg = ctx.st.config();
     let dir = PathBuf::from(if cfg.download_dir.is_empty() {

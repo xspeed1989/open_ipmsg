@@ -127,7 +127,8 @@ async function reveal() {
 
 <template>
   <div class="viewer" @mousemove="onMove" @mouseup="onUp" @mouseleave="onUp">
-    <header class="bar" data-tauri-drag-region @dblclick="appWindow.toggleMaximize().catch(() => {})">
+    <!-- 双击最大化由 Tauri 的 drag-region 脚本原生处理，勿再绑 @dblclick（会切换两次） -->
+    <header class="bar" data-tauri-drag-region>
       <span class="title" data-tauri-drag-region>{{ name }}</span>
       <div class="acts">
         <button title="缩小 ( - )" @click="zoom(1 / 1.2)">－</button>

@@ -23,10 +23,10 @@ function matchUser(u) {
   return hay.includes(q)
 }
 
-/** 按群组分组的联系人；组内未读优先，其余按昵称排序 */
+/** 按群组分组的会话；组内未读优先，其次在线，其余按昵称排序 */
 const contactGroups = computed(() => {
   const groups = {}
-  for (const u of store.users) {
+  for (const u of store.sessionList) {
     if (!matchUser(u)) continue
     const g = u.group || '未分组'
     ;(groups[g] ||= []).push(u)
@@ -39,6 +39,7 @@ const contactGroups = computed(() => {
       users: list.sort(
         (x, y) =>
           unreadOf(y) - unreadOf(x) ||
+          Number(y.online) - Number(x.online) ||
           (x.nickname || '').localeCompare(y.nickname || '', 'zh')
       ),
     }))
@@ -78,16 +79,16 @@ function openContact(u) {
           :key="u.key"
           class="row contact"
           :data-user-key="u.key"
-          :class="{ active: store.activeKey === u.key }"
+          :class="{ active: store.activeKey === u.key, off: !u.online }"
           @click="openContact(u)"
         >
           <div class="ava">
             <Avatar :name="u.nickname || u.user || '?'" :seed="u.key" :size="36" />
-            <i class="status-dot on" title="在线"></i>
+            <i class="status-dot" :class="u.online ? 'on' : 'off'" :title="u.online ? '在线' : '离线'"></i>
           </div>
           <div class="mid">
             <div class="r1 ellipsis">{{ u.nickname || u.user || '未知用户' }}</div>
-            <div class="r2 ellipsis">{{ u.host }} · {{ u.ip }}{{ u.group ? ' · ' + u.group : '' }}</div>
+            <div class="r2 ellipsis">{{ u.host || '' }}{{ u.ip ? ' · ' + u.ip : '' }}{{ u.group ? ' · ' + u.group : '' }}</div>
           </div>
           <div class="right">
             <i v-if="store.unread[u.key]" class="badge">
@@ -119,7 +120,7 @@ function openContact(u) {
       </template>
 
       <div v-if="!contactGroups.length && !q" class="empty-tip">
-        <p>局域网内暂无其他用户</p>
+        <p>暂无会话</p>
         <p class="sub">请确认对方已运行 IPMsg 客户端（UDP 端口 2425），或点击聊天窗口右上角「刷新」重新广播</p>
       </div>
     </div>
@@ -237,6 +238,13 @@ function openContact(u) {
 }
 .status-dot.on {
   background: var(--c-accent);
+}
+/* 离线会话：灰点，整行弱化 */
+.status-dot.off {
+  background: var(--c-weak);
+}
+.row.contact.off .r1 {
+  color: var(--c-sub);
 }
 .group-head {
   padding: 8px 12px 4px;

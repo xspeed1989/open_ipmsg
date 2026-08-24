@@ -2560,6 +2560,7 @@ dependencies = [
  "gtk",
  "hostname",
  "ksni",
+ "libc",
  "local-ip-address",
  "serde",
  "serde_json",

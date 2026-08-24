@@ -35,6 +35,10 @@ fn show_main_window(app: &tauri::AppHandle) {
 
 /// 从托盘唤起主窗口：顺带通知前端「跳到最新的未读会话」。
 /// SNI 的回调跑在 DBus 线程上，这里统一回主线程操作窗口。
+///
+/// 注意：Wayland/KWin 可能拒绝来自外部的 set_focus（防抢焦点）；前端收到
+/// open-unread 事件后会自己再 show/unminimize/setFocus 一次 —— 窗口自我激活
+/// 任何合成器都无条件允许，保证「窗口可见但被盖住」时点击托盘也能弹到最前面。
 fn activate_from_tray(app: &tauri::AppHandle) {
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
@@ -485,6 +489,44 @@ async fn set_unread(app: tauri::AppHandle, total: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// 读系统剪贴板里的位图（截图后粘贴用）。
+///
+/// Linux 的 WebKitGTK 不把剪贴板图片暴露给网页（paste 事件拿不到图），
+/// 和文件 URI 是同一类缺口 —— 只能直接读 GTK 剪贴板。
+/// 返回 PNG 编码的 base64 与字节数；剪贴板里没有图片时返回 null。
+#[tauri::command]
+async fn clipboard_image(app: tauri::AppHandle) -> Result<Option<Value>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        use base64::Engine as _;
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+        // GTK 调用必须在主线程上做
+        app.run_on_main_thread(move || {
+            let png = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD)
+                .wait_for_image()
+                .and_then(|pix| pix.save_to_bufferv("png", &[]).ok());
+            let _ = tx.send(png);
+        })
+        .map_err(|e| format!("读取剪贴板失败: {e}"))?;
+        let png = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .map_err(|e| format!("读取剪贴板超时: {e}"))?;
+        Ok(png.map(|bytes| {
+            json!({
+                "mime": "image/png",
+                "size": bytes.len(),
+                "b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            })
+        }))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = app;
+        Ok(None)
+    }
+}
+
 /// 读系统剪贴板里的文件列表（复制文件后粘贴用）。
 ///
 /// Linux 的 WebKitGTK 不会把 `text/uri-list` / `x-special/gnome-copied-files`
@@ -689,6 +731,26 @@ async fn mark_read(ctx: State<'_, SharedCtx>, key: String, pkts: Vec<u32>) -> Re
     net::mark_read_and_receipt(&ctx, &key, &pkts).await
 }
 
+/// 本地标记出站消息已被对端阅读（不发包）。
+/// 用于「对方回话即视为已读」的兜底：飞秋等实现不会回 READMSG。
+#[tauri::command]
+fn mark_out_read(st: State<'_, SharedState>, key: String, pkts: Vec<u32>) -> Result<usize, String> {
+    let st = st.inner().clone();
+    let mut changed = 0;
+    for p in pkts {
+        if st.mark_out_read(&key, p) {
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
+/// 全部历史会话摘要（含离线的，中栏展示用）
+#[tauri::command]
+fn list_sessions(st: State<'_, SharedState>) -> Result<Vec<state::SessionInfo>, String> {
+    Ok(st.inner().list_sessions())
+}
+
 /* ================= 启动 ================= */
 
 pub fn run() {
@@ -851,6 +913,14 @@ pub fn run() {
 
             let st = Arc::new(AppState::new(data_dir));
             st.load_config();
+            // 恢复离线消息待投递队列（对方上线后自动重投）
+            st.load_pending();
+            // 会话键从 ip:port 归一化为纯 IP：把旧命名的 `<ip>_<端口>.jsonl`
+            // 迁移成 `<ip>.jsonl`，并改写记录内的 peer.key 快照
+            let migrated = st.migrate_legacy_history_keys();
+            if migrated > 0 {
+                st.diag(&format!("history-migrate 迁移旧会话文件 {migrated} 个"));
+            }
             // 一次性修复旧版本遗留的历史文件（重投副本堆积 / 并发写入的坏行）
             let (merged, dropped) = st.compact_histories();
             if merged > 0 || dropped > 0 {
@@ -996,11 +1066,14 @@ pub fn run() {
             send_clipboard_image,
             stage_pasted_file,
             clipboard_file_paths,
+            clipboard_image,
             set_unread,
             download_file,
             read_image_data,
             open_image_viewer,
-            mark_read
+            mark_read,
+            mark_out_read,
+            list_sessions
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -15,6 +15,9 @@ export const saveConfig = (patch) => invoke('save_config', { patch })
 /** 在线用户列表 */
 export const getUsers = () => invoke('get_users')
 
+/** 全部历史会话摘要（含离线的，中栏展示用） */
+export const listSessions = () => invoke('list_sessions')
+
 /** 重新广播上线（BR_ENTRY） */
 export const refreshUsers = () => invoke('refresh_users')
 
@@ -39,6 +42,9 @@ export const setUnread = (total) => invoke('set_unread', { total })
 /** 读系统剪贴板里的文件列表（Linux 下 webview 拿不到，走原生 GTK 剪贴板） */
 export const clipboardFilePaths = () => invoke('clipboard_file_paths')
 
+/** 读系统剪贴板里的位图（截图粘贴用；返回 {mime,size,b64} 或 null） */
+export const clipboardImage = () => invoke('clipboard_image')
+
 /** 把粘贴进来的文件内容落盘，返回可发送的本地路径 */
 export const stagePastedFile = (name, b64) => invoke('stage_pasted_file', { name, b64 })
 
@@ -56,6 +62,9 @@ export const downloadFile = (key, pktNo, fileId, name, rid, size, isDir) =>
 
 /** 标记入站消息已读，并对要求回执的消息发送 READMSG；返回发出的回执数 */
 export const markRead = (key, pkts) => invoke('mark_read', { key, pkts })
+
+/** 本地标记出站消息已被对端阅读（不发包）；返回实际翻转的条数 */
+export const markOutRead = (key, pkts) => invoke('mark_out_read', { key, pkts })
 
 /** 事件常量 */
 export const EVT = {

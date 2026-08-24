@@ -8,6 +8,8 @@ import {
 import * as ipc from './lib/ipc'
 import { splitDelayedNote } from './lib/text'
 import { pickLatestUnread } from './lib/unread'
+import { unreadReceiptPkts } from './lib/receipts'
+import { mergeSessions } from './lib/sessions'
 import { applyTheme } from './lib/theme'
 
 export const store = reactive({
@@ -22,6 +24,10 @@ export const store = reactive({
   /** 在线用户 PeerInfo[] 与 key->PeerInfo 映射 */
   users: [],
   userMap: {},
+  /** 离线历史会话（list_sessions） */
+  sessions: [],
+  /** 中栏列表 = 在线用户 ∪ 离线会话（mergeSessions 结果） */
+  sessionList: [],
 
   /** key -> { msgs: [] }，历史与会话内容 */
   chats: {},
@@ -116,9 +122,35 @@ export async function loadUsers() {
         group: clean(u.group),
       }
     }
+    mergeSessionList()
   } catch (e) {
     console.error('loadUsers failed', e)
   }
+}
+
+/** 拉取离线历史会话并合并进中栏列表（在线优先，离线补位） */
+export async function loadSessions() {
+  try {
+    store.sessions = await ipc.listSessions()
+    // 离线会话也进 peerMeta：打开历史会话时昵称/群组能正常显示
+    for (const s of store.sessions) {
+      if (!store.peerMeta[s.key]) {
+        store.peerMeta[s.key] = {
+          nickname: clean(s.nickname) || clean(s.key),
+          host: clean(s.host),
+          group: clean(s.group),
+        }
+      }
+    }
+    mergeSessionList()
+  } catch (e) {
+    console.error('loadSessions failed', e)
+  }
+}
+
+/** 用「在线用户 ∪ 离线会话」重建中栏列表 */
+function mergeSessionList() {
+  store.sessionList = mergeSessions(store.users, store.sessions)
 }
 
 export async function refreshUsers() {
@@ -263,28 +295,44 @@ function isChatVisible(key) {
   return store.windowFocused && store.activeKey === key
 }
 
-export async function sendText(text) {
-  const key = store.activeKey
-  if (!key || !text.trim()) return
+/** 发送文本到指定会话（转发/批量发送用）；对方离线时后端自动入队，返回的
+ * 记录带 queued 标记，气泡上显示「离线留言·上线后自动投递」 */
+export async function sendTextTo(key, text) {
+  if (!key || !text?.trim()) return null
   const msg = await ipc.sendText(key, text)
-  pushMsg(key, msg)
+  await pushMsg(key, msg)
+  return msg
+}
+
+/** 发送文本到当前会话 */
+export async function sendText(text) {
+  return sendTextTo(store.activeKey, text)
+}
+
+/** 发送文件/文件夹到指定会话；target 省略时发给当前会话（拖放到列表某个用户时指定目标） */
+export async function sendFilesTo(key, paths) {
+  if (!key || !paths?.length) return null
+  const msg = await ipc.sendFiles(key, paths)
+  await pushMsg(key, msg)
+  return msg
 }
 
 /** 发送文件/文件夹；target 省略时发给当前会话（拖放到列表某个用户时指定目标） */
 export async function sendFiles(paths, target) {
-  const key = target || store.activeKey
-  if (!key || !paths?.length) return
-  const msg = await ipc.sendFiles(key, paths)
-  pushMsg(key, msg)
-  return msg
+  return sendFilesTo(target || store.activeKey, paths)
 }
 
 /** 发送剪贴板里的图片（对端按普通附件接收，本客户端内联显示） */
-export async function sendClipboardImage(b64, mime, text = '') {
-  const key = store.activeKey
-  if (!key || !b64) return
+export async function sendClipboardImageTo(key, b64, mime, text = '') {
+  if (!key || !b64) return null
   const msg = await ipc.sendClipboardImage(key, text, b64, mime)
-  pushMsg(key, msg)
+  await pushMsg(key, msg)
+  return msg
+}
+
+/** 发送剪贴板里的图片到当前会话 */
+export async function sendClipboardImage(b64, mime, text = '') {
+  return sendClipboardImageTo(store.activeKey, b64, mime, text)
 }
 
 /** 发起文件下载；进度通过 file-progress 事件回填 */
@@ -397,7 +445,10 @@ export async function boot() {
     }
   })
 
-  await ipc.listenEvent(ipc.EVT.usersUpdated, () => loadUsers())
+  await ipc.listenEvent(ipc.EVT.usersUpdated, () => {
+    loadUsers()
+    loadSessions()
+  })
   await ipc.listenEvent(ipc.EVT.msgIn, async ({ key, msg, resend }) => {
     if (!key || !msg) return
     // 对端延迟重发（同包号重复投递）不重复计未读、不重复通知
@@ -406,6 +457,18 @@ export async function boot() {
       (store.chats[key]?.msgs || []).some((m) => m.dir === 'in' && m.pkt === msg.pkt)
     // 等消息真正入列再判断已读，否则 markReadFor 可能看不到这条新消息
     await pushMsg(key, msg)
+    // 「对方回话即视为已读」兜底：飞秋等实现不会对我们带 READCHECKOPT 的
+    // 消息回 READMSG，出站消息的未读标记会永远挂着。对端既然发来了新消息，
+    // 人就在对话里 —— 把此前要求回执且未读的出站消息翻成已读（本地+落库）。
+    if (msg.dir === 'in' && !isRebroadcast) {
+      const pkts = unreadReceiptPkts(store.chats[key]?.msgs)
+      if (pkts.length) {
+        for (const m of store.chats[key].msgs) {
+          if (pkts.includes(m.pkt)) m.read = true
+        }
+        ipc.markOutRead(key, pkts).catch((e) => console.error('mark_out_read failed', e))
+      }
+    }
     if (isChatVisible(key)) {
       await markReadFor(key)
     } else if (!isRebroadcast) {
@@ -414,8 +477,15 @@ export async function boot() {
       notify(displayName(key), previewText(msg))
     }
   })
-  // 托盘唤起主窗口：有未读就直接进最新的那个会话
+  // 托盘唤起主窗口：有未读就直接进最新的那个会话。
+  // Wayland/KWin 会拒绝「外部激活」（DBus 托盘点过来的 set_focus 可能被忽略），
+  // 但窗口自己请求自己激活总是允许的 —— 所以这里由前端再次 show/unminimize/focus，
+  // 保证窗口已可见但被盖住时也能弹到最前面。
   await ipc.listenEvent(ipc.EVT.openUnread, async () => {
+    const w = getCurrentWindow()
+    await w.show()
+    await w.unminimize()
+    await w.setFocus()
     const key = latestUnreadKey()
     if (key) await openChat(key)
   })
@@ -432,6 +502,7 @@ export async function boot() {
   )
 
   await loadUsers()
+  await loadSessions()
 
   if (!store.config.nickname) store.firstRun = true
   if (store.firstRun) store.settingsOpen = true

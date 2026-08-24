@@ -6,13 +6,19 @@ import * as ipc from '../lib/ipc'
 import {
   store, sendText, sendFiles, sendClipboardImage, downloadFile, clearHistory,
   openChat, displayName, dayLabel, fmtTime, fmtSize, refreshUsers, splitDelayedNote,
+  sendTextTo, sendFilesTo, sendClipboardImageTo,
 } from '../store'
 import { parseFileUris, highlightParts } from '../lib/text'
+import { computePopupPosition } from '../lib/popup'
+import { composeReplyBody, quotePreview } from '../lib/reply'
+import { forwardPayload } from '../lib/forward'
+import { pendingImgFromB64 } from '../lib/clipimg'
 import { open as openFileDialog, confirm as confirmDialog } from '@tauri-apps/plugin-dialog'
 import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import Avatar from './Avatar.vue'
 import EmojiPicker from './EmojiPicker.vue'
+import RecipientPicker from './RecipientPicker.vue'
 
 const activeUser = computed(
   () => store.userMap[store.activeKey] || store.peerMeta[store.activeKey] || null
@@ -66,13 +72,127 @@ watch(() => msgs.value.length, () => scrollBottom(true))
 const draft = ref('')
 const ta = ref(null)
 
+/* ---------- 右键回复 ---------- */
+/** 正在回复的目标：{ preview, nick }；发送/取消/切换会话后清空 */
+const replyTarget = ref(null)
+/** 右键菜单：{ x, y, msg }；msg 用于启动回复 */
+const ctxMenu = ref(null)
+const ctxMenuRef = ref(null)
+
+function openCtx(msg, e) {
+  ctxMenu.value = {
+    x: Math.min(e.clientX, window.innerWidth - 120),
+    y: Math.min(e.clientY, window.innerHeight - 48),
+    msg,
+  }
+}
+function closeCtx() {
+  ctxMenu.value = null
+}
+function onCtxMouseDown(e) {
+  const path = e.composedPath ? e.composedPath() : []
+  if (path.includes(ctxMenuRef.value)) return
+  closeCtx()
+}
+function onCtxKeyDown(e) {
+  if (e.key === 'Escape') closeCtx()
+}
+watch(ctxMenu, (open) => {
+  if (open) {
+    document.addEventListener('mousedown', onCtxMouseDown, true)
+    document.addEventListener('keydown', onCtxKeyDown)
+  } else {
+    document.removeEventListener('mousedown', onCtxMouseDown, true)
+    document.removeEventListener('keydown', onCtxKeyDown)
+  }
+})
+
+function startReply() {
+  const m = ctxMenu.value?.msg
+  if (!m) return
+  replyTarget.value = {
+    preview: quotePreview(m),
+    nick: m.dir === 'out' ? '我' : displayName(store.activeKey),
+  }
+  closeCtx()
+  nextTick(() => ta.value?.focus())
+}
+function cancelReply() {
+  replyTarget.value = null
+}
+
+/* ---------- 转发 / 批量发送 ---------- */
+const picker = ref(null) // { mode: 'forward'|'batch', payload }
+
+function startForward() {
+  const m = ctxMenu.value?.msg
+  if (!m) return
+  const payload = forwardPayload(m)
+  closeCtx()
+  if (!payload.ok) {
+    alert(payload.reason)
+    return
+  }
+  picker.value = { mode: 'forward', payload }
+}
+
+function startBatch() {
+  if (!store.activeKey) {
+    alert('请先在左侧选择一个会话')
+    return
+  }
+  // 输入框为空时不再静默禁用按钮，点击给出明确引导
+  if (!canSend.value) {
+    alert('请先在输入框填写要批量发送的内容（文字或粘贴图片）')
+    nextTick(() => ta.value?.focus())
+    return
+  }
+  picker.value = { mode: 'batch', payload: null }
+}
+
+async function onPickerConfirm(keys) {
+  const p = picker.value
+  picker.value = null
+  if (!p || !keys.length) return
+  const fails = []
+  let ok = 0
+  for (const k of keys) {
+    try {
+      if (p.mode === 'forward') {
+        if (p.payload.kind === 'text') await sendTextTo(k, p.payload.text)
+        else await sendFilesTo(k, p.payload.paths)
+      } else {
+        const text = draft.value.replace(/\n{3,}/g, '\n\n').trimEnd()
+        const img = pendingImg.value
+        if (img) await sendClipboardImageTo(k, img.b64, img.mime, text)
+        else await sendTextTo(k, text)
+      }
+      ok++
+    } catch (e) {
+      fails.push(k)
+    }
+  }
+  if (p.mode === 'batch') {
+    if (pendingImg.value) clearPendingImg()
+    draft.value = ''
+  }
+  const name = (k) => displayName(k) || k
+  if (!fails.length) alert(`已发送给 ${ok} 人：${keys.map(name).join('、')}`)
+  else alert(`成功 ${ok} 人；失败 ${fails.length} 人：${fails.map(name).join('、')}`)
+}
+
 watch(() => store.activeKey, () => nextTick(() => ta.value?.focus()))
 
 const canSend = computed(() => !!draft.value.trim() || !!pendingImg.value)
 
 async function doSend() {
   if (!store.activeKey || !canSend.value) return
-  const text = draft.value.replace(/\n{3,}/g, '\n\n').trimEnd()
+  let text = draft.value.replace(/\n{3,}/g, '\n\n').trimEnd()
+  // 正在回复某条消息时，把引用原文作为文本并入正文（对方看到即回的内容）
+  if (replyTarget.value) {
+    text = composeReplyBody(replyTarget.value.preview, text)
+    replyTarget.value = null
+  }
   const img = pendingImg.value
   try {
     if (img) {
@@ -184,9 +304,9 @@ async function onPaste(e) {
 }
 
 /**
- * Ctrl/⌘+V 兜底：Linux 的文件管理器复制文件时，剪贴板里只有 text/uri-list，
- * WebKitGTK 既不会把它交给网页，往往连 paste 事件都不触发 —— 所以不能只等
- * paste 事件。这里在按键后确认网页层确实没拿到内容，再去读原生 GTK 剪贴板。
+ * Ctrl/⌘+V 兜底：WebKitGTK 既不会把文件/图片剪贴板内容交给网页，
+ * 往往连 paste 事件都不触发 —— 所以不能只等 paste 事件。这里在按键后
+ * 确认网页层确实没拿到内容，再去读原生 GTK 剪贴板（文件路径 → 图片）。
  */
 let pasteSeen = false
 function onPasteHotkey(e) {
@@ -196,9 +316,20 @@ function onPasteHotkey(e) {
     if (pasteSeen) return // 网页层已经处理（普通文本或文件）
     try {
       const native = await ipc.clipboardFilePaths()
-      if (native?.length) await sendPastedPaths(native)
+      if (native?.length) {
+        await sendPastedPaths(native)
+        return
+      }
+      // 剪贴板里没有文件路径 → 可能是截图：读原生剪贴板位图，先预览再发
+      const img = await ipc.clipboardImage()
+      if (img?.b64) {
+        const p = pendingImgFromB64(img.b64, img.mime, img.size)
+        clearPendingImg()
+        pendingImg.value = { ...p, url: URL.createObjectURL(p.blob) }
+        nextTick(() => ta.value?.focus())
+      }
     } catch (err) {
-      console.error('clipboard_file_paths failed', err)
+      console.error('clipboard fallback failed', err)
     }
   }, 80)
 }
@@ -282,13 +413,26 @@ onMounted(() => {
   window.addEventListener('paste', onPaste)
   window.addEventListener('keydown', onPasteHotkey)
   window.addEventListener('keydown', onFindHotkey)
+  window.addEventListener('keydown', onReplyEsc)
 })
 onUnmounted(() => {
   if (unlistenDrop) unlistenDrop()
   window.removeEventListener('paste', onPaste)
   window.removeEventListener('keydown', onPasteHotkey)
   window.removeEventListener('keydown', onFindHotkey)
+  window.removeEventListener('keydown', onReplyEsc)
 })
+/** Esc 依次关闭：接收人弹窗 → 回复条；输入框/搜索框内按 Esc 不干扰 */
+function onReplyEsc(e) {
+  if (e.key !== 'Escape') return
+  const t = e.target
+  if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement) return
+  if (picker.value) {
+    picker.value = null
+    return
+  }
+  if (replyTarget.value) cancelReply()
+}
 function onKeydown(e) {
   // Enter 发送；Ctrl/Cmd+Enter 与 Shift+Enter 换行（微信PC习惯）
   if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) {
@@ -323,6 +467,69 @@ async function pickFolder() {
 
 /* ---------- 表情 ---------- */
 const emojiOpen = ref(false)
+// 面板尺寸估估值：宽度取实际样式，高度按 5 行网格估算（仅用于上下翻转判断）
+const EMOJI_PANEL_W = 264
+const EMOJI_PANEL_H = 176
+const emojiBtnRef = ref(null)
+const emojiPanelRef = ref(null)
+const emojiStyle = ref({})
+
+function toggleEmoji() {
+  if (emojiOpen.value) {
+    emojiOpen.value = false
+    return
+  }
+  const btn = emojiBtnRef.value
+  const rect = (btn?.$el || btn)?.getBoundingClientRect?.()
+  if (!rect) {
+    emojiOpen.value = true
+    return
+  }
+  // 跟随按钮位置弹出（上方优先，越界翻转/夹回），而不是固定挂在右下角
+  const { left, top } = computePopupPosition(
+    { left: rect.left, top: rect.top, bottom: rect.bottom, width: rect.width },
+    EMOJI_PANEL_W,
+    EMOJI_PANEL_H,
+    window.innerWidth,
+    window.innerHeight,
+  )
+  emojiStyle.value = { position: 'fixed', left: left + 'px', top: top + 'px' }
+  emojiOpen.value = true
+}
+
+/** 点击面板和触发按钮之外的地方 / 按 Esc → 关闭面板 */
+function onDocMouseDown(e) {
+  const path = e.composedPath ? e.composedPath() : []
+  const panelEl = emojiPanelRef.value?.$el || emojiPanelRef.value
+  if (path.includes(panelEl) || path.includes(emojiBtnRef.value)) return
+  emojiOpen.value = false
+}
+function onDocKeyDown(e) {
+  if (e.key === 'Escape') emojiOpen.value = false
+}
+watch(emojiOpen, (open) => {
+  if (open) {
+    document.addEventListener('mousedown', onDocMouseDown, true)
+    document.addEventListener('keydown', onDocKeyDown)
+  } else {
+    document.removeEventListener('mousedown', onDocMouseDown, true)
+    document.removeEventListener('keydown', onDocKeyDown)
+  }
+})
+// 切换会话时收起面板、回复状态与接收人弹窗，避免挂在新会话上
+watch(() => store.activeKey, () => {
+  emojiOpen.value = false
+  replyTarget.value = null
+  picker.value = null
+  closeCtx()
+})
+onUnmounted(() => {
+  document.removeEventListener('mousedown', onDocMouseDown, true)
+  document.removeEventListener('keydown', onDocKeyDown)
+  document.removeEventListener('mousedown', onCtxMouseDown, true)
+  document.removeEventListener('keydown', onCtxKeyDown)
+})
+
 function insertEmoji(e) {
   const el = ta.value
   if (!el) return
@@ -585,7 +792,8 @@ watch(
           <Avatar class="m-ava" :name="v.m.dir === 'out' ? store.config?.nickname : displayName(store.activeKey)"
             :seed="v.m.dir === 'out' ? 'self' : store.activeKey" :size="34" />
           <div class="bubble-wrap">
-            <div class="bubble" :class="{ file: v.m.kind === 'file' }">
+            <div class="bubble" :class="{ file: v.m.kind === 'file' }"
+              @contextmenu.prevent="openCtx(v.m, $event)">
               <div v-if="bodyOf(v.m)" class="b-text">
                 <template v-if="hlQuery">
                   <span v-for="(p, i) in textParts(v.m)" :key="i" :class="{ hl: p.hit }">{{ p.text }}</span>
@@ -651,8 +859,11 @@ watch(
             <div v-if="delayedOf(v.m) !== null" class="delay-tag" :title="'对方在 ' + delayedOf(v.m) + ' 发出，你当时不在线，上线后才补投'">
               离线留言 · 原发送时间 {{ delayedOf(v.m) || '未知' }}
             </div>
+            <div v-if="v.m.dir === 'out' && v.m.queued" class="delay-tag out-queued">
+              离线留言 · 对方上线后自动投递
+            </div>
             <div class="m-time" :class="{ self: v.m.dir === 'out' }">
-              <span v-if="v.m.dir === 'out' && v.m.rcpt" class="read-tag" :class="{ done: v.m.read }">
+              <span v-if="v.m.dir === 'out' && v.m.rcpt && !v.m.queued" class="read-tag" :class="{ done: v.m.read }">
                 {{ v.m.read ? '已读' : '未读' }}
               </span>
               {{ fmtTime(v.m.ts) }}
@@ -663,8 +874,25 @@ watch(
       <div style="height: 10px"></div>
     </div>
 
-    <!-- 空态 -->
-    <div v-else class="placeholder">
+    <!-- 消息右键菜单 -->
+    <div v-if="ctxMenu" ref="ctxMenuRef" class="ctx-menu"
+      :style="{ position: 'fixed', left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }">
+      <button class="ctx-item" @click="startReply">回复</button>
+      <button class="ctx-item" @click="startForward">转发</button>
+    </div>
+
+    <!-- 转发 / 批量发送的接收人选择 -->
+    <RecipientPicker
+      v-if="picker"
+      :title="picker.mode === 'forward' ? '转发给' : '批量发送给'"
+      :exclude-key="store.activeKey"
+      @confirm="onPickerConfirm"
+      @cancel="picker = null"
+    />
+
+    <!-- 空态：显式条件，不依赖与上方元素的 v-if/v-else 配对
+         （中间隔着右键菜单/接收人弹窗时，v-else 会错误地配给它们） -->
+    <div v-if="!activeUser" class="placeholder">
       <svg width="72" height="72" viewBox="0 0 24 24" fill="none">
         <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v8a2.5 2.5 0 0 1-2.5 2.5H9l-4.2 3.6c-.5.42-1.3.07-1.3-.6V5.5z"
           stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" />
@@ -676,12 +904,18 @@ watch(
     <!-- 输入区 -->
     <footer v-if="activeUser" class="composer">
       <div class="toolbar">
-        <button title="表情" @click="emojiOpen = !emojiOpen">
+        <button ref="emojiBtnRef" title="表情" @click="toggleEmoji">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
             <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6" />
             <circle cx="9" cy="10" r="1.2" fill="currentColor" />
             <circle cx="15" cy="10" r="1.2" fill="currentColor" />
             <path d="M8.2 14c.9 1.4 2.2 2.1 3.8 2.1s2.9-.7 3.8-2.1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+          </svg>
+        </button>
+        <button title="批量发送" @click="startBatch">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 3" />
+            <path d="M7 12h10M12 7v10" stroke="currentColor" stroke-width="1.6" />
           </svg>
         </button>
         <button title="发送文件" @click="pickFiles">
@@ -707,7 +941,13 @@ watch(
         </button>
       </div>
 
-      <EmojiPicker v-if="emojiOpen" @pick="insertEmoji" />
+      <!-- 正在回复某条消息：输入区上方的引用条 -->
+      <div v-if="replyTarget" class="reply-bar">
+        <span class="rb-txt ellipsis">回复 {{ replyTarget.nick }}：{{ replyTarget.preview }}</span>
+        <button class="rb-x" title="取消回复（Esc）" @click="cancelReply">✕</button>
+      </div>
+
+      <EmojiPicker ref="emojiPanelRef" v-if="emojiOpen" :style="emojiStyle" @pick="insertEmoji" />
 
       <!-- 待发送的剪贴板图片 -->
       <div v-if="pendingImg" class="paste-strip">
@@ -1186,5 +1426,60 @@ watch(
 .s-key {
   font-size: 11px;
   color: var(--c-sub);
+}
+
+/* ---------- 右键回复 ---------- */
+.ctx-menu {
+  z-index: 40;
+  min-width: 96px;
+  padding: 4px;
+  background: var(--c-card);
+  border: 1px solid var(--c-hairline);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px var(--c-shadow);
+}
+.ctx-item {
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: 4px;
+  text-align: left;
+  font-size: 13px;
+  color: var(--c-text);
+}
+.ctx-item:hover {
+  background: var(--c-list-hover);
+}
+
+.reply-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--c-card);
+  border: 1px solid var(--c-hairline);
+  border-radius: 6px;
+  margin: 6px 12px 0;
+  font-size: 12px;
+  color: var(--c-sub);
+}
+.rb-txt {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rb-x {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  color: var(--c-sub);
+}
+.rb-x:hover {
+  background: var(--c-hover);
+  color: var(--c-text);
 }
 </style>

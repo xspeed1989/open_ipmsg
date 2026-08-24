@@ -44,12 +44,39 @@ impl Default for Config {
     }
 }
 
+/// 待投递的离线消息（对方上线后自动发送，官方 IPMsg 语义）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PendingOut {
+    /// 对方会话 key（IP）
+    pub key: String,
+    /// 原包号：重投用同一包号，对端按 (IP, pkt) 去重
+    pub pkt: u32,
+    /// 消息正文（不含延迟尾注，投递时现拼）
+    pub text: String,
+    /// 原始发送时间
+    pub ts: u64,
+}
+
+/// 历史会话摘要（中栏「离线会话」数据源）
+#[derive(Serialize, Clone, Debug)]
+pub struct SessionInfo {
+    pub key: String,
+    pub nickname: String,
+    pub host: String,
+    pub group: String,
+    /// 该会话最近一条消息的时间戳
+    pub last_ts: u64,
+}
+
 /// 局域网内的对端用户
 #[derive(Serialize, Clone, Debug)]
 pub struct PeerInfo {
-    /// 稳定标识："ip:port"
+    /// 稳定标识：对端 IP。一台主机一个用户（与官方 IPMsg 语义一致）——
+    /// NAT 改写或套接字重绑会让同一主机的每次广播来自不同源端口，
+    /// 按 ip:port 去重会把同一个人挂成一串重复条目
     pub key: String,
     pub ip: String,
+    /// 最近一次报文的源端口，用作投递地址（随报文更新）
     pub port: u16,
     pub nickname: String,
     pub group: String,
@@ -85,6 +112,8 @@ pub struct AppState {
     seen_set: Mutex<HashSet<(IpAddr, u32)>>,
     /// 聊天记录文件的读-改-写互斥（防止并发追加与重写互相覆盖）
     hist_lock: Mutex<()>,
+    /// 待投递的离线消息：会话 key → 队列（FIFO）
+    pending_out: Mutex<HashMap<String, Vec<PendingOut>>>,
     on_event: Mutex<Option<EventFn>>,
     pub data_dir: PathBuf,
     pub logs_dir: PathBuf,
@@ -111,6 +140,7 @@ impl AppState {
             seen_queue: Mutex::new(VecDeque::new()),
             seen_set: Mutex::new(HashSet::new()),
             hist_lock: Mutex::new(()),
+            pending_out: Mutex::new(HashMap::new()),
             on_event: Mutex::new(None),
             data_dir,
             logs_dir,
@@ -194,6 +224,9 @@ impl AppState {
     /* ---------- 用户表 ---------- */
 
     /// 插入或刷新用户；返回是否为新增。所有文本字段先清洗控制字符。
+    ///
+    /// 身份以 IP 为准：key 一律归一化为 `info.ip`，同 IP 的重复广播
+    /// （哪怕源端口不同）原地合并；端口仅作为投递地址随最新报文刷新。
     pub fn upsert_peer(&self, mut info: PeerInfo) -> bool {
         use crate::protocol::strip_control;
         info.nickname = strip_control(&info.nickname);
@@ -201,10 +234,12 @@ impl AppState {
         info.host = strip_control(&info.host);
         info.user = strip_control(&info.user);
         info.last_seen = now_secs();
+        info.key = info.ip.clone();
         let mut peers = self.peers.lock().unwrap();
         match peers.get_mut(&info.key) {
             Some(existing) => {
                 existing.last_seen = info.last_seen;
+                existing.port = info.port;
                 if !info.nickname.is_empty() {
                     existing.nickname = info.nickname;
                 }
@@ -310,7 +345,150 @@ impl AppState {
         true
     }
 
+    /* ---------- 离线消息待投递队列 ---------- */
+
+    fn pending_path(&self) -> PathBuf {
+        self.data_dir.join("pending_out.json")
+    }
+
+    fn persist_pending(&self) {
+        let data = self.pending_out.lock().unwrap();
+        let bytes = serde_json::to_vec(&*data).unwrap_or_default();
+        drop(data);
+        if let Some(dir) = self.pending_path().parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(self.pending_path(), bytes);
+    }
+
+    /// 启动时从磁盘恢复待投递队列（重启不丢，官方 IPMsg 语义）
+    pub fn load_pending(&self) {
+        let Ok(content) = std::fs::read_to_string(self.pending_path()) else {
+            return;
+        };
+        if let Ok(map) = serde_json::from_str::<HashMap<String, Vec<PendingOut>>>(&content) {
+            *self.pending_out.lock().unwrap() = map;
+        }
+    }
+
+    /// 入队一条离线消息；同 key 同包号已存在时不重复入队，返回是否新增
+    pub fn enqueue_pending(&self, item: PendingOut) -> bool {
+        let mut map = self.pending_out.lock().unwrap();
+        let q = map.entry(item.key.clone()).or_default();
+        if q.iter().any(|p| p.pkt == item.pkt) {
+            return false;
+        }
+        q.push(item);
+        drop(map);
+        self.persist_pending();
+        true
+    }
+
+    /// 某会话的待投递列表（副本，FIFO 顺序；投递复查用，不取出）
+    pub fn pending_for(&self, key: &str) -> Vec<PendingOut> {
+        self.pending_out
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// 取出某会话全部待投递并清空（当前仅测试用；线上投递走 ack 出队）
+    pub fn take_pending(&self, key: &str) -> Vec<PendingOut> {
+        let mut map = self.pending_out.lock().unwrap();
+        let taken = map.remove(key).unwrap_or_default();
+        drop(map);
+        if !taken.is_empty() {
+            self.persist_pending();
+        }
+        taken
+    }
+
+    /// 对端回 RECVMSG（送达确认）：把该会话对应包号的待投递出队，返回是否有变更
+    pub fn ack_pending(&self, key: &str, pkt: u32) -> bool {
+        let mut map = self.pending_out.lock().unwrap();
+        let Some(q) = map.get_mut(key) else {
+            return false;
+        };
+        let before = q.len();
+        q.retain(|p| p.pkt != pkt);
+        let changed = q.len() != before;
+        drop(map);
+        if changed {
+            self.persist_pending();
+        }
+        changed
+    }
+
     /* ---------- 聊天记录 ---------- */
+
+    /// 启动迁移：旧版会话键是 `ip:端口`，历史文件因此叫 `<ip>_<端口>.jsonl`。
+    /// 现在身份键归一化为纯 IP，把这类文件改名为 `<ip>.jsonl`，并同步把记录内
+    /// `peer.key` 快照（`ip:port`）改写成裸 IP —— 否则搜索跳转、已读回执等
+    /// 按记录内 key 寻址的路径会找不到会话。目标文件已存在时保留旧文件不动
+    /// （正常升级流程不会发生，不做有损合并）。返回迁移的文件数。
+    pub fn migrate_legacy_history_keys(&self) -> usize {
+        let _g = self.hist_lock.lock().unwrap();
+        let Ok(rd) = std::fs::read_dir(&self.logs_dir) else {
+            return 0;
+        };
+        let mut moved = 0usize;
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            // 仅匹配 `<ipv4>_<port>` 形状；其余命名一律不动
+            let Some((ip_part, port_part)) = stem.rsplit_once('_') else {
+                continue;
+            };
+            if ip_part.parse::<std::net::Ipv4Addr>().is_err()
+                || port_part.parse::<u16>().is_err()
+            {
+                continue;
+            }
+            let target = self.logs_dir.join(format!("{ip_part}.jsonl"));
+            if target.exists() {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let prefix = format!("{ip_part}:");
+            let mut out = String::with_capacity(content.len());
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(mut rec) => {
+                        if let Some(kv) = rec.get_mut("peer").and_then(|p| p.get_mut("key")) {
+                            if kv.as_str().is_some_and(|s| s.starts_with(&prefix)) {
+                                *kv = serde_json::Value::String(ip_part.to_string());
+                            }
+                        }
+                        out.push_str(&rec.to_string());
+                        out.push('\n');
+                    }
+                    // 坏行原样搬运，交给 compact_histories 统一清理
+                    Err(_) => {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
+            }
+            if std::fs::write(&target, &out).is_ok() {
+                let _ = std::fs::remove_file(&path);
+                moved += 1;
+            }
+        }
+        moved
+    }
 
     fn log_path(&self, key: &str) -> PathBuf {
         let safe: String = key
@@ -484,6 +662,86 @@ impl AppState {
         });
         hits.truncate(limit);
         hits
+    }
+
+    /// 遍历历史记录文件，返回全部会话摘要（含离线会话，中栏展示用）。
+    ///
+    /// key/昵称/群组以记录内 peer 快照为准（迁移后已是纯 IP 键），
+    /// 无快照时退化为文件名；时间为该会话最大消息 ts，倒序返回。
+    /// 防御性跳过旧版 `<ipv4>_<port>` 命名（迁移遗漏时不当成会话）。
+    pub fn list_sessions(&self) -> Vec<SessionInfo> {
+        let _g = self.hist_lock.lock().unwrap();
+        let Ok(rd) = std::fs::read_dir(&self.logs_dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<SessionInfo> = Vec::new();
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some((ip_part, port_part)) = stem.rsplit_once('_') {
+                if ip_part.parse::<std::net::Ipv4Addr>().is_ok()
+                    && port_part.parse::<u16>().is_ok()
+                {
+                    continue;
+                }
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut key = stem.clone();
+            let (mut nickname, mut host, mut group) = (String::new(), String::new(), String::new());
+            let mut last_ts = 0u64;
+            for line in content.lines() {
+                let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if let Some(ts) = rec.get("ts").and_then(|v| v.as_u64()) {
+                    last_ts = last_ts.max(ts);
+                }
+                let Some(peer) = rec.get("peer") else {
+                    continue;
+                };
+                if key == stem {
+                    if let Some(k) = peer.get("key").and_then(|v| v.as_str()) {
+                        if !k.is_empty() {
+                            key = k.to_string();
+                        }
+                    }
+                }
+                // 昵称/群组/主机取最新一条快照的非空值
+                if let Some(n) = peer.get("nickname").and_then(|v| v.as_str()) {
+                    if !n.is_empty() {
+                        nickname = n.to_string();
+                    }
+                }
+                if let Some(h) = peer.get("host").and_then(|v| v.as_str()) {
+                    if !h.is_empty() {
+                        host = h.to_string();
+                    }
+                }
+                if let Some(g) = peer.get("group").and_then(|v| v.as_str()) {
+                    if !g.is_empty() {
+                        group = g.to_string();
+                    }
+                }
+            }
+            out.push(SessionInfo {
+                key,
+                nickname,
+                host,
+                group,
+                last_ts,
+            });
+        }
+        out.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+        out
     }
 
     /// 清空某会话的聊天记录（删除对应的 JSONL 文件）。
@@ -927,9 +1185,101 @@ mod tests {
     }
 
     #[test]
-    fn peer_upsert_prune() {
+    fn pending_out_queue_roundtrip_and_ack() {
+        let st = temp_state("pending");
+        // 离线人发消息：入队并持久化
+        assert!(st.enqueue_pending(PendingOut {
+            key: "10.0.0.9".into(),
+            pkt: 777,
+            text: "等你上线".into(),
+            ts: 100,
+        }));
+        let list = st.pending_for("10.0.0.9");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].pkt, 777);
+        assert!(st.pending_for("10.0.0.8").is_empty());
+
+        // 重启（新实例读同一数据目录）后队列仍在
+        let st2 = AppState::new(st.data_dir.clone());
+        st2.load_pending();
+        let list2 = st2.pending_for("10.0.0.9");
+        assert_eq!(list2.len(), 1, "重启不丢待投递");
+        assert_eq!(list2[0].text, "等你上线");
+
+        // 收到 RECVMSG 确认后出队
+        assert!(st2.ack_pending("10.0.0.9", 777));
+        assert!(st2.pending_for("10.0.0.9").is_empty());
+        let st3 = AppState::new(st.data_dir.clone());
+        st3.load_pending();
+        assert!(st3.pending_for("10.0.0.9").is_empty(), "确认后持久化移除");
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn pending_out_can_drop_all_for_key() {
+        let st = temp_state("pending-drop");
+        for pkt in [1u32, 2, 3] {
+            st.enqueue_pending(PendingOut {
+                key: "10.0.0.9".into(),
+                pkt,
+                text: "x".into(),
+                ts: 1,
+            });
+        }
+        let taken = st.take_pending("10.0.0.9");
+        assert_eq!(taken.len(), 3);
+        assert!(st.pending_for("10.0.0.9").is_empty(), "取出后即清空");
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn list_sessions_returns_history_chats() {
+        let st = temp_state("sessions");
+        std::fs::create_dir_all(&st.logs_dir).unwrap();
+        // 两个会话：一个在线时会话（peer 快照完整），一个只靠文件名兜底
+        let a = "10.0.0.5";
+        let b = "192.168.1.8";
+        st.log_record(a, &serde_json::json!({
+            "dir": "in", "pkt": 1, "ts": 100, "text": "hi",
+            "peer": {"key": a, "nickname": "小王", "host": "pc-wang", "group": "财务"}
+        }));
+        st.log_record(b, &serde_json::json!({
+            "dir": "out", "pkt": 2, "ts": 300, "text": "yo"
+        }));
+        let list = st.list_sessions();
+        assert_eq!(list.len(), 2, "两个有历史的会话都列出");
+        let by_key: std::collections::HashMap<_, _> =
+            list.iter().map(|s| (s.key.as_str(), s)).collect();
+        assert_eq!(by_key[a].nickname, "小王");
+        assert_eq!(by_key[a].group, "财务");
+        assert_eq!(by_key[a].last_ts, 100);
+        assert_eq!(by_key[b].last_ts, 300, "无 peer 快照时按文件名校出 key，时间取最大");
+        assert_eq!(by_key[b].key, b);
+        // 按最近时间倒序
+        assert_eq!(list[0].key, b);
+        // 无历史时返回空
+        let st2 = temp_state("sessions2");
+        assert!(st2.list_sessions().is_empty());
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+        let _ = std::fs::remove_dir_all(&st2.data_dir);
+    }
+
+    #[test]
+    fn list_sessions_skips_legacy_ip_port_files() {
+        let st = temp_state("sessions-legacy");
+        std::fs::create_dir_all(&st.logs_dir).unwrap();
+        // 迁移遗漏的旧命名文件（防御性跳过，不当作两个会话）
+        std::fs::write(st.logs_dir.join("10.0.0.6_2425.jsonl"), "{}\n").unwrap();
+        assert!(st.list_sessions().is_empty());
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn peer_upsert_merges_same_ip_across_ports() {
         let st = temp_state("peers");
-        let info = PeerInfo {
+        // 同一主机先从固定端口 :2425 上线；NAT 改写/套接字重绑后，
+        // 后续广播可能来自任意临时端口 —— 必须识别为同一个用户
+        assert!(st.upsert_peer(PeerInfo {
             key: "10.0.0.3:2425".into(),
             ip: "10.0.0.3".into(),
             port: 2425,
@@ -938,30 +1288,74 @@ mod tests {
             host: "pc-wang".into(),
             user: "wang".into(),
             last_seen: 0,
-        };
-        assert!(st.upsert_peer(info));
+        }));
+        let t0 = now_secs();
         assert!(!st.upsert_peer(PeerInfo {
-            key: "10.0.0.3:2425".into(),
+            key: "10.0.0.3:50000".into(),
             ip: "10.0.0.3".into(),
-            port: 2425,
+            port: 50000,
             nickname: String::new(),
             group: String::new(),
             host: String::new(),
             user: String::new(),
-            last_seen: 0,
+            // last_seen 由 upsert 统一盖为当前时间，注入值会被覆盖
+            last_seen: 5,
         }));
-        assert_eq!(st.peers.lock().unwrap()["10.0.0.3:2425"].nickname, "老王");
-        assert_eq!(st.peers.lock().unwrap()["10.0.0.3:2425"].group, "财务");
+        let peers = st.peers.lock().unwrap();
+        assert_eq!(peers.len(), 1, "同 IP 不同源端口只允许一条记录");
+        let p = &peers["10.0.0.3"];
+        assert_eq!(p.nickname, "老王", "新报文字段为空时保留既有昵称");
+        assert_eq!(p.group, "财务");
+        assert_eq!(p.port, 50000, "端口随最新报文更新，否则回包发往失效地址");
+        assert!(p.last_seen >= t0, "活跃时间随最新报文刷新");
+        drop(peers);
         assert!(st.prune_stale_peers(u64::MAX).is_empty());
         // 手动回拨时间戳，模拟长时间未刷新
         st.peers
             .lock()
             .unwrap()
-            .get_mut("10.0.0.3:2425")
+            .get_mut("10.0.0.3")
             .unwrap()
             .last_seen = 1;
         assert_eq!(st.prune_stale_peers(60).len(), 1);
         assert!(st.peers.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn legacy_history_files_migrate_to_ip_keys() {
+        let st = temp_state("migrate");
+        std::fs::create_dir_all(&st.logs_dir).unwrap();
+        // 旧版会话文件以 `ip_端口.jsonl` 命名，记录内 peer.key 也是 ip:port
+        let legacy = st.logs_dir.join("10.0.0.3_2425.jsonl");
+        let body = concat!(
+            r#"{"dir":"in","pkt":1,"ts":1,"text":"hi","peer":{"key":"10.0.0.3:2425","nickname":"老王"}}"#,
+            "\n",
+            r#"{"dir":"out","pkt":2,"ts":2,"text":"yo","peer":{"key":"10.0.0.3:2425","nickname":"老王"}}"#,
+            "\n",
+        );
+        std::fs::write(&legacy, body).unwrap();
+        // 无关文件不受影响；目标已存在时不吞掉旧文件
+        std::fs::write(st.logs_dir.join("notes.jsonl"), "{}\n").unwrap();
+        std::fs::write(st.logs_dir.join("10.0.0.9.jsonl"), "{}\n").unwrap();
+        std::fs::write(st.logs_dir.join("10.0.0.9_2425.jsonl"), "{}\n").unwrap();
+
+        let n = st.migrate_legacy_history_keys();
+        assert_eq!(n, 1);
+        assert!(!legacy.exists(), "旧命名文件应已迁移");
+        let hist = st.read_history("10.0.0.3", 50);
+        assert_eq!(hist.len(), 2, "迁移后按 IP 键可读到全部历史");
+        assert_eq!(
+            hist[0]["peer"]["key"], "10.0.0.3",
+            "记录内快照的会话键同步归一化，搜索跳转才找得到会话"
+        );
+        assert_eq!(hist[0]["peer"]["nickname"], "老王", "其余字段原样保留");
+        assert!(st.logs_dir.join("notes.jsonl").exists(), "非会话命名不受影响");
+        assert!(st.logs_dir.join("10.0.0.9.jsonl").exists());
+        assert!(
+            st.logs_dir.join("10.0.0.9_2425.jsonl").exists(),
+            "目标已存在时保留旧文件，不做有损合并"
+        );
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 }

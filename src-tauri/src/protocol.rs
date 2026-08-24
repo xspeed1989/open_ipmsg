@@ -344,6 +344,45 @@ pub fn is_utf8_mode(encoding: &str) -> bool {
     !encoding.eq_ignore_ascii_case("gbk")
 }
 
+/// 官方延迟投递尾注里的时间：`MM/DD HH:MM`，**本地时区**。
+/// Unix 平台用 libc::localtime_r 取本地时间；其它平台回退 UTC 分量
+/// （civil_from_days 换算，仅作保底）。
+pub fn fmt_delayed(ts: u64) -> String {
+    #[cfg(unix)]
+    {
+        let t = ts as i64;
+        let mut tmv: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::localtime_r(&t, &mut tmv);
+        }
+        format!(
+            "{:02}/{:02} {:02}:{:02}",
+            tmv.tm_mon + 1,
+            tmv.tm_mday,
+            tmv.tm_hour,
+            tmv.tm_min
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        fn civil_from_days(z: i64) -> (i64, u32, u32) {
+            let z = z + 719_468;
+            let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+            let doe = (z - era * 146_097) as u64;
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+            let y = yoe as i64 + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+            let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+            (if m <= 2 { y + 1 } else { y }, m, d)
+        }
+        let (_, mo, d) = civil_from_days((ts / 86_400) as i64);
+        let secs = ts % 86_400;
+        format!("{:02}/{:02} {:02}:{:02}", mo, d, secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 /* ---------------- 单元测试 ---------------- */
 
 #[cfg(test)]
@@ -490,5 +529,20 @@ mod tests {
         assert!(parse(b"not a packet").is_none());
         assert!(parse(b"1:x:y:z:abc:def").is_none());
         assert!(parse(b"").is_none());
+    }
+
+    #[test]
+    fn fmt_delayed_matches_official_shape() {
+        // 官方延迟投递尾注形如 "(IPMsg Delayed Send: 08/22 15:02)"
+        // 具体值依赖机器时区，这里只断言形状与跨天变化（与时区无关）
+        assert_eq!(fmt_delayed(0).len(), 11, "MM/DD HH:MM = 11 字符");
+        assert_ne!(fmt_delayed(0), fmt_delayed(86_400), "跨天必须变化");
+        assert_ne!(
+            fmt_delayed(0),
+            fmt_delayed(31 * 86_400),
+            "跨月必须变化（至少日期不同）"
+        );
+        // 本机（UTC+8，对照 diag.log 的本地时间戳）校验精确值：
+        // fmt_delayed(1787537826) == "08/24 10:17"
     }
 }

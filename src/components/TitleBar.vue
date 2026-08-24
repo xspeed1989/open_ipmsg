@@ -32,7 +32,9 @@ function close() {
 </script>
 
 <template>
-  <div class="titlebar" data-tauri-drag-region @dblclick="toggleMax">
+  <!-- 双击最大化由 Tauri 注入的 drag-region 脚本原生处理（Linux/Windows），
+       这里不能再绑 @dblclick，否则会切换两次：先最大化又还原 -->
+  <div class="titlebar" data-tauri-drag-region>
     <div class="tb-left" data-tauri-drag-region>
       <span class="logo" data-tauri-drag-region></span>
       <span class="app-name" data-tauri-drag-region>
