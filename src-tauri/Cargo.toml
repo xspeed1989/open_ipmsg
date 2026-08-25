@@ -57,8 +57,9 @@ aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 ctr = "0.9"
 blowfish = "0.9"
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = { version = "0.10", features = ["oid"] }
+# oid：PKCS#1 v1.5 签名需要 DigestInfo 前缀（SigningKey/VerifyingKey 要求 AssociatedOid）
+sha2 = { version = "0.10", features = ["oid"] }
 rand = "0.8"
 
 [features]

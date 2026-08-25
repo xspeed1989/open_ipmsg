@@ -5,7 +5,13 @@
 // 暂时压制 dead_code 提示；后续任务接入后可移除。
 #![allow(dead_code)]
 
-use rsa::{BigUint, RsaPrivateKey, RsaPublicKey};
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use rand::RngCore;
+use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
+use rsa::signature::{RandomizedSigner, SignatureEncoding, Verifier};
+use rsa::{BigUint, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
+use sha1::Sha1;
+use sha2::Sha256;
 
 // 能力位（ipmsg.h Ver4.50）
 pub const CAPA_RSA1024: u32 = 0x0000_0002;
@@ -133,6 +139,143 @@ pub fn parse_anspubkey(extra: &str) -> Option<(u32, RsaPublicKey)> {
     Some((capa, pubk))
 }
 
+// ---------------------------------------------------------------------------
+// 消息打包/解包（spec §2.2 / §6）
+// ---------------------------------------------------------------------------
+
+type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+// 本模块只解包 Blowfish（官方第二组合的打包仅在测试辅助里构造，见 tests）
+type BlowfishCbcDec = cbc::Decryptor<blowfish::Blowfish>;
+
+/// CBC 的 IV 恒为全零（官方实现如此，密钥每次随机所以 IV 不需要随机）。
+/// 注意分组长度不同：AES 为 16B，Blowfish 分组为 64bit → IV 只有 8B。
+const CBC_IV0_AES: [u8; 16] = [0u8; 16];
+const CBC_IV0_BLOWFISH: [u8; 8] = [0u8; 8];
+
+/// 加密封包（hex 文本）总长上限
+pub const MAX_ENCRYPTED_PACKET: usize = 8000;
+/// 明文预算：capa+分隔符 + E(512 hex) + ct(2×(n+padding)) + sig(512 hex)
+/// ≤ MAX_ENCRYPTED_PACKET 的安全值（约 3.4KB）
+const MAX_PLAIN_FOR_SEAL: usize = 3400;
+
+/// 解包结果：`plain` 已剥掉尾部一个 `\0`；`sig_ok` 在无签名段或无对端公钥时为 true
+/// （后者由调用方记 diag）。
+#[derive(Debug)]
+pub struct OpenMsg {
+    pub plain: Vec<u8>,
+    pub sig_ok: bool,
+}
+
+/// 加密封包：输出扩展部 "{CAPA_OUR_SEND:X}:{E:x}:{ct:x}:{sig:x}"。
+/// - 会话钥：随机 32B → RSA-PKCS1v15 加密到对端公钥；
+/// - 正文：AES-256-CBC（IV=0、PKCS#7），对象是**含尾部 \0** 的完整明文；
+/// - 签名：RSA-PKCS1v15-SHA256，用我方私钥 `me`，对象同样是含 \0 的完整明文。
+pub fn seal_message(pub_key: &RsaPublicKey, me: &KeyPair, plain: &[u8]) -> Result<String, String> {
+    if plain.len() > MAX_PLAIN_FOR_SEAL {
+        return Err("消息过长，加密模式下请分段".into());
+    }
+    let mut rng = rand::thread_rng();
+    let mut skey = [0u8; 32];
+    rng.fill_bytes(&mut skey);
+    let ct_key = pub_key
+        .encrypt(&mut rng, Pkcs1v15Encrypt, &skey)
+        .map_err(|e| format!("会话钥加密失败：{e}"))?;
+
+    let mut buf = plain.to_vec();
+    let ct = Aes256CbcEnc::new_from_slices(&skey, &CBC_IV0_AES)
+        .map_err(|_| "AES 会话钥初始化失败".to_string())?
+        .encrypt_padded_vec_mut::<Pkcs7>(&mut buf);
+
+    let signing = SigningKey::<Sha256>::new(me.priv_key.clone());
+    let sig = signing.sign_with_rng(&mut rng, plain);
+
+    Ok(format!(
+        "{:X}:{}:{}:{}",
+        CAPA_OUR_SEND,
+        hex_lower(&ct_key),
+        hex_lower(&ct),
+        hex_lower(&sig.to_vec()),
+    ))
+}
+
+/// 解包扩展部 "{capa}:{E}:{ct}[:{sig}]"。线上不可信数据：任何畸形输入都只返回 Err，
+/// 绝不 panic。受支持组合：
+/// - `RSA_2048|AES_256` → AES-256-CBC（IV=0、PKCS#7）
+/// - `RSA_1024|BLOWFISH_128` → Blowfish-CBC（同上；会话钥按变长 4~56B 处理）
+///
+/// 签名校验针对**剥掉尾部 \0 之前**的完整明文；带 SIGN_SHA256 用 SHA-256，
+/// 带 SIGN_SHA1 用 SHA-1。无签名段、或调用方没给对端公钥（无法验签）→ `sig_ok=true`；
+/// 签名段存在但 hex 坏/验签失败/未声明哈希算法且给了对端公钥 → `sig_ok=false`。
+pub fn open_message(
+    priv_kp: &KeyPair,
+    extra: &str,
+    peer_pub: Option<&RsaPublicKey>,
+) -> Result<OpenMsg, String> {
+    let segs: Vec<&str> = extra.split(':').collect();
+    if !(3..=4).contains(&segs.len()) {
+        return Err("报文段数非法（应为 3~4 段）".into());
+    }
+    let capa = u32::from_str_radix(segs[0].trim().trim_start_matches("0x"), 16)
+        .map_err(|_| "坏的能力位".to_string())?;
+    // 先选对称算法再解 RSA：不支持的组合直接拒绝，省一次昂贵的私钥运算
+    let aes_mode = if capa & CAPA_AES256 != 0 {
+        true
+    } else if capa & CAPA_BLOWFISH128 != 0 {
+        false
+    } else {
+        return Err("不支持加密组合".into());
+    };
+
+    let ct_key = hex_decode_loose(segs[1]).ok_or("会话钥 hex 坏")?;
+    let skey = priv_kp
+        .priv_key
+        .decrypt(Pkcs1v15Encrypt, &ct_key)
+        .map_err(|_| "会话钥解密失败（可能并非发给我方）".to_string())?;
+    let ct = hex_decode_loose(segs[2]).ok_or("密文 hex 坏")?;
+
+    let plain_full: Vec<u8> = if aes_mode {
+        let k32: [u8; 32] = skey.try_into().map_err(|_| "AES 会话钥长度异常".to_string())?;
+        Aes256CbcDec::new_from_slices(&k32, &CBC_IV0_AES)
+            .map_err(|_| "AES 初始化失败".to_string())?
+            .decrypt_padded_vec_mut::<Pkcs7>(&ct)
+            .map_err(|_| "AES 解密失败（填充校验不过）".to_string())?
+    } else {
+        BlowfishCbcDec::new_from_slices(&skey, &CBC_IV0_BLOWFISH)
+            .map_err(|_| "Blowfish 会话钥/IV 异常".to_string())?
+            .decrypt_padded_vec_mut::<Pkcs7>(&ct)
+            .map_err(|_| "Blowfish 解密失败（填充校验不过）".to_string())?
+    };
+
+    // 签名校验：完整明文（含尾部 \0）
+    let mut sig_ok = true;
+    if let (Some(pp), Some(sig_hex)) = (peer_pub, segs.get(3)) {
+        sig_ok = match hex_decode_loose(sig_hex).and_then(|b| Signature::try_from(&b[..]).ok()) {
+            Some(sig) => {
+                if capa & CAPA_SIGN_SHA256 != 0 {
+                    VerifyingKey::<Sha256>::new(pp.clone())
+                        .verify(&plain_full, &sig)
+                        .is_ok()
+                } else if capa & CAPA_SIGN_SHA1 != 0 {
+                    VerifyingKey::<Sha1>::new(pp.clone())
+                        .verify(&plain_full, &sig)
+                        .is_ok()
+                } else {
+                    // 有签名段却没声明哈希算法：无法验证，按不可信处理
+                    false
+                }
+            }
+            None => false, // 签名段不是合法 hex
+        };
+    }
+
+    let mut plain = plain_full;
+    if plain.last() == Some(&0) {
+        plain.pop(); // 只剥一个尾部 \0
+    }
+    Ok(OpenMsg { plain, sig_ok })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +354,141 @@ mod tests {
             Some(vec![0xab, 0xcd]) // 大小写通吃
         );
         assert_eq!(hex_decode_loose(" 01  "), Some(vec![0x01])); // 容忍首尾空白
+    }
+
+    #[test]
+    fn seal_open_roundtrip_with_files_section() {
+        let (kp_a, kp_b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
+        // 接口修正后的签名：加密目标是对方公钥，签名者是我方密钥对
+        let (me, peer_pub) = (&kp_a, &kp_b.public_key());
+        // 模拟「正文\0文件公告」整体进密文（spec §6）。
+        // 注：brief 原文用 `\a`，Rust 无此转义——文件公告段的结束符就是 BEL(0x07)，字节串里写作 \x07
+        let plain = b"hello\nworld\0report.zip:100:20:1:\x07";
+        let sealed = seal_message(peer_pub, me, plain).unwrap();
+        assert!(sealed.starts_with(&format!("{:X}:", CAPA_OUR_SEND)));
+        let out = open_message(&kp_b, &sealed, Some(&kp_a.public_key())).unwrap();
+        assert_eq!(out.plain, &plain[..]); // 含文件公告整体，尾部 \0 已剥掉一个
+        assert!(out.sig_ok);
+        // 解密本身只要求接收方私钥；无对端公钥时无法验签，sig_ok 保持 true（调用方记 diag）
+        let out_no_pp = open_message(&kp_b, &sealed, None).unwrap();
+        assert_eq!(out_no_pp.plain, &plain[..]);
+        assert!(out_no_pp.sig_ok);
+    }
+
+    #[test]
+    fn open_supports_blowfish_combo() {
+        // 官方第二组合样本的接收方是 RSA-1024。KeyPair::generate 固定 2048 位，
+        // 故按 brief 在测试内直接构造 1024 位私钥（仅限测试），再包成 KeyPair。
+        let mut rng = rand::thread_rng();
+        let priv_1024 = RsaPrivateKey::new(&mut rng, 1024).unwrap();
+        let kp = KeyPair { priv_key: priv_1024 };
+        let plain = b"legacy\0";
+        let sealed = seal_message_compat_rsa1024_blowfish(&kp.public_key(), plain).unwrap();
+        assert!(sealed.starts_with(&format!("{:X}:", CAPA_RSA1024 | CAPA_BLOWFISH128)));
+        let out = open_message(&kp, &sealed, None).unwrap();
+        assert_eq!(out.plain, b"legacy");
+        assert_eq!(out.sig_ok, true); // 该组合无签名段
+    }
+
+    #[test]
+    fn tampered_signature_is_reported_not_fatal() {
+        let (kp_a, kp_b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
+        let sealed = seal_message(&kp_b.public_key(), &kp_a, b"x\0").unwrap();
+        // 破坏签名段最后两个字符（保证与原值不同的确定性替换）
+        let (head, sig) = sealed.rsplit_once(':').unwrap();
+        let mut bad_tail = sig[..sig.len() - 2].to_owned();
+        bad_tail.push_str(if sig.ends_with("00") { "11" } else { "00" });
+        let bad = format!("{}:{}", head, bad_tail);
+        let out = open_message(&kp_b, &bad, Some(&kp_a.public_key())).unwrap();
+        assert!(!out.sig_ok);
+    }
+
+    #[test]
+    fn undecodable_signature_hex_is_reported() {
+        let (kp_a, kp_b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
+        let sealed = seal_message(&kp_b.public_key(), &kp_a, b"x\0").unwrap();
+        let (head, _) = sealed.rsplit_once(':').unwrap();
+        // 签名段存在但不是合法 hex：有对端公钥时必须报 sig_ok=false，且不能致命
+        let bad = format!("{}:zz", head);
+        let out = open_message(&kp_b, &bad, Some(&kp_a.public_key())).unwrap();
+        assert!(!out.sig_ok);
+    }
+
+    #[test]
+    fn oversize_plain_is_rejected_with_hint() {
+        let (me, peer) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
+        let big = vec![b'a'; MAX_ENCRYPTED_PACKET]; // 远超 hex 上限
+        let err = seal_message(&peer.public_key(), &me, &big).unwrap_err();
+        assert!(err.contains("消息过长"));
+    }
+
+    #[test]
+    fn open_rejects_unsupported_combination() {
+        let kp = KeyPair::generate().unwrap();
+        // 只有 RSA/签名位、没有任何受支持的对称算法位
+        let bogus = format!(
+            "{:X}:{}:{}",
+            CAPA_RSA2048 | CAPA_SIGN_SHA256,
+            hex_lower(&[0x42u8; 8]),
+            hex_lower(&[0u8; 16])
+        );
+        let err = open_message(&kp, &bogus, None).unwrap_err();
+        assert!(err.contains("不支持加密组合"));
+    }
+
+    #[test]
+    fn open_survives_hostile_input_without_panic() {
+        // 解析的是线上不可信数据：任何垃圾输入都只能得到 Err/结果，绝不允许 panic
+        let kp = KeyPair::generate().unwrap();
+        let s_capa_only = format!("{:X}:", CAPA_OUR_SEND);
+        let s_max_nums = format!("{:X}:{:x}:{:x}", u32::MAX, u64::MAX, u64::MAX);
+        let samples = [
+            "",
+            ":",
+            "::",
+            "::::",
+            "zz:zz:zz",
+            "4:x:y:z",
+            "40001004:::",
+            "40001004:ffff:ffff:zz",
+            "😀😀😀",
+            s_capa_only.as_str(),
+            s_max_nums.as_str(),
+        ];
+        for s in samples {
+            let _ = open_message(&kp, s, None);
+            let _ = open_message(&kp, s, Some(&kp.public_key()));
+        }
+    }
+
+    /// 测试专用辅助：构造官方第二组合（RSA-1024 + Blowfish-128-CBC，IV=0，PKCS#7）
+    /// 的报文，无签名段。仅用于验证接收端对该组合的宽容解码。
+    fn seal_message_compat_rsa1024_blowfish(
+        peer_pub: &RsaPublicKey,
+        plain: &[u8],
+    ) -> Result<String, String> {
+        type BlowfishCbcEnc = cbc::Encryptor<blowfish::Blowfish>;
+        use aes::cipher::{KeyIvInit, block_padding::Pkcs7};
+        use aes::cipher::BlockEncryptMut;
+        use rsa::Pkcs1v15Encrypt;
+
+        let mut rng = rand::thread_rng();
+        // 官方该组合的会话钥为 Blowfish-128（16 字节）
+        let mut skey = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rng, &mut skey);
+        let ct_key = peer_pub
+            .encrypt(&mut rng, Pkcs1v15Encrypt, &skey)
+            .map_err(|e| format!("会话钥加密失败：{e}"))?;
+        let iv = [0u8; 8]; // Blowfish 分组 64bit，CBC IV 为 8B 全零
+        let mut buf = plain.to_vec();
+        let ct = BlowfishCbcEnc::new_from_slices(&skey, &iv)
+            .expect("测试内 16 字节会话钥合法")
+            .encrypt_padded_vec_mut::<Pkcs7>(&mut buf);
+        Ok(format!(
+            "{:X}:{}:{}",
+            CAPA_RSA1024 | CAPA_BLOWFISH128,
+            hex_lower(&ct_key),
+            hex_lower(&ct)
+        ))
     }
 }
