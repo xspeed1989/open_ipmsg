@@ -14,6 +14,10 @@ use rsa::signature::{RandomizedSigner, SignatureEncoding, Verifier};
 use rsa::{BigUint, Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 use sha1::Sha1;
 use sha2::Sha256;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 // 能力位（ipmsg.h Ver4.50）
 pub const CAPA_RSA1024: u32 = 0x0000_0002;
@@ -175,11 +179,22 @@ pub struct OpenMsg {
     pub sig_ok: bool,
 }
 
-/// 加密封包：输出扩展部 "{CAPA_OUR_SEND:X}:{E:x}:{ct:x}:{sig:x}"。
-/// - 会话钥：随机 32B → RSA-PKCS1v15 加密到对端公钥；
-/// - 正文：AES-256-CBC（IV=0、PKCS#7），对象是**含尾部 \0** 的完整明文；
-/// - 签名：RSA-PKCS1v15-SHA256，用我方私钥 `me`，对象同样是含 \0 的完整明文。
-pub fn seal_message(pub_key: &RsaPublicKey, me: &KeyPair, plain: &[u8]) -> Result<String, String> {
+/// 签名哈希选择（打包管线共用）
+enum SealHash {
+    Sha1,
+    Sha256,
+}
+
+/// 密封管线（spec §2.2）：随机 32B 会话钥 → RSA-PKCS1v15 加密到对端公钥；
+/// 正文 AES-256-CBC（IV=0、PKCS#7）对象是完整明文；签名用我方私钥 `me`，
+/// 哈希按调用方选择。输出 "{capa:X}:{E:x}:{ct:x}:{sig:x}"。
+fn seal_with_hash(
+    pub_key: &RsaPublicKey,
+    me: &KeyPair,
+    plain: &[u8],
+    capa: u32,
+    hash: SealHash,
+) -> Result<String, String> {
     if plain.len() > MAX_PLAIN_FOR_SEAL {
         return Err("消息过长，加密模式下请分段".into());
     }
@@ -195,16 +210,25 @@ pub fn seal_message(pub_key: &RsaPublicKey, me: &KeyPair, plain: &[u8]) -> Resul
         .map_err(|_| "AES 会话钥初始化失败".to_string())?
         .encrypt_padded_vec_mut::<Pkcs7>(&mut buf);
 
-    let signing = SigningKey::<Sha256>::new(me.priv_key.clone());
-    let sig = signing.sign_with_rng(&mut rng, plain);
+    let sig = match hash {
+        SealHash::Sha256 => SigningKey::<Sha256>::new(me.priv_key.clone()).sign_with_rng(&mut rng, plain),
+        SealHash::Sha1 => SigningKey::<Sha1>::new(me.priv_key.clone()).sign_with_rng(&mut rng, plain),
+    };
 
     Ok(format!(
-        "{:X}:{}:{}:{}",
-        CAPA_OUR_SEND,
+        "{capa:X}:{}:{}:{}",
         hex_lower(&ct_key),
         hex_lower(&ct),
         hex_lower(&sig.to_vec()),
     ))
+}
+
+/// 加密封包：输出扩展部 "{CAPA_OUR_SEND:X}:{E:x}:{ct:x}:{sig:x}"。
+/// - 会话钥：随机 32B → RSA-PKCS1v15 加密到对端公钥；
+/// - 正文：AES-256-CBC（IV=0、PKCS#7），对象是**含尾部 \0** 的完整明文；
+/// - 签名：RSA-PKCS1v15-SHA256，用我方私钥 `me`，对象同样是含 \0 的完整明文。
+pub fn seal_message(pub_key: &RsaPublicKey, me: &KeyPair, plain: &[u8]) -> Result<String, String> {
+    seal_with_hash(pub_key, me, plain, CAPA_OUR_SEND, SealHash::Sha256)
 }
 
 /// 解包扩展部 "{capa}:{E}:{ct}[:{sig}]"。线上不可信数据：任何畸形输入都只返回 Err，
@@ -285,6 +309,48 @@ pub fn open_message(
 }
 
 // ---------------------------------------------------------------------------
+// 取文件请求的密封/解封（spec §7）
+// ---------------------------------------------------------------------------
+
+/// 文件请求钉死 SHA-1 变体组合：CAPA_RSA2048|CAPA_AES256|CAPA_SIGN_SHA1
+pub const CAPA_FILE_REQUEST: u32 = CAPA_RSA2048 | CAPA_AES256 | CAPA_SIGN_SHA1;
+
+/// 密封装文件取回请求（spec §7）：内层 `{pkt:x}:{id:x}[:{offset:x}]:(900000|4000000)[:key]`。
+/// 打包格式与 seal_message 完全一致，仅组合与签名哈希按 §7 钉为
+/// RSA-2048 + AES-256 + SHA-1（capa=CAPA_FILE_REQUEST=0x20100004）。
+/// `pkt_no` 为语义预留（TCP 请求行头部的包号，CTR nonce 由它派生），不参与签名。
+pub fn seal_file_request(
+    pub_key: &RsaPublicKey,
+    me: &KeyPair,
+    _pkt_no: u32,
+    inner: &str,
+) -> Result<String, String> {
+    seal_with_hash(pub_key, me, inner.as_bytes(), CAPA_FILE_REQUEST, SealHash::Sha1)
+}
+
+/// 解封装文件取回请求。签名核验此处跳过（服务端通常未缓存请求方公钥，
+/// 无法验签；需要严格化时由调用方在缓存命中后另行校验）。
+/// 返回 `(内层字符串, 正文是否加密)`：
+/// - 内层末段为 `4000000` → enc_body=false（NOENC_FILEBODY，明文流）；
+/// - 倒数第二段为 `900000`（末段是 64 位 hex 的 AES-256 钥）→ enc_body=true；
+/// - 其它参数一律 Err（「不支持文件加密参数」）。
+///
+/// 兼容 SHA-256 变体的历史/前向请求：open_message 按能力位自适应。
+pub fn open_file_request(priv_kp: &KeyPair, extra: &str) -> Result<(String, bool), String> {
+    let out = open_message(priv_kp, extra, None)?;
+    let inner = String::from_utf8_lossy(&out.plain).into_owned();
+    let segs: Vec<&str> = inner.split(':').collect();
+    let enc_body = if segs.last().copied() == Some("4000000") {
+        false
+    } else if segs.len() >= 2 && segs[segs.len() - 2] == "900000" {
+        true
+    } else {
+        return Err("不支持文件加密参数".into());
+    };
+    Ok((inner, enc_body))
+}
+
+// ---------------------------------------------------------------------------
 // CTR 文件流原语（spec §7）：nonce 规则 + 断点续传偏移对齐
 // ---------------------------------------------------------------------------
 
@@ -321,6 +387,69 @@ impl CtrCipher {
     /// 对 buf 原地施加（或解除）密钥流。
     pub fn apply(&mut self, buf: &mut [u8]) {
         self.cipher.apply_keystream(buf);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TCP 文件流加密包装（spec §7）：双向过同一 CTR 密钥流
+// ---------------------------------------------------------------------------
+
+/// 把任意 AsyncRead+AsyncWrite 流包进 AES-256-CTR 密钥流：
+/// 读方向对每次新读入的字节解密，写方向对写出字节加密，
+/// 密钥流位置 = 流绝对偏移（构造时 seek 到 start_pos，断点续传免费对齐）。
+pub struct EncStream<S> {
+    pub inner: S,
+    pub c: CtrCipher,
+}
+
+impl<S> EncStream<S> {
+    /// `start_pos` 为流的绝对起始偏移（整文件传输传 0；断点续传传已收字节数）
+    pub fn new(inner: S, key: &[u8; 32], pkt_no: u32, start_pos: u64) -> Self {
+        let mut c = CtrCipher::new(key, pkt_no);
+        if start_pos > 0 {
+            c.seek(start_pos);
+        }
+        Self { inner, c }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for EncStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            // 只解密本次新读入的段落：密钥流随流绝对偏移连续推进
+            Poll::Ready(Ok(())) => {
+                this.c.apply(&mut buf.filled_mut()[before..]);
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for EncStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let mut enc = buf.to_vec();
+        this.c.apply(&mut enc);
+        Pin::new(&mut this.inner).poll_write(cx, &enc)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
@@ -582,6 +711,132 @@ mod tests {
             out.extend_from_slice(&chunk);
         }
         assert_eq!(out, whole);
+    }
+
+    /* ---------------- Task 10：文件请求密封/解封 与 TCP 流加密（spec §7） ---------------- */
+
+    #[test]
+    fn file_request_roundtrip() {
+        let (a, b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
+        let inner = "1f:2a:900000:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let sealed = seal_file_request(&b.public_key(), &a, 999, inner).unwrap();
+        // 注：brief 原文断言 "20001004:"，但按已提交常量
+        // RSA2048|AES256|SIGN_SHA1 = 0x4|0x100000|0x20000000 = 0x20100004，
+        // 正确前缀为 "20100004:"（与 Task 1 对 brief 数值笔误的处理先例一致）
+        assert!(sealed.starts_with(&format!("{:X}:", CAPA_FILE_REQUEST)));
+        let (got, enc_body) = open_file_request(&b, &sealed).unwrap();
+        assert!(enc_body);
+        assert_eq!(got, inner);
+        // NOENC 变体
+        let inner2 = "1f:2a:4000000";
+        let (got2, enc2) =
+            open_file_request(&b, &seal_file_request(&b.public_key(), &a, 998, inner2).unwrap())
+                .unwrap();
+        assert!(!enc2);
+        assert_eq!(got2, inner2);
+    }
+
+    #[test]
+    fn file_request_accepts_sha256_variant_for_forward_compat() {
+        // 前向兼容：沿用 SHA-256 组合的文件请求也必须能解封
+        let (a, b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
+        let inner = "1f:2a:4000000";
+        let sealed = seal_message(&b.public_key(), &a, inner.as_bytes()).unwrap();
+        assert!(sealed.starts_with(&format!("{:X}:", CAPA_OUR_SEND)));
+        let (got, enc_body) = open_file_request(&b, &sealed).unwrap();
+        assert!(!enc_body);
+        assert_eq!(got, inner);
+    }
+
+    #[test]
+    fn file_request_rejects_unknown_enc_param() {
+        let (a, b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
+        let sealed = seal_file_request(&b.public_key(), &a, 7, "1f:2a:777777").unwrap();
+        let err = open_file_request(&b, &sealed).unwrap_err();
+        assert!(err.contains("不支持文件加密参数"));
+    }
+
+    #[test]
+    fn file_request_survives_hostile_input_without_panic() {
+        // 解封的是线上不可信数据：垃圾输入只允许 Err，绝不允许 panic
+        let kp = KeyPair::generate().unwrap();
+        let max_nums = format!("{:X}:{:x}:{:x}", u32::MAX, u64::MAX, u64::MAX);
+        for s in ["", ":", "zz", "1:2", max_nums.as_str()] {
+            let _ = open_file_request(&kp, s);
+        }
+    }
+
+    /// 写方向：明文过 EncStream 后线上字节必须等于整流一次性 CTR 的密文
+    #[tokio::test]
+    async fn enc_stream_write_side_matches_ctr_whole_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let key = [11u8; 32];
+        let pkt = 555;
+        let data: Vec<u8> = (0..70_000usize).map(|i| ((i * 13 + 9) % 253) as u8).collect();
+        let (c, mut raw_peer) = tokio::io::duplex(128 * 1024);
+        let mut w = EncStream::new(c, &key, pkt, 0);
+        w.write_all(&data).await.unwrap();
+        w.flush().await.unwrap();
+        w.shutdown().await.unwrap();
+
+        let mut wire = Vec::new();
+        raw_peer.read_to_end(&mut wire).await.unwrap();
+        let mut want_ct = data.clone();
+        CtrCipher::new(&key, pkt).apply(&mut want_ct);
+        assert_eq!(wire, want_ct, "写方向逐字节等于 AES-CTR 整流密文");
+    }
+
+    /// 读方向：对端发来的 CTR 密文经 EncStream 必须还原成明文
+    #[tokio::test]
+    async fn enc_stream_read_side_recovers_plaintext() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let key = [22u8; 32];
+        let pkt = 556;
+        let data: Vec<u8> = (0..70_000usize).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+        let mut ct = data.clone();
+        CtrCipher::new(&key, pkt).apply(&mut ct);
+
+        let (c, mut raw_feed) = tokio::io::duplex(128 * 1024);
+        let mut r = EncStream::new(c, &key, pkt, 0);
+        raw_feed.write_all(&ct).await.unwrap();
+        raw_feed.shutdown().await.unwrap();
+
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, data, "读方向必须还原明文");
+    }
+
+    /// 断点续传对齐（spec §7）：写端/读端各自从同一绝对偏移起步。
+    /// 线上字节必须等于「整流一次性加密后的对应片段」（写方向 seek 生效），
+    /// 读端还原结果必须等于原始明文尾部（读方向 seek 生效）。
+    #[tokio::test]
+    async fn enc_stream_seek_aligns_like_ctr_whole_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let key = [5u8; 32];
+        let pkt = 88;
+        let start = 123u64;
+        let payload: Vec<u8> = (0..5000usize).map(|i| (i % 249) as u8).collect();
+        let mut whole = payload.clone();
+        CtrCipher::new(&key, pkt).apply(&mut whole);
+
+        // 写方向：EncStream 从 start 起步，线上字节 == 整流密文的对应片段
+        let (c1, mut raw_peer) = tokio::io::duplex(64 * 1024);
+        let mut w = EncStream::new(c1, &key, pkt, start);
+        w.write_all(&payload[start as usize..]).await.unwrap();
+        w.flush().await.unwrap();
+        w.shutdown().await.unwrap();
+        let mut wire = Vec::new();
+        raw_peer.read_to_end(&mut wire).await.unwrap();
+        assert_eq!(wire, &whole[start as usize..], "续传片段的密文须与整流片段一致");
+
+        // 读方向：同一密文喂给从 start 起步的 EncStream，必须还原明文尾部
+        let (c2, mut raw_feed) = tokio::io::duplex(64 * 1024);
+        let mut r = EncStream::new(c2, &key, pkt, start);
+        raw_feed.write_all(&wire).await.unwrap();
+        raw_feed.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, &payload[start as usize..], "读端 seek 后必须还原明文尾部");
     }
 
     /// 测试专用辅助：构造官方第二组合（RSA-1024 + Blowfish-128-CBC，IV=0，PKCS#7）

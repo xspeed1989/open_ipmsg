@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 /// 共享网络上下文
@@ -1312,12 +1312,14 @@ fn spawn_tcp_server(ctx: Arc<NetCtx>) {
 
 /// 服务端：解析 GETFILEDATA 请求并回传文件字节流
 async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::SocketAddr) {
-    // 读请求行：容忍有无结尾换行
-    let mut buf = Vec::with_capacity(256);
-    let mut chunk = [0u8; 256];
+    // 读请求行：容忍有无结尾换行。上限按加密封包预算放宽（spec §2：
+    // MAX_ENCRYPTED_PACKET=8000）——加密的取文件请求扩展部约 1.2KB，
+    // 明文请求几十字节就完成解析，不会多等。
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = vec![0u8; 1024];
     let deadline = Instant::now() + Duration::from_millis(800);
     let mut req_pkt = None;
-    while buf.len() < 1024 && Instant::now() < deadline {
+    while buf.len() < crypto::MAX_ENCRYPTED_PACKET && Instant::now() < deadline {
         let n = match tokio::time::timeout(Duration::from_millis(300), stream.read(&mut chunk)).await {
             Ok(Ok(n)) if n > 0 => n,
             Ok(Ok(_)) => break, // EOF
@@ -1335,11 +1337,60 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
     if base != cmd::GETFILEDATA && base != cmd::GETDIRFILES {
         return;
     }
-    // extra: pkt_id:file_id[:offset]（GETDIRFILES 无断点续传，offset 可缺省）
-    let parts: Vec<String> = String::from_utf8_lossy(&req.extra)
-        .split(':')
-        .map(|s| s.trim().to_string())
-        .collect();
+    // extra: pkt_id:file_id[:offset]（GETDIRFILES 无断点续传，offset 可缺省）。
+    // 带 ENCRYPTOPT 时扩展部是密封的取文件请求（spec §7）：先解封再取字段，
+    // 槽位查找放在解封之后 —— 未解开的请求连槽位都不该探到。
+    // 加密请求是方言无关的：内层数字按官方约定写十六进制；
+    // id_candidates 十进制/十六进制都试，保持既有宽容度。
+    let mut ctr_key: Option<[u8; 32]> = None;
+    let parts: Vec<String>;
+    if req.command & opt::ENCRYPTOPT != 0 {
+        let inner = match crypto::open_file_request(
+            &ctx.st.own_keypair(),
+            &String::from_utf8_lossy(&req.extra),
+        ) {
+            Ok((inner, true)) => {
+                // enc_body：内层倒数第二段恒为 900000，末段是 64 位 hex 的 AES-256 钥
+                let segs: Vec<&str> = inner.split(':').collect();
+                match crypto::hex_decode_loose(segs[segs.len() - 1]) {
+                    Some(k) if k.len() == 32 => {
+                        ctr_key = Some(k.try_into().expect("长度已在上一行校验为 32"));
+                    }
+                    _ => {
+                        ctx.st.diag("tcp-enc-bad-key 文件请求的 CTR 钥不是 32 字节，断开");
+                        return;
+                    }
+                }
+                inner
+            }
+            Ok((inner, false)) => inner, // NOENC_FILEBODY：验证通过，回明文流
+            Err(e) => {
+                // 解不开的请求直接断开不给任何反馈：可能是敌意探测，也可能
+                // 是对方还持着已被我们撤换的旧公钥
+                eprintln!("[tcp] {peer} 加密取文件请求解封失败: {e}");
+                ctx.st.diag(&format!("tcp-enc-open-fail {peer}: {e}"));
+                return;
+            }
+        };
+        // Task 10 自检依赖此标记确认加密路径被真实执行（而非回退明文）。
+        // enc=1 表示正文确定走密钥流；绝不记录内层原文 —— 它的末段就是本次
+        // 会话的 CTR 钥。
+        ctx.st.diag(&format!("tcp-hit enc={} {peer}", u8::from(ctr_key.is_some())));
+        let segs: Vec<String> = inner.split(':').map(|s| s.trim().to_string()).collect();
+        // 掐掉尾部的加密参数段（enc: "900000"+"key" 两段；noenc: "4000000" 一段），
+        // 剩下的才是 pkt:id[:offset]
+        let body_len = if ctr_key.is_some() {
+            segs.len().saturating_sub(2)
+        } else {
+            segs.len().saturating_sub(1)
+        };
+        parts = segs[..body_len.min(segs.len())].to_vec();
+    } else {
+        parts = String::from_utf8_lossy(&req.extra)
+            .split(':')
+            .map(|s| s.trim().to_string())
+            .collect();
+    }
     if parts.len() < 2 {
         return;
     }
@@ -1384,11 +1435,17 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
                 .diag(&format!("tcp-dir-wrong-cmd {peer} file={fname} cmd={:#x}", req.command));
             return;
         }
-        let sent = serve_dir_stream(&mut stream, &path, &fname).await;
-        let _ = stream.flush().await;
-        let _ = stream.shutdown().await;
+        // 整条目录流（头部+内容）统一过密钥流：包装在 writer 抽象上，
+        // serve_dir_stream 对加密与否无感知。目录无断点续传，密钥流从流头起步。
+        let mut w: Box<dyn AsyncWrite + Unpin + Send> = match ctr_key {
+            Some(k) => Box::new(crypto::EncStream::new(stream, &k, req.pkt_no, offset)),
+            None => Box::new(stream),
+        };
+        let sent = serve_dir_stream(&mut w, &path, &fname).await;
+        let _ = w.flush().await;
+        let _ = w.shutdown().await;
         eprintln!("[tcp] 已向 {peer} 发送目录 {fname}: {sent} 字节");
-        ctx.st.diag(&format!("tcp-sent-dir {peer} dir={fname} bytes={sent}"));
+        ctx.st.diag(&format!("tcp-sent-dir {peer} dir={fname} bytes={sent} enc={}", ctr_key.is_some()));
         return;
     }
     if base == cmd::GETDIRFILES {
@@ -1416,6 +1473,12 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
             return;
         }
     }
+    // 正文写出统一走 writer 抽象：加密请求时整条流过 AES-CTR 密钥流，
+    // 密钥流位置 = 文件绝对偏移（EncStream::new 内部 seek），与对端读端对齐。
+    let mut w: Box<dyn AsyncWrite + Unpin + Send> = match ctr_key {
+        Some(k) => Box::new(crypto::EncStream::new(stream, &k, req.pkt_no, offset)),
+        None => Box::new(stream),
+    };
     // 只发公告时声明的字节数：文件在公告后被追加写入时，多发的部分会让
     // 对端按大小校验失败
     let mut remain = size.saturating_sub(offset);
@@ -1426,7 +1489,7 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
         match file.read(&mut chunk[..want]).await {
             Ok(0) => break,
             Ok(n) => {
-                if stream.write_all(&chunk[..n]).await.is_err() {
+                if w.write_all(&chunk[..n]).await.is_err() {
                     break;
                 }
                 sent += n as u64;
@@ -1435,9 +1498,9 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
             Err(_) => break,
         }
     }
-    let _ = stream.flush().await;
+    let _ = w.flush().await;
     // 主动关闭写端：对端据此判断传输结束
-    let _ = stream.shutdown().await;
+    let _ = w.shutdown().await;
     eprintln!("[tcp] 已向 {peer} 发送 {fname}: {sent} 字节");
     ctx.st.diag(&format!("tcp-sent {peer} file={fname} bytes={sent}"));
 }
@@ -1553,9 +1616,11 @@ fn dir_header(name: &str, size: u64, attr: u32) -> Vec<u8> {
     }
 }
 
-/// 服务端：把目录树按流发给对端，返回发出的内容字节数
-async fn serve_dir_stream(
-    stream: &mut TcpStream,
+/// 服务端：把目录树按流发给对端，返回发出的内容字节数。
+/// writer 用泛型抽象：明文传 TcpStream，加密时传 EncStream<TcpStream>，
+/// 整条流（头部+内容）无差别过密钥流。
+async fn serve_dir_stream<W: AsyncWrite + Unpin>(
+    w: &mut W,
     root: &std::path::Path,
     root_name: &str,
 ) -> u64 {
@@ -1564,23 +1629,23 @@ async fn serve_dir_stream(
     for op in collect_dir_ops(root, root_name) {
         match op {
             DirOp::Enter(name) => {
-                if stream.write_all(&dir_header(&name, 0, dirattr::ENTER)).await.is_err() {
+                if w.write_all(&dir_header(&name, 0, dirattr::ENTER)).await.is_err() {
                     return sent;
                 }
             }
             DirOp::Ret => {
-                if stream.write_all(&dir_header(".", 0, dirattr::RETPARENT)).await.is_err() {
+                if w.write_all(&dir_header(".", 0, dirattr::RETPARENT)).await.is_err() {
                     return sent;
                 }
             }
             DirOp::File(path, name, size) => {
                 // 以登记时的大小为准：发送期间文件被改写也要保证头部与内容一致
-                if stream.write_all(&dir_header(&name, size, dirattr::REGULAR)).await.is_err() {
+                if w.write_all(&dir_header(&name, size, dirattr::REGULAR)).await.is_err() {
                     return sent;
                 }
                 let Ok(mut f) = tokio::fs::File::open(&path).await else {
                     // 打开失败：内容按 0 字节补齐，流结构不能错位
-                    if !write_zeros(stream, size, &mut chunk).await {
+                    if !write_zeros(w, size, &mut chunk).await {
                         return sent;
                     }
                     sent += size;
@@ -1592,7 +1657,7 @@ async fn serve_dir_stream(
                     match f.read(&mut chunk[..want]).await {
                         Ok(0) => break,
                         Ok(n) => {
-                            if stream.write_all(&chunk[..n]).await.is_err() {
+                            if w.write_all(&chunk[..n]).await.is_err() {
                                 return sent;
                             }
                             sent += n as u64;
@@ -1603,7 +1668,7 @@ async fn serve_dir_stream(
                 }
                 // 文件变短：补零到头部声明的长度，避免对端错位解析后续条目
                 if remain > 0 {
-                    if !write_zeros(stream, remain, &mut chunk).await {
+                    if !write_zeros(w, remain, &mut chunk).await {
                         return sent;
                     }
                     sent += remain;
@@ -1614,16 +1679,16 @@ async fn serve_dir_stream(
     sent
 }
 
-async fn write_zeros(stream: &mut TcpStream, mut n: u64, buf: &mut [u8]) -> bool {
+async fn write_zeros<W: AsyncWrite + Unpin>(w: &mut W, mut n: u64, buf: &mut [u8]) -> bool {
     for b in buf.iter_mut() {
         *b = 0;
     }
     while n > 0 {
-        let w = (n as usize).min(buf.len());
-        if stream.write_all(&buf[..w]).await.is_err() {
+        let wr = (n as usize).min(buf.len());
+        if w.write_all(&buf[..wr]).await.is_err() {
             return false;
         }
-        n -= w as u64;
+        n -= wr as u64;
     }
     true
 }
@@ -1881,7 +1946,7 @@ async fn fetch_dir_tree(
     tmp_root: &std::path::Path,
 ) -> Result<Option<u64>, String> {
     let mut stream =
-        open_transfer(ctx, target, pkt_no, file_id, rid, cmd::GETDIRFILES, d).await?;
+        open_transfer(ctx, target, pkt_no, file_id, rid, cmd::GETDIRFILES, d, 0).await?;
     std::fs::create_dir_all(tmp_root).map_err(|e| format!("创建临时目录失败: {e}"))?;
 
     let mut rd = StreamReader::new(stream_timeout());
@@ -2017,7 +2082,7 @@ impl StreamReader {
     }
 
     /// 补充至少 1 字节；返回 false 表示对端已关闭
-    async fn fill(&mut self, stream: &mut TcpStream) -> Result<bool, String> {
+    async fn fill<R: AsyncRead + Unpin>(&mut self, stream: &mut R) -> Result<bool, String> {
         if self.pos > 0 && self.pos == self.buf.len() {
             self.buf.clear();
             self.pos = 0;
@@ -2035,9 +2100,9 @@ impl StreamReader {
     }
 
     /// 读一个条目头部：`<总长16进制>:<名称>:<大小16进制>:<属性16进制>:`
-    async fn read_header(
+    async fn read_header<R: AsyncRead + Unpin>(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut R,
     ) -> Result<Option<(String, u64, u32)>, String> {
         // 先取长度字段（第一个冒号之前）
         let colon;
@@ -2093,7 +2158,11 @@ impl StreamReader {
     }
 
     /// 丢弃接下来的 want 字节（用于跳过不落盘的条目），返回实际跳过量
-    async fn skip_exact(&mut self, stream: &mut TcpStream, want: u64) -> Result<u64, String> {
+    async fn skip_exact<R: AsyncRead + Unpin>(
+        &mut self,
+        stream: &mut R,
+        want: u64,
+    ) -> Result<u64, String> {
         let mut left = want;
         while left > 0 {
             if self.avail() == 0 && !self.fill(stream).await? {
@@ -2107,9 +2176,9 @@ impl StreamReader {
     }
 
     /// 把接下来的 want 字节写入文件，返回实际写入量（不足即为对端提前断流）
-    async fn copy_exact(
+    async fn copy_exact<R: AsyncRead + Unpin>(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut R,
         out: &mut tokio::fs::File,
         want: u64,
     ) -> Result<u64, String> {
@@ -2169,7 +2238,14 @@ pub const DIALECTS: [Dialect; 4] = [
     Dialect { hex_pkt: false, hex_id: true, newline: true },
 ];
 
-/// 建立传输连接并发出取文件/取目录请求
+/// 建立传输连接并发出取文件/取目录请求，返回供下载循环读取的流。
+///
+/// 加密路径（spec §7）：对端声明 CAPFILEENC 且我方加密开关开启时，扩展部改为
+/// 密封的内层 `{pkt:x}:{id:x}[:{offset:x}]:900000:{key_hex}`（随机会话钥，
+/// 请求方言无关），命令追加 ENCRYPTOPT|ENCFILEOPT；返回的读取端用同一把钥
+/// 包上 EncStream —— 密钥流位置 = 流绝对偏移，断点续传时 seek(offset) 免费对齐。
+/// 返回类型用 trait object 而非 TcpStream/枚举：两个调用点只读不写，
+/// 统一读端让下载循环零分支。
 #[allow(clippy::too_many_arguments)]
 async fn open_transfer(
     ctx: &NetCtx,
@@ -2179,7 +2255,8 @@ async fn open_transfer(
     rid: &str,
     command: u32,
     d: Dialect,
-) -> Result<TcpStream, String> {
+    offset: u64,
+) -> Result<Box<dyn AsyncRead + Unpin + Send>, String> {
     let cfg = ctx.st.config();
     let mut stream = tokio::time::timeout(Duration::from_secs(6), TcpStream::connect(target))
         .await
@@ -2195,22 +2272,74 @@ async fn open_transfer(
     } else {
         rid.trim().to_string()
     };
-    let req = format!(
-        "1:{}:{}:{}:{}:{}:{}:0{}",
-        proto::next_packet_no(),
+    // CTR nonce 由 TCP 请求行的包号派生：收发双方都拿它当密钥流种子（spec §7）
+    let req_pkt_no = proto::next_packet_no();
+
+    let peer_ip = target.ip().to_string();
+    // 密封失败（如公钥缺失）直接报错而不是回退明文：
+    // 对端既然广告了文件流加密能力，静默明文会让用户误以为传输是加密的
+    let enc = if cfg.encrypt && ctx.st.peer_capa(&peer_ip) & crypto::CAPA_CAPFILEENC != 0 {
+        let peer_pub = ctx.st.peer_pubkey(&peer_ip).ok_or_else(|| {
+            format!("{peer_ip} 广告了文件流加密能力但缺少公钥缓存，拒绝明文回退")
+        })?;
+        let key: [u8; 32] = rand::random();
+        let mut inner = format!("{pkt_no:x}:{file_id:x}");
+        if offset > 0 {
+            inner.push_str(&format!(":{offset:x}")); // 断点续传才带偏移
+        }
+        inner.push_str(":900000:");
+        inner.push_str(&crypto::hex_lower(&key));
+        let sealed =
+            crypto::seal_file_request(&peer_pub, &ctx.st.own_keypair(), req_pkt_no, &inner)?;
+        Some((key, sealed))
+    } else {
+        None
+    };
+
+    // 加密请求在命令位上声明：ENCRYPTOPT（扩展部密封）| ENCFILEOPT（正文走密钥流）
+    let command = if enc.is_some() {
+        command | opt::ENCRYPTOPT | opt::ENCFILEOPT
+    } else {
+        command
+    };
+    // 明文请求保持既有线上字节（extra = pkt:id + 终止符 0）；
+    // 加密请求的扩展部整体是密封串，绝不能再拼 ":0" —— 那会被当成
+    // 内层最后一个段，破坏解封。
+    let mut req = format!(
+        "1:{}:{}:{}:{}:",
+        req_pkt_no,
         my_user(&cfg),
         my_host(),
-        command,
-        pkt_field,
-        id_field,
-        if d.newline { "\n" } else { "" }
+        command
     );
-    eprintln!("[download] 连接 {target} 请求 cmd={command:#x} pkt={pkt_field} id={id_field}");
+    match &enc {
+        Some((_, sealed)) => {
+            // 加密请求方言无关：恒以换行收尾
+            req.push_str(sealed);
+            req.push('\n');
+        }
+        None => {
+            req.push_str(&pkt_field);
+            req.push(':');
+            req.push_str(&id_field);
+            req.push_str(":0");
+            if d.newline {
+                req.push('\n');
+            }
+        }
+    }
+    eprintln!(
+        "[download] 连接 {target} 请求 cmd={command:#x} pkt={pkt_field} id={id_field} enc={}",
+        enc.is_some()
+    );
     stream
         .write_all(req.as_bytes())
         .await
         .map_err(|e| format!("发送请求失败: {e}"))?;
-    Ok(stream)
+    Ok(match enc {
+        Some((key, _)) => Box::new(crypto::EncStream::new(stream, &key, req_pkt_no, offset)),
+        None => Box::new(stream),
+    })
 }
 
 /// 下载失败的统一收尾：推事件 + 回写历史，避免卡片永远停在"下载中"
@@ -2238,8 +2367,9 @@ async fn fetch_to_file(
     d: Dialect,
     tmp: &std::path::Path,
 ) -> Result<u64, String> {
+    // 目录流读取端可能是 TcpStream 或解密包装（open_transfer 决定）
     let mut stream =
-        open_transfer(ctx, target, pkt_no, file_id, rid, cmd::GETFILEDATA, d).await?;
+        open_transfer(ctx, target, pkt_no, file_id, rid, cmd::GETFILEDATA, d, 0).await?;
 
     let mut file = tokio::fs::File::create(tmp)
         .await

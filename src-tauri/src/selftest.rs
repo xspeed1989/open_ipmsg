@@ -9,9 +9,11 @@
 //!   1. 单播发现 → 双向预握手 → 双方 peer_keys.json 各缓存对方公钥
 //!   2. A→B 文本密文送达，B 落库 enc=true 且 sig_ok=true
 //!   3. B→A 反向同样断言
-//!   4. 能力撤回：encrypt=false 的实例 C 以同一 IP 上线 → A 丢弃缓存 →
+//!   4. 加密文件传输：双方互发附件，取回请求带 ENCRYPTOPT|ENCFILEOPT、
+//!      正文双向过 AES-CTR，逐字节一致；服务端 diag.log 留 tcp-hit enc=1 标记
+//!      （Task 10）
+//!   5. 能力撤回：encrypt=false 的实例 C 以同一 IP 上线 → A 丢弃缓存 →
 //!      后续发送回退明文，C 落库 enc=false
-//!   （文件传输加密属 Task 10 范围，本场景不涉及附件断言。）
 //! 全部通过打印 PASS 行并以退出码 0 结束；任一失败打印 FAIL 且退出码非 0。
 
 use crate::net;
@@ -724,6 +726,136 @@ async fn crypto_roundtrip() -> bool {
     })
     .await;
     log.check("A 解密落库：文本一致且 enc=true、sig_ok=true", got_in_a);
+
+    /* ---- 3b. A 公告文件，B 以加密取回请求下载（正文过 AES-CTR） ---- */
+    let content_ab: Vec<u8> = (0..150_000u32).map(|i| ((i * 17 + 5) % 253) as u8).collect();
+    let path_ab = dir_a.join("enc_upload.bin");
+    std::fs::write(&path_ab, &content_ab).unwrap();
+    let rec_file_ab = match net::send_message(
+        &ctx_a,
+        key,
+        "加密文件给你",
+        vec![path_ab.to_string_lossy().into_owned()],
+    )
+    .await
+    {
+        Ok(rec) => {
+            log.check(
+                "A 的文件公告以密文发出（enc=true）",
+                rec["dir"] == "out" && rec["enc"] == true,
+            );
+            Some(rec)
+        }
+        Err(e) => {
+            eprintln!("      A 发送文件公告错误: {e}");
+            log.check("A 的文件公告以密文发出（enc=true）", false);
+            None
+        }
+    };
+    // 公告包号/文件 ID 直接取自 out 记录；B 解密登记后按同值提供下载槽位
+    let ab_pkt = rec_file_ab
+        .as_ref()
+        .and_then(|r| r["pkt"].as_u64())
+        .unwrap_or(0) as u32;
+    let ab_id = rec_file_ab
+        .as_ref()
+        .and_then(|r| r["files"][0]["id"].as_u64())
+        .unwrap_or(0) as u32;
+    let registered_at_b = wait_for(4000, || {
+        st_b
+            .read_history(key, 50)
+            .iter()
+            .any(|r| r["dir"] == "in" && r["pkt"].as_u64() == Some(ab_pkt as u64))
+    })
+    .await;
+    log.check("B 解密并登记 A 的文件公告", registered_at_b);
+    match net::download_file_task(
+        &ctx_b,
+        key,
+        ab_pkt,
+        ab_id,
+        "enc_upload.bin",
+        "",
+        content_ab.len() as u64,
+        false,
+    )
+    .await
+    {
+        Ok(path) => {
+            let saved = std::fs::read(&path).unwrap_or_default();
+            log.check("B 经加密流取回 A 的文件且逐字节一致", saved == content_ab);
+        }
+        Err(e) => {
+            eprintln!("      B 加密下载错误: {e}");
+            log.check("B 经加密流取回 A 的文件且逐字节一致", false);
+        }
+    }
+
+    /* ---- 3c. 反向：B 公告文件，A 加密下载；加密请求标记必须落在 B 的日志里 ---- */
+    let content_ba: Vec<u8> = (0..90_000u32).map(|i| ((i * 23 + 11) % 251) as u8).collect();
+    let path_ba = dir_b.join("enc_reply.bin");
+    std::fs::write(&path_ba, &content_ba).unwrap();
+    let rec_file_ba = match net::send_message(
+        &ctx_b,
+        key,
+        "回赠加密文件",
+        vec![path_ba.to_string_lossy().into_owned()],
+    )
+    .await
+    {
+        Ok(rec) => Some(rec),
+        Err(e) => {
+            eprintln!("      B 发送文件公告错误: {e}");
+            log.check("B 的文件公告以密文发出（enc=true）", false);
+            None
+        }
+    };
+    if let Some(rec) = rec_file_ba.as_ref() {
+        log.check(
+            "B 的文件公告以密文发出（enc=true）",
+            rec["dir"] == "out" && rec["enc"] == true,
+        );
+        let ba_pkt = rec["pkt"].as_u64().unwrap_or(0) as u32;
+        let ba_id = rec["files"][0]["id"].as_u64().unwrap_or(0) as u32;
+        let registered_at_a = wait_for(4000, || {
+            st_a
+                .read_history(key, 50)
+                .iter()
+                .any(|r| r["dir"] == "in" && r["pkt"].as_u64() == Some(ba_pkt as u64))
+        })
+        .await;
+        log.check("A 解密并登记 B 的文件公告", registered_at_a);
+        match net::download_file_task(
+            &ctx_a,
+            key,
+            ba_pkt,
+            ba_id,
+            "enc_reply.bin",
+            "",
+            content_ba.len() as u64,
+            false,
+        )
+        .await
+        {
+            Ok(path) => {
+                let saved = std::fs::read(&path).unwrap_or_default();
+                log.check("A 经加密流取回 B 的文件且逐字节一致", saved == content_ba);
+            }
+            Err(e) => {
+                eprintln!("      A 加密下载错误: {e}");
+                log.check("A 经加密流取回 B 的文件且逐字节一致", false);
+            }
+        }
+    }
+    {
+        // 服务端收到 ENCRYPTOPT 取文件请求才会写这个标记 —— 有它才能证明
+        // 走的是加密路径而不是明文回退。注意内层含会话钥，绝不落日志。
+        let diag_b = std::fs::read_to_string(dir_b.join("diag.log")).unwrap_or_default();
+        log.check(
+            "B 的 diag.log 含 tcp-hit enc=1（加密取文件请求被服务端真实解封）",
+            diag_b.contains("tcp-hit enc=1"),
+        );
+    }
 
     /* ---- 4. 能力撤回：encrypt=false 的实例 C 以同一 IP 上线 ---- */
     // 与真实场景同构：老对手关掉加密后重新上线，广播里不再有 ENCRYPTOPT。
