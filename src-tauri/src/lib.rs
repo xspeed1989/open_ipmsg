@@ -186,8 +186,11 @@ async fn send_files(
     ctx: State<'_, SharedCtx>,
     key: String,
     paths: Vec<String>,
+    text: Option<String>,
 ) -> Result<Value, String> {
-    net::send_message(&ctx, &key, "", paths).await
+    // 正文与附件同发（IPMsg 一条消息可同时带正文和附件）；
+    // 省略 text 时保持旧语义（纯附件），兼容旧前端
+    net::send_message(&ctx, &key, text.as_deref().unwrap_or(""), paths).await
 }
 
 #[tauri::command]
@@ -774,6 +777,7 @@ async fn import_ipmsg_log(
         let mut total = 0usize;
         let mut skipped = 0usize;
         let mut sessions_new = 0usize;
+        let mut merged_sessions = 0usize;
         let mut files: Vec<Value> = Vec::new();
         for p in &paths {
             let path = std::path::PathBuf::from(p);
@@ -782,12 +786,14 @@ async fn import_ipmsg_log(
                     total += rep.imported;
                     skipped += rep.skipped;
                     sessions_new += rep.sessions_new;
+                    merged_sessions += rep.merged_sessions;
                     files.push(json!({
                         "path": p,
                         "ok": true,
                         "imported": rep.imported,
                         "skipped": rep.skipped,
                         "sessions_new": rep.sessions_new,
+                        "sessions_merged": rep.merged_sessions,
                     }));
                 }
                 Err(e) => {
@@ -799,6 +805,7 @@ async fn import_ipmsg_log(
             "total": total,
             "skipped": skipped,
             "sessionsNew": sessions_new,
+            "mergedSessions": merged_sessions,
             "files": files,
             "failed": files.iter().filter(|f| f["ok"] == json!(false)).count(),
         }))

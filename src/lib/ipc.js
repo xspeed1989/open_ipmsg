@@ -34,8 +34,8 @@ export const searchHistory = (query, key, limit) =>
 
 export const sendText = (key, text) => invoke('send_text', { key, text })
 
-/** 发送附件（多个文件路径），返回消息记录 */
-export const sendFiles = (key, paths) => invoke('send_files', { key, paths })
+/** 发送附件（多个文件路径）+ 可选正文，一条消息同时携带；返回消息记录 */
+export const sendFiles = (key, paths, text = '') => invoke('send_files', { key, paths, text })
 
 /** 按未读总数切换托盘图标（有未读时带红点角标） */
 export const setUnread = (total) => invoke('set_unread', { total })

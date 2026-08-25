@@ -127,27 +127,46 @@ pub(crate) fn hex_decode_loose(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// ANSPUBKEY 扩展部："{capa:X}:{e:x}-{n:x}"（capa 大写 hex，E/N 小写 hex）
+/// ANSPUBKEY 扩展部："{capa:X}:{e:x}-{n:x}"（capa 大写 hex，E/N 小写 hex）。
+///
+/// 模数按官方线格式 **revendian**（字节逆序）输出：官方 Windows 端
+/// （v3f_mainwin.cpp MsgGetPubKey）用 `bin2hexstr_revendian` 发送、解析端用
+/// `hexstr2bin_revendian` 还原——线上惯例即逆序，我们此前按标准大端输出，
+/// 导致官方客户端解析我们的 ANSPUBKEY 得到字节序错误的公钥（2026-08 现场
+/// 复现：官方 v4 客户端回包带尾 \0 且全部握手失败）。
 pub fn build_anspubkey(capa: u32, key: &KeyPair) -> String {
-    format!(
-        "{capa:X}:{}-{}",
-        hex_lower(&key.exponent_be()),
-        hex_lower(&key.modulus_be())
-    )
+    // 官方线格式 E 为数值 hex、无前导零（`%X` of DWORD：65537 → "10001"），
+    // 按 BigUint 数值输出而非字节 hex（字节形式会是 "010001"，带前导零）
+    let e_val = BigUint::from_bytes_be(&key.exponent_be());
+    let n_rev: Vec<u8> = key.modulus_be().iter().rev().cloned().collect();
+    format!("{capa:X}:{e_val:x}-{}", hex_lower(&n_rev))
 }
 
 /// 宽容解析 ANSPUBKEY 扩展部："{capa}:{e}-{n}"，hex 大小写通吃；
+/// N 按官方 revendian 解读（字节逆序还原为标准大端）；
+/// 容忍 C 字符串惯例的尾部 '\0'（官方及相关实现发送时带尾 \0，
+/// 不剥离会使模数段变奇数长度而解析失败）；
 /// N 允许被对端裁掉前导零字节（BigUint 按值还原，天然左补零语义）
 pub fn parse_anspubkey(extra: &str) -> Option<(u32, RsaPublicKey)> {
-    let (capa_s, rest) = extra.trim().split_once(':')?;
+    let extra = extra.trim_end_matches('\0').trim();
+    let (capa_s, rest) = extra.split_once(':')?;
     let capa = u32::from_str_radix(capa_s.trim().trim_start_matches("0x"), 16).ok()?;
     let (e_s, n_s) = rest.split_once('-')?;
-    let e = hex_decode_loose(e_s)?;
-    let n = hex_decode_loose(n_s)?;
+    // E 是数值 hex（官方将 65537 写作 "10001"——奇数长度、字节不对齐），
+    // 按数值还原而非字节解码；奇数长度时左补零到偶数字节再解码
+    let e_txt = e_s.trim_end_matches('\0').trim();
+    let e_pad = if e_txt.len() % 2 == 1 {
+        format!("0{e_txt}")
+    } else {
+        e_txt.to_string()
+    };
+    let e = BigUint::from_bytes_be(&hex_decode_loose(&e_pad)?);
+    let mut n = hex_decode_loose(n_s.trim_end_matches('\0').trim())?;
     if n.len() > RSA_BITS / 8 * 2 {
         return None; // 超过 4096 位直接拒绝
     }
-    let pubk = RsaPublicKey::new(BigUint::from_bytes_be(&n), BigUint::from_bytes_be(&e)).ok()?;
+    n.reverse(); // 官方 revendian：还原为标准大端
+    let pubk = RsaPublicKey::new(BigUint::from_bytes_be(&n), e).ok()?;
     Some((capa, pubk))
 }
 
@@ -579,28 +598,59 @@ mod tests {
     }
 
     #[test]
-    fn anspubkey_parse_tolerates_case_and_short_n() {
+    fn anspubkey_parse_tolerates_case_and_revendian() {
         let kp = KeyPair::generate().unwrap();
         let e = kp.exponent_be();
         let n = kp.modulus_be();
+        // 线格式为 revendian：输入按字节逆序 hex 构造；capa/e/n 全小写也必须能解析
+        let n_rev: Vec<u8> = n.iter().rev().cloned().collect();
         let s = format!(
-            "{:x}:{}-{}",             // 全小写也必须能解析（hex_lower 产物已是 hex 文本，勿再套 {:x}）
+            "{:x}:{}-{}",
             CAPA_OUR_SEND,
             hex_lower(&e),
-            hex_lower(&n[1..])         // 模数少一个前导零字节也要能左补齐
+            hex_lower(&n_rev)
         );
         let (capa, pubk) = parse_anspubkey(&s).unwrap();
         assert_eq!(capa, CAPA_OUR_SEND);
-        // 注：brief 原文 `to_bytes_be()[255]` 必越界 panic——左裁后的 N 按值还原成
-        // 255 字节的最小大端编码，故比较尾字节（与原断言意图一致：模数值未变）
-        assert_eq!(pubk.n().to_bytes_be().last(), n.last());
+        // revendian 逆转后必须完整还原原模数
+        assert_eq!(pubk.n().to_bytes_be(), n);
         assert_eq!(pubk.e().to_bytes_be(), e);
+        // 官方 build 产物（e 无前导零 + revendian）roundtrip
+        let s2 = build_anspubkey(CAPA_OUR_SEND, &kp);
+        assert!(s2.starts_with(&format!("{:X}:10001-", CAPA_OUR_SEND)));
+        let (_, pubk2) = parse_anspubkey(&s2).unwrap();
+        assert_eq!(pubk2.n().to_bytes_be(), n);
     }
 
     #[test]
     fn anspubkey_parse_rejects_junk() {
         assert!(parse_anspubkey("no-colon").is_none());
         assert!(parse_anspubkey("40100004:zz-aa").is_none());
+    }
+
+    /// 官方客户端 ANSPUBKEY 现场样本（2026-08 排查捕获，10.200.231.11）：
+    /// extra 全长 528B = capa8 ':' e5 '-' n512 + 尾部 '\0'（C 字符串惯例）。
+    /// 模数按官方 revendian（字节逆序）发送。修复前该样本解析失败
+    /// （尾 \0 使 n 段变 513 字符奇数长度）。
+    #[test]
+    fn anspubkey_accepts_official_sample_with_trailing_nul() {
+        // 用我们自己的密钥构造"官方样式"样本：revendian 模数 hex + 尾 \0，
+        // e 按官方格式无前导零（"10001"）
+        let kp = KeyPair::generate().unwrap();
+        let n = kp.modulus_be();
+        let n_rev: Vec<u8> = n.iter().rev().cloned().collect();
+        let s = format!(
+            "{:X}:{}-{}\0",
+            0x6592_0006u32,
+            "10001",
+            hex_lower(&n_rev)
+        );
+        assert_eq!(s.len(), 528);
+        let (capa, pubk) = parse_anspubkey(&s).unwrap();
+        assert_eq!(capa, 0x6592_0006);
+        // revendian 反转后必须还原出原始标准大端模数
+        assert_eq!(pubk.n().to_bytes_be(), kp.modulus_be());
+        assert_eq!(pubk.e().to_bytes_be(), vec![1, 0, 1]);
     }
 
     #[test]

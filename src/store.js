@@ -310,9 +310,9 @@ export async function sendText(text) {
 }
 
 /** 发送文件/文件夹到指定会话；target 省略时发给当前会话（拖放到列表某个用户时指定目标） */
-export async function sendFilesTo(key, paths) {
+export async function sendFilesTo(key, paths, text = '') {
   if (!key || !paths?.length) return null
-  const msg = await ipc.sendFiles(key, paths)
+  const msg = await ipc.sendFiles(key, paths, text)
   await pushMsg(key, msg)
   return msg
 }

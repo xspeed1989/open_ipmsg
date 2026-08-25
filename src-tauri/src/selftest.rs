@@ -626,12 +626,14 @@ fn finish(log: Log, tasks: Vec<tokio::task::JoinHandle<()>>, data_dir: &Path) ->
 
 /* ==================== 场景：双实例端到端加密全链路 ==================== */
 
-/// peer_keys.json 里是否已缓存该 IP 的公钥（读盘断言，重启口径）
+/// peer_keys.json 里是否已缓存该 IP 的公钥（读盘断言，重启口径；
+    /// 文件为 {rev, keys:{ip:{...}}} 版本化结构）
 fn peer_keys_cached(dir: &Path, ip: &str) -> bool {
     std::fs::read_to_string(dir.join("peer_keys.json"))
         .ok()
         .and_then(|txt| serde_json::from_str::<Value>(&txt).ok())
-        .map(|v| v.get(ip).is_some())
+        .and_then(|v| v.get("keys").cloned())
+        .map(|keys| keys.get(ip).is_some())
         .unwrap_or(false)
 }
 

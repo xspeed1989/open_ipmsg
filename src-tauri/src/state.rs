@@ -119,6 +119,16 @@ struct PeerKeyEntry {
     e_b64: String,
 }
 
+/// peer_keys.json 容器（rev=2：ANSPUBKEY 线格式改用官方 revendian 后，
+/// rev<2 的旧缓存里公钥字节序是错的，必须整体作废重新握手）
+#[derive(Serialize, Deserialize)]
+struct PeerKeyFile {
+    rev: u32,
+    keys: HashMap<String, PeerKeyEntry>,
+}
+
+const PEER_KEY_FILE_REV: u32 = 2;
+
 fn b64_encode(b: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(b)
@@ -139,8 +149,9 @@ pub struct AppState {
     ack_count: Mutex<HashMap<(IpAddr, u32), u32>>,
     seen_queue: Mutex<VecDeque<(IpAddr, u32)>>,
     seen_set: Mutex<HashSet<(IpAddr, u32)>>,
-    /// 聊天记录文件的读-改-写互斥（防止并发追加与重写互相覆盖）
-    hist_lock: Mutex<()>,
+    /// 聊天记录文件的读-改-写互斥（防止并发追加与重写互相覆盖）;
+    /// ipmsg_import 的会话归并需要整段持锁做原子合并
+    pub(crate) hist_lock: Mutex<()>,
     /// 待投递的离线消息：会话 key → 队列（FIFO）
     pending_out: Mutex<HashMap<String, Vec<PendingOut>>>,
     on_event: Mutex<Option<EventFn>>,
@@ -482,7 +493,7 @@ impl AppState {
     fn persist_peer_keys(&self) {
         use rsa::traits::PublicKeyParts;
         let data = self.peer_crypto.lock().unwrap();
-        let map: HashMap<String, PeerKeyEntry> = data
+        let keys: HashMap<String, PeerKeyEntry> = data
             .iter()
             .map(|(ip, (capa, k))| {
                 (
@@ -496,21 +507,26 @@ impl AppState {
             })
             .collect();
         drop(data);
-        let bytes = serde_json::to_vec(&map).unwrap_or_default();
+        let bytes = serde_json::to_vec(&PeerKeyFile { rev: PEER_KEY_FILE_REV, keys }).unwrap_or_default();
         if let Some(dir) = self.peer_keys_path().parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = std::fs::write(self.peer_keys_path(), bytes);
     }
 
-    /// 启动时从磁盘恢复对端密钥缓存；单条损坏跳过该条，整体损坏视为无缓存
+    /// 启动时从磁盘恢复对端密钥缓存；单条损坏跳过该条，整体损坏视为无缓存。
+    /// 版本不符（rev<2，旧公钥字节序错误）时整体作废，等待重新握手。
     pub fn load_peer_keys(&self) {
         let Ok(content) = std::fs::read_to_string(self.peer_keys_path()) else {
             return;
         };
-        let Ok(map) = serde_json::from_str::<HashMap<String, PeerKeyEntry>>(&content) else {
+        let Ok(file) = serde_json::from_str::<PeerKeyFile>(&content) else {
             return;
         };
+        if file.rev != PEER_KEY_FILE_REV {
+            return;
+        }
+        let map = file.keys;
         let mut out: HashMap<String, (u32, RsaPublicKey)> = HashMap::new();
         for (ip, ent) in map {
             let (Some(n), Some(e)) = (b64_decode(&ent.n_b64), b64_decode(&ent.e_b64)) else {
@@ -710,7 +726,8 @@ impl AppState {
         moved
     }
 
-    fn log_path(&self, key: &str) -> PathBuf {
+    /// 会话 key → 聊天记录文件路径（文件名做了安全清洗）
+    pub(crate) fn log_path(&self, key: &str) -> PathBuf {
         let safe: String = key
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })

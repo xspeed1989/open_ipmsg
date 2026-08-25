@@ -84,7 +84,8 @@ async function importIpmsg() {
         ? `${lines.join('\n')}`
         : `导入完成：共 ${r.total} 条消息` +
           (r.skipped ? `（跳过 ${r.skipped} 条已存在/备忘录）` : '') +
-          (r.sessionsNew ? `，新增 ${r.sessionsNew} 个会话` : '')
+          (r.sessionsNew ? `，新增 ${r.sessionsNew} 个会话` : '') +
+          (r.mergedSessions ? `，按名称+主机归并 ${r.mergedSessions} 个重复会话` : '')
     if (!r.total && !r.failed) msg += '\n没有新消息可导入。'
     alert(msg)
   } catch (e) {

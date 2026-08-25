@@ -4,9 +4,9 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import * as ipc from '../lib/ipc'
 import {
-  store, sendText, sendFiles, sendClipboardImage, downloadFile, clearHistory,
+  store, sendText, sendFiles, sendFilesTo, downloadFile, clearHistory,
   openChat, displayName, dayLabel, fmtTime, fmtSize, refreshUsers, splitDelayedNote,
-  sendTextTo, sendFilesTo, sendClipboardImageTo,
+  sendTextTo,
 } from '../store'
 import { parseFileUris, highlightParts } from '../lib/text'
 import { computePopupPosition } from '../lib/popup'
@@ -144,7 +144,7 @@ function startBatch() {
   }
   // 输入框为空时不再静默禁用按钮，点击给出明确引导
   if (!canSend.value) {
-    alert('请先在输入框填写要批量发送的内容（文字或粘贴图片）')
+    alert('请先在输入框填写要批量发送的内容（文字或粘贴的图片/文件）')
     nextTick(() => ta.value?.focus())
     return
   }
@@ -157,6 +157,15 @@ const selMode = ref(false)
 const selected = ref(new Set()) // 消息对象引用集合（会话内稳定）
 
 function copyMsg() {
+  // 用户已经选中了部分文本 → 复制选中部分；没有选区才复制整条消息
+  // （气泡正文可自由选中，Windows/WebView2 上同样生效）
+  const sel = window.getSelection()
+  const selText = sel && !sel.isCollapsed ? sel.toString() : ''
+  if (selText.trim()) {
+    closeCtx()
+    ipc.copyText(selText).catch((e) => alert('复制失败：' + e))
+    return
+  }
   const m = ctxMenu.value?.msg
   closeCtx()
   if (!m) return
@@ -204,6 +213,16 @@ async function onPickerConfirm(keys) {
   const p = picker.value
   picker.value = null
   if (!p || !keys.length) return
+  // 批量发送：待发送附件只落盘一次，多个收件人复用同一批路径
+  let paths = null
+  if (p.mode === 'batch' && pendingList.value.length) {
+    try {
+      paths = await pendingToPaths(pendingList.value)
+    } catch (e) {
+      alert('准备附件失败：' + e)
+      return
+    }
+  }
   const fails = []
   let ok = 0
   for (const k of keys) {
@@ -213,8 +232,7 @@ async function onPickerConfirm(keys) {
         else await sendFilesTo(k, p.payload.paths)
       } else {
         const text = draft.value.replace(/\n{3,}/g, '\n\n').trimEnd()
-        const img = pendingImg.value
-        if (img) await sendClipboardImageTo(k, img.b64, img.mime, text)
+        if (paths) await sendFilesTo(k, paths, text)
         else await sendTextTo(k, text)
       }
       ok++
@@ -223,7 +241,7 @@ async function onPickerConfirm(keys) {
     }
   }
   if (p.mode === 'batch') {
-    if (pendingImg.value) clearPendingImg()
+    clearPending()
     draft.value = ''
   }
   const name = (k) => displayName(k) || k
@@ -235,7 +253,7 @@ watch(() => store.activeKey, () => nextTick(() => ta.value?.focus()))
 // 切会话退出多选模式：选中集是按消息对象引用记的，跨会话无意义
 watch(() => store.activeKey, () => exitSel())
 
-const canSend = computed(() => !!draft.value.trim() || !!pendingImg.value)
+const canSend = computed(() => !!draft.value.trim() || pendingList.value.length > 0)
 
 async function doSend() {
   if (!store.activeKey || !canSend.value) return
@@ -245,12 +263,12 @@ async function doSend() {
     text = composeReplyBody(replyTarget.value.preview, text)
     replyTarget.value = null
   }
-  const img = pendingImg.value
   try {
-    if (img) {
-      // 图片与随行文字一并发出（IPMsg 的一条消息可同时带正文和附件）
-      await sendClipboardImage(img.b64, img.mime, text)
-      clearPendingImg()
+    if (pendingList.value.length) {
+      // 待发送附件与随行文字一并发出（IPMsg 的一条消息可同时带正文和附件）
+      const paths = await pendingToPaths(pendingList.value)
+      await sendFilesTo(store.activeKey, paths, text)
+      clearPending()
     } else {
       await sendText(text)
     }
@@ -261,12 +279,53 @@ async function doSend() {
   }
 }
 
-/* ---------- 剪贴板图片 ---------- */
-const pendingImg = ref(null)
+/* ---------- 待发送附件（剪贴板图片 / 粘贴的文件） ----------
+   与微信一致：粘贴只进输入区上方的待发送列表，按 Enter 或点「发送」才真正发出；
+   每条未发送的附件都可以单独移除。条目两类：
+     { kind:'img',  b64, mime, size, url, name }   —— 剪贴板截图，发送时落盘
+     { kind:'file', path, name }                   —— 已有本地路径的文件
+*/
+const pendingList = ref([])
 
-function clearPendingImg() {
-  if (pendingImg.value?.url) URL.revokeObjectURL(pendingImg.value.url)
-  pendingImg.value = null
+function baseName(p) {
+  return (p || '').split(/[\\/]/).pop() || p || ''
+}
+const MIME_EXT = {
+  'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif',
+  'image/bmp': 'bmp', 'image/webp': 'webp',
+}
+function imgItemName(mime) {
+  return '剪贴板图片.' + (MIME_EXT[mime] || 'png')
+}
+
+/** 把粘贴得到的本地路径统一变成待发送文件条目 */
+function pendingFileItems(paths) {
+  return (paths || []).filter(Boolean).map((path) => ({ kind: 'file', path, name: baseName(path) }))
+}
+
+/** 把待发送条目全部落成可发送的本地路径（剪贴板图片先落盘），失败抛错 */
+async function pendingToPaths(items) {
+  const paths = []
+  for (const it of items || []) {
+    if (it.kind === 'file' && it.path) paths.push(it.path)
+    else paths.push(await ipc.stagePastedFile(it.name || imgItemName(it.mime), it.b64))
+  }
+  return paths
+}
+
+/** 从待发送列表移除一条（未发送的文件可随时取消） */
+function removePending(i) {
+  const it = pendingList.value[i]
+  if (it?.url) URL.revokeObjectURL(it.url)
+  pendingList.value.splice(i, 1)
+}
+
+/** 清空待发送列表并释放预览 URL */
+function clearPending() {
+  for (const it of pendingList.value) {
+    if (it.url) URL.revokeObjectURL(it.url)
+  }
+  pendingList.value = []
 }
 
 /** 大数组分块转 base64，避免 String.fromCharCode 参数过多爆栈 */
@@ -286,22 +345,24 @@ async function takeImageFile(file) {
     return false
   }
   const buf = new Uint8Array(await file.arrayBuffer())
-  clearPendingImg()
-  pendingImg.value = {
+  const mime = file.type || 'image/png'
+  pendingList.value.push({
+    kind: 'img',
     b64: bytesToB64(buf),
-    mime: file.type || 'image/png',
+    mime,
     size: buf.length,
     url: URL.createObjectURL(file),
-  }
+    name: imgItemName(mime),
+  })
   nextTick(() => ta.value?.focus())
   return true
 }
 
 /**
  * 粘贴处理（窗口级，Ctrl+V 在哪都生效）：
- *  1. clipboardData 里就有文件路径 → 和拖放一样直接发送
+ *  1. clipboardData 里就有文件路径 → 进「待发送列表」，按 Enter 才发（不再直接发）
  *  2. clipboardData 什么都没有（Linux/WebKitGTK 不暴露文件类剪贴板）→ 读原生 GTK 剪贴板
- *  3. 只有文件内容没有路径（Windows 资源管理器 / 邮件客户端）→ 落盘后发送
+ *  3. 只有文件内容没有路径（Windows 资源管理器 / 邮件客户端）→ 落盘后进待发送列表
  *  4. 只是一张位图（截图工具）→ 转成待发送附件，先预览再按 Enter 发
  *  5. 普通文字 → 保持默认粘贴行为
  */
@@ -314,11 +375,12 @@ async function onPaste(e) {
     pasteSeen = true
   }
 
-  // 1) 有路径：零拷贝，直接走发送文件通道
+  // 1) 有路径（文件管理器复制的 file:// 列表）：零拷贝，先收进待发送列表
   const paths = parseFileUris(dt.getData('text/uri-list') || dt.getData('text/plain') || '')
   if (paths.length) {
     e.preventDefault()
-    await sendPastedPaths(paths)
+    pendingList.value.push(...pendingFileItems(paths))
+    nextTick(() => ta.value?.focus())
     return
   }
 
@@ -342,16 +404,16 @@ async function onPaste(e) {
     return
   }
 
-  // 3) 有内容没路径（Windows 资源管理器 / 邮件客户端）：落盘后按普通附件发送
+  // 3) 有内容没路径（Windows 资源管理器 / 邮件客户端）：落盘后进待发送列表
   try {
-    const staged = []
     for (const f of files) {
       const buf = new Uint8Array(await f.arrayBuffer())
-      staged.push(await ipc.stagePastedFile(f.name || '粘贴文件', bytesToB64(buf)))
+      const path = await ipc.stagePastedFile(f.name || '粘贴文件', bytesToB64(buf))
+      pendingList.value.push({ kind: 'file', path, name: baseName(f.name || '粘贴文件') })
     }
-    await sendPastedPaths(staged)
+    nextTick(() => ta.value?.focus())
   } catch (err) {
-    alert('粘贴发送失败：' + err)
+    alert('粘贴失败：' + err)
   }
 }
 
@@ -369,35 +431,29 @@ function onPasteHotkey(e) {
     try {
       const native = await ipc.clipboardFilePaths()
       if (native?.length) {
-        await sendPastedPaths(native)
+        // 复制的文件路径：进待发送列表，不直接发
+        pendingList.value.push(...pendingFileItems(native))
+        nextTick(() => ta.value?.focus())
         return
       }
       // 剪贴板里没有文件路径 → 可能是截图：读原生剪贴板位图，先预览再发
       const img = await ipc.clipboardImage()
       if (img?.b64) {
         const p = pendingImgFromB64(img.b64, img.mime, img.size)
-        clearPendingImg()
-        pendingImg.value = { ...p, url: URL.createObjectURL(p.blob) }
+        pendingList.value.push({
+          kind: 'img',
+          b64: p.b64,
+          mime: p.mime,
+          size: p.size,
+          url: URL.createObjectURL(p.blob),
+          name: imgItemName(p.mime),
+        })
         nextTick(() => ta.value?.focus())
       }
     } catch (err) {
       console.error('clipboard fallback failed', err)
     }
   }, 80)
-}
-
-/** 粘贴到的文件统一从这里发出（与拖放同一条通道） */
-async function sendPastedPaths(paths) {
-  if (!store.activeKey) {
-    alert('请先在左侧选择要发送给谁')
-    return
-  }
-  try {
-    await sendFiles(paths)
-    autoBottom = true
-  } catch (e) {
-    alert('发送失败：' + e)
-  }
 }
 
 /* ---------- 拖放文件发送 ----------
@@ -1022,14 +1078,22 @@ watch(
 
       <EmojiPicker ref="emojiPanelRef" v-if="emojiOpen" :style="emojiStyle" @pick="insertEmoji" />
 
-      <!-- 待发送的剪贴板图片 -->
-      <div v-if="pendingImg" class="paste-strip">
-        <img :src="pendingImg.url" class="paste-thumb" />
-        <div class="paste-meta">
-          <div>剪贴板图片</div>
-          <div class="paste-sub">{{ fmtSize(pendingImg.size) }} · Enter 发送</div>
+      <!-- 待发送附件列表：剪贴板图片 / 粘贴的文件；未发送前可逐项移除 -->
+      <div v-if="pendingList.length" class="paste-strip">
+        <div v-for="(it, i) in pendingList" :key="i" class="paste-item">
+          <img v-if="it.kind === 'img'" :src="it.url" class="paste-thumb" />
+          <div v-else class="paste-ficon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+              <path d="M6 3h8l4 4v14H6V3z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+              <path d="M14 3v4h4" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+            </svg>
+          </div>
+          <div class="paste-meta">
+            <div class="paste-name ellipsis" :title="it.name">{{ it.name }}</div>
+            <div class="paste-sub">{{ it.kind === 'img' ? fmtSize(it.size) + ' · ' : '' }}Enter 发送</div>
+          </div>
+          <button class="paste-x" title="从待发送列表移除" @click="removePending(i)">✕</button>
         </div>
-        <button class="paste-x" title="取消" @click="clearPendingImg">✕</button>
       </div>
 
       <textarea
@@ -1042,7 +1106,7 @@ watch(
       ></textarea>
 
       <div class="composer-foot">
-        <span class="hint">Enter 发送 / Ctrl+Enter 换行 / 可直接粘贴图片</span>
+        <span class="hint">Enter 发送 / Ctrl+Enter 换行 / 可直接粘贴图片或文件</span>
         <button class="send-btn" :disabled="!canSend" @click="doSend">
           发送<span class="s-key">(S)</span>
         </button>
@@ -1154,25 +1218,51 @@ watch(
 }
 .paste-strip {
   display: flex;
-  align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px;
   margin: 0 12px 6px;
-  padding: 6px 8px;
+  padding: 8px;
   border: 1px solid var(--c-line, var(--c-hairline));
   border-radius: 6px;
   background: var(--c-tint);
+  max-height: 148px;
+  overflow-y: auto;
+}
+.paste-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border: 1px solid var(--c-hairline);
+  border-radius: 6px;
+  background: var(--c-card);
+  min-width: 0;
 }
 .paste-thumb {
-  width: 46px;
-  height: 46px;
+  width: 42px;
+  height: 42px;
   object-fit: cover;
   border-radius: 4px;
   flex: none;
+}
+.paste-ficon {
+  width: 42px;
+  height: 42px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  background: var(--c-tint);
+  color: var(--c-sub);
 }
 .paste-meta {
   flex: 1;
   min-width: 0;
   font-size: 12px;
+}
+.paste-name {
+  max-width: 220px;
 }
 .paste-sub {
   color: var(--c-sub);
@@ -1188,7 +1278,7 @@ watch(
   padding: 4px 6px;
 }
 .paste-x:hover {
-  color: var(--c-text);
+  color: var(--c-danger);
 }
 .chat-window {
   flex: 1;
@@ -1304,6 +1394,10 @@ watch(
   white-space: pre-wrap;
   box-shadow: 0 1px 1px var(--c-tint);
   max-width: 100%;
+  /* 全局 body 关了选择，气泡正文单独放开：Windows/WebView2 上也能
+     像微信一样用鼠标自由选中文本再复制 */
+  user-select: text;
+  -webkit-user-select: text;
 }
 .bubble.file {
   white-space: normal;

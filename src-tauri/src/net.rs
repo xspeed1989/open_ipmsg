@@ -405,7 +405,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
     // 线路诊断：记录入站报文摘要（含原始附加数据十六进制，便于定位互通格式差异）
     {
         use std::fmt::Write as _;
-        let raw = &pkt.extra[..pkt.extra.len().min(120)];
+        let raw = &pkt.extra[..pkt.extra.len().min(1600)];
         let mut hexs = String::with_capacity(raw.len() * 3);
         for b in raw {
             let _ = write!(hexs, "{b:02x} ");
@@ -600,12 +600,23 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
         }
         cmd::ANSPUBKEY => {
             // 对端公钥应答：宽容解析后缓存能力位与公钥（持久化，重启免握手）
+            // 「解析失败」时附上长度与冒号/连字符位置，便于定位官方 revendian
+            // 或非标长度模数等互通格式差异（2026-08 现场排查用）
             match crypto::parse_anspubkey(&String::from_utf8_lossy(&pkt.extra)) {
                 Some((capa, pubk)) => {
                     ctx.st.remember_peer_key(&key, capa, &pubk);
                     ctx.st.diag(&format!("<- {from} ANSPUBKEY 已缓存 capa={capa:X}"));
                 }
-                None => ctx.st.diag(&format!("<- {from} ANSPUBKEY 解析失败，忽略")),
+                None => {
+                    let s = String::from_utf8_lossy(&pkt.extra);
+                    let colon = s.find(':').map(|i| i.to_string()).unwrap_or("-".into());
+                    let dash = s.find('-').map(|i| i.to_string()).unwrap_or("-".into());
+                    ctx.st.diag(&format!(
+                        "<- {from} ANSPUBKEY 解析失败，忽略 len={} colon@{colon} dash@{dash} head={}",
+                        s.len(),
+                        s.chars().take(24).collect::<String>()
+                    ));
+                }
             }
         }
         cmd::RELEASEFILES => {
