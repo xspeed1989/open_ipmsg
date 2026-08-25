@@ -1,5 +1,6 @@
 //! Tauri 应用层：命令注册、事件桥接、托盘、通知与生命周期。
 
+mod crypto;
 mod ipmsg_import;
 mod net;
 mod protocol;

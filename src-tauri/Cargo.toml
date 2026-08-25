@@ -51,6 +51,15 @@ encoding_rs = "0.8"
 local-ip-address = "0.6"
 hostname = "0.4"
 tauri-plugin-single-instance = "2.4.3"
+# 官方协议加密（spec §2）：RSA 会话钥交换 + AES/Blowfish 会话加密 + SHA 签名
+rsa = "0.9"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+ctr = "0.9"
+blowfish = "0.9"
+sha1 = "0.10"
+sha2 = "0.10"
+rand = "0.8"
 
 [features]
 net_debug = []
