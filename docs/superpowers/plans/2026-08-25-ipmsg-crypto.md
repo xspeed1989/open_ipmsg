@@ -45,7 +45,7 @@
 # 官方协议加密（spec §2）：RSA 会话钥交换 + AES/Blowfish 会话加密 + SHA 签名
 rsa = "0.9"
 aes = "0.8"
-cbc = { version = "0.4", features = ["alloc"] }
+cbc = { version = "0.1", features = ["alloc"] }
 ctr = "0.9"
 blowfish = "0.9"
 sha1 = "0.10"
