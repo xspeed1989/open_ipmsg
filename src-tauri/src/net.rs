@@ -3,6 +3,7 @@
 //! 所有出站报文都从同一个绑定在协议端口上的主 socket 发出，
 //! 保证对端看到的 (ip, port) 身份稳定。
 
+use crate::crypto;
 use crate::protocol::{self as proto, cmd, fileattr, opt};
 use crate::state::{now_secs, AppState, Config, OfferedFile, PeerInfo, PendingOut};
 use serde_json::{json, Value};
@@ -55,6 +56,18 @@ fn local_ipv4_set() -> &'static std::collections::HashSet<IpAddr> {
             .map(|v| v.into_iter().map(|(_, ip)| ip).collect())
             .unwrap_or_default()
     })
+}
+
+/* ================= 能力广告与上线通告 ================= */
+
+/// 上线类报文的能力位，受加密总开关控制：开 → ENCRYPTOPT|CAPFILEENCOPT，关 → 0。
+/// 广播/单播通告、ANSENTRY 应答、预握手 GETPUBKEY 扩展部共用这一口径（spec §5/§7）。
+fn entry_caps(cfg: &Config) -> u32 {
+    if cfg.encrypt {
+        opt::ENCRYPTOPT | opt::CAPFILEENCOPT
+    } else {
+        0
+    }
 }
 
 /* ================= 广播目标计算 ================= */
@@ -197,7 +210,8 @@ pub async fn announce(ctx: &NetCtx) {
     let pkt = proto::Packet {
         extra: proto::build_entry_extra(&cfg.nickname, &cfg.group, &cfg.encoding),
         command: cmd::BR_ENTRY
-            | if utf8 { opt::UTF8OPT } else { 0 },
+            | if utf8 { opt::UTF8OPT } else { 0 }
+            | entry_caps(&cfg),
         ..proto::Packet::new(0)
     };
     let bytes = pkt.encode(&my_user(&cfg), &my_host());
@@ -217,7 +231,8 @@ pub async fn announce_unicast(ctx: &NetCtx, addrs: &[SocketAddr]) {
     let pkt = proto::Packet {
         extra: proto::build_entry_extra(&cfg.nickname, &cfg.group, &cfg.encoding),
         command: cmd::BR_ENTRY
-            | if utf8 { opt::UTF8OPT } else { 0 },
+            | if utf8 { opt::UTF8OPT } else { 0 }
+            | entry_caps(&cfg),
         ..proto::Packet::new(0)
     };
     let bytes = pkt.encode(&my_user(&cfg), &my_host());
@@ -255,6 +270,31 @@ fn peer_addr(peer: &PeerInfo) -> Option<SocketAddr> {
         peer.ip.parse::<IpAddr>().ok()?,
         peer.port,
     )))
+}
+
+/// 发现即预握手（spec §5）：对端上线类报文声明 ENCRYPTOPT、我方开关开启、
+/// 尚未缓存对方公钥且对方未被标明文 → 立刻索取公钥，避免首条消息明文发送。
+/// GETPUBKEY 扩展部 = 我方能力位小写 hex（口径与 entry_caps 一致）。
+async fn maybe_start_handshake(
+    ctx: &NetCtx,
+    from: SocketAddr,
+    pkt: &proto::Packet,
+    key: &str,
+    cfg: &Config,
+) {
+    if !cfg.encrypt
+        || pkt.command & opt::ENCRYPTOPT == 0
+        || ctx.st.peer_pubkey(key).is_some()
+        || ctx.st.peer_marked_plain(key)
+    {
+        return;
+    }
+    let capa = entry_caps(cfg) | crypto::CAPA_OUR_SEND;
+    let mut g = proto::Packet::new(cmd::GETPUBKEY);
+    g.extra = format!("{capa:x}").into_bytes();
+    let bytes = g.encode(&my_user(cfg), &my_host());
+    let _ = ctx.sock.send_to(&bytes, from).await;
+    ctx.st.diag(&format!("-> {from} GETPUBKEY 预握手 capa={capa:x}"));
 }
 
 /* ================= 入站处理 ================= */
@@ -332,12 +372,14 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                 user: pkt.user.clone(),
                 last_seen: now_secs(),
             });
-            // 回应 ANSENTRY（单播），携带自己的昵称\0群组
+            // 回应 ANSENTRY（单播），携带自己的昵称\0群组；能力位随总开关一起广告
             let cfg = ctx.st.config();
             let utf8 = proto::is_utf8_mode(&cfg.encoding);
             let ans = proto::Packet {
                 extra: proto::build_entry_extra(&cfg.nickname, &cfg.group, &cfg.encoding),
-                command: cmd::ANSENTRY | if utf8 { opt::UTF8OPT } else { 0 },
+                command: cmd::ANSENTRY
+                    | if utf8 { opt::UTF8OPT } else { 0 }
+                    | entry_caps(&cfg),
                 ..proto::Packet::new(0)
             };
             let bytes = ans.encode(&my_user(&cfg), &my_host());
@@ -345,6 +387,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             if added {
                 ctx.st.emit("users-updated", json!({}));
             }
+            maybe_start_handshake(ctx, from, &pkt, &key, &cfg).await;
             // 对方刚上线（BR_ENTRY）：立即重投此前的离线消息
             flush_pending_for(ctx, &key).await;
         }
@@ -363,6 +406,9 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             });
             ctx.st.emit("users-updated", json!({}));
             let _ = added;
+            // 对端应答里若声明加密能力，同样触发预握手（对方可能没收到我们的 BR_ENTRY）
+            let cfg = ctx.st.config();
+            maybe_start_handshake(ctx, from, &pkt, &key, &cfg).await;
             // ANSENTRY 通常是对我们上线通告的应答：对方在线，重投离线消息
             flush_pending_for(ctx, &key).await;
         }
@@ -431,6 +477,30 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             let bytes = r.encode(&my_user(&cfg), &my_host());
             let _ = ctx.sock.send_to(&bytes, from).await;
         }
+        cmd::GETPUBKEY => {
+            // 公钥握手请求（spec §5）：我方开关关闭时不广告、不应答，对端会回退明文
+            let cfg = ctx.st.config();
+            if cfg.encrypt {
+                let capa = entry_caps(&cfg) | crypto::CAPA_OUR_SEND;
+                let mut r = proto::Packet::new(cmd::ANSPUBKEY);
+                r.extra = crypto::build_anspubkey(capa, &ctx.st.own_keypair()).into_bytes();
+                let bytes = r.encode(&my_user(&cfg), &my_host());
+                let _ = ctx.sock.send_to(&bytes, from).await;
+                ctx.st.diag(&format!("-> {from} ANSPUBKEY capa={capa:X}"));
+            } else {
+                ctx.st.diag(&format!("<- {from} GETPUBKEY 忽略：本机加密已关闭"));
+            }
+        }
+        cmd::ANSPUBKEY => {
+            // 对端公钥应答：宽容解析后缓存能力位与公钥（持久化，重启免握手）
+            match crypto::parse_anspubkey(&String::from_utf8_lossy(&pkt.extra)) {
+                Some((capa, pubk)) => {
+                    ctx.st.remember_peer_key(&key, capa, &pubk);
+                    ctx.st.diag(&format!("<- {from} ANSPUBKEY 已缓存 capa={capa:X}"));
+                }
+                None => ctx.st.diag(&format!("<- {from} ANSPUBKEY 解析失败，忽略")),
+            }
+        }
         cmd::RELEASEFILES => {
             // 对端放弃接收：释放对应的文件槽。包编号的进制约定各家不一，两种都试
             let first = pkt.extra.split(|&b| b == b':').next().unwrap_or(b"");
@@ -443,7 +513,6 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                     .retain(|(p, _), _| !cands.contains(p));
             }
         }
-        // GETPUBKEY：不支持加密协商，忽略即可（对端会回退明文）
         _ => {}
     }
 }
@@ -965,6 +1034,14 @@ mod tests {
         assert_eq!(id_candidates("0x1f"), vec![31]);
         assert!(id_candidates("").is_empty());
         assert!(id_candidates("zz").is_empty());
+    }
+
+    #[test]
+    fn entry_caps_follow_switch() {
+        let mut cfg = crate::state::Config::default();
+        assert_eq!(super::entry_caps(&cfg), opt::ENCRYPTOPT | opt::CAPFILEENCOPT);
+        cfg.encrypt = false;
+        assert_eq!(super::entry_caps(&cfg), 0);
     }
 
     #[test]

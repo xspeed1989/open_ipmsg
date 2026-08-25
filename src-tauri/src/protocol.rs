@@ -62,6 +62,8 @@ pub mod opt {
     pub const READCHECKOPT: u32 = 0x0010_0000;
     pub const SECRETEXOPT: u32 = 0x0030_0000; // READCHECK|SECRET
     pub const ENCRYPTOPT: u32 = 0x0040_0000;
+    /// 文件流加密能力广告位（spec §2 常量表）：上线类报文置位表示支持 TCP 文件流加密
+    pub const CAPFILEENCOPT: u32 = 0x0004_0000;
     pub const CAPUTF8OPT: u32 = 0x0100_0000;
     /// 官方编码协商标志（ipmsg.h）：置位表示报文文本为 UTF-8，
     /// 未置位表示本地代码页（中文系统为 GBK）
