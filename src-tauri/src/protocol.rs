@@ -64,10 +64,11 @@ pub mod opt {
     pub const ENCRYPTOPT: u32 = 0x0040_0000;
     /// 文件流加密能力广告位（spec §2 常量表）：上线类报文置位表示支持 TCP 文件流加密
     pub const CAPFILEENCOPT: u32 = 0x0004_0000;
-    /// 文件流加密标志（官方 ipmsg.h）：GETFILEDATA/GETDIRFILES 置位表示扩展部为
-    /// 密封的取文件请求、正文双向过 AES-CTR 密钥流（spec §7）。
-    /// 与加密能力位 CAPA_SIGN_SHA1 同值但命名空间不同（命令选项位 vs ANSPUBKEY capa）。
-    pub const ENCFILEOPT: u32 = 0x2000_0000;
+    /// 文件流加密标志（官方 ipmsg.h L119 = 0x00000800）：GETFILEDATA/GETDIRFILES
+    /// 置位表示扩展部为密封的取文件请求、正文双向过 AES-CTR 密钥流（spec §7）。
+    /// 官方协议按命令类别复用 0x800（入口类报文里同值是 MULTICASTOPT），
+    /// 与本文件既有 MULTICASTOPT 的并存正是官方语义。
+    pub const ENCFILEOPT: u32 = 0x0000_0800;
     pub const CAPUTF8OPT: u32 = 0x0100_0000;
     /// 官方编码协商标志（ipmsg.h）：置位表示报文文本为 UTF-8，
     /// 未置位表示本地代码页（中文系统为 GBK）
