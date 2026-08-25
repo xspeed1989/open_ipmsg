@@ -168,8 +168,8 @@ fn spawn_ticker(ctx: Arc<NetCtx>) {
 }
 
 /// 出站加密的明文输入：完整扩展部 + 恰好一个尾部 \0。
-/// 官方加密报文的密文对象是含 \0 的完整明文（对端解密后剥一个尾部 \0，
-/// 见 rebuild_decrypted），而本端明文扩展部本身不带尾部 \0。
+/// 官方加密报文的密文对象是含 \0 的完整明文（对端解密后由 crypto::OpenMsg.plain
+/// 剥掉这个尾部 \0），而本端明文扩展部本身不带尾部 \0。
 fn plain_payload(extra: &[u8]) -> Vec<u8> {
     let mut p = extra.to_vec();
     p.push(0);
@@ -501,13 +501,12 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                         peer_pub.as_ref(),
                     ) {
                         Ok(m) => {
-                            pkt = match rebuild_decrypted(pkt) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    ctx.st.diag(&format!("decrypt-fail {from}: {e}"));
-                                    return;
-                                }
-                            };
+                            // 解包明文已剥掉密封时附加的尾部 \0（crypto::OpenMsg.plain），
+                            // 直接换回原扩展部并清掉 ENCRYPTOPT，重构出等价明文报文；
+                            // 其余命令标志（READCHECKOPT 等）原样保留，下游按普通
+                            // 明文路径处理。
+                            pkt.extra = m.plain;
+                            pkt.command &= !opt::ENCRYPTOPT;
                             enc_meta = Some(m.sig_ok);
                         }
                         Err(e) => {
@@ -595,18 +594,6 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
         }
         _ => {}
     }
-}
-
-/// 解密成功后重构等价明文报文：剥掉 ENCRYPTOPT 与密文尾部的一个 \0
-///
-/// 只剥**一个**尾部 \0（文件公告以 \a 结尾，其后的 \0 才是密文填充），
-/// 其余命令标志（READCHECKOPT 等）原样保留，让下游按普通明文报文处理。
-fn rebuild_decrypted(mut p: proto::Packet) -> Result<proto::Packet, String> {
-    if p.extra.last() == Some(&0) {
-        p.extra.pop();
-    }
-    p.command &= !opt::ENCRYPTOPT;
-    Ok(p)
 }
 
 async fn handle_sendmsg(
@@ -1179,22 +1166,6 @@ mod tests {
             super::plain_payload(b"a\0f.zip:1:1:1:\x07"),
             b"a\0f.zip:1:1:1:\x07\0"
         );
-    }
-
-    #[test]
-    fn rebuild_packet_from_decrypted_strips_one_trailing_nul() {
-        let p = super::rebuild_decrypted(proto::Packet {
-            pkt_no: 1,
-            user: "a".into(),
-            host: "b".into(),
-            command: cmd::SENDMSG | opt::ENCRYPTOPT | opt::READCHECKOPT,
-            extra: b"hi\0rep.zip:1:2:3:\x07\0".to_vec(),
-        })
-        .unwrap();
-        assert_eq!(p.command & opt::ENCRYPTOPT, 0);
-        assert_eq!(p.command & opt::READCHECKOPT, opt::READCHECKOPT);
-        assert_eq!(proto::text_of(&p), "hi");
-        assert!(p.extra.ends_with(b":\x07")); // 只剥一个尾部 \0（\x07 即 C 转义 \a）
     }
 
     #[test]
