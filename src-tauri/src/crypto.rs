@@ -5,7 +5,7 @@
 // 暂时压制 dead_code 提示；后续任务接入后可移除。
 #![allow(dead_code)]
 
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{BigUint, RsaPrivateKey, RsaPublicKey};
 
 // 能力位（ipmsg.h Ver4.50）
 pub const CAPA_RSA1024: u32 = 0x0000_0002;
@@ -87,9 +87,56 @@ impl KeyPair {
     }
 }
 
+/// 小写 hex 编码（ANSPUBKEY 的 E/N 段）
+pub(crate) fn hex_lower(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// 宽容 hex 解码：大小写通吃、容忍首尾空白；空串/奇数长度/非 hex 字符返回 None。
+/// 按字节对解码而非按 &str 切片：对端字符串不可信，非 ASCII 输入不得 panic。
+pub(crate) fn hex_decode_loose(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 || s.is_empty() {
+        return None;
+    }
+    let b = s.as_bytes();
+    (0..b.len())
+        .step_by(2)
+        .map(|i| {
+            let chunk = std::str::from_utf8(&b[i..i + 2]).ok()?;
+            u8::from_str_radix(chunk, 16).ok()
+        })
+        .collect()
+}
+
+/// ANSPUBKEY 扩展部："{capa:X}:{e:x}-{n:x}"（capa 大写 hex，E/N 小写 hex）
+pub fn build_anspubkey(capa: u32, key: &KeyPair) -> String {
+    format!(
+        "{capa:X}:{}-{}",
+        hex_lower(&key.exponent_be()),
+        hex_lower(&key.modulus_be())
+    )
+}
+
+/// 宽容解析 ANSPUBKEY 扩展部："{capa}:{e}-{n}"，hex 大小写通吃；
+/// N 允许被对端裁掉前导零字节（BigUint 按值还原，天然左补零语义）
+pub fn parse_anspubkey(extra: &str) -> Option<(u32, RsaPublicKey)> {
+    let (capa_s, rest) = extra.trim().split_once(':')?;
+    let capa = u32::from_str_radix(capa_s.trim().trim_start_matches("0x"), 16).ok()?;
+    let (e_s, n_s) = rest.split_once('-')?;
+    let e = hex_decode_loose(e_s)?;
+    let n = hex_decode_loose(n_s)?;
+    if n.len() > RSA_BITS / 8 * 2 {
+        return None; // 超过 4096 位直接拒绝
+    }
+    let pubk = RsaPublicKey::new(BigUint::from_bytes_be(&n), BigUint::from_bytes_be(&e)).ok()?;
+    Some((capa, pubk))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsa::traits::PublicKeyParts;
 
     #[test]
     fn keypair_json_roundtrip() {
@@ -111,5 +158,58 @@ mod tests {
         let fp = kp.fingerprint();
         assert_eq!(fp.split(':').count(), 8);
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit() || c == ':'));
+    }
+
+    #[test]
+    fn anspubkey_roundtrip() {
+        let kp = KeyPair::generate().unwrap();
+        let capa = CAPA_RSA2048 | CAPA_AES256 | CAPA_CAPFILEENC;
+        let s = build_anspubkey(capa, &kp);
+        // 大写 hex capa。注：brief 原文断言 "40100404:"，但按 Task 1 已提交常量
+        // RSA2048|AES256|CAPFILEENC = 0x4|0x100000|0x40000 = 0x140004，正确前缀为 "140004:"
+        assert!(s.starts_with("140004:"));
+        let (got_capa, pubk) = parse_anspubkey(&s).unwrap();
+        assert_eq!(got_capa, capa);
+        assert_eq!(pubk.n().to_bytes_be(), kp.modulus_be());
+        assert_eq!(pubk.e().to_bytes_be(), vec![1, 0, 1]);
+    }
+
+    #[test]
+    fn anspubkey_parse_tolerates_case_and_short_n() {
+        let kp = KeyPair::generate().unwrap();
+        let e = kp.exponent_be();
+        let n = kp.modulus_be();
+        let s = format!(
+            "{:x}:{}-{}",             // 全小写也必须能解析（hex_lower 产物已是 hex 文本，勿再套 {:x}）
+            CAPA_OUR_SEND,
+            hex_lower(&e),
+            hex_lower(&n[1..])         // 模数少一个前导零字节也要能左补齐
+        );
+        let (capa, pubk) = parse_anspubkey(&s).unwrap();
+        assert_eq!(capa, CAPA_OUR_SEND);
+        // 注：brief 原文 `to_bytes_be()[255]` 必越界 panic——左裁后的 N 按值还原成
+        // 255 字节的最小大端编码，故比较尾字节（与原断言意图一致：模数值未变）
+        assert_eq!(pubk.n().to_bytes_be().last(), n.last());
+        assert_eq!(pubk.e().to_bytes_be(), e);
+    }
+
+    #[test]
+    fn anspubkey_parse_rejects_junk() {
+        assert!(parse_anspubkey("no-colon").is_none());
+        assert!(parse_anspubkey("40100004:zz-aa").is_none());
+    }
+
+    #[test]
+    fn hex_decode_loose_rejects_bad_input_without_panic() {
+        // 对端发来的字符串不可信：非 ASCII（偶数字节长）也不得 panic
+        assert!(hex_decode_loose("").is_none()); // 空串
+        assert!(hex_decode_loose("abc").is_none()); // 奇数长度
+        assert!(hex_decode_loose("zz").is_none()); // 非 hex 字符
+        assert!(hex_decode_loose("中中").is_none()); // 多字节 UTF-8，字节长为偶数
+        assert_eq!(
+            hex_decode_loose("AbCd"),
+            Some(vec![0xab, 0xcd]) // 大小写通吃
+        );
+        assert_eq!(hex_decode_loose(" 01  "), Some(vec![0x01])); // 容忍首尾空白
     }
 }
