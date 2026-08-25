@@ -450,6 +450,18 @@ impl AppState {
         self.persist_peer_keys();
     }
 
+    /// 撤回对端公钥缓存并持久化（能力撤回规则）。
+    ///
+    /// 先前广告过加密能力的对端重新上线时不再声明 ENCRYPTOPT，说明对方已
+    /// 关闭加密 —— 继续持有旧公钥会让我方误发密文、对方永远解不开。
+    /// 未缓存的对端是安全空操作；只影响目标 IP，其它缓存原样保留。
+    pub fn forget_peer_key(&self, ip: &str) {
+        let removed = self.peer_crypto.lock().unwrap().remove(ip).is_some();
+        if removed {
+            self.persist_peer_keys();
+        }
+    }
+
     fn persist_peer_keys(&self) {
         use rsa::traits::PublicKeyParts;
         let data = self.peer_crypto.lock().unwrap();
@@ -1547,6 +1559,33 @@ mod tests {
         assert!(st.peer_marked_plain("10.0.0.8"));
         assert!(!st.peer_marked_plain("10.0.0.9"));
         assert!(!st2.peer_marked_plain("10.0.0.8"), "明文标记不持久化");
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn forget_peer_key_drops_cache_and_persists_withdrawal() {
+        let st = temp_state("forget");
+        let kp = KeyPair::generate().unwrap();
+        st.remember_peer_key("10.0.0.9", 0x40100004, &kp.public_key());
+        assert!(st.peer_pubkey("10.0.0.9").is_some());
+
+        // 能力撤回：对端重新上线却不再声明 ENCRYPTOPT 时必须清掉其公钥缓存，
+        // 否则我方会继续向已关闭加密的对端发送密文（对方永远解不开）
+        st.forget_peer_key("10.0.0.9");
+        assert!(
+            st.peer_pubkey("10.0.0.9").is_none(),
+            "撤回后内存缓存立即失效"
+        );
+        // 撤回必须持久化：重启（新实例读盘）后旧公钥不得复活
+        let st2 = AppState::new(st.data_dir.clone());
+        st2.load_peer_keys();
+        assert!(st2.peer_pubkey("10.0.0.9").is_none(), "撤回写盘，重启不复活");
+
+        // 未缓存的对端撤回是安全空操作；其它对端的缓存不受影响
+        st.forget_peer_key("10.0.0.99");
+        st.remember_peer_key("10.0.0.8", 1, &kp.public_key());
+        st.forget_peer_key("10.0.0.9");
+        assert!(st.peer_pubkey("10.0.0.8").is_some(), "只撤回目标对端");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 

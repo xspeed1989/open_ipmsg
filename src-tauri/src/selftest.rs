@@ -5,6 +5,13 @@
 //!   3. 发送附件 —— 假对端作为 TCP 客户端把文件完整取回并逐字节比对
 //!   4. 接收附件 —— 假对端作为 TCP 服务端供我们下载并逐字节比对
 //!   5. 下线广播（BR_EXIT）
+//! 第二个场景（双实例加密全链路）拉起两套完整网络栈 A/B：
+//!   1. 单播发现 → 双向预握手 → 双方 peer_keys.json 各缓存对方公钥
+//!   2. A→B 文本密文送达，B 落库 enc=true 且 sig_ok=true
+//!   3. B→A 反向同样断言
+//!   4. 能力撤回：encrypt=false 的实例 C 以同一 IP 上线 → A 丢弃缓存 →
+//!      后续发送回退明文，C 落库 enc=false
+//!   （文件传输加密属 Task 10 范围，本场景不涉及附件断言。）
 //! 全部通过打印 PASS 行并以退出码 0 结束；任一失败打印 FAIL 且退出码非 0。
 
 use crate::net;
@@ -55,7 +62,9 @@ pub fn run() -> bool {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    rt.block_on(async_run())
+    let plain_ok = rt.block_on(async_run());
+    let crypto_ok = rt.block_on(crypto_roundtrip());
+    plain_ok && crypto_ok
 }
 
 async fn free_udp_port() -> u16 {
@@ -609,6 +618,165 @@ fn finish(log: Log, tasks: Vec<tokio::task::JoinHandle<()>>, data_dir: &Path) ->
     let ok = log.all_ok();
     let _ = std::fs::remove_dir_all(data_dir);
     println!("== 自检{} ==", if ok { "全部通过 ✔" } else { "存在失败项 ✘" });
+    ok
+}
+
+/* ==================== 场景：双实例端到端加密全链路 ==================== */
+
+/// peer_keys.json 里是否已缓存该 IP 的公钥（读盘断言，重启口径）
+fn peer_keys_cached(dir: &Path, ip: &str) -> bool {
+    std::fs::read_to_string(dir.join("peer_keys.json"))
+        .ok()
+        .and_then(|txt| serde_json::from_str::<Value>(&txt).ok())
+        .map(|v| v.get(ip).is_some())
+        .unwrap_or(false)
+}
+
+/// 双实例加密全链路：握手 → 密文互发 → 能力撤回。
+///
+/// A、B 是两套完整网络栈（独立 UDP 端口 + 数据目录），均默认 encrypt=true；
+/// 回环上所有实例的会话键都是对端 IP「127.0.0.1」，各自读写独立数据目录互不
+/// 干扰。撤回环节用第三实例 C（encrypt=false）扮演「同一对端重新上线却不再
+/// 声明 ENCRYPTOPT」：A 必须丢弃其公钥缓存，之后的发送回退明文。
+async fn crypto_roundtrip() -> bool {
+    println!("== 场景：双实例加密全链路 ==");
+    let base =
+        std::env::temp_dir().join(format!("open-ipmsg-selftest-crypto-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (dir_a, dir_b, dir_c) = (base.join("a"), base.join("b"), base.join("c"));
+    let port_a = free_udp_port().await;
+    let port_b = free_udp_port().await;
+    let port_c = free_udp_port().await;
+    let key = "127.0.0.1";
+    let mut log = Log(vec![]);
+
+    /* -- 实例 A / B：Config::default 的 encrypt 即为 true -- */
+    let st_a = Arc::new(AppState::new(dir_a.clone()));
+    let mut cfg_a = Config::default();
+    cfg_a.nickname = "加密实例A".into();
+    cfg_a.group = "测试组".into();
+    cfg_a.encoding = "utf8".into();
+    cfg_a.download_dir = dir_a.join("dl").to_string_lossy().into_owned();
+    st_a.set_config(cfg_a);
+    let ctx_a = net::start_network(st_a.clone(), port_a).await.expect("start A");
+
+    let st_b = Arc::new(AppState::new(dir_b.clone()));
+    let mut cfg_b = Config::default();
+    cfg_b.nickname = "加密实例B".into();
+    cfg_b.group = "测试组".into();
+    cfg_b.encoding = "utf8".into();
+    cfg_b.download_dir = dir_b.join("dl").to_string_lossy().into_owned();
+    st_b.set_config(cfg_b);
+    let ctx_b = net::start_network(st_b.clone(), port_b).await.expect("start B");
+
+    /* ---- 1. A 单播发现 B；双方各走一遍 GETPUBKEY 预握手 ---- */
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let addr_b: SocketAddr = format!("127.0.0.1:{port_b}").parse().unwrap();
+    net::announce_unicast(&ctx_a, &[addr_b]).await;
+
+    let discovered = wait_for(2500, || st_a.peers.lock().unwrap().contains_key(key)).await;
+    log.check("发现实例 B（BR_ENTRY→ANSENTRY 注册）", discovered);
+    // B 缓存了 A 的公钥 = B 侧预握手已完成（peer_keys.json 非空且含本机回环键）
+    let b_cached_a = wait_for(5000, || peer_keys_cached(&dir_b, key)).await;
+    log.check("A 广播声明 ENCRYPTOPT → B 完成预握手并持久化 A 的公钥", b_cached_a);
+    let a_cached_b = wait_for(5000, || peer_keys_cached(&dir_a, key)).await;
+    log.check("B 应答声明 ENCRYPTOPT → A 完成预握手并持久化 B 的公钥", a_cached_b);
+    if !a_cached_b || !b_cached_a {
+        return finish_crypto(log, &base);
+    }
+
+    /* ---- 2. A→B 文本：密封发出，B 解密落库 ---- */
+    let text_ab = "密文互发：A 到 B";
+    match net::send_message(&ctx_a, key, text_ab, vec![]).await {
+        Ok(rec) => log.check(
+            "A 发送返回 out 记录且实际密文发出（enc=true）",
+            rec["dir"] == "out" && rec["enc"] == true,
+        ),
+        Err(e) => {
+            eprintln!("      A 发送错误: {e}");
+            log.check("A 发送返回 out 记录且实际密文发出（enc=true）", false);
+        }
+    }
+    let got_in_b = wait_for(4000, || {
+        st_b.read_history(key, 50).iter().any(|r| {
+            r["dir"] == "in" && r["text"] == text_ab && r["enc"] == true && r["sig_ok"] == true
+        })
+    })
+    .await;
+    log.check("B 解密落库：文本一致且 enc=true、sig_ok=true", got_in_b);
+
+    /* ---- 3. 反向 B→A 同样断言 ---- */
+    let text_ba = "密文互发：B 回 A";
+    match net::send_message(&ctx_b, key, text_ba, vec![]).await {
+        Ok(rec) => log.check(
+            "B 发送返回 out 记录且实际密文发出（enc=true）",
+            rec["dir"] == "out" && rec["enc"] == true,
+        ),
+        Err(e) => {
+            eprintln!("      B 发送错误: {e}");
+            log.check("B 发送返回 out 记录且实际密文发出（enc=true）", false);
+        }
+    }
+    let got_in_a = wait_for(4000, || {
+        st_a.read_history(key, 50).iter().any(|r| {
+            r["dir"] == "in" && r["text"] == text_ba && r["enc"] == true && r["sig_ok"] == true
+        })
+    })
+    .await;
+    log.check("A 解密落库：文本一致且 enc=true、sig_ok=true", got_in_a);
+
+    /* ---- 4. 能力撤回：encrypt=false 的实例 C 以同一 IP 上线 ---- */
+    // 与真实场景同构：老对手关掉加密后重新上线，广播里不再有 ENCRYPTOPT。
+    // A 视角下会话键不变（仍是 127.0.0.1），只是投递端口随最新报文刷新到 C。
+    let st_c = Arc::new(AppState::new(dir_c.clone()));
+    let mut cfg_c = Config::default();
+    cfg_c.nickname = "明文实例C".into();
+    cfg_c.group = "测试组".into();
+    cfg_c.encoding = "utf8".into();
+    cfg_c.encrypt = false; // 撤回方：上线通告不再携带 ENCRYPTOPT
+    cfg_c.download_dir = dir_c.join("dl").to_string_lossy().into_owned();
+    st_c.set_config(cfg_c);
+    let ctx_c = net::start_network(st_c.clone(), port_c).await.expect("start C");
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let addr_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
+    net::announce_unicast(&ctx_c, &[addr_a]).await;
+
+    let forgotten = wait_for(4000, || !peer_keys_cached(&dir_a, key)).await;
+    log.check(
+        "重新上线却未声明 ENCRYPTOPT → A 撤回该对端公钥缓存（写盘生效）",
+        forgotten,
+    );
+
+    /* ---- 5. 撤回后 A 只能明文发送：C 收到的记录 enc=false ---- */
+    let text_plain = "撤回后的明文消息";
+    match net::send_message(&ctx_a, key, text_plain, vec![]).await {
+        Ok(rec) => log.check(
+            "撤回后发送回退明文（out 记录 enc=false）",
+            rec["dir"] == "out" && rec["enc"] == false,
+        ),
+        Err(e) => {
+            eprintln!("      A 发送错误: {e}");
+            log.check("撤回后发送回退明文（out 记录 enc=false）", false);
+        }
+    }
+    let plain_at_c = wait_for(4000, || {
+        st_c.read_history(key, 50).iter().any(|r| {
+            r["dir"] == "in" && r["text"] == text_plain && r["enc"] == false
+        })
+    })
+    .await;
+    log.check("明文实例 C 收到该消息且记录 enc=false", plain_at_c);
+
+    finish_crypto(log, &base)
+}
+
+fn finish_crypto(log: Log, base: &Path) -> bool {
+    let ok = log.all_ok();
+    let _ = std::fs::remove_dir_all(base);
+    println!(
+        "== 加密场景{} ==",
+        if ok { "全部通过 ✔" } else { "存在失败项 ✘" }
+    );
     ok
 }
 

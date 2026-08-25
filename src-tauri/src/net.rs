@@ -326,6 +326,23 @@ async fn maybe_start_handshake(
     send_getpubkey(ctx, from, cfg).await;
 }
 
+/// 能力撤回（与 maybe_start_handshake 互补，spec §7 补充）：对端此前广告过
+/// 加密能力、我方已缓存其公钥，如今上线类报文却不再声明 ENCRYPTOPT ——
+/// 说明对方已关闭加密。继续持有缓存会让我方向它发送密文（永远解不开），
+/// 必须立刻丢弃缓存；之后的出站消息自然回退明文并重新触发握手探测。
+fn maybe_withdraw_peer_key(
+    ctx: &NetCtx,
+    from: SocketAddr,
+    pkt: &proto::Packet,
+    key: &str,
+    cfg: &Config,
+) {
+    if cfg.encrypt && pkt.command & opt::ENCRYPTOPT == 0 && ctx.st.peer_pubkey(key).is_some() {
+        ctx.st.forget_peer_key(key);
+        ctx.st.diag(&format!("<- {from} 上线通告未声明 ENCRYPTOPT，撤回该对端公钥缓存"));
+    }
+}
+
 /// GETPUBKEY 构造与发送（Task 6 口径）：扩展部 = 我方能力位小写 hex
 /// （与 entry_caps 一致，另带 CAPA_OUR_SEND 声明我方也会加密）。
 /// 发出即返回，不等对方 ANSPUBKEY —— 调用方各自决定是否继续本次明文投递。
@@ -429,6 +446,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                 ctx.st.emit("users-updated", json!({}));
             }
             maybe_start_handshake(ctx, from, &pkt, &key, &cfg).await;
+            maybe_withdraw_peer_key(ctx, from, &pkt, &key, &cfg);
             // 对方刚上线（BR_ENTRY）：立即重投此前的离线消息
             flush_pending_for(ctx, &key).await;
         }
@@ -450,6 +468,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             // 对端应答里若声明加密能力，同样触发预握手（对方可能没收到我们的 BR_ENTRY）
             let cfg = ctx.st.config();
             maybe_start_handshake(ctx, from, &pkt, &key, &cfg).await;
+            maybe_withdraw_peer_key(ctx, from, &pkt, &key, &cfg);
             // ANSENTRY 通常是对我们上线通告的应答：对方在线，重投离线消息
             flush_pending_for(ctx, &key).await;
         }
