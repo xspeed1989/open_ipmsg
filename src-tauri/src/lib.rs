@@ -60,6 +60,9 @@ struct ConfigPatch {
     encoding: String,
     #[serde(default)]
     theme: Option<String>,
+    /// 加密开关；省略时保留现值（旧前端兼容）
+    #[serde(default)]
+    encrypt: Option<bool>,
 }
 
 /// 配置 + 本机信息（前端设置页展示）
@@ -85,9 +88,12 @@ async fn get_config(st: State<'_, SharedState>) -> Result<Value, String> {
         "download_dir": cfg.download_dir,
         "encoding": cfg.encoding,
         "theme": cfg.theme,
+        "encrypt": cfg.encrypt,
         "hostname": hostname,
         "ips": ips,
         "version": env!("CARGO_PKG_VERSION"),
+        // 本机公钥指纹：设置页与对端核对密钥用（首次调用会触发生成并落盘）
+        "key_fp": st.fingerprint(),
     }))
 }
 
@@ -100,6 +106,7 @@ async fn save_config(
     if patch.nickname.trim().is_empty() {
         return Err("昵称不能为空".into());
     }
+    let prev = st.config();
     let cfg = Config {
         nickname: patch.nickname.trim().to_string(),
         group: patch.group.trim().to_string(),
@@ -114,6 +121,8 @@ async fn save_config(
             "dark" => "dark".into(),
             _ => "system".into(),
         },
+        // 加密开关：补丁未携带时保留现值，避免旧前端保存配置时误关加密
+        encrypt: patch.encrypt.unwrap_or(prev.encrypt),
     };
     st.set_config(cfg.clone());
     st.persist_config().map_err(|e| e.to_string())?;
@@ -928,6 +937,7 @@ pub fn run() {
                 encoding: "utf8".into(),
                 download_dir: String::new(),
                 theme: "system".into(),
+                encrypt: true,
             });
             let _ctx = net::start_network(st.clone(), protocol::DEFAULT_PORT)
                 .await
@@ -963,6 +973,8 @@ pub fn run() {
             st.load_config();
             // 恢复离线消息待投递队列（对方上线后自动重投）
             st.load_pending();
+            // 恢复对端公钥缓存（加密会话重启后无需重新交换公钥）
+            st.load_peer_keys();
             // 会话键从 ip:port 归一化为纯 IP：把旧命名的 `<ip>_<端口>.jsonl`
             // 迁移成 `<ip>.jsonl`，并改写记录内的 peer.key 快照
             let migrated = st.migrate_legacy_history_keys();

@@ -4,8 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::crypto::KeyPair;
+use rsa::{BigUint, RsaPublicKey};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Config {
@@ -20,6 +23,9 @@ pub struct Config {
     /// 界面主题：system（跟随系统）/ light / dark
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// 端到端加密总开关：默认开启；关闭时消息按官方明文协议发送
+    #[serde(default = "default_encrypt")]
+    pub encrypt: bool,
 }
 
 fn default_theme() -> String {
@@ -32,6 +38,10 @@ fn default_encoding() -> String {
     "utf8".into()
 }
 
+fn default_encrypt() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -40,6 +50,7 @@ impl Default for Config {
             download_dir: String::new(),
             encoding: default_encoding(),
             theme: default_theme(),
+            encrypt: default_encrypt(),
         }
     }
 }
@@ -100,6 +111,24 @@ pub const OFFER_TTL_SECS: u64 = 24 * 3600;
 
 type EventFn = Box<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 
+/// peer_keys.json 单条记录：{ip: {capa, n_b64, e_b64}}
+#[derive(Serialize, Deserialize)]
+struct PeerKeyEntry {
+    capa: u32,
+    n_b64: String,
+    e_b64: String,
+}
+
+fn b64_encode(b: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
+}
+
 pub struct AppState {
     pub config: Mutex<Config>,
     pub peers: Mutex<HashMap<String, PeerInfo>>,
@@ -115,11 +144,19 @@ pub struct AppState {
     /// 待投递的离线消息：会话 key → 队列（FIFO）
     pending_out: Mutex<HashMap<String, Vec<PendingOut>>>,
     on_event: Mutex<Option<EventFn>>,
+    /// 对端 IP →（最近一次 ANSPUBKEY 的能力位，对端公钥）；持久化到 peer_keys.json
+    peer_crypto: Mutex<HashMap<String, (u32, RsaPublicKey)>>,
+    /// 已确认走明文协议的对端 IP（仅内存态：重启后重新协商）
+    peer_plain: Mutex<HashSet<String>>,
+    /// 本机密钥对：懒加载生成 + ipmsg_key.json 持久化（进程内只生成一次）
+    own_key: OnceLock<Arc<KeyPair>>,
     pub data_dir: PathBuf,
     pub logs_dir: PathBuf,
 }
 
 const SEEN_CAP: usize = 8192;
+/// 对端公钥缓存条数上限：正常局域网远用不满，防敌意洪泛导致无限膨胀
+const PEER_KEY_CAP: usize = 4096;
 
 pub fn now_secs() -> u64 {
     SystemTime::now()
@@ -142,6 +179,9 @@ impl AppState {
             hist_lock: Mutex::new(()),
             pending_out: Mutex::new(HashMap::new()),
             on_event: Mutex::new(None),
+            peer_crypto: Mutex::new(HashMap::new()),
+            peer_plain: Mutex::new(HashSet::new()),
+            own_key: OnceLock::new(),
             data_dir,
             logs_dir,
         }
@@ -343,6 +383,126 @@ impl AppState {
             }
         }
         true
+    }
+
+    /* ---------- 端到端加密：本机密钥与对端公钥缓存 ---------- */
+
+    fn own_key_path(&self) -> PathBuf {
+        self.data_dir.join("ipmsg_key.json")
+    }
+
+    fn peer_keys_path(&self) -> PathBuf {
+        self.data_dir.join("peer_keys.json")
+    }
+
+    /// 本机 RSA 密钥对（懒加载）：进程内只生成/读取一次。
+    /// 首次调用时读 `ipmsg_key.json`，有且合法 → 加载；无 → 生成并落盘；
+    /// 文件损坏 → 记 diag 后重新生成并覆盖写回，绝不因坏文件而 panic。
+    pub fn own_keypair(&self) -> Arc<KeyPair> {
+        self.own_key
+            .get_or_init(|| {
+                let path = self.own_key_path();
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    match KeyPair::from_json(&content) {
+                        Ok(kp) => return Arc::new(kp),
+                        Err(e) => self.diag(&format!("own-key 密钥文件损坏，重新生成：{e}")),
+                    }
+                }
+                let kp = Arc::new(KeyPair::generate().expect("RSA-2048 密钥生成失败"));
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                if let Err(e) = std::fs::write(&path, kp.to_json()) {
+                    self.diag(&format!("own-key 密钥落盘失败：{e}"));
+                }
+                kp
+            })
+            .clone()
+    }
+
+    /// 本机公钥指纹（设置页核对用；get_config 透出）
+    pub fn fingerprint(&self) -> String {
+        self.own_keypair().fingerprint()
+    }
+
+    /// 对端最近一次公告的公钥（未缓存返回 None）
+    pub fn peer_pubkey(&self, ip: &str) -> Option<RsaPublicKey> {
+        self.peer_crypto.lock().unwrap().get(ip).map(|(_, k)| k.clone())
+    }
+
+    /// 对端最近一次公告的能力位（未缓存返回 0）
+    pub fn peer_capa(&self, ip: &str) -> u32 {
+        self.peer_crypto.lock().unwrap().get(ip).map(|(c, _)| *c).unwrap_or(0)
+    }
+
+    /// 缓存对端公钥并持久化到 peer_keys.json（重启不丢）
+    pub fn remember_peer_key(&self, ip: &str, capa: u32, pubk: &RsaPublicKey) {
+        {
+            let mut m = self.peer_crypto.lock().unwrap();
+            m.insert(ip.to_string(), (capa, pubk.clone()));
+            if m.len() > PEER_KEY_CAP {
+                // 防御性上限：异常洪泛时不无限膨胀。保留当前这条，其余清空，
+                // 避免把刚学到的对端也丢掉、或把空表写回磁盘
+                m.clear();
+                m.insert(ip.to_string(), (capa, pubk.clone()));
+            }
+        }
+        self.persist_peer_keys();
+    }
+
+    fn persist_peer_keys(&self) {
+        use rsa::traits::PublicKeyParts;
+        let data = self.peer_crypto.lock().unwrap();
+        let map: HashMap<String, PeerKeyEntry> = data
+            .iter()
+            .map(|(ip, (capa, k))| {
+                (
+                    ip.clone(),
+                    PeerKeyEntry {
+                        capa: *capa,
+                        n_b64: b64_encode(&k.n().to_bytes_be()),
+                        e_b64: b64_encode(&k.e().to_bytes_be()),
+                    },
+                )
+            })
+            .collect();
+        drop(data);
+        let bytes = serde_json::to_vec(&map).unwrap_or_default();
+        if let Some(dir) = self.peer_keys_path().parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(self.peer_keys_path(), bytes);
+    }
+
+    /// 启动时从磁盘恢复对端密钥缓存；单条损坏跳过该条，整体损坏视为无缓存
+    pub fn load_peer_keys(&self) {
+        let Ok(content) = std::fs::read_to_string(self.peer_keys_path()) else {
+            return;
+        };
+        let Ok(map) = serde_json::from_str::<HashMap<String, PeerKeyEntry>>(&content) else {
+            return;
+        };
+        let mut out: HashMap<String, (u32, RsaPublicKey)> = HashMap::new();
+        for (ip, ent) in map {
+            let (Some(n), Some(e)) = (b64_decode(&ent.n_b64), b64_decode(&ent.e_b64)) else {
+                continue;
+            };
+            if let Ok(pubk) =
+                RsaPublicKey::new(BigUint::from_bytes_be(&n), BigUint::from_bytes_be(&e))
+            {
+                out.insert(ip, (ent.capa, pubk));
+            }
+        }
+        *self.peer_crypto.lock().unwrap() = out;
+    }
+
+    /// 标记该对端只走明文协议（仅内存态：重启后按报文重新协商）
+    pub fn mark_peer_plain(&self, ip: &str) {
+        self.peer_plain.lock().unwrap().insert(ip.to_string());
+    }
+
+    pub fn peer_marked_plain(&self, ip: &str) -> bool {
+        self.peer_plain.lock().unwrap().contains(ip)
     }
 
     /* ---------- 离线消息待投递队列 ---------- */
@@ -1356,6 +1516,94 @@ mod tests {
             st.logs_dir.join("10.0.0.9_2425.jsonl").exists(),
             "目标已存在时保留旧文件，不做有损合并"
         );
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn peer_key_cache_persists_across_reload() {
+        use crate::crypto::KeyPair;
+        use rsa::traits::PublicKeyParts;
+        let st = temp_state("pcrypt");
+        let kp = KeyPair::generate().unwrap();
+        st.remember_peer_key("10.0.0.9", 0x40100004, &kp.public_key());
+        assert!(st.peer_pubkey("10.0.0.9").is_some());
+        assert_eq!(st.peer_capa("10.0.0.9") & 0x40100004, 0x40100004);
+        // 未缓存的对端：公钥 None、能力位 0
+        assert!(st.peer_pubkey("10.0.0.99").is_none());
+        assert_eq!(st.peer_capa("10.0.0.99"), 0);
+
+        // 新建同目录实例模拟重启
+        let st2 = AppState::new(st.data_dir.clone());
+        st2.load_peer_keys();
+        assert!(st2.peer_pubkey("10.0.0.9").is_some(), "重启后密钥仍在");
+        assert_eq!(
+            st2.peer_pubkey("10.0.0.9").unwrap().n().to_bytes_be(),
+            kp.public_key().n().to_bytes_be()
+        );
+        assert_eq!(st2.peer_capa("10.0.0.9"), 0x40100004, "能力位随密钥一起恢复");
+
+        // 明文标记是内存态，不跨实例
+        st.mark_peer_plain("10.0.0.8");
+        assert!(st.peer_marked_plain("10.0.0.8"));
+        assert!(!st.peer_marked_plain("10.0.0.9"));
+        assert!(!st2.peer_marked_plain("10.0.0.8"), "明文标记不持久化");
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn own_keypair_lazy_generates_and_persists() {
+        let st = temp_state("ownkey");
+        let fp1 = st.own_keypair().fingerprint();
+        assert!(st.data_dir.join("ipmsg_key.json").exists(), "生成即落盘");
+        // 幂等：同一实例反复取是同一把钥匙
+        assert_eq!(st.own_keypair().fingerprint(), fp1);
+
+        // 重启（新实例读同一数据目录）后仍是同一把钥匙
+        let st2 = AppState::new(st.data_dir.clone());
+        assert_eq!(st2.own_keypair().fingerprint(), fp1);
+        assert_eq!(st.fingerprint(), fp1);
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn own_keypair_regenerates_on_corrupt_file() {
+        let st = temp_state("ownkey-corrupt");
+        std::fs::create_dir_all(&st.data_dir).unwrap();
+        std::fs::write(st.data_dir.join("ipmsg_key.json"), "{{{不是JSON").unwrap();
+        // 损坏文件不能让进程崩：重新生成一把并覆盖写回
+        let kp = st.own_keypair();
+        assert_eq!(kp.modulus_be().len(), crate::crypto::RSA_BITS / 8);
+        let fp = kp.fingerprint();
+        let st2 = AppState::new(st.data_dir.clone());
+        assert_eq!(st2.own_keypair().fingerprint(), fp, "重生的钥匙已落盘");
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn encrypt_flag_defaults_true_and_persists() {
+        let st = temp_state("encflag");
+        std::fs::create_dir_all(&st.data_dir).unwrap();
+        st.load_config();
+        assert!(st.config().encrypt, "默认开启加密");
+
+        let mut cfg = st.config();
+        cfg.encrypt = false;
+        st.set_config(cfg);
+        st.persist_config().unwrap();
+
+        let st2 = AppState::new(st.data_dir.clone());
+        st2.load_config();
+        assert!(!st2.config().encrypt, "关闭状态重启后保留");
+
+        // 旧版本配置文件没有 encrypt 字段时按默认值补齐（serde default）
+        let path = st.data_dir.join("config.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("encrypt");
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let st3 = AppState::new(st.data_dir.clone());
+        st3.load_config();
+        assert!(st3.config().encrypt, "缺失字段回落 serde 默认值 true");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 }

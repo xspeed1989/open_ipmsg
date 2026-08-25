@@ -61,6 +61,12 @@ impl KeyPair {
             .map_err(|e| format!("密钥文件损坏：{e}"))?;
         let priv_key = RsaPrivateKey::from_pkcs8_der(&der)
             .map_err(|e| format!("密钥文件损坏：{e}"))?;
+        // 尺寸绑定校验：模数必须恰好 RSA_BITS 位。错误尺寸（敌意或损坏）的
+        // 密钥文件会让 modulus_be 的定长补齐逻辑下溢/越界 panic，入口直接拒绝。
+        use rsa::traits::PublicKeyParts;
+        if priv_key.n().bits() != RSA_BITS {
+            return Err(format!("密钥模数不是 {RSA_BITS} 位，拒绝加载"));
+        }
         Ok(KeyPair { priv_key })
     }
 
@@ -335,6 +341,19 @@ mod tests {
     #[test]
     fn from_json_rejects_garbage() {
         assert!(KeyPair::from_json("not json").is_err());
+    }
+
+    #[test]
+    fn from_json_rejects_wrong_size_key() {
+        // 敌意/错误尺寸的密钥文件必须被拒绝：非 2048 位模数会让 modulus_be
+        // 的定长补齐逻辑越界。加载入口就挡掉，绝不能让坏钥匙混进来。
+        let mut rng = rand::thread_rng();
+        let priv_1024 = RsaPrivateKey::new(&mut rng, 1024).unwrap();
+        let kp = KeyPair { priv_key: priv_1024 };
+        assert!(
+            KeyPair::from_json(&kp.to_json()).is_err(),
+            "非 {RSA_BITS} 位密钥的 from_json 必须 Err"
+        );
     }
 
     #[test]
