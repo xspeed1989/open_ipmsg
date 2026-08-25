@@ -6,6 +6,8 @@
 #![allow(dead_code)]
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use aes::cipher::generic_array::GenericArray;
+use ctr::cipher::{StreamCipher, StreamCipherSeek};
 use rand::RngCore;
 use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
 use rsa::signature::{RandomizedSigner, SignatureEncoding, Verifier};
@@ -276,6 +278,46 @@ pub fn open_message(
     Ok(OpenMsg { plain, sig_ok })
 }
 
+// ---------------------------------------------------------------------------
+// CTR 文件流原语（spec §7）：nonce 规则 + 断点续传偏移对齐
+// ---------------------------------------------------------------------------
+
+/// CTR 初始计数器：包号十进制 ASCII 左对齐进前 10 字节，其余字节全零
+/// （官方实现如此，保证收发双方对同一包号推出同一密钥流）。
+/// 十进制超过 10 位时截取前 10 位，绝不 panic。
+pub fn ctr_nonce(pkt_no: u32) -> [u8; 16] {
+    let mut n = [0u8; 16];
+    let s = pkt_no.to_string();
+    let take = s.len().min(10);
+    n[..take].copy_from_slice(&s.as_bytes()[..take]);
+    n
+}
+
+/// AES-256-CTR 文件流加解密器（CTR 模式加解密同操作）。
+pub struct CtrCipher {
+    cipher: ctr::Ctr128BE<aes::Aes256>,
+}
+
+impl CtrCipher {
+    pub fn new(key: &[u8; 32], pkt_no: u32) -> Self {
+        let nonce = ctr_nonce(pkt_no);
+        Self {
+            cipher: ctr::Ctr128BE::new(key.into(), GenericArray::from_slice(&nonce)),
+        }
+    }
+
+    /// 密钥流位置 = 流绝对偏移（断点续传对齐，spec §7）：
+    /// 在 `abs_pos` 处续写分片，结果与整流一次性处理逐字节一致。
+    pub fn seek(&mut self, abs_pos: u64) {
+        self.cipher.seek(abs_pos);
+    }
+
+    /// 对 buf 原地施加（或解除）密钥流。
+    pub fn apply(&mut self, buf: &mut [u8]) {
+        self.cipher.apply_keystream(buf);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,7 +409,8 @@ mod tests {
         let sealed = seal_message(peer_pub, me, plain).unwrap();
         assert!(sealed.starts_with(&format!("{:X}:", CAPA_OUR_SEND)));
         let out = open_message(&kp_b, &sealed, Some(&kp_a.public_key())).unwrap();
-        assert_eq!(out.plain, &plain[..]); // 含文件公告整体，尾部 \0 已剥掉一个
+        assert_eq!(out.plain, &plain[..]); // 含文件公告整体；明文以 \x07 结尾，无尾部 \0 可剥
+                                           // （尾部 \0 剥离的覆盖见 open_supports_blowfish_combo 的 b"legacy\0"）
         assert!(out.sig_ok);
         // 解密本身只要求接收方私钥；无对端公钥时无法验签，sig_ok 保持 true（调用方记 diag）
         let out_no_pp = open_message(&kp_b, &sealed, None).unwrap();
@@ -401,6 +444,17 @@ mod tests {
         let bad = format!("{}:{}", head, bad_tail);
         let out = open_message(&kp_b, &bad, Some(&kp_a.public_key())).unwrap();
         assert!(!out.sig_ok);
+    }
+
+    #[test]
+    fn signature_verifies_over_full_pre_strip_plaintext() {
+        // 回归钉子：官方客户端的签名对象是**含尾部 \0** 的完整明文。
+        // 若未来把验签对象误改成剥掉 \0 之后的明文（互操作回归），本测试必须失败。
+        let (kp_a, kp_b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
+        let sealed = seal_message(&kp_b.public_key(), &kp_a, b"x\0").unwrap();
+        let out = open_message(&kp_b, &sealed, Some(&kp_a.public_key())).unwrap();
+        assert!(out.sig_ok);
+        assert_eq!(out.plain, b"x"); // 剥离只影响返回值，不影响验签对象
     }
 
     #[test]
@@ -459,6 +513,56 @@ mod tests {
             let _ = open_message(&kp, s, None);
             let _ = open_message(&kp, s, Some(&kp.public_key()));
         }
+    }
+
+    #[test]
+    fn ctr_nonce_layout() {
+        let n = ctr_nonce(12345);
+        assert_eq!(&n[..5], b"12345"); // 十进制 ASCII 左对齐
+                                       // 其余全零（共 16 字节）——整组比较一次钉死布局
+        assert_eq!(n, *b"12345\0\0\0\0\0\0\0\0\0\0\0");
+    }
+
+    #[test]
+    fn ctr_nonce_fills_ten_digits_at_u32_max() {
+        // u32 最大值恰好 10 位十进制：占满前 10 字节 + 6 零；截断护栏不得 panic
+        assert_eq!(ctr_nonce(u32::MAX), *b"4294967295\0\0\0\0\0\0");
+    }
+
+    #[test]
+    fn ctr_seek_alignment_matches_whole_stream() {
+        let key = [7u8; 32];
+        let pkt = 42;
+        let file: Vec<u8> = (0..1000usize).map(|i| i as u8).collect();
+        // 整流一次性“加密”
+        let mut whole = file.clone();
+        CtrCipher::new(&key, pkt).apply(&mut whole);
+        // 从 offset=777 开始加密的分片，必须与整流的对应片段逐字节相同
+        let mut tail = file[777..].to_vec();
+        let mut c = CtrCipher::new(&key, pkt);
+        c.seek(777);
+        c.apply(&mut tail);
+        assert_eq!(&whole[777..], &tail[..]);
+    }
+
+    #[test]
+    fn ctr_multi_chunk_resume_aligns_with_whole_stream() {
+        // 模拟多次断点续传：在任意绝对偏移处重新 seek 续写，
+        // 各分片拼接结果必须与整流一次性处理逐字节相同（spec §7 对齐契约）
+        let key = [9u8; 32];
+        let pkt = 7;
+        let file: Vec<u8> = (0..600usize).map(|i| (i * 7 % 251) as u8).collect();
+        let mut whole = file.clone();
+        CtrCipher::new(&key, pkt).apply(&mut whole);
+        let mut out = Vec::with_capacity(file.len());
+        for (start, len) in [(0usize, 1usize), (1, 199), (200, 5), (205, 395)] {
+            let mut c = CtrCipher::new(&key, pkt);
+            c.seek(start as u64);
+            let mut chunk = file[start..start + len].to_vec();
+            c.apply(&mut chunk);
+            out.extend_from_slice(&chunk);
+        }
+        assert_eq!(out, whole);
     }
 
     /// 测试专用辅助：构造官方第二组合（RSA-1024 + Blowfish-128-CBC，IV=0，PKCS#7）
