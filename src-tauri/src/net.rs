@@ -167,6 +167,15 @@ fn spawn_ticker(ctx: Arc<NetCtx>) {
     });
 }
 
+/// 出站加密的明文输入：完整扩展部 + 恰好一个尾部 \0。
+/// 官方加密报文的密文对象是含 \0 的完整明文（对端解密后剥一个尾部 \0，
+/// 见 rebuild_decrypted），而本端明文扩展部本身不带尾部 \0。
+fn plain_payload(extra: &[u8]) -> Vec<u8> {
+    let mut p = extra.to_vec();
+    p.push(0);
+    p
+}
+
 /// 把某会话的待投递离线消息重发给对方（对方已在线时）。
 /// 不删除队列：以对端 RECVMSG 送达确认为准（见 ack_pending），
 /// 否则对方离线期间的重发会静默丢包。
@@ -188,12 +197,38 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
         let note = proto::fmt_delayed(item.ts);
         // 官方尾注：对端（含本客户端）据此显示「离线留言 · 原发送时间」
         let body = format!("{}\n----\n(IPMsg Delayed Send: {note} )", item.text);
-        let pkt = proto::Packet::new(
-            cmd::SENDMSG | opt::SENDCHECKOPT | opt::READCHECKOPT | if utf8 { opt::UTF8OPT } else { 0 },
-        )
-        .with_pkt_no(item.pkt);
+        let plain = proto::encode_out(&body, &cfg.encoding);
+        // 重投时套用与直发一致的加密决策：此刻已缓存对方公钥就密封，
+        // 否则保守明文。这里不触发握手、绝不阻塞重投——对方上线广播后
+        // 预握手通常已完成，后续消息自然恢复加密。密封意外失败（如加注
+        // 尾注后超限）同样降级明文并记诊断，保证离线留言最终可达。
+        let mut enc = false;
+        let wire_extra = match if cfg.encrypt { ctx.st.peer_pubkey(key) } else { None } {
+            Some(pubk) => {
+                match crypto::seal_message(&pubk, &ctx.st.own_keypair(), &plain_payload(&plain)) {
+                    Ok(sealed) => {
+                        enc = true;
+                        sealed.into_bytes()
+                    }
+                    Err(e) => {
+                        ctx.st.diag(&format!(
+                            "-> {key} 离线重投加密失败（pkt={}），降级明文：{e}",
+                            item.pkt
+                        ));
+                        plain
+                    }
+                }
+            }
+            None => plain,
+        };
+        let command = cmd::SENDMSG
+            | opt::SENDCHECKOPT
+            | opt::READCHECKOPT
+            | if utf8 { opt::UTF8OPT } else { 0 }
+            | if enc { opt::ENCRYPTOPT } else { 0 };
+        let pkt = proto::Packet::new(command).with_pkt_no(item.pkt);
         let pkt = proto::Packet {
-            extra: proto::encode_out(&body, &cfg.encoding),
+            extra: wire_extra,
             ..pkt
         };
         let bytes = pkt.encode(&my_user(&cfg), &my_host());
@@ -274,7 +309,6 @@ fn peer_addr(peer: &PeerInfo) -> Option<SocketAddr> {
 
 /// 发现即预握手（spec §5）：对端上线类报文声明 ENCRYPTOPT、我方开关开启、
 /// 尚未缓存对方公钥且对方未被标明文 → 立刻索取公钥，避免首条消息明文发送。
-/// GETPUBKEY 扩展部 = 我方能力位小写 hex（口径与 entry_caps 一致）。
 async fn maybe_start_handshake(
     ctx: &NetCtx,
     from: SocketAddr,
@@ -289,12 +323,19 @@ async fn maybe_start_handshake(
     {
         return;
     }
+    send_getpubkey(ctx, from, cfg).await;
+}
+
+/// GETPUBKEY 构造与发送（Task 6 口径）：扩展部 = 我方能力位小写 hex
+/// （与 entry_caps 一致，另带 CAPA_OUR_SEND 声明我方也会加密）。
+/// 发出即返回，不等对方 ANSPUBKEY —— 调用方各自决定是否继续本次明文投递。
+async fn send_getpubkey(ctx: &NetCtx, target: SocketAddr, cfg: &Config) {
     let capa = entry_caps(cfg) | crypto::CAPA_OUR_SEND;
     let mut g = proto::Packet::new(cmd::GETPUBKEY);
     g.extra = format!("{capa:x}").into_bytes();
     let bytes = g.encode(&my_user(cfg), &my_host());
-    let _ = ctx.sock.send_to(&bytes, from).await;
-    ctx.st.diag(&format!("-> {from} GETPUBKEY 预握手 capa={capa:x}"));
+    let _ = ctx.sock.send_to(&bytes, target).await;
+    ctx.st.diag(&format!("-> {target} GETPUBKEY 预握手 capa={capa:x}"));
 }
 
 /* ================= 入站处理 ================= */
@@ -891,6 +932,8 @@ pub async fn send_message(
             "peer": {"key": key, "nickname": "", "host": "", "group": ""},
             "rcpt": true, "read": false,
             "queued": true,
+            // 入队时必然明文暂存；实际是否加密由重投时的 flush_pending_for 决定
+            "enc": false, "sig_ok": true,
         });
         ctx.st.log_record(key, &rec);
         if enqueued {
@@ -957,13 +1000,35 @@ pub async fn send_message(
     // 文件消息不请求已读回执（减少未知标志组合被对端丢弃的风险）；
     // 纯文本消息保留回执
     let want_rcpt = entries.is_empty();
+
+    // 出站加密决策（spec §5/§6）：开关开启且已缓存对方公钥 → 密封完整扩展部
+    // （含尾部 \0）。seal_message 内置 UDP 上限保护，超限错误直接抛给前端分段。
+    // 尚无缓存且对方未被标明文 → 本次仍明文发送，同时后台触发 GETPUBKEY
+    // （发出即返回、不等应答），对方上线后预握手通常已完成，下条消息自然加密。
+    let mut enc = false;
+    let mut wire_extra = extra.clone();
+    if cfg.encrypt {
+        if let Some(pubk) = ctx.st.peer_pubkey(key) {
+            match crypto::seal_message(&pubk, &ctx.st.own_keypair(), &plain_payload(&extra)) {
+                Ok(sealed) => {
+                    wire_extra = sealed.into_bytes();
+                    enc = true;
+                }
+                Err(e) => return Err(e), // 「消息过长…」等直接抛给前端
+            }
+        } else if !ctx.st.peer_marked_plain(key) {
+            send_getpubkey(ctx, target, &cfg).await;
+        }
+    }
+
     let utf8 = proto::is_utf8_mode(&cfg.encoding);
     let command = cmd::SENDMSG
         | if want_rcpt { opt::READCHECKOPT } else { 0 }
         | if entries.is_empty() { 0 } else { opt::FILEATTACHOPT }
-        | if utf8 { opt::UTF8OPT } else { 0 };
+        | if utf8 { opt::UTF8OPT } else { 0 }
+        | if enc { opt::ENCRYPTOPT } else { 0 };
     let mut pkt = proto::Packet::new(command).with_pkt_no(pkt_no);
-    pkt.extra = extra.clone();
+    pkt.extra = wire_extra;
     let bytes = pkt.encode(&my_user(&cfg), &my_host());
 
     // 线路诊断：记录我方出站公告原始字节（与 diag.log 入站样本对照用）
@@ -1004,6 +1069,8 @@ pub async fn send_message(
         "peer": {"key": peer.key, "nickname": peer.nickname, "host": peer.host, "group": peer.group},
         "rcpt": want_rcpt,
         "read": false,
+        // 本次实际是否加密发出；我方发出的消息签名恒可核验
+        "enc": enc, "sig_ok": true,
     });
     ctx.st.log_record(key, &rec);
     Ok(rec)
@@ -1102,6 +1169,16 @@ mod tests {
         assert_eq!(super::entry_caps(&cfg), opt::ENCRYPTOPT | opt::CAPFILEENCOPT);
         cfg.encrypt = false;
         assert_eq!(super::entry_caps(&cfg), 0);
+    }
+
+    #[test]
+    fn plain_payload_appends_single_nul() {
+        assert_eq!(super::plain_payload(b"hi"), b"hi\0");
+        // 文件公告尾部 \a 分隔符（Rust 字节串写作 \x07）之后补且仅补一个 \0
+        assert_eq!(
+            super::plain_payload(b"a\0f.zip:1:1:1:\x07"),
+            b"a\0f.zip:1:1:1:\x07\0"
+        );
     }
 
     #[test]
