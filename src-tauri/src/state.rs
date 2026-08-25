@@ -148,6 +148,8 @@ pub struct AppState {
     peer_crypto: Mutex<HashMap<String, (u32, RsaPublicKey)>>,
     /// 已确认走明文协议的对端 IP（仅内存态：重启后重新协商）
     peer_plain: Mutex<HashSet<String>>,
+    /// 对端 IP → 已发出的 GETPUBKEY 探测次数（仅内存态：重启即重置）
+    probe_counts: Mutex<HashMap<String, u32>>,
     /// 本机密钥对：懒加载生成 + ipmsg_key.json 持久化（进程内只生成一次）
     own_key: OnceLock<Arc<KeyPair>>,
     pub data_dir: PathBuf,
@@ -157,6 +159,9 @@ pub struct AppState {
 const SEEN_CAP: usize = 8192;
 /// 对端公钥缓存条数上限：正常局域网远用不满，防敌意洪泛导致无限膨胀
 const PEER_KEY_CAP: usize = 4096;
+/// GETPUBKEY 探测预算（spec §5「已标记无能力」的最小实现）：同一 IP 连续
+/// 探测达到该次数仍无公钥缓存 → 认定对端不支持加密，标记明文、停止探测。
+pub const PLAIN_PROBE_BUDGET: u32 = 3;
 
 pub fn now_secs() -> u64 {
     SystemTime::now()
@@ -181,6 +186,7 @@ impl AppState {
             on_event: Mutex::new(None),
             peer_crypto: Mutex::new(HashMap::new()),
             peer_plain: Mutex::new(HashSet::new()),
+            probe_counts: Mutex::new(HashMap::new()),
             own_key: OnceLock::new(),
             data_dir,
             logs_dir,
@@ -415,6 +421,17 @@ impl AppState {
                 if let Err(e) = std::fs::write(&path, kp.to_json()) {
                     self.diag(&format!("own-key 密钥落盘失败：{e}"));
                 }
+                // 私钥文件是未加密 PKCS#8：落盘后立即收紧为属主可读写，
+                // 覆盖 umask 默认（0644 会把私钥暴露给同机其它用户）。
+                // 初次生成与损坏重写共用这一处写入，两条路径都生效。
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
                 kp
             })
             .clone()
@@ -515,6 +532,37 @@ impl AppState {
 
     pub fn peer_marked_plain(&self, ip: &str) -> bool {
         self.peer_plain.lock().unwrap().contains(ip)
+    }
+
+    /// 记一次 GETPUBKEY 探测（send_getpubkey 发出时调用），返回含本次的累计次数
+    pub fn record_probe(&self, ip: &str) -> u32 {
+        let mut m = self.probe_counts.lock().unwrap();
+        let c = m.entry(ip.to_string()).or_insert(0);
+        *c += 1;
+        *c
+    }
+
+    /// 该 IP 的历史 GETPUBKEY 探测次数（无记录为 0）
+    pub fn probe_count(&self, ip: &str) -> u32 {
+        self.probe_counts.lock().unwrap().get(ip).copied().unwrap_or(0)
+    }
+
+    /// send_message 无缓存分支的探测决策（spec §5）：
+    /// - 预算未用尽 → false，调用方继续发 GETPUBKEY；
+    /// - 恰在阈值穿越点 → true 并把对端标记为明文（只发生一次），
+    ///   此后消息经 peer_marked_plain 静默走明文、不再探测。
+    ///
+    /// 与规格的偏差：预算是纯内存计数，重启即满血重来；规格原文是
+    /// 「对方重新上线广播后重置」。这里放宽为进程生命周期粒度 —— 不持久化
+    /// 误标结果，对端真上线后一条 ENCRYPTOPT 报文即可重新握手。
+    pub fn retire_probe_budget(&self, ip: &str) -> bool {
+        if self.probe_count(ip) < PLAIN_PROBE_BUDGET {
+            return false;
+        }
+        if !self.peer_marked_plain(ip) {
+            self.mark_peer_plain(ip);
+        }
+        true
     }
 
     /* ---------- 离线消息待投递队列 ---------- */
@@ -1562,6 +1610,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
+    /// GETPUBKEY 探测预算（spec §5「已标记无能力」的最小实现）：
+    /// 同一 IP 累计探测达阈值时，无缓存分支必须把对端标记为明文 ——
+    /// 否则对每个不支持加密的客户端永远反复探测。
+    #[test]
+    fn probe_budget_crossing_marks_peer_plain() {
+        let st = temp_state("probe");
+        let ip = "10.9.9.9";
+        // 每发一次 GETPUBKEY 计一次数；未达阈值时分支继续探测、不标记
+        for sent in 1..PLAIN_PROBE_BUDGET {
+            assert_eq!(st.record_probe(ip), sent, "计数按发送次数累加");
+            assert!(
+                !st.retire_probe_budget(ip),
+                "预算未用尽前应返回「继续探测」"
+            );
+            assert!(!st.peer_marked_plain(ip), "穿越前不得标记明文");
+        }
+        // 第 3 次：恰在此刻穿越阈值 → 分支把对端标记为明文
+        st.record_probe(ip);
+        assert!(
+            st.retire_probe_budget(ip),
+            "第 {PLAIN_PROBE_BUDGET} 次探测后预算用尽，应触发明文标记"
+        );
+        assert!(
+            st.peer_marked_plain(ip),
+            "阈值穿越后 peer_marked_plain 必须翻转，后续消息静默走明文"
+        );
+        // 幂等：已标记后再评估不产生副作用，计数不受影响
+        assert!(st.retire_probe_budget(ip));
+        assert_eq!(st.probe_count(ip), PLAIN_PROBE_BUDGET);
+        // 计数按 IP 相互独立
+        st.record_probe("10.9.9.10");
+        assert_eq!(st.probe_count("10.9.9.10"), 1);
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
     #[test]
     fn forget_peer_key_drops_cache_and_persists_withdrawal() {
         let st = temp_state("forget");
@@ -1643,6 +1726,37 @@ mod tests {
         let st3 = AppState::new(st.data_dir.clone());
         st3.load_config();
         assert!(st3.config().encrypt, "缺失字段回落 serde 默认值 true");
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    /// 私钥文件存的是未加密 PKCS#8（含全部私钥成分），落盘必须收紧为
+    /// 属主可读写（0o600），不能带着 umask 默认的组/其他人可读权限躺在磁盘上。
+    #[cfg(unix)]
+    #[test]
+    fn own_key_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of = |dir: &std::path::Path| -> u32 {
+            std::fs::metadata(dir.join("ipmsg_key.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        // 1) 首次生成路径
+        let st = temp_state("keymode");
+        std::fs::create_dir_all(&st.data_dir).unwrap();
+        let _ = st.own_keypair();
+        assert_eq!(mode_of(&st.data_dir), 0o600, "初次生成的私钥文件应为 0o600");
+
+        // 2) 损坏后重写路径（重新生成并覆盖写回，同样要收紧）
+        std::fs::write(st.data_dir.join("ipmsg_key.json"), "{{{不是JSON").unwrap();
+        let st2 = AppState::new(st.data_dir.clone());
+        let _ = st2.own_keypair();
+        assert_eq!(
+            mode_of(&st.data_dir),
+            0o600,
+            "损坏重写后的私钥文件也应为 0o600"
+        );
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 }

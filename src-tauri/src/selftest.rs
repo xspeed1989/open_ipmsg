@@ -11,7 +11,8 @@
 //!   3. B→A 反向同样断言
 //!   4. 加密文件传输：双方互发附件，取回请求带 ENCRYPTOPT|ENCFILEOPT、
 //!      正文双向过 AES-CTR，逐字节一致；服务端 diag.log 留 tcp-hit enc=1 标记
-//!      （Task 10）
+//!      （Task 10）；另以非零偏移（777，十进制）直调下载路径验证断点续传
+//!      密钥流对齐与偏移的十进制编码
 //!   5. 能力撤回：encrypt=false 的实例 C 以同一 IP 上线 → A 丢弃缓存 →
 //!      后续发送回退明文，C 落库 enc=false
 //! 全部通过打印 PASS 行并以退出码 0 结束；任一失败打印 FAIL 且退出码非 0。
@@ -789,6 +790,58 @@ async fn crypto_roundtrip() -> bool {
             eprintln!("      B 加密下载错误: {e}");
             log.check("B 经加密流取回 A 的文件且逐字节一致", false);
         }
+    }
+
+    /* ---- 3b-2. 断点续传腿：非零偏移的加密取回（终审修复回归钉） ---- */
+    // 直接走下载路径 open_transfer 以偏移 777 续传：777 的十六进制是全数字
+    // 的 309 —— 若密封内层把偏移误编码成十六进制，A 的服务端按十进制优先
+    // 解析（num_flex_dec_first）会读成 309：不仅密钥流错位，还会从错误的
+    // 文件位置续传。断言从 777 起读到的字节与源文件尾部逐字节一致，且
+    // A 的 diag 里 offset 按十进制落为 777。
+    {
+        let target_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
+        const RESUME_OFF: u64 = 777;
+        match net::open_transfer(
+            &ctx_b,
+            target_a,
+            ab_pkt,
+            ab_id,
+            "",
+            cmd::GETFILEDATA,
+            net::DIALECTS[1],
+            RESUME_OFF,
+        )
+        .await
+        {
+            Ok(mut stream) => {
+                let mut rest = Vec::new();
+                let got =
+                    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut rest))
+                        .await;
+                match got {
+                    Ok(Ok(_)) => log.check(
+                        &format!("断点续传：从偏移 {RESUME_OFF} 续取加密流且逐字节一致"),
+                        rest == content_ab[RESUME_OFF as usize..],
+                    ),
+                    Ok(Err(e)) => {
+                        eprintln!("      续传读取错误: {e}");
+                        log.check("断点续传：从非零偏移续取加密流", false);
+                    }
+                    Err(_) => log.check("断点续传：读取超时", false),
+                }
+            }
+            Err(e) => {
+                eprintln!("      续传请求错误: {e}");
+                log.check(&format!("断点续传：请求失败: {e}"), false);
+            }
+        }
+        // 服务端解析出的续传偏移必须就是十进制 777（若收到十六进制 "309" 并
+        // 误读，这里会是 offset=309）
+        let diag_a = std::fs::read_to_string(dir_a.join("diag.log")).unwrap_or_default();
+        log.check(
+            &format!("服务端按十进制解析续传偏移（diag 记录 offset={RESUME_OFF}）"),
+            diag_a.contains(&format!("offset={RESUME_OFF}")),
+        );
     }
 
     /* ---- 3c. 反向：B 公告文件，A 加密下载；加密请求标记必须落在 B 的日志里 ---- */

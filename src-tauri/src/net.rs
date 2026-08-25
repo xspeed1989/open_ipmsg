@@ -346,13 +346,17 @@ fn maybe_withdraw_peer_key(
 /// GETPUBKEY 构造与发送（Task 6 口径）：扩展部 = 我方能力位小写 hex
 /// （与 entry_caps 一致，另带 CAPA_OUR_SEND 声明我方也会加密）。
 /// 发出即返回，不等对方 ANSPUBKEY —— 调用方各自决定是否继续本次明文投递。
+/// 每次发出都计入该 IP 的探测预算（会话键即对端 IP，见 handle_datagram 注释）；
+/// 预算语义见 AppState::retire_probe_budget。
 async fn send_getpubkey(ctx: &NetCtx, target: SocketAddr, cfg: &Config) {
+    let n = ctx.st.record_probe(&target.ip().to_string());
     let capa = entry_caps(cfg) | crypto::CAPA_OUR_SEND;
     let mut g = proto::Packet::new(cmd::GETPUBKEY);
     g.extra = format!("{capa:x}").into_bytes();
     let bytes = g.encode(&my_user(cfg), &my_host());
     let _ = ctx.sock.send_to(&bytes, target).await;
-    ctx.st.diag(&format!("-> {target} GETPUBKEY 预握手 capa={capa:x}"));
+    ctx.st
+        .diag(&format!("-> {target} GETPUBKEY 预握手 capa={capa:x} 第 {n} 次探测"));
 }
 
 /* ================= 入站处理 ================= */
@@ -468,7 +472,12 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             // 对端应答里若声明加密能力，同样触发预握手（对方可能没收到我们的 BR_ENTRY）
             let cfg = ctx.st.config();
             maybe_start_handshake(ctx, from, &pkt, &key, &cfg).await;
-            maybe_withdraw_peer_key(ctx, from, &pkt, &key, &cfg);
+            // 撤回只认 ANSENTRY：第三方客户端的下线通告（BR_ABSENCE）常不带
+            // 能力位，若据此撤回会把仍在线、支持加密的对端公钥误丢 ——
+            // 虽然下次上线会自愈，但表现为反复横跳的加解密抖动。
+            if base == cmd::ANSENTRY {
+                maybe_withdraw_peer_key(ctx, from, &pkt, &key, &cfg);
+            }
             // ANSENTRY 通常是对我们上线通告的应答：对方在线，重投离线消息
             flush_pending_for(ctx, &key).await;
         }
@@ -1011,6 +1020,9 @@ pub async fn send_message(
     // （含尾部 \0）。seal_message 内置 UDP 上限保护，超限错误直接抛给前端分段。
     // 尚无缓存且对方未被标明文 → 本次仍明文发送，同时后台触发 GETPUBKEY
     // （发出即返回、不等应答），对方上线后预握手通常已完成，下条消息自然加密。
+    // 探测不是无限的：retire_probe_budget 在第 PLAIN_PROBE_BUDGET 次探测后
+    // 的首次评估时把对端标记为明文（spec §5「已标记无能力」），此后静默明文、
+    // 不再对每个不支持加密的客户端永远反复 GETPUBKEY。
     let mut enc = false;
     let mut wire_extra = extra.clone();
     if cfg.encrypt {
@@ -1022,7 +1034,9 @@ pub async fn send_message(
                 }
                 Err(e) => return Err(e), // 「消息过长…」等直接抛给前端
             }
-        } else if !ctx.st.peer_marked_plain(key) {
+        } else if ctx.st.retire_probe_budget(key) {
+            // 预算用尽：内部恰在阈值穿越点 mark_peer_plain 一次，本条起走明文
+        } else {
             send_getpubkey(ctx, target, &cfg).await;
         }
     }
@@ -1286,6 +1300,28 @@ mod tests {
         assert_eq!(num_flex_dec_first("10"), Some(10));
         assert_eq!(num_flex_dec_first("0x1f"), Some(31));
         assert_eq!(num_flex_dec_first("ff"), Some(255));
+    }
+
+    /// spec §2.3 钉死：密封内层的续传偏移是 **十进制** `<offset_dec>`。
+    /// 777 的十六进制是 309，全数字 —— 若误用 {offset:x} 渲染成 ":309:"，
+    /// 我方服务端 num_flex_dec_first 会按十进制读成 309，静默从错误位置续传。
+    #[test]
+    fn file_request_inner_offset_is_decimal() {
+        let key_hex = "00".repeat(32);
+        let inner = file_request_inner("1f", "2a", 777, &key_hex);
+        assert!(
+            inner.contains(":777:"),
+            "偏移必须按十进制渲染（spec §2.3 offset_dec），实际内层：{inner}"
+        );
+        assert!(!inner.contains(":309:"), "不得按十六进制渲染偏移：{inner}");
+        assert_eq!(inner, format!("1f:2a:777:900000:{key_hex}"));
+    }
+
+    /// 无续传（offset=0）时内层不携带偏移段 —— 保持既有线上格式
+    #[test]
+    fn file_request_inner_omits_offset_when_zero() {
+        let inner = file_request_inner("1f", "2a", 0, &"ab".repeat(32));
+        assert_eq!(inner, format!("1f:2a:900000:{}", "ab".repeat(32)));
     }
 }
 
@@ -2246,6 +2282,21 @@ pub const DIALECTS: [Dialect; 4] = [
     Dialect { hex_pkt: false, hex_id: true, newline: true },
 ];
 
+/// 密封取文件请求的内层串（spec §2.3）：
+/// `<pkt_hex>:<fileid_hex>[:<offset_dec>]:900000:<key_hex>`。
+/// 偏移只在断点续传（offset > 0）时携带，且按 **十进制** 书写 —— 官方口径，
+/// 我们的服务端也以 num_flex_dec_first 十进制优先解析该字段；若误写十六进制，
+/// 全数字的偏移（如 777=0x309）会被静默读错、从错误位置续传。
+fn file_request_inner(pkt_field: &str, id_field: &str, offset: u64, key_hex: &str) -> String {
+    let mut inner = format!("{pkt_field}:{id_field}");
+    if offset > 0 {
+        inner.push_str(&format!(":{offset}")); // 断点续传才带偏移（十进制，spec §2.3）
+    }
+    inner.push_str(":900000:");
+    inner.push_str(key_hex);
+    inner
+}
+
 /// 建立传输连接并发出取文件/取目录请求，返回供下载循环读取的流。
 ///
 /// 加密路径（spec §7）：对端声明 CAPFILEENC 且我方加密开关开启时，扩展部改为
@@ -2254,8 +2305,9 @@ pub const DIALECTS: [Dialect; 4] = [
 /// 包上 EncStream —— 密钥流位置 = 流绝对偏移，断点续传时 seek(offset) 免费对齐。
 /// 返回类型用 trait object 而非 TcpStream/枚举：两个调用点只读不写，
 /// 统一读端让下载循环零分支。
+/// pub(crate)：selftest 的断点续传腿直接以非零偏移调用本下载路径做回归验证。
 #[allow(clippy::too_many_arguments)]
-async fn open_transfer(
+pub(crate) async fn open_transfer(
     ctx: &NetCtx,
     target: SocketAddr,
     pkt_no: u32,
@@ -2291,12 +2343,12 @@ async fn open_transfer(
             format!("{peer_ip} 广告了文件流加密能力但缺少公钥缓存，拒绝明文回退")
         })?;
         let key: [u8; 32] = rand::random();
-        let mut inner = format!("{pkt_no:x}:{file_id:x}");
-        if offset > 0 {
-            inner.push_str(&format!(":{offset:x}")); // 断点续传才带偏移
-        }
-        inner.push_str(":900000:");
-        inner.push_str(&crypto::hex_lower(&key));
+        let inner = file_request_inner(
+            &format!("{pkt_no:x}"),
+            &format!("{file_id:x}"),
+            offset,
+            &crypto::hex_lower(&key),
+        );
         let sealed =
             crypto::seal_file_request(&peer_pub, &ctx.st.own_keypair(), req_pkt_no, &inner)?;
         Some((key, sealed))
