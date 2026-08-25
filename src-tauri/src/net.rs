@@ -1369,21 +1369,53 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
     // 读请求行：容忍有无结尾换行。上限按加密封包预算放宽（spec §2：
     // MAX_ENCRYPTED_PACKET=8000）——加密的取文件请求扩展部约 1.2KB，
     // 明文请求几十字节就完成解析，不会多等。
-    let mut buf = Vec::with_capacity(1024);
-    let mut chunk = vec![0u8; 1024];
-    let deadline = Instant::now() + Duration::from_millis(800);
+    //
+    // 完整性判定（2026-08 现场故障根因）：proto::parse 只校验头部五个冒号，
+    // 扩展部截断也会"解析成功"。加密请求 ~1.3KB 在真实网络上被 TCP 拆包后，
+    // 服务端把截断的密封串当完整请求处理 → 解封失败 → 静默断开 → 对端 10054
+    // （环回单包送达故自检永不复现；明文请求过短也永远安全）。
+    // 因此：解析成功后若带 '\n'（我方加密/新方言请求恒以换行收尾）→ 立即
+    // 视为完整；否则进入 80ms 安静确认期，仍无新数据才确定完整（兼容无
+    // 换行的老明文方言）；总时限 3s 兜底网络慢/重传。
+    let mut buf = Vec::with_capacity(2048);
+    let mut chunk = vec![0u8; 8192];
+    let deadline = Instant::now() + Duration::from_secs(3);
     let mut req_pkt = None;
-    while buf.len() < crypto::MAX_ENCRYPTED_PACKET && Instant::now() < deadline {
-        let n = match tokio::time::timeout(Duration::from_millis(300), stream.read(&mut chunk)).await {
-            Ok(Ok(n)) if n > 0 => n,
-            Ok(Ok(_)) => break, // EOF
-            Ok(Err(_)) => break,
-            Err(_) => break, // 超时就用已有数据尝试解析
-        };
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(p) = proto::parse(&buf) {
-            req_pkt = Some(p);
+    loop {
+        if buf.len() >= crypto::MAX_ENCRYPTED_PACKET || Instant::now() > deadline {
             break;
+        }
+        // 已解析成功：带 \n 立即完成；否则给一小段安静期确认没有后续分段
+        if req_pkt.is_some() {
+            if buf.ends_with(b"\n") {
+                break;
+            }
+            match tokio::time::timeout(Duration::from_millis(80), stream.read(&mut chunk)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(p) = proto::parse(&buf) {
+                        req_pkt = Some(p);
+                    }
+                    continue;
+                }
+                Err(_) => break, // 安静期无新数据：请求完整
+            }
+        }
+        match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(p) = proto::parse(&buf) {
+                    req_pkt = Some(p);
+                }
+            }
+            Ok(_) => break, // EOF / 读错误
+            Err(_) => {
+                if req_pkt.is_some() {
+                    break; // 总时间内头部已齐且无更多数据
+                }
+                // 头部未齐：继续等待剩余分段（总时限兜底）
+            }
         }
     }
     let Some(req) = req_pkt else { return };
