@@ -445,7 +445,46 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                 }
             }
         }
-        cmd::SENDMSG => handle_sendmsg(ctx, from, &pkt, &key).await,
+        cmd::SENDMSG => {
+            // 入站加密消息拦截：在进入普通明文处理路径前还原报文。
+            // 只拦 base==SENDMSG 且带 ENCRYPTOPT 的包；其余报文零开销直通。
+            let mut pkt = pkt; // 解密后要改写 command/extra，取得所有权
+            let mut enc_meta: Option<bool> = None; // Some(sig_ok)：该消息曾加密
+            if pkt.command & opt::ENCRYPTOPT != 0 {
+                let cfg = ctx.st.config();
+                if cfg.encrypt {
+                    let peer_pub = ctx.st.peer_pubkey(&key);
+                    match crypto::open_message(
+                        &ctx.st.own_keypair(),
+                        &String::from_utf8_lossy(&pkt.extra),
+                        peer_pub.as_ref(),
+                    ) {
+                        Ok(m) => {
+                            pkt = match rebuild_decrypted(pkt) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    ctx.st.diag(&format!("decrypt-fail {from}: {e}"));
+                                    return;
+                                }
+                            };
+                            enc_meta = Some(m.sig_ok);
+                        }
+                        Err(e) => {
+                            // 无法解密的报文按垃圾丢弃（对端会重发或回退明文）
+                            ctx.st.diag(&format!("decrypt-fail {from}: {e}"));
+                            return;
+                        }
+                    }
+                } else {
+                    // 加密关闭但收到密文：以占位文本入会话，避免静默丢消息；
+                    // 清掉 ENCRYPTOPT 让它走普通明文路径。sig 无法核验 → Some(false)
+                    pkt.extra = "🔒 无法解密（加密已关闭）".as_bytes().to_vec();
+                    pkt.command &= !opt::ENCRYPTOPT;
+                    enc_meta = Some(false);
+                }
+            }
+            handle_sendmsg(ctx, from, &pkt, &key, enc_meta).await;
+        }
         cmd::READMSG => {
             // 对端已读回执：extra = 原消息包编号，把对应出站消息标记为已读
             let no = String::from_utf8_lossy(&pkt.extra)
@@ -517,7 +556,25 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
     }
 }
 
-async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key: &str) {
+/// 解密成功后重构等价明文报文：剥掉 ENCRYPTOPT 与密文尾部的一个 \0
+///
+/// 只剥**一个**尾部 \0（文件公告以 \a 结尾，其后的 \0 才是密文填充），
+/// 其余命令标志（READCHECKOPT 等）原样保留，让下游按普通明文报文处理。
+fn rebuild_decrypted(mut p: proto::Packet) -> Result<proto::Packet, String> {
+    if p.extra.last() == Some(&0) {
+        p.extra.pop();
+    }
+    p.command &= !opt::ENCRYPTOPT;
+    Ok(p)
+}
+
+async fn handle_sendmsg(
+    ctx: &NetCtx,
+    from: SocketAddr,
+    pkt: &proto::Packet,
+    key: &str,
+    enc_meta: Option<bool>,
+) {
     let attach = pkt.command & opt::FILEATTACHOPT != 0;
     let files = if attach {
         proto::parse_file_entries(&pkt.extra)
@@ -635,6 +692,9 @@ async fn handle_sendmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key
         // 对端要求已读回执：待用户查看后由 mark_read 发送 READMSG
         "need_read": pkt.command & opt::READCHECKOPT != 0,
         "read": already_read,
+        // 曾加密（enc）；签名是否可核验（sig_ok）。未加密消息 sig_ok 恒为 true
+        "enc": enc_meta.is_some(),
+        "sig_ok": enc_meta.unwrap_or(true),
     });
     // 同包号原地更新，历史不再被重发副本撑爆
     let first_seen = ctx.st.upsert_in_record(key, &rec);
@@ -1042,6 +1102,22 @@ mod tests {
         assert_eq!(super::entry_caps(&cfg), opt::ENCRYPTOPT | opt::CAPFILEENCOPT);
         cfg.encrypt = false;
         assert_eq!(super::entry_caps(&cfg), 0);
+    }
+
+    #[test]
+    fn rebuild_packet_from_decrypted_strips_one_trailing_nul() {
+        let p = super::rebuild_decrypted(proto::Packet {
+            pkt_no: 1,
+            user: "a".into(),
+            host: "b".into(),
+            command: cmd::SENDMSG | opt::ENCRYPTOPT | opt::READCHECKOPT,
+            extra: b"hi\0rep.zip:1:2:3:\x07\0".to_vec(),
+        })
+        .unwrap();
+        assert_eq!(p.command & opt::ENCRYPTOPT, 0);
+        assert_eq!(p.command & opt::READCHECKOPT, opt::READCHECKOPT);
+        assert_eq!(proto::text_of(&p), "hi");
+        assert!(p.extra.ends_with(b":\x07")); // 只剥一个尾部 \0（\x07 即 C 转义 \a）
     }
 
     #[test]
