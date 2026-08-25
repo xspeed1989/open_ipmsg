@@ -400,6 +400,10 @@ impl CtrCipher {
 pub struct EncStream<S> {
     pub inner: S,
     pub c: CtrCipher,
+    /// 已加密、尚未被底层完全接受的密文（写路径缓冲）
+    outbuf: Vec<u8>,
+    /// outbuf 中底层已接受的前缀长度
+    outpos: usize,
 }
 
 impl<S> EncStream<S> {
@@ -409,7 +413,7 @@ impl<S> EncStream<S> {
         if start_pos > 0 {
             c.seek(start_pos);
         }
-        Self { inner, c }
+        Self { inner, c, outbuf: Vec::new(), outpos: 0 }
     }
 }
 
@@ -432,6 +436,32 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncStream<S> {
     }
 }
 
+impl<S: AsyncWrite + Unpin> EncStream<S> {
+    /// 排空 outbuf 中尚未被底层接受的剩余密文。
+    /// 返回本次排空新接受的字节数；Pending 原样上抛（此时未消耗任何新明文，
+    /// 调用方之后会用同一缓冲重新 poll，密钥流绝不因此二次推进）。
+    fn poll_drain_outbuf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        let mut accepted_now = 0usize;
+        while self.outpos < self.outbuf.len() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.outbuf[self.outpos..]) {
+                Poll::Ready(Ok(n)) => {
+                    if n == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "EncStream 底层零写入",
+                        )));
+                    }
+                    self.outpos += n;
+                    accepted_now += n;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(accepted_now))
+    }
+}
+
 impl<S: AsyncWrite + Unpin> AsyncWrite for EncStream<S> {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -439,17 +469,58 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncStream<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        let mut enc = buf.to_vec();
-        this.c.apply(&mut enc);
-        Pin::new(&mut this.inner).poll_write(cx, &enc)
+        // 残留密文在途：本次只推进一格并按实际接受量记账（Ok(n) 让调用方
+        // 前移切片），绝不在残留未清空时对新 buf 加密——否则同一段明文会
+        // 既已随残留上线、又被重新加密重发，密钥流与线上长度双重错位。
+        // AsyncWrite 契约保证 Pending/短写后调用方以剩余切片重试，因此残留
+        // 恰好始终对应「当前未记账明文的后缀」。
+        if this.outpos < this.outbuf.len() {
+            return match Pin::new(&mut this.inner).poll_write(cx, &this.outbuf[this.outpos..]) {
+                Poll::Ready(Ok(n)) => {
+                    this.outpos += n;
+                    Poll::Ready(Ok(n))
+                }
+                other => other,
+            };
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        // 无残留：整段新明文只加密一次，随后立即尝试推送一次；
+        // 短写/Pending 的余量留给上面的残留分支续传
+        let mut ct = buf.to_vec();
+        this.c.apply(&mut ct);
+        this.outbuf = ct;
+        this.outpos = 0;
+        match Pin::new(&mut this.inner).poll_write(cx, &this.outbuf) {
+            Poll::Ready(Ok(n)) => {
+                this.outpos += n;
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        // 先把未落盘的密文全部推给底层，再让底层刷
+        match this.poll_drain_outbuf(cx) {
+            Poll::Ready(Ok(_)) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        // 关闭前必须排空缓存密文，否则尾部密文丢失、对端校验失败
+        match this.poll_drain_outbuf(cx) {
+            Poll::Ready(Ok(_)) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -715,6 +786,12 @@ mod tests {
 
     /* ---------------- Task 10：文件请求密封/解封 与 TCP 流加密（spec §7） ---------------- */
 
+    /// 线上常量钉死：文件请求组合的 hex 值一旦漂移，真机互通即静默失败
+    #[test]
+    fn wire_constant_pins() {
+        assert_eq!(CAPA_FILE_REQUEST, 0x2010_0004); // RSA2048|AES256|SIGN_SHA1
+    }
+
     #[test]
     fn file_request_roundtrip() {
         let (a, b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
@@ -837,6 +914,67 @@ mod tests {
         let mut got = Vec::new();
         r.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, &payload[start as usize..], "读端 seek 后必须还原明文尾部");
+    }
+
+    /// 测试专用写端：每次 poll_write 只接受 1 字节，且「接受一次、Pending 一次」交替，
+    /// 强制触发 AsyncWrite 短写/Pending 契约 —— tokio write_all 会用剩余明文切片
+    /// 反复重新 poll。回环自检（duplex 全量接受）永远暴露不了这类失步。
+    struct TrickleWriter {
+        /// 已被底层接受的字节（即真正的线上密文）
+        accepted: Vec<u8>,
+        calls: u64,
+    }
+
+    impl AsyncWrite for TrickleWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.calls += 1;
+            if self.calls % 2 == 0 {
+                // 模拟背压：本次一个字节都不接受；立即唤醒以便下次重试
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            assert!(!buf.is_empty(), "底层不应被以空切片轮询");
+            self.accepted.push(buf[0]);
+            Poll::Ready(Ok(1))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// 回归：短写/Pending 下密钥流绝不能二次推进。
+    /// EncStream 必须把整段新明文只加密一次并缓存密文，按底层接受量排空；
+    /// 若每次 poll 都对传入切片重新 apply 密钥流，重 poll 会让 CTR 位置错乱，
+    /// 线上密文不再等于整流一次性 CTR。
+    #[tokio::test]
+    async fn enc_stream_short_writes_keep_ctr_aligned() {
+        use tokio::io::AsyncWriteExt;
+        let key = [33u8; 32];
+        let pkt = 909;
+        let data: Vec<u8> = (0..300usize).map(|i| ((i * 31 + 17) % 254) as u8).collect();
+
+        let sink = TrickleWriter { accepted: Vec::new(), calls: 0 };
+        let mut w = EncStream::new(sink, &key, pkt, 0);
+        w.write_all(&data).await.unwrap();
+        w.flush().await.unwrap();
+
+        let wire = w.inner.accepted.clone();
+        assert_eq!(wire.len(), data.len(), "线上字节数必须等于明文长度");
+        let mut want_ct = data.clone();
+        CtrCipher::new(&key, pkt).apply(&mut want_ct);
+        assert_eq!(
+            wire, want_ct,
+            "短写+Pending 反复重 poll 后，线上密文仍须逐字节等于整流一次性 CTR"
+        );
     }
 
     /// 测试专用辅助：构造官方第二组合（RSA-1024 + Blowfish-128-CBC，IV=0，PKCS#7）

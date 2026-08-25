@@ -1177,6 +1177,13 @@ mod tests {
         assert_eq!(super::entry_caps(&cfg), 0);
     }
 
+    /// 线上常量钉死：官方 ipmsg.h L119 ENCFILEOPT=0x800（与 MULTICASTOPT
+    /// 按命令类别复用）。曾误写 0x20000000（SIGN_SHA1 位）导致真机互通必败。
+    #[test]
+    fn encfileopt_matches_official_wire_value() {
+        assert_eq!(opt::ENCFILEOPT, 0x0000_0800);
+    }
+
     #[test]
     fn plain_payload_appends_single_nul() {
         assert_eq!(super::plain_payload(b"hi"), b"hi\0");
@@ -1436,9 +1443,10 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
             return;
         }
         // 整条目录流（头部+内容）统一过密钥流：包装在 writer 抽象上，
-        // serve_dir_stream 对加密与否无感知。目录无断点续传，密钥流从流头起步。
+        // serve_dir_stream 对加密与否无感知。目录无断点续传，密钥流从流头起步
+        // （显式传 0：GETDIRFILES 请求内层不含偏移）。
         let mut w: Box<dyn AsyncWrite + Unpin + Send> = match ctr_key {
-            Some(k) => Box::new(crypto::EncStream::new(stream, &k, req.pkt_no, offset)),
+            Some(k) => Box::new(crypto::EncStream::new(stream, &k, req.pkt_no, 0)),
             None => Box::new(stream),
         };
         let sent = serve_dir_stream(&mut w, &path, &fname).await;
