@@ -18,7 +18,7 @@ export const store = reactive({
   firstRun: false,
   search: '',
 
-  /** 本机配置（nickname/group/download_dir/encoding/hostname/ips） */
+  /** 本机配置（nickname/group/download_dir/encoding/encrypt/hostname/ips/key_fp） */
   config: null,
 
   /** 在线用户 PeerInfo[] 与 key->PeerInfo 映射 */

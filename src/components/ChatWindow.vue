@@ -926,7 +926,10 @@ watch(
               <span v-if="v.m.dir === 'out' && v.m.rcpt && !v.m.queued" class="read-tag" :class="{ done: v.m.read }">
                 {{ v.m.read ? '已读' : '未读' }}
               </span>
-              {{ fmtTime(v.m.ts) }}
+              {{ fmtTime(v.m.ts) }}<svg v-if="v.m.enc" class="m-lock" width="10" height="10" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <rect x="4.5" y="10" width="15" height="10" rx="2" stroke="currentColor" stroke-width="2" />
+                <path d="M8 10V7.5a4 4 0 0 1 8 0V10" stroke="currentColor" stroke-width="2" />
+              </svg><span v-if="v.m.enc && v.m.sig_ok === false" class="sig-warn" title="签名校验失败">⚠</span>
             </div>
           </div>
         </div>
@@ -1333,6 +1336,18 @@ watch(
 }
 .read-tag.done {
   color: var(--c-accent);
+}
+/* 加密锁标：仅 enc===true 的记录显示（旧记录/明文消息无该字段，渲染保持原样） */
+.m-lock {
+  margin-left: 3px;
+  vertical-align: -1px;
+  opacity: 0.8;
+}
+/* 签名校验失败警示：仅加密且 sig_ok===false 的记录显示 */
+.sig-warn {
+  margin-left: 3px;
+  color: var(--c-danger);
+  cursor: help;
 }
 
 /* 图片内联预览 */

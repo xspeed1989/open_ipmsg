@@ -1,5 +1,5 @@
 <script setup>
-// 设置弹窗：昵称 / 群组 / 下载目录 / 主题 / 发送编码 + 本机信息
+// 设置弹窗：昵称 / 群组 / 下载目录 / 主题 / 发送编码 / 消息加密 + 本机信息
 import { reactive, watch, computed, ref } from 'vue'
 import { applyTheme, store, refreshConfig, refreshUsers, loadSessions } from '../store'
 import * as ipc from '../lib/ipc'
@@ -11,6 +11,8 @@ const form = reactive({
   download_dir: '',
   encoding: 'utf8',
   theme: 'system',
+  // 加密默认开启：config 缺失该字段（旧版本后端）时也按开启处理
+  encrypt: true,
 })
 
 watch(
@@ -22,12 +24,31 @@ watch(
       form.download_dir = store.config.download_dir || ''
       form.encoding = store.config.encoding || 'utf8'
       form.theme = store.config.theme || 'system'
+      form.encrypt = store.config.encrypt !== false
     }
   },
   { immediate: true }
 )
 
 const canClose = computed(() => !store.firstRun)
+
+// 点击指纹行 → 复制本机密钥指纹（复用 ipc.copyText 的原生剪贴板通道）
+const fpCopied = ref(false)
+let fpTimer = null
+async function copyFp() {
+  const fp = store.config?.key_fp
+  if (!fp) return
+  try {
+    await ipc.copyText(fp)
+    fpCopied.value = true
+    clearTimeout(fpTimer)
+    fpTimer = setTimeout(() => {
+      fpCopied.value = false
+    }, 1500)
+  } catch {
+    // 剪贴板不可用时静默：指纹文本本身仍完整可见、可手动选择复制
+  }
+}
 
 // 选中即预览：不必按保存就能看到效果；取消关闭时再还原成已保存的主题
 watch(() => form.theme, (t) => applyTheme(t))
@@ -90,6 +111,7 @@ async function save() {
     download_dir: form.download_dir.trim(),
     encoding: form.encoding,
     theme: form.theme,
+    encrypt: !!form.encrypt,
   }
   try {
     await ipc.saveConfig(patch)
@@ -142,6 +164,27 @@ async function save() {
             <option value="gbk">GBK（兼容老版中文飞鸽）</option>
           </select>
         </label>
+
+        <div class="field">
+          <span class="lab">消息加密</span>
+          <div class="enc-col">
+            <div class="enc-line">
+              <button type="button" class="switch" :class="{ on: form.encrypt }" role="switch"
+                :aria-checked="form.encrypt ? 'true' : 'false'" title="消息加密"
+                @click="form.encrypt = !form.encrypt">
+                <i class="knob"></i>
+              </button>
+              <span class="enc-state">{{ form.encrypt ? '已开启' : '已关闭' }}</span>
+            </div>
+            <div class="enc-hint">关闭后与所有联系人使用明文通讯</div>
+            <!-- 本机公钥指纹：与对端核对密钥用；点击整行复制 -->
+            <div v-if="store.config?.key_fp" class="fp-row" title="点击复制本机密钥指纹" @click="copyFp">
+              <span class="fp-lab">本机密钥指纹</span>
+              <code class="fp-val">{{ store.config.key_fp }}</code>
+              <span v-if="fpCopied" class="fp-copied">已复制</span>
+            </div>
+          </div>
+        </div>
 
         <div class="selfinfo">
           <div class="si-title">聊天记录</div>
@@ -268,6 +311,84 @@ header {
 .dir-input {
   background: var(--c-card-alt);
   color: var(--c-sub);
+}
+/* 消息加密开关 + 本机密钥指纹 */
+.enc-col {
+  flex: 1;
+  min-width: 0;
+}
+.enc-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.switch {
+  position: relative;
+  width: 38px;
+  height: 21px;
+  border-radius: 11px;
+  background: var(--c-border);
+  transition: background 0.15s;
+  flex: none;
+}
+.switch.on {
+  background: var(--c-accent);
+}
+.switch .knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px var(--c-shadow);
+  transition: left 0.15s;
+}
+.switch.on .knob {
+  left: 19px;
+}
+.enc-state {
+  font-size: 12.5px;
+  color: var(--c-sub);
+}
+.enc-hint {
+  font-size: 11.5px;
+  color: var(--c-weak);
+  margin-top: 4px;
+}
+.fp-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  cursor: pointer;
+  min-width: 0;
+}
+.fp-lab {
+  font-size: 11.5px;
+  color: var(--c-sub);
+  flex: none;
+}
+.fp-val {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--c-text);
+  background: var(--c-card-alt);
+  border: 1px solid var(--c-hairline);
+  border-radius: 4px;
+  padding: 2px 6px;
+  user-select: text;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.fp-row:hover .fp-val {
+  border-color: var(--c-accent);
+}
+.fp-copied {
+  font-size: 11.5px;
+  color: var(--c-accent);
+  flex: none;
 }
 .selfinfo {
   background: var(--c-card-alt);

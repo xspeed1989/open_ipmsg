@@ -7,10 +7,10 @@ import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 export const listenEvent = (event, handler) =>
   listen(event, (e) => handler(e.payload))
 
-/** 获取配置（含本机信息 hostname / ips） */
+/** 获取配置（含本机信息 hostname / ips、加密开关 encrypt 与公钥指纹 key_fp） */
 export const getConfig = () => invoke('get_config')
 
-/** 保存配置，patch: { nickname, group, download_dir, encoding } */
+/** 保存配置，patch: { nickname, group, download_dir, encoding, theme, encrypt } */
 export const saveConfig = (patch) => invoke('save_config', { patch })
 
 /** 在线用户列表 */
