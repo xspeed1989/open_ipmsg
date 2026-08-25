@@ -136,16 +136,21 @@ pub(crate) fn hex_decode_loose(s: &str) -> Option<Vec<u8>> {
 /// 复现：官方 v4 客户端回包带尾 \0 且全部握手失败）。
 pub fn build_anspubkey(capa: u32, key: &KeyPair) -> String {
     // 官方线格式 E 为数值 hex、无前导零（`%X` of DWORD：65537 → "10001"），
-    // 按 BigUint 数值输出而非字节 hex（字节形式会是 "010001"，带前导零）
+    // 按 BigUint 数值输出而非字节 hex（字节形式会是 "010001"，带前导零）。
+    // 模数直接输出标准大端 hex：官方发送端 bin2hexstr_revendian 先抵消其
+    // CryptoAPI 小端 blob，线上即大端（2026-08 现场以真实样本实测定论）。
     let e_val = BigUint::from_bytes_be(&key.exponent_be());
-    let n_rev: Vec<u8> = key.modulus_be().iter().rev().cloned().collect();
-    format!("{capa:X}:{e_val:x}-{}", hex_lower(&n_rev))
+    format!(
+        "{capa:X}:{e_val:x}-{}",
+        hex_lower(&key.modulus_be())
+    )
 }
 
 /// 宽容解析 ANSPUBKEY 扩展部："{capa}:{e}-{n}"，hex 大小写通吃；
-/// N 按官方 revendian 解读（字节逆序还原为标准大端）；
-/// 容忍 C 字符串惯例的尾部 '\0'（官方及相关实现发送时带尾 \0，
-/// 不剥离会使模数段变奇数长度而解析失败）；
+/// N 为标准大端（线上惯例，勿做字节反转）；E 是数值 hex、可为奇数长度
+/// （官方 65537 → "10001"）——按数值解析而非字节解码；
+/// 容忍 C 字符串惯例的尾部 '\0'（官方及相关实现发送时带尾 \0，不剥离会
+/// 使模数段变奇数长度而解析失败）；
 /// N 允许被对端裁掉前导零字节（BigUint 按值还原，天然左补零语义）
 pub fn parse_anspubkey(extra: &str) -> Option<(u32, RsaPublicKey)> {
     let extra = extra.trim_end_matches('\0').trim();
@@ -161,11 +166,10 @@ pub fn parse_anspubkey(extra: &str) -> Option<(u32, RsaPublicKey)> {
         e_txt.to_string()
     };
     let e = BigUint::from_bytes_be(&hex_decode_loose(&e_pad)?);
-    let mut n = hex_decode_loose(n_s.trim_end_matches('\0').trim())?;
+    let n = hex_decode_loose(n_s.trim_end_matches('\0').trim())?;
     if n.len() > RSA_BITS / 8 * 2 {
         return None; // 超过 4096 位直接拒绝
     }
-    n.reverse(); // 官方 revendian：还原为标准大端
     let pubk = RsaPublicKey::new(BigUint::from_bytes_be(&n), e).ok()?;
     Some((capa, pubk))
 }
@@ -598,28 +602,24 @@ mod tests {
     }
 
     #[test]
-    fn anspubkey_parse_tolerates_case_and_revendian() {
+    fn anspubkey_parse_tolerates_case_and_build_roundtrip() {
         let kp = KeyPair::generate().unwrap();
-        let e = kp.exponent_be();
-        let n = kp.modulus_be();
-        // 线格式为 revendian：输入按字节逆序 hex 构造；capa/e/n 全小写也必须能解析
-        let n_rev: Vec<u8> = n.iter().rev().cloned().collect();
-        let s = format!(
-            "{:x}:{}-{}",
+        // 全小写 hex（含 E 数值小写）也必须能解析；官方样本再叠尾 \0
+        let s_lower = format!(
+            "{:x}:{}-{}\0",
             CAPA_OUR_SEND,
-            hex_lower(&e),
-            hex_lower(&n_rev)
+            "10001",
+            hex_lower(&kp.modulus_be())
         );
-        let (capa, pubk) = parse_anspubkey(&s).unwrap();
+        let (capa, pubk) = parse_anspubkey(&s_lower).unwrap();
         assert_eq!(capa, CAPA_OUR_SEND);
-        // revendian 逆转后必须完整还原原模数
-        assert_eq!(pubk.n().to_bytes_be(), n);
-        assert_eq!(pubk.e().to_bytes_be(), e);
-        // 官方 build 产物（e 无前导零 + revendian）roundtrip
+        assert_eq!(pubk.n().to_bytes_be(), kp.modulus_be());
+        assert_eq!(pubk.e().to_bytes_be(), vec![1, 0, 1]);
+        // build 产物（e 无前导零大端）roundtrip
         let s2 = build_anspubkey(CAPA_OUR_SEND, &kp);
         assert!(s2.starts_with(&format!("{:X}:10001-", CAPA_OUR_SEND)));
         let (_, pubk2) = parse_anspubkey(&s2).unwrap();
-        assert_eq!(pubk2.n().to_bytes_be(), n);
+        assert_eq!(pubk2.n().to_bytes_be(), kp.modulus_be());
     }
 
     #[test]
@@ -630,25 +630,21 @@ mod tests {
 
     /// 官方客户端 ANSPUBKEY 现场样本（2026-08 排查捕获，10.200.231.11）：
     /// extra 全长 528B = capa8 ':' e5 '-' n512 + 尾部 '\0'（C 字符串惯例）。
-    /// 模数按官方 revendian（字节逆序）发送。修复前该样本解析失败
-    /// （尾 \0 使 n 段变 513 字符奇数长度）。
+    /// N 为标准大端 hex（官方 revendian 已在其发送端抵消 CryptoAPI 小端）。
+    /// 修复前该样本解析失败（尾 \0 使 n 段变 513 字符奇数长度；E "10001"
+    /// 5 字符按字节解码亦失败）。
     #[test]
     fn anspubkey_accepts_official_sample_with_trailing_nul() {
-        // 用我们自己的密钥构造"官方样式"样本：revendian 模数 hex + 尾 \0，
-        // e 按官方格式无前导零（"10001"）
         let kp = KeyPair::generate().unwrap();
-        let n = kp.modulus_be();
-        let n_rev: Vec<u8> = n.iter().rev().cloned().collect();
         let s = format!(
             "{:X}:{}-{}\0",
             0x6592_0006u32,
             "10001",
-            hex_lower(&n_rev)
+            hex_lower(&kp.modulus_be())
         );
         assert_eq!(s.len(), 528);
         let (capa, pubk) = parse_anspubkey(&s).unwrap();
         assert_eq!(capa, 0x6592_0006);
-        // revendian 反转后必须还原出原始标准大端模数
         assert_eq!(pubk.n().to_bytes_be(), kp.modulus_be());
         assert_eq!(pubk.e().to_bytes_be(), vec![1, 0, 1]);
     }
