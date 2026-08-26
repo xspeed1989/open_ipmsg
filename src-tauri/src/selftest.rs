@@ -112,7 +112,7 @@ async fn async_run() -> bool {
         st.set_event(Box::new(move |e, v| ev.lock().unwrap().push((e.to_string(), v))));
     }
 
-    let ctx = net::start_network(st.clone(), port_app)
+    let ctx = net::start_network_quiet(st.clone(), port_app)
         .await
         .expect("start network");
     println!("[..] 网络栈已启动 (UDP/TCP 端口 {port_app})");
@@ -122,6 +122,7 @@ async fn async_run() -> bool {
     let offer_pkt_no = proto::next_packet_no();
     let shared = Arc::new(Mutex::new(PeerShared::default()));
     let img_pkt_no = proto::next_packet_no();
+    let empty_pkt_no = proto::next_packet_no();
     let peer_tasks = spawn_fake_peer(
         port_peer,
         port_app,
@@ -129,6 +130,7 @@ async fn async_run() -> bool {
         fake_content.clone(),
         offer_pkt_no,
         img_pkt_no,
+        empty_pkt_no,
     );
     println!("[..] 假对端已就绪 (端口 {port_peer})");
     // 假对端只绑定在 127.0.0.1，广播到不了它 —— 按真实场景做单播发现
@@ -319,6 +321,52 @@ async fn async_run() -> bool {
         );
     }
 
+    /* ---- 4a-3. 空文件（0 字节）下载：0 字节 = 完整传输，必须记为成功 ---- */
+    {
+        let offered = wait_for(3000, || {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(e, v)| e == "msg-in" && v["msg"]["text"] == "请收空文件")
+        })
+        .await;
+        log.check("收到空文件的入站公告", offered);
+        let dl = if offered {
+            net::download_file_task(
+                &ctx,
+                &peer_key,
+                empty_pkt_no,
+                13,
+                "空文件.txt",
+                "",
+                0,
+                false,
+            )
+            .await
+        } else {
+            Err("空文件公告未到达，跳过下载".into())
+        };
+        match dl {
+            Ok(path) => {
+                let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(u64::MAX);
+                log.check("空文件下载成功且落盘为 0 字节", len == 0);
+                let hist = st.read_history(&peer_key, 30);
+                let state_ok = hist
+                    .iter()
+                    .rev()
+                    .find(|r| r["pkt"].as_u64() == Some(empty_pkt_no as u64))
+                    .and_then(|r| r["files"][0]["state"].as_str())
+                    .map(|s| s == "done")
+                    .unwrap_or(false);
+                log.check("空文件历史记录状态记为 done（而非 failed）", state_ok);
+            }
+            Err(e) => {
+                log.check(&format!("空文件下载失败: {e}"), false);
+            }
+        }
+    }
+
     /* ---- 4b. 接收目录（对端以 GETDIRFILES 流回传） ---- */
     match net::download_file_task(
         &ctx,
@@ -444,9 +492,11 @@ async fn async_run() -> bool {
     );
 
     /* ---- 5. 已读回执 ---- */
-    // 出站方向：我们发的消息带 READCHECKOPT，假对端回复 READMSG 后应标记为已读
+    // 出站方向：我们发的消息带 READCHECKOPT，假对端回复 READMSG 后应标记为已读。
+    // 注意：read_history 只保留末尾 limit 条，前面的新增记录（如空文件公告）会
+    // 把最早的消息挤出窗口 —— 这里按文本找最早的出站消息，limit 必须足够大
     let out_read = wait_for(3000, || {
-        st.read_history(&peer_key, 10)
+        st.read_history(&peer_key, 50)
             .iter()
             .find(|r| r["dir"] == "out" && r["text"] == "你好，假对端！")
             .and_then(|r| r.get("read"))
@@ -524,7 +574,7 @@ async fn async_run() -> bool {
     cfg2.encoding = "utf8".into();
     cfg2.download_dir = data_dir.join("dl").to_string_lossy().into_owned();
     st2.set_config(cfg2);
-    let ctx2 = net::start_network(st2.clone(), port_app2)
+    let ctx2 = net::start_network_quiet(st2.clone(), port_app2)
         .await
         .expect("restart network");
     net::announce_unicast(&ctx2, &[peer_addr]).await;
@@ -588,6 +638,29 @@ async fn async_run() -> bool {
     }
     let hex_ok = hex_ok || wait_for(4000, || !shared.lock().unwrap().queued_hex).await;
     log.check("对端只认十六进制包编号时，重投后自动换写法确认成功", hex_ok);
+
+    /* ---- 5b-4. 会话摘要的未读计数与历史 read 标志逐条一致 ---- */
+    // 前端启动时用 list_sessions 的未读摘要补回「WebView 就绪前被丢弃的
+    // msg-in 事件」（对端离线留言在我方上线瞬间重投即属此列），摘要必须与
+    // 历史记录里的持久化 read 标志一致：重投继承已读的 777123 不得再计。
+    let mut sess_ok = false;
+    let mut sess_snap = String::new();
+    if let Some(s) = st2.list_sessions().into_iter().find(|s| s.key == peer_key) {
+        let hist = st2.read_history(&peer_key, 500);
+        let expect = hist
+            .iter()
+            .filter(|r| r["dir"] == "in" && !r["read"].as_bool().unwrap_or(false))
+            .count() as u32;
+        let expect_ts = hist
+            .iter()
+            .filter(|r| r["dir"] == "in" && !r["read"].as_bool().unwrap_or(false))
+            .filter_map(|r| r["ts"].as_u64())
+            .max()
+            .unwrap_or(0);
+        sess_ok = s.unread == expect && s.unread_ts == expect_ts;
+        sess_snap = format!("摘要 unread={}（期望 {expect}）unread_ts={}（期望 {expect_ts}）", s.unread, s.unread_ts);
+    }
+    log.check(&format!("会话摘要未读数与会话内未读记录一致（{sess_snap}）"), sess_ok);
 
     /* ---- 5c. 清空会话聊天记录 ---- */
     let before = st2.read_history(&peer_key, 500).len();
@@ -653,6 +726,11 @@ async fn crypto_roundtrip() -> bool {
     let port_b = free_udp_port().await;
     let port_c = free_udp_port().await;
     let key = "127.0.0.1";
+    // B 独占 127.0.0.2：A↔B 会话的会话键是 127.0.0.2，与 127.0.0.1 上任何
+    // 外来流量（本机真实客户端应答等）完全隔离，预握手断言才确定。
+    // C 也绑 127.0.0.2 并接管这个会话键 —— 撤回场景的语义就是
+    // 「同一 IP 换成新实例重新上线」。
+    let key_b = "127.0.0.2";
     let mut log = Log(vec![]);
 
     /* -- 实例 A / B：Config::default 的 encrypt 即为 true -- */
@@ -663,7 +741,7 @@ async fn crypto_roundtrip() -> bool {
     cfg_a.encoding = "utf8".into();
     cfg_a.download_dir = dir_a.join("dl").to_string_lossy().into_owned();
     st_a.set_config(cfg_a);
-    let ctx_a = net::start_network(st_a.clone(), port_a).await.expect("start A");
+    let ctx_a = net::start_network_quiet(st_a.clone(), port_a).await.expect("start A");
 
     let st_b = Arc::new(AppState::new(dir_b.clone()));
     let mut cfg_b = Config::default();
@@ -672,27 +750,30 @@ async fn crypto_roundtrip() -> bool {
     cfg_b.encoding = "utf8".into();
     cfg_b.download_dir = dir_b.join("dl").to_string_lossy().into_owned();
     st_b.set_config(cfg_b);
-    let ctx_b = net::start_network(st_b.clone(), port_b).await.expect("start B");
+    let ctx_b =
+        net::start_network_loopback(st_b.clone(), key_b.parse().unwrap(), port_b)
+            .await
+            .expect("start B");
 
     /* ---- 1. A 单播发现 B；双方各走一遍 GETPUBKEY 预握手 ---- */
     tokio::time::sleep(Duration::from_millis(60)).await;
-    let addr_b: SocketAddr = format!("127.0.0.1:{port_b}").parse().unwrap();
+    let addr_b: SocketAddr = format!("{key_b}:{port_b}").parse().unwrap();
     net::announce_unicast(&ctx_a, &[addr_b]).await;
 
-    let discovered = wait_for(2500, || st_a.peers.lock().unwrap().contains_key(key)).await;
+    let discovered = wait_for(2500, || st_a.peers.lock().unwrap().contains_key(key_b)).await;
     log.check("发现实例 B（BR_ENTRY→ANSENTRY 注册）", discovered);
-    // B 缓存了 A 的公钥 = B 侧预握手已完成（peer_keys.json 非空且含本机回环键）
+    // B 缓存了 A 的公钥 = B 侧预握手已完成（peer_keys.json 非空且含回环键）
     let b_cached_a = wait_for(5000, || peer_keys_cached(&dir_b, key)).await;
     log.check("A 广播声明 ENCRYPTOPT → B 完成预握手并持久化 A 的公钥", b_cached_a);
-    let a_cached_b = wait_for(5000, || peer_keys_cached(&dir_a, key)).await;
+    let a_cached_b = wait_for(5000, || peer_keys_cached(&dir_a, key_b)).await;
     log.check("B 应答声明 ENCRYPTOPT → A 完成预握手并持久化 B 的公钥", a_cached_b);
-    if !a_cached_b || !b_cached_a {
+    if !b_cached_a || !a_cached_b {
         return finish_crypto(log, &base);
     }
 
     /* ---- 2. A→B 文本：密封发出，B 解密落库 ---- */
     let text_ab = "密文互发：A 到 B";
-    match net::send_message(&ctx_a, key, text_ab, vec![]).await {
+    match net::send_message(&ctx_a, key_b, text_ab, vec![]).await {
         Ok(rec) => log.check(
             "A 发送返回 out 记录且实际密文发出（enc=true）",
             rec["dir"] == "out" && rec["enc"] == true,
@@ -723,7 +804,7 @@ async fn crypto_roundtrip() -> bool {
         }
     }
     let got_in_a = wait_for(4000, || {
-        st_a.read_history(key, 50).iter().any(|r| {
+        st_a.read_history(key_b, 50).iter().any(|r| {
             r["dir"] == "in" && r["text"] == text_ba && r["enc"] == true && r["sig_ok"] == true
         })
     })
@@ -736,7 +817,7 @@ async fn crypto_roundtrip() -> bool {
     std::fs::write(&path_ab, &content_ab).unwrap();
     let rec_file_ab = match net::send_message(
         &ctx_a,
-        key,
+        key_b,
         "加密文件给你",
         vec![path_ab.to_string_lossy().into_owned()],
     )
@@ -875,7 +956,7 @@ async fn crypto_roundtrip() -> bool {
         let ba_id = rec["files"][0]["id"].as_u64().unwrap_or(0) as u32;
         let registered_at_a = wait_for(4000, || {
             st_a
-                .read_history(key, 50)
+                .read_history(key_b, 50)
                 .iter()
                 .any(|r| r["dir"] == "in" && r["pkt"].as_u64() == Some(ba_pkt as u64))
         })
@@ -883,7 +964,7 @@ async fn crypto_roundtrip() -> bool {
         log.check("A 解密并登记 B 的文件公告", registered_at_a);
         match net::download_file_task(
             &ctx_a,
-            key,
+            key_b,
             ba_pkt,
             ba_id,
             "enc_reply.bin",
@@ -913,9 +994,11 @@ async fn crypto_roundtrip() -> bool {
         );
     }
 
-    /* ---- 4. 能力撤回：encrypt=false 的实例 C 以同一 IP 上线 ---- */
+    /* ---- 4. 能力撤回：encrypt=false 的实例 C 以 B 的 IP 上线 ---- */
     // 与真实场景同构：老对手关掉加密后重新上线，广播里不再有 ENCRYPTOPT。
-    // A 视角下会话键不变（仍是 127.0.0.1），只是投递端口随最新报文刷新到 C。
+    // C 抢占 B 的会话键（127.0.0.2）：A 视角下会话键不变，只是投递端口随
+    // 最新报文刷新到 C —— 撤回语义与 B 在不在线无关，只认「同 IP 不再声明
+    // 加密能力」。
     let st_c = Arc::new(AppState::new(dir_c.clone()));
     let mut cfg_c = Config::default();
     cfg_c.nickname = "明文实例C".into();
@@ -924,12 +1007,14 @@ async fn crypto_roundtrip() -> bool {
     cfg_c.encrypt = false; // 撤回方：上线通告不再携带 ENCRYPTOPT
     cfg_c.download_dir = dir_c.join("dl").to_string_lossy().into_owned();
     st_c.set_config(cfg_c);
-    let ctx_c = net::start_network(st_c.clone(), port_c).await.expect("start C");
+    let ctx_c = net::start_network_loopback(st_c.clone(), key_b.parse().unwrap(), port_c)
+        .await
+        .expect("start C");
     tokio::time::sleep(Duration::from_millis(60)).await;
     let addr_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
     net::announce_unicast(&ctx_c, &[addr_a]).await;
 
-    let forgotten = wait_for(4000, || !peer_keys_cached(&dir_a, key)).await;
+    let forgotten = wait_for(4000, || !peer_keys_cached(&dir_a, key_b)).await;
     log.check(
         "重新上线却未声明 ENCRYPTOPT → A 撤回该对端公钥缓存（写盘生效）",
         forgotten,
@@ -937,7 +1022,7 @@ async fn crypto_roundtrip() -> bool {
 
     /* ---- 5. 撤回后 A 只能明文发送：C 收到的记录 enc=false ---- */
     let text_plain = "撤回后的明文消息";
-    match net::send_message(&ctx_a, key, text_plain, vec![]).await {
+    match net::send_message(&ctx_a, key_b, text_plain, vec![]).await {
         Ok(rec) => log.check(
             "撤回后发送回退明文（out 记录 enc=false）",
             rec["dir"] == "out" && rec["enc"] == false,
@@ -948,6 +1033,7 @@ async fn crypto_roundtrip() -> bool {
         }
     }
     let plain_at_c = wait_for(4000, || {
+        // C 的会话键 = A 的 IP（127.0.0.1），与 C 自己绑在哪个地址无关
         st_c.read_history(key, 50).iter().any(|r| {
             r["dir"] == "in" && r["text"] == text_plain && r["enc"] == false
         })
@@ -977,6 +1063,7 @@ fn spawn_fake_peer(
     serve_content: Vec<u8>,
     offer_pkt_no: u32,
     img_pkt_no: u32,
+    empty_pkt_no: u32,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut tasks = Vec::new();
 
@@ -1074,6 +1161,34 @@ fn spawn_fake_peer(
             extra.extend_from_slice(entry.serialize("utf8").as_bytes());
             let pkt = proto::Packet {
                 pkt_no: img_pkt_no,
+                user: "假对端".into(),
+                host: "fake-host".into(),
+                command: cmd::SENDMSG | opt::FILEATTACHOPT,
+                extra,
+            };
+            let _ = ps.send_to(&pkt.encode("假对端", "fake-host"), target).await;
+        }
+    }));
+
+    /* -- 主动提供空文件（0 字节）下载：传输应以成功收尾，而非误判失败 -- */
+    tasks.push(tokio::spawn({
+        let ps = ps.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(550)).await;
+            let target: SocketAddr = format!("127.0.0.1:{port_app}").parse().unwrap();
+            let entry = proto::FileEntry {
+                id: 13,
+                raw_id: String::new(),
+                name: "空文件.txt".into(),
+                size: 0,
+                mtime: 123,
+                attr: fileattr::REGULAR,
+            };
+            let mut extra = "请收空文件".as_bytes().to_vec();
+            extra.push(0);
+            extra.extend_from_slice(entry.serialize("utf8").as_bytes());
+            let pkt = proto::Packet {
+                pkt_no: empty_pkt_no,
                 user: "假对端".into(),
                 host: "fake-host".into(),
                 command: cmd::SENDMSG | opt::FILEATTACHOPT,
@@ -1247,17 +1362,18 @@ fn spawn_fake_peer(
                 // 按官方 IP Messenger 约定解析：包编号是十六进制。
                 // 真实的飞秋类客户端就是这么解析的 —— 请求方若发十进制，
                 // 这里对不上号，于是接受连接后一个字节都不回。
-                let pkt_ok = fields
+                let pkt_val = fields
                     .next()
                     .and_then(|f| u32::from_str_radix(f.trim(), 16).ok())
-                    .map(|p| p == offer_pkt_no || p == img_pkt_no)
-                    .unwrap_or(false);
-                if !pkt_ok {
+                    .filter(|p| *p == offer_pkt_no || *p == img_pkt_no || *p == empty_pkt_no);
+                if pkt_val.is_none() {
                     let _ = stream.shutdown().await;
                     return;
                 }
                 let body = if req.command & 0xFF == cmd::GETDIRFILES {
                     fake_dir_stream()
+                } else if pkt_val == Some(empty_pkt_no) {
+                    Vec::new() // 空文件：0 字节内容
                 } else {
                     content
                 };

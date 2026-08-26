@@ -104,7 +104,44 @@ pub fn broadcast_targets() -> Vec<IpAddr> {
 /* ================= 启动 ================= */
 
 pub async fn start_network(st: Arc<AppState>, port: u16) -> io::Result<Arc<NetCtx>> {
-    let sock = Arc::new(UdpSocket::bind(("0.0.0.0", port)).await?);
+    start_network_impl(st, None, port, true).await
+}
+
+/// 测试用：与 `start_network` 相同，但跳过启动时对 2425 端口的上线广播。
+///
+/// 无人值守自检在同一台机器上并跑多个实例；若各实例启动即广播，本机/局域网
+/// 真实运行的 open-ipmsg（2425 端口）会应答这些广播，用相同的会话键（对端 IP）
+/// 抢先注册、甚至先于被测对端完成公钥握手 —— 公钥缓存一旦被真实客户端占据，
+/// 握手守护（有缓存不握手）就会跳过与被测对端的握手，造成环境性抖动。
+pub(crate) async fn start_network_quiet(st: Arc<AppState>, port: u16) -> io::Result<Arc<NetCtx>> {
+    start_network_impl(st, None, port, false).await
+}
+
+/// 测试用：绑定到指定 IP 的静默启动（多实例自检的隔离手段）。
+///
+/// 自检的 A/B/C 三个实例若都绑 0.0.0.0，会话键全是 127.0.0.1，任何一台
+/// 本机/局域网真实 open-ipmsg 的应答都能混进它们各自的会话（见 start_network_quiet
+/// 注释）；把 B 绑到独占的 127.0.0.2 后，A↔B 会话的键（127.0.0.2）不受
+/// 127.0.0.1 上任何外来流量影响，预握手断言才确定。C 保留 127.0.0.1，因为
+/// 撤回场景的语义就是「同一 IP 换新实例」。
+pub(crate) async fn start_network_loopback(
+    st: Arc<AppState>,
+    bind: Ipv4Addr,
+    port: u16,
+) -> io::Result<Arc<NetCtx>> {
+    start_network_impl(st, Some(bind), port, false).await
+}
+
+async fn start_network_impl(
+    st: Arc<AppState>,
+    bind: Option<Ipv4Addr>,
+    port: u16,
+    announce_start: bool,
+) -> io::Result<Arc<NetCtx>> {
+    let sock = Arc::new(match bind {
+        Some(ip) => UdpSocket::bind(SocketAddr::from((ip, port))).await?,
+        None => UdpSocket::bind(("0.0.0.0", port)).await?,
+    });
     sock.set_broadcast(true)?;
 
     let ctx = Arc::new(NetCtx {
@@ -113,7 +150,9 @@ pub async fn start_network(st: Arc<AppState>, port: u16) -> io::Result<Arc<NetCt
         port,
     });
 
-    announce(&ctx).await;
+    if announce_start {
+        announce(&ctx).await;
+    }
     spawn_udp_loop(ctx.clone());
     spawn_tcp_server(ctx.clone());
     spawn_ticker(ctx.clone());
@@ -1950,7 +1989,12 @@ pub async fn download_file_task(
     }
 
     // 对端接受连接却不回数据，多半是请求里数字字段的进制不合它的口味：
-    // 换一种方言重试，命中后记住，后续下载不再多花往返
+    // 换一种方言重试，命中后记住，后续下载不再多花往返。
+    //
+    // 例外：公告大小就是 0（空文件）——空文件的完整传输恰好也是 0 字节，
+    // 与「对端不认方言」在字节层面无法区分。此时收到 0 字节就是完整成功，
+    // 立即收工，不再花往返试其余方言（结果不会因方言而不同），否则 4 种
+    // 方言全部返回 0 字节后会被误判成「对方未返回文件数据」而失败。
     let mut result: Result<(u64, bool), String> = Ok((0, false));
     for idx in ctx.st.dialect_order(&peer.ip, DIALECTS.len()) {
         let d = DIALECTS[idx];
@@ -1959,6 +2003,7 @@ pub async fn download_file_task(
         )
         .await;
         match &result {
+            Ok(_) if expect_size == 0 => break, // 空文件：0 字节即完整传输
             Ok((0, _)) => {
                 ctx.st.diag(&format!(
                     "dl-try {key} pkt={pkt_no} id={file_id:x} 方言#{idx}({d:?}) -> 0 字节，换下一种"
@@ -1977,8 +2022,9 @@ pub async fn download_file_task(
         }
     }
     match result {
-        Ok((0, _)) => {
-            // 对端接受了连接但没有回数据（部分私有实现的前置校验未通过）
+        Ok((0, _)) if expect_size > 0 => {
+            // 对端接受了连接但没有回数据，而公告大小非 0：
+            // 空文件已经在上面的方言循环里直接成功，走到这里必然是传输异常
             let _ = tokio::fs::remove_file(&tmp_path).await;
             ctx.st
                 .diag(&format!("dl-empty {key} pkt={pkt_no} id={file_id:x}: 对端未返回数据"));
