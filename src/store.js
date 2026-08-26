@@ -11,6 +11,7 @@ import { pickLatestUnread } from './lib/unread'
 import { unreadReceiptPkts } from './lib/receipts'
 import { mergeSessions } from './lib/sessions'
 import { applyTheme } from './lib/theme'
+import { t, setLocale, detectLocale, dayLabel as i18nDayLabel } from './lib/i18n'
 
 export const store = reactive({
   booted: false,
@@ -59,7 +60,6 @@ export function fmtSize(n) {
 function pad(x) {
   return String(x).padStart(2, '0')
 }
-const DAY = 86400000
 
 export function fmtTime(ts) {
   if (!ts) return ''
@@ -67,18 +67,8 @@ export function fmtTime(ts) {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-/** 消息流中的日期分隔标签 */
-export function dayLabel(ts) {
-  const d = new Date(ts * 1000)
-  const now = new Date()
-  const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() / 1000
-  if (ts >= midnight) return '今天'
-  if (ts >= midnight - DAY) return '昨天'
-  const wd = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][d.getDay()]
-  if (ts >= midnight - 6 * DAY) return wd
-  const sameYear = d.getFullYear() === now.getFullYear()
-  return `${sameYear ? '' : d.getFullYear() + '年'}${d.getMonth() + 1}月${d.getDate()}日`
-}
+/** 消息流中的日期分隔标签（文案按当前界面语言） */
+export const dayLabel = (ts) => i18nDayLabel(ts)
 
 export function displayName(key) {
   const u = store.userMap[key]
@@ -94,6 +84,8 @@ export async function refreshConfig() {
   store.config = await ipc.getConfig()
   // 配置里的主题立刻生效（首屏与保存设置后都走这里）
   applyTheme(store.config?.theme)
+  // 界面语言：config.lang 未设置（空串 = 跟随系统）时按系统语言探测
+  setLocale(store.config?.lang || detectLocale())
 }
 
 export { applyTheme }
@@ -285,11 +277,13 @@ export { splitDelayedNote }
 export function previewText(msg) {
   if (msg.kind === 'file') {
     const n = (msg.files || []).length
-    return `[文件] ${msg.files?.[0]?.name || ''}${n > 1 ? ` 等${n}个` : ''}`
+    const name = msg.files?.[0]?.name || ''
+    const head = `${t('file.tag')} ${name}`
+    return n > 1 ? head + t('preview.etc', { n }) : head
   }
   const { body, delayed } = splitDelayedNote(msg.text)
-  const t = (body || (delayed !== null ? '[离线留言]' : '')).replace(/\s+/g, ' ')
-  return t.length > 48 ? t.slice(0, 48) + '…' : t
+  const tip = (body || (delayed !== null ? t('preview.offline') : '')).replace(/\s+/g, ' ')
+  return tip.length > 48 ? tip.slice(0, 48) + '…' : tip
 }
 
 /** 消息可见（聊天已打开且窗口聚焦）时视为已读 */

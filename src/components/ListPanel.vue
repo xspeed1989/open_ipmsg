@@ -3,12 +3,13 @@
 import { computed } from 'vue'
 import { store, openChat, onSearchInput, openHit, displayName, fmtTime } from '../store'
 import { makeSnippet } from '../lib/text'
+import { t } from '../lib/i18n'
 import Avatar from './Avatar.vue'
 
 const q = computed(() => store.search.trim())
 /** 命中条目的一行摘要：文本消息截命中处，文件消息显示文件名 */
 function hitLine(h) {
-  if (h.hit === 'file') return `[文件] ${(h.files || []).join('、')}`
+  if (h.hit === 'file') return `${t('file.tag')} ${(h.files || []).join(t('sep.list'))}`
   return makeSnippet(h.text, q.value)
 }
 function hitTitle(h) {
@@ -28,7 +29,7 @@ const contactGroups = computed(() => {
   const groups = {}
   for (const u of store.sessionList) {
     if (!matchUser(u)) continue
-    const g = u.group || '未分组'
+    const g = u.group || t('ungrouped')
     ;(groups[g] ||= []).push(u)
   }
   const unreadOf = (u) => store.unread[u.key] || 0
@@ -60,20 +61,20 @@ function openContact(u) {
         </svg>
         <input
           :value="store.search"
-          placeholder="搜索联系人 / 聊天记录"
+          :placeholder="t('list.searchPh')"
           spellcheck="false"
           @input="onSearchInput($event.target.value)"
         />
-        <button v-if="q" class="clear" title="清空" @click="onSearchInput('')">✕</button>
+        <button v-if="q" class="clear" :title="t('list.clear')" @click="onSearchInput('')">✕</button>
       </div>
     </div>
 
     <div class="rows">
       <div v-if="q && contactGroups.length" class="group-head">
-        联系人（{{ contactGroups.reduce((n, g) => n + g.users.length, 0) }}）
+        {{ t('list.contactsCount', { n: contactGroups.reduce((n, g) => n + g.users.length, 0) }) }}
       </div>
       <template v-for="g in contactGroups" :key="g.group">
-        <div v-if="!q" class="group-head">{{ g.group }}（{{ g.users.length }}）</div>
+        <div v-if="!q" class="group-head">{{ g.group }}{{ t('list.groupCount', { n: g.users.length }) }}</div>
         <div
           v-for="u in g.users"
           :key="u.key"
@@ -84,10 +85,10 @@ function openContact(u) {
         >
           <div class="ava">
             <Avatar :name="u.nickname || u.user || '?'" :seed="u.key" :size="36" />
-            <i class="status-dot" :class="u.online ? 'on' : 'off'" :title="u.online ? '在线' : '离线'"></i>
+            <i class="status-dot" :class="u.online ? 'on' : 'off'" :title="u.online ? t('online') : t('offline')"></i>
           </div>
           <div class="mid">
-            <div class="r1 ellipsis">{{ u.nickname || u.user || '未知用户' }}</div>
+            <div class="r1 ellipsis">{{ u.nickname || u.user || t('unknownUser') }}</div>
             <div class="r2 ellipsis">{{ u.host || '' }}{{ u.ip ? ' · ' + u.ip : '' }}{{ u.group ? ' · ' + u.group : '' }}</div>
           </div>
           <div class="right">
@@ -101,7 +102,7 @@ function openContact(u) {
       <!-- 聊天记录命中 -->
       <template v-if="q">
         <div class="group-head">
-          聊天记录（{{ store.searching ? '搜索中…' : store.searchHits.length }}）
+          {{ store.searching ? t('list.recordsSearching') : t('list.recordsCount', { n: store.searchHits.length }) }}
         </div>
         <div
           v-for="h in store.searchHits"
@@ -115,13 +116,13 @@ function openContact(u) {
           </div>
         </div>
         <div v-if="!store.searching && !store.searchHits.length" class="empty-tip">
-          <p class="sub">没有匹配的聊天记录</p>
+          <p class="sub">{{ t('list.noMatch') }}</p>
         </div>
       </template>
 
       <div v-if="!contactGroups.length && !q" class="empty-tip">
-        <p>暂无会话</p>
-        <p class="sub">请确认对方已运行 IPMsg 客户端（UDP 端口 2425），或点击聊天窗口右上角「刷新」重新广播</p>
+        <p>{{ t('list.empty') }}</p>
+        <p class="sub">{{ t('list.emptySub') }}</p>
       </div>
     </div>
   </aside>

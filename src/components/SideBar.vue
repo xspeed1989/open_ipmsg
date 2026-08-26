@@ -1,6 +1,7 @@
 <script setup>
 // 左侧功能栏：头像（点击进设置）+ 底部设置齿轮
 import { store } from '../store'
+import { t } from '../lib/i18n'
 import Avatar from './Avatar.vue'
 
 function openSettings() {
@@ -10,9 +11,9 @@ function openSettings() {
 
 <template>
   <nav class="rail">
-    <div class="self" title="个人信息与设置" @click="openSettings">
+    <div class="self" :title="t('sidebar.profile')" @click="openSettings">
       <Avatar
-        :name="store.config?.nickname || '我'"
+        :name="store.config?.nickname || t('me')"
         :seed="'self-' + (store.config?.hostname || 'me')"
         :size="34"
       />
@@ -20,7 +21,7 @@ function openSettings() {
 
     <div class="spacer"></div>
 
-    <button class="nav-btn" title="设置" @click="openSettings">
+    <button class="nav-btn" :title="t('sidebar.settings')" @click="openSettings">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
         <circle cx="12" cy="12" r="3.2" stroke="currentColor" stroke-width="1.6" />
         <path d="M12 2.8l1 2.6a7 7 0 0 1 2.4 1l2.7-.8 1.6 2.8-1.9 2a7 7 0 0 1 .2 2.6l2 1.9-1.5 2.8-2.8-.7a7 7 0 0 1-2.3 1.4L13 21.2h-3.2l-.5-2.8a7 7 0 0 1-2.3-1.4l-2.8.7-1.5-2.8 2-1.9a7 7 0 0 1 0-2.6l-1.9-2 1.6-2.8 2.7.8a7 7 0 0 1 2.4-1l1-2.6z"

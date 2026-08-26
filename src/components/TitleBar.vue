@@ -3,6 +3,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { store } from '../store'
+import { t } from '../lib/i18n'
 
 const appWindow = getCurrentWindow()
 const maximized = ref(false)
@@ -42,10 +43,10 @@ function close() {
       </span>
     </div>
     <div class="tb-controls">
-      <button class="tb-btn" title="最小化" @click="minimize">
+      <button class="tb-btn" :title="t('titlebar.min')" @click="minimize">
         <svg width="10" height="10" viewBox="0 0 10 10"><path d="M1 5h8" stroke="currentColor" stroke-width="1" /></svg>
       </button>
-      <button class="tb-btn" :title="maximized ? '还原' : '最大化'" @click="toggleMax">
+      <button class="tb-btn" :title="maximized ? t('titlebar.restore') : t('titlebar.max')" @click="toggleMax">
         <svg v-if="!maximized" width="10" height="10" viewBox="0 0 10 10">
           <rect x="1.5" y="1.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1" />
         </svg>
@@ -54,7 +55,7 @@ function close() {
           <path d="M3.5 1.5h5v5" fill="none" stroke="currentColor" stroke-width="1" />
         </svg>
       </button>
-      <button class="tb-btn tb-close" title="关闭" @click="close">
+      <button class="tb-btn tb-close" :title="t('titlebar.close')" @click="close">
         <svg width="10" height="10" viewBox="0 0 10 10"><path d="M1.5 1.5l7 7M8.5 1.5l-7 7" stroke="currentColor" stroke-width="1" /></svg>
       </button>
     </div>

@@ -4,7 +4,10 @@
  * 引用随消息作为普通文本发送（IPMsg 协议没有引用字段）：
  * 对方（含飞秋等老客户端）收到的就是「「原文」\n回复内容」这样的文本，
  * 零协议改动、互操作最稳。本地 UI 用 quotePreview 生成摘要条。
+ * 标记字符（引号、[文件]）按当前界面语言取，见 lib/i18n。
  */
+
+import { t } from './i18n.js'
 
 /** 把消息内容压成单行摘要（空白压实），用于引用条显示 */
 function collapse(s) {
@@ -23,7 +26,7 @@ export function quotePreview(msg) {
   if (!msg) return ''
   if (msg.kind === 'file') {
     const name = msg.files?.[0]?.name
-    return name ? `[文件] ${collapse(name)}` : '[文件]'
+    return name ? `${t('file.tag')} ${collapse(name)}` : t('file.tag')
   }
   const text = collapse(msg.text)
   if (!text) return ''
@@ -43,5 +46,5 @@ export function composeReplyBody(quoteText, replyText) {
   const q = collapse(quoteText)
   const body = replyText.replace(/\n{3,}/g, '\n\n').trimEnd()
   if (!q) return body
-  return `「${q}」\n${body}`
+  return `${t('reply.qOpen')}${q}${t('reply.qClose')}\n${body}`
 }

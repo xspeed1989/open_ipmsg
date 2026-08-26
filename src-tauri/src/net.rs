@@ -566,7 +566,13 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                 } else {
                     // 加密关闭但收到密文：以占位文本入会话，避免静默丢消息；
                     // 清掉 ENCRYPTOPT 让它走普通明文路径。sig 无法核验 → Some(false)
-                    pkt.extra = "🔒 无法解密（加密已关闭）".as_bytes().to_vec();
+                    // 占位文案按界面语言（config.lang）取简中/英文
+                    let lang = ctx.st.config().lang;
+                    pkt.extra = if lang.eq_ignore_ascii_case("en") {
+                        "🔒 Cannot decrypt (encryption is off)".as_bytes().to_vec()
+                    } else {
+                        "🔒 无法解密（加密已关闭）".as_bytes().to_vec()
+                    };
                     pkt.command &= !opt::ENCRYPTOPT;
                     enc_meta = Some(false);
                 }

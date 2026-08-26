@@ -7,13 +7,14 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
+import { t } from '../lib/i18n'
 
 const appWindow = getCurrentWindow()
 // 参数优先取窗口创建时注入的对象，其次回退查询串
 const boot = window.__OIM_VIEWER__ || {}
 const params = new URLSearchParams(location.search)
 const path = boot.path || params.get('path') || ''
-const name = boot.name || path.split(/[\\/]/).pop() || '图片'
+const name = boot.name || path.split(/[\\/]/).pop() || t('viewer.image')
 
 const src = ref('')
 const error = ref('')
@@ -36,13 +37,13 @@ const style = computed(() => ({
 
 onMounted(async () => {
   if (!path) {
-    error.value = '缺少图片路径'
+    error.value = t('viewer.missingPath')
   } else {
     try {
       const r = await invoke('read_image_data', { path })
       src.value = `data:${r.mime};base64,${r.b64}`
     } catch (e) {
-      error.value = String(e)
+      error.value = t('viewer.failed', { e })
     }
   }
   window.addEventListener('keydown', onKey)
@@ -131,20 +132,20 @@ async function reveal() {
     <header class="bar" data-tauri-drag-region>
       <span class="title" data-tauri-drag-region>{{ name }}</span>
       <div class="acts">
-        <button title="缩小 ( - )" @click="zoom(1 / 1.2)">－</button>
-        <button title="放大 ( + )" @click="zoom(1.2)">＋</button>
+        <button :title="t('viewer.zoomOut')" @click="zoom(1 / 1.2)">－</button>
+        <button :title="t('viewer.zoomIn')" @click="zoom(1.2)">＋</button>
         <span class="pct">{{ pct }}%</span>
-        <button :title="zoomed ? '适应窗口 ( 0 )' : '原始大小'" @click="toggleZoom">
-          {{ zoomed ? '适应' : '1:1' }}
+        <button :title="zoomed ? t('viewer.fitTitle') : t('viewer.actualSize')" @click="toggleZoom">
+          {{ zoomed ? t('viewer.fit') : t('viewer.oneToOne') }}
         </button>
-        <button title="旋转 90° ( R )" @click="rotate = (rotate + 90) % 360">⟳</button>
-        <button title="所在文件夹" @click="reveal">📂</button>
-        <button class="x" title="关闭 ( Esc )" @click="close">✕</button>
+        <button :title="t('viewer.rotate')" @click="rotate = (rotate + 90) % 360">⟳</button>
+        <button :title="t('viewer.reveal')" @click="reveal">📂</button>
+        <button class="x" :title="t('viewer.close')" @click="close">✕</button>
       </div>
     </header>
 
     <div class="stage" @wheel="onWheel" @mousedown="onDown" @dblclick="toggleZoom">
-      <p v-if="error" class="err">图片打开失败：{{ error }}</p>
+      <p v-if="error" class="err">{{ error }}</p>
       <img
         v-else-if="src"
         ref="img"
@@ -154,7 +155,7 @@ async function reveal() {
         alt=""
         @load="measure"
       />
-      <p v-else class="loading">正在加载…</p>
+      <p v-else class="loading">{{ t('viewer.loading') }}</p>
     </div>
   </div>
 </template>

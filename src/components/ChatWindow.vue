@@ -14,6 +14,7 @@ import { composeReplyBody, quotePreview } from '../lib/reply'
 import { forwardPayload, mergeForward } from '../lib/forward'
 import { copyTextOf } from '../lib/copymsg'
 import { pendingImgFromB64 } from '../lib/clipimg'
+import { t } from '../lib/i18n'
 import { open as openFileDialog, confirm as confirmDialog } from '@tauri-apps/plugin-dialog'
 import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -113,7 +114,7 @@ function startReply() {
   if (!m) return
   replyTarget.value = {
     preview: quotePreview(m),
-    nick: m.dir === 'out' ? '我' : displayName(store.activeKey),
+    nick: m.dir === 'out' ? t('me') : displayName(store.activeKey),
   }
   closeCtx()
   nextTick(() => ta.value?.focus())
@@ -139,12 +140,12 @@ function startForward() {
 
 function startBatch() {
   if (!store.activeKey) {
-    alert('请先在左侧选择一个会话')
+    alert(t('chat.alertSelectSession'))
     return
   }
   // 输入框为空时不再静默禁用按钮，点击给出明确引导
   if (!canSend.value) {
-    alert('请先在输入框填写要批量发送的内容（文字或粘贴的图片/文件）')
+    alert(t('chat.alertFillContent'))
     nextTick(() => ta.value?.focus())
     return
   }
@@ -163,18 +164,18 @@ function copyMsg() {
   const selText = sel && !sel.isCollapsed ? sel.toString() : ''
   if (selText.trim()) {
     closeCtx()
-    ipc.copyText(selText).catch((e) => alert('复制失败：' + e))
+    ipc.copyText(selText).catch((e) => alert(t('chat.alertCopyFailed', { e })))
     return
   }
   const m = ctxMenu.value?.msg
   closeCtx()
   if (!m) return
-  const t = copyTextOf(m)
-  if (!t) {
-    alert('这条消息没有可复制的内容')
+  const ct = copyTextOf(m)
+  if (!ct) {
+    alert(t('chat.alertNoCopy'))
     return
   }
-  ipc.copyText(t).catch((e) => alert('复制失败：' + e))
+  ipc.copyText(ct).catch((e) => alert(t('chat.alertCopyFailed', { e })))
 }
 
 function enterSelMode() {
@@ -199,10 +200,10 @@ function toggleSel(m) {
 }
 
 function startMultiForward() {
-  const peerNick = displayName(store.activeKey) || '对方'
-  const merged = mergeForward([...selected.value], (dir) => (dir === 'out' ? '我' : peerNick))
+  const peerNick = displayName(store.activeKey) || t('chat.peer')
+  const merged = mergeForward([...selected.value], (dir) => (dir === 'out' ? t('me') : peerNick))
   if (!merged) {
-    alert('选中的消息没有可转发的内容')
+    alert(t('chat.alertNoForward'))
     return
   }
   exitSel()
@@ -219,7 +220,7 @@ async function onPickerConfirm(keys) {
     try {
       paths = await pendingToPaths(pendingList.value)
     } catch (e) {
-      alert('准备附件失败：' + e)
+      alert(t('chat.alertStageFailed', { e }))
       return
     }
   }
@@ -245,8 +246,9 @@ async function onPickerConfirm(keys) {
     draft.value = ''
   }
   const name = (k) => displayName(k) || k
-  if (!fails.length) alert(`已发送给 ${ok} 人：${keys.map(name).join('、')}`)
-  else alert(`成功 ${ok} 人；失败 ${fails.length} 人：${fails.map(name).join('、')}`)
+  const names = keys.map(name).join(t('sep.list'))
+  if (!fails.length) alert(t('chat.alertSentTo', { n: ok, names }))
+  else alert(t('chat.alertPartial', { ok, fail: fails.length, names }))
 }
 
 watch(() => store.activeKey, () => nextTick(() => ta.value?.focus()))
@@ -275,7 +277,7 @@ async function doSend() {
     draft.value = ''
     autoBottom = true
   } catch (e) {
-    alert('发送失败：' + e)
+    alert(t('chat.alertSendFailed', { e }))
   }
 }
 
@@ -306,7 +308,7 @@ const MIME_EXT = {
   'image/bmp': 'bmp', 'image/webp': 'webp',
 }
 function imgItemName(mime) {
-  return '剪贴板图片.' + (MIME_EXT[mime] || 'png')
+  return t('chat.clipboardImage') + '.' + (MIME_EXT[mime] || 'png')
 }
 
 /** 把粘贴得到的本地路径统一变成待发送文件条目 */
@@ -356,7 +358,7 @@ function bytesToB64(bytes) {
 async function takeImageFile(file) {
   if (!file) return false
   if (file.size > 32 * 1024 * 1024) {
-    alert('图片超过 32MB，请改用「发送文件」')
+    alert(t('chat.alertImgTooBig'))
     return false
   }
   const buf = new Uint8Array(await file.arrayBuffer())
@@ -424,12 +426,12 @@ async function onPaste(e) {
     const pending = pendingOf(store.activeKey)
     for (const f of files) {
       const buf = new Uint8Array(await f.arrayBuffer())
-      const path = await ipc.stagePastedFile(f.name || '粘贴文件', bytesToB64(buf))
-      pending.push({ kind: 'file', path, name: baseName(f.name || '粘贴文件') })
+      const path = await ipc.stagePastedFile(f.name || t('chat.pasteFile'), bytesToB64(buf))
+      pending.push({ kind: 'file', path, name: baseName(f.name || t('chat.pasteFile')) })
     }
     nextTick(() => ta.value?.focus())
   } catch (err) {
-    alert('粘贴失败：' + err)
+    alert(t('chat.alertPasteFailed', { e: err }))
   }
 }
 
@@ -531,7 +533,7 @@ onMounted(async () => {
       // 落点在联系人上 → 打开对应会话再附加；其余位置 → 当前会话的待发送列表
       const key = hoverKey || store.activeKey
       if (!key) {
-        alert('请先选择要发送给谁，或把文件拖到中栏的联系人上')
+        alert(t('chat.alertPickContact'))
         return
       }
       if (hoverKey && hoverKey !== store.activeKey) await openChat(hoverKey)
@@ -587,24 +589,24 @@ function onKeydown(e) {
 async function pickFiles() {
   if (!store.activeKey) return
   try {
-    const sel = await openFileDialog({ multiple: true, title: '选择要发送的文件' })
+    const sel = await openFileDialog({ multiple: true, title: t('chat.pickFilesTitle') })
     if (!sel) return
     await sendFiles(Array.isArray(sel) ? sel : [sel])
     autoBottom = true
   } catch (e) {
-    alert('发送文件失败：' + e)
+    alert(t('chat.alertSendFailed', { e }))
   }
 }
 
 async function pickFolder() {
   if (!store.activeKey) return
   try {
-    const sel = await openFileDialog({ multiple: true, directory: true, title: '选择要发送的文件夹' })
+    const sel = await openFileDialog({ multiple: true, directory: true, title: t('chat.pickFolderTitle') })
     if (!sel) return
     await sendFiles(Array.isArray(sel) ? sel : [sel])
     autoBottom = true
   } catch (e) {
-    alert('发送文件夹失败：' + e)
+    alert(t('chat.alertSendFailed', { e }))
   }
 }
 
@@ -700,14 +702,14 @@ async function viewImage(f) {
   try {
     await ipc.openImageViewer(f.path, f.name)
   } catch (e) {
-    alert('打开图片失败：' + e)
+    alert(t('chat.alertOpenImg', { e }))
   }
 }
 async function openFile(path) {
-  try { await openPath(path) } catch (e) { alert('打开失败：' + e) }
+  try { await openPath(path) } catch (e) { alert(t('chat.alertOpen', { e })) }
 }
 async function revealFile(path) {
-  try { await revealItemInDir(path) } catch (e) { alert('打开文件夹失败：' + e) }
+  try { await revealItemInDir(path) } catch (e) { alert(t('chat.alertReveal', { e })) }
 }
 
 /* ---------- 会话内查找（Ctrl+F）与搜索结果定位 ---------- */
@@ -817,14 +819,14 @@ async function doClearHistory() {
   if (!key) return
   const who = displayName(key)
   const ok = await confirmDialog(
-    `确定清空与「${who}」的聊天记录吗？\n本地记录将被删除且无法恢复（不影响对方）。`,
-    { title: '清空聊天记录', kind: 'warning', okLabel: '清空', cancelLabel: '取消' }
+    t('chat.clearConfirm', { who }),
+    { title: t('chat.clearTitle'), kind: 'warning', okLabel: t('chat.clearOk'), cancelLabel: t('cancel') }
   )
   if (!ok) return
   try {
     await clearHistory(key)
   } catch (e) {
-    alert('清空失败：' + e)
+    alert(t('chat.alertClear', { e }))
   }
 }
 
@@ -870,19 +872,19 @@ watch(
       <div class="peer">
         <div class="name">{{ displayName(store.activeKey) }}</div>
         <div class="sub">
-          <i class="stat" :class="isOnline ? 'on' : 'off'">{{ isOnline ? '● 在线' : '● 离线' }}</i>
+          <i class="stat" :class="isOnline ? 'on' : 'off'">{{ isOnline ? '● ' + t('online') : '● ' + t('offline') }}</i>
           {{ activeUser.host || '' }}<template v-if="activeUser.ip"> · {{ activeUser.ip }}</template>
           <template v-if="activeUser.group"> · {{ activeUser.group }}</template>
         </div>
       </div>
       <div class="head-actions">
-        <button class="mini-btn" title="清空聊天记录" @click="doClearHistory">
+        <button class="mini-btn" :title="t('chat.clearHistory')" @click="doClearHistory">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
             <path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13" stroke="currentColor" stroke-width="1.8"
               stroke-linecap="round" stroke-linejoin="round" />
           </svg>
         </button>
-        <button class="mini-btn" title="重新广播上线，刷新在线用户" @click="refreshUsers">
+        <button class="mini-btn" :title="t('chat.refreshUsers')" @click="refreshUsers">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
             <path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
           </svg>
@@ -899,10 +901,10 @@ watch(
           <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" stroke="currentColor" stroke-width="1.8"
             stroke-linecap="round" />
         </svg>
-        <p v-if="store.dragHoverKey">松开后打开「{{ displayName(store.dragHoverKey) }}」的会话并加入待发送</p>
-        <p v-else-if="activeUser">松开后加入待发送列表</p>
-        <p v-else>请先选择会话，或把文件拖到中栏的联系人上</p>
-        <span class="sub">支持多个文件与文件夹 · Enter 发送</span>
+        <p v-if="store.dragHoverKey">{{ t('chat.dropOpen', { name: displayName(store.dragHoverKey) }) }}</p>
+        <p v-else-if="activeUser">{{ t('chat.dropAdd') }}</p>
+        <p v-else>{{ t('chat.dropChoose') }}</p>
+        <span class="sub">{{ t('chat.dropSupport') }}</span>
       </div>
     </div>
 
@@ -911,15 +913,15 @@ watch(
       <input
         ref="findInput"
         v-model="findQuery"
-        placeholder="在本会话中查找"
+        :placeholder="t('chat.findPh')"
         spellcheck="false"
         @keydown.enter.prevent="stepFind(1)"
         @keydown.esc.prevent="closeFind"
       />
       <span class="cnt">{{ findHits.length ? findIdx + 1 : 0 }}/{{ findHits.length }}</span>
-      <button title="上一个" :disabled="!findHits.length" @click="stepFind(-1)">∧</button>
-      <button title="下一个（Enter）" :disabled="!findHits.length" @click="stepFind(1)">∨</button>
-      <button title="关闭（Esc）" @click="closeFind">✕</button>
+      <button :title="t('chat.findPrev')" :disabled="!findHits.length" @click="stepFind(-1)">∧</button>
+      <button :title="t('chat.findNext')" :disabled="!findHits.length" @click="stepFind(1)">∨</button>
+      <button :title="t('chat.findClose')" @click="closeFind">✕</button>
     </div>
 
     <!-- 消息区 -->
@@ -949,7 +951,7 @@ watch(
               <template v-for="f in v.m.files || []" :key="f.id">
                 <!-- 图片：本地已有内容时直接内联预览，点击查看原图（多选模式下点击改为切换选中） -->
                 <div v-if="isImg(f.name) && f.src" class="img-wrap">
-                  <img :src="f.src" class="chat-img" title="点击在新窗口查看原图" @click="selMode ? toggleSel(v.m) : viewImage(f)" />
+                  <img :src="f.src" class="chat-img" :title="t('chat.viewImg')" @click="selMode ? toggleSel(v.m) : viewImage(f)" />
                 </div>
                 <!-- 无预览时显示文件卡片（下载中/失败/非图片/超大图） -->
                 <div v-else class="file-card">
@@ -973,33 +975,33 @@ watch(
                   <div class="fc-sub">
                     <!-- 历史导入的附件：官方日志库里只有文件名没有内容，不给下载/定位 -->
                     <template v-if="f.state === 'imported'">
-                      <span class="muted">历史附件 · 仅文件名</span>
+                      <span class="muted">{{ t('chat.histImport') }}</span>
                     </template>
                     <template v-else>
                       <span>{{ fmtSize(f.size) }}</span>
                       <!-- 收到的文件 -->
                       <template v-if="v.m.dir === 'in'">
                         <template v-if="f.state === 'pending'">
-                          <a @click.prevent="downloadFile(v.m, f)">下载</a>
+                          <a @click.prevent="downloadFile(v.m, f)">{{ t('chat.download') }}</a>
                         </template>
                         <template v-else-if="f.state === 'downloading'">
                           <span>{{ progressLabel(f) }}</span>
                           <i v-if="f.total" class="bar"><i :style="{ width: pct(f) + '%' }"></i></i>
                         </template>
                         <template v-else-if="f.state === 'done'">
-                          <span class="ok">{{ f.dir_entry ? '文件夹已保存' : '已保存' }}</span>
-                          <a @click.prevent="openFile(f.path)">打开</a>
-                          <a @click.prevent="revealFile(f.path)">所在文件夹</a>
+                          <span class="ok">{{ f.dir_entry ? t('chat.folderSaved') : t('chat.saved') }}</span>
+                          <a @click.prevent="openFile(f.path)">{{ t('chat.open') }}</a>
+                          <a @click.prevent="revealFile(f.path)">{{ t('chat.revealDir') }}</a>
                         </template>
                         <template v-else-if="f.state === 'failed'">
-                          <span class="err">失败</span>
-                          <a @click.prevent="downloadFile(v.m, f)">重试</a>
+                          <span class="err">{{ t('chat.failed') }}</span>
+                          <a @click.prevent="downloadFile(v.m, f)">{{ t('chat.retry') }}</a>
                         </template>
                       </template>
                       <!-- 发出的文件 -->
                       <template v-else>
-                        <span class="ok">已发送</span>
-                        <a @click.prevent="revealFile(f.path)">所在文件夹</a>
+                        <span class="ok">{{ t('chat.sent') }}</span>
+                        <a @click.prevent="revealFile(f.path)">{{ t('chat.revealDir') }}</a>
                       </template>
                     </template>
                   </div>
@@ -1008,20 +1010,20 @@ watch(
               </template>
             </div>
             <!-- 对端「延迟发送/离线留言」的尾注：收成一个小标记，不占正文 -->
-            <div v-if="delayedOf(v.m) !== null" class="delay-tag" :title="'对方在 ' + delayedOf(v.m) + ' 发出，你当时不在线，上线后才补投'">
-              离线留言 · 原发送时间 {{ delayedOf(v.m) || '未知' }}
+            <div v-if="delayedOf(v.m) !== null" class="delay-tag" :title="t('chat.delayedTitle', { t: delayedOf(v.m) || t('unknown') })">
+              {{ t('chat.delayedNote', { t: delayedOf(v.m) || t('unknown') }) }}
             </div>
             <div v-if="v.m.dir === 'out' && v.m.queued" class="delay-tag out-queued">
-              离线留言 · 对方上线后自动投递
+              {{ t('chat.queuedNote') }}
             </div>
             <div class="m-time" :class="{ self: v.m.dir === 'out' }">
               <span v-if="v.m.dir === 'out' && v.m.rcpt && !v.m.queued" class="read-tag" :class="{ done: v.m.read }">
-                {{ v.m.read ? '已读' : '未读' }}
+                {{ v.m.read ? t('chat.read') : t('chat.unread') }}
               </span>
               {{ fmtTime(v.m.ts) }}<svg v-if="v.m.enc" class="m-lock" width="10" height="10" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                 <rect x="4.5" y="10" width="15" height="10" rx="2" stroke="currentColor" stroke-width="2" />
                 <path d="M8 10V7.5a4 4 0 0 1 8 0V10" stroke="currentColor" stroke-width="2" />
-              </svg><span v-if="v.m.enc && v.m.sig_ok === false" class="sig-warn" title="签名校验失败">⚠</span>
+              </svg><span v-if="v.m.enc && v.m.sig_ok === false" class="sig-warn" :title="t('chat.sigWarn')">⚠</span>
             </div>
           </div>
         </div>
@@ -1032,16 +1034,16 @@ watch(
     <!-- 消息右键菜单 -->
     <div v-if="ctxMenu" ref="ctxMenuRef" class="ctx-menu"
       :style="{ position: 'fixed', left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }">
-      <button class="ctx-item" @click="copyMsg">复制</button>
-      <button class="ctx-item" @click="startReply">回复</button>
-      <button class="ctx-item" @click="startForward">转发</button>
-      <button class="ctx-item" @click="enterSelMode">多选</button>
+      <button class="ctx-item" @click="copyMsg">{{ t('chat.copy') }}</button>
+      <button class="ctx-item" @click="startReply">{{ t('chat.reply') }}</button>
+      <button class="ctx-item" @click="startForward">{{ t('chat.forward') }}</button>
+      <button class="ctx-item" @click="enterSelMode">{{ t('chat.multiSelect') }}</button>
     </div>
 
     <!-- 转发 / 批量发送的接收人选择 -->
     <RecipientPicker
       v-if="picker"
-      :title="picker.mode === 'forward' ? '转发给' : '批量发送给'"
+      :title="picker.mode === 'forward' ? t('chat.forwardTo') : t('chat.batchTo')"
       :exclude-key="store.activeKey"
       @confirm="onPickerConfirm"
       @cancel="picker = null"
@@ -1054,22 +1056,22 @@ watch(
         <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v8a2.5 2.5 0 0 1-2.5 2.5H9l-4.2 3.6c-.5.42-1.3.07-1.3-.6V5.5z"
           stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" />
       </svg>
-      <p>选择一个会话，开始聊天</p>
-      <p class="sub">局域网内基于 IPMsg 协议（UDP/TCP 2425）</p>
+      <p>{{ t('chat.placeholderTitle') }}</p>
+      <p class="sub">{{ t('chat.placeholderSub') }}</p>
     </div>
 
     <!-- 多选模式操作条：合并转发 / 取消 -->
     <div v-if="selMode && activeUser" class="sel-bar">
-      <span class="sel-count">已选 {{ selected.size }} 条</span>
+      <span class="sel-count">{{ t('chat.selected', { n: selected.size }) }}</span>
       <span class="flex1"></span>
-      <button class="btn-plain" @click="exitSel">取消</button>
-      <button class="btn-primary" :disabled="!selected.size" @click="startMultiForward">合并转发</button>
+      <button class="btn-plain" @click="exitSel">{{ t('cancel') }}</button>
+      <button class="btn-primary" :disabled="!selected.size" @click="startMultiForward">{{ t('chat.mergeForward') }}</button>
     </div>
 
     <!-- 输入区 -->
     <footer v-if="activeUser" class="composer">
       <div class="toolbar">
-        <button ref="emojiBtnRef" title="表情" @click="toggleEmoji">
+        <button ref="emojiBtnRef" :title="t('chat.emoji')" @click="toggleEmoji">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
             <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6" />
             <circle cx="9" cy="10" r="1.2" fill="currentColor" />
@@ -1077,13 +1079,13 @@ watch(
             <path d="M8.2 14c.9 1.4 2.2 2.1 3.8 2.1s2.9-.7 3.8-2.1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
           </svg>
         </button>
-        <button title="批量发送" @click="startBatch">
+        <button :title="t('chat.batchSend')" @click="startBatch">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
             <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 3" />
             <path d="M7 12h10M12 7v10" stroke="currentColor" stroke-width="1.6" />
           </svg>
         </button>
-        <button title="发送文件" @click="pickFiles">
+        <button :title="t('chat.sendFiles')" @click="pickFiles">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
             <path d="M11 5.5A3.5 3.5 0 0 1 17.9 7l.6 6.5a5.5 5.5 0 0 1-11 .5L7 8" stroke="currentColor"
               stroke-width="1.6" stroke-linecap="round" transform="rotate(45 12 12)" />
@@ -1091,13 +1093,13 @@ watch(
               stroke-width="1.6" stroke-linecap="round" />
           </svg>
         </button>
-        <button title="发送文件夹" @click="pickFolder">
+        <button :title="t('chat.sendFolder')" @click="pickFolder">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
             <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"
               stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
           </svg>
         </button>
-        <button class="disabled" title="截图功能开发中" disabled>
+        <button class="disabled" :title="t('chat.screenshotSoon')" disabled>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
             <rect x="3" y="6" width="18" height="14" rx="2" stroke="currentColor" stroke-width="1.6" />
             <path d="M8 6l1.5-2.5h5L16 6" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
@@ -1108,8 +1110,8 @@ watch(
 
       <!-- 正在回复某条消息：输入区上方的引用条 -->
       <div v-if="replyTarget" class="reply-bar">
-        <span class="rb-txt ellipsis">回复 {{ replyTarget.nick }}：{{ replyTarget.preview }}</span>
-        <button class="rb-x" title="取消回复（Esc）" @click="cancelReply">✕</button>
+        <span class="rb-txt ellipsis">{{ t('chat.replyTo', { nick: replyTarget.nick }) }}{{ replyTarget.preview }}</span>
+        <button class="rb-x" :title="t('chat.cancelReply')" @click="cancelReply">✕</button>
       </div>
 
       <EmojiPicker ref="emojiPanelRef" v-if="emojiOpen" :style="emojiStyle" @pick="insertEmoji" />
@@ -1126,9 +1128,9 @@ watch(
           </div>
           <div class="paste-meta">
             <div class="paste-name ellipsis" :title="it.name">{{ it.name }}</div>
-            <div class="paste-sub">{{ it.kind === 'img' ? fmtSize(it.size) + ' · ' : '' }}Enter 发送</div>
+            <div class="paste-sub">{{ it.kind === 'img' ? fmtSize(it.size) + ' · ' : '' }}{{ t('chat.pendingEnter') }}</div>
           </div>
-          <button class="paste-x" title="从待发送列表移除" @click="removePending(i)">✕</button>
+          <button class="paste-x" :title="t('chat.removePending')" @click="removePending(i)">✕</button>
         </div>
       </div>
 
@@ -1136,15 +1138,15 @@ watch(
         ref="ta"
         v-model="draft"
         class="input-area"
-        placeholder="输入消息…"
+        :placeholder="t('chat.inputPh')"
         spellcheck="false"
         @keydown="onKeydown"
       ></textarea>
 
       <div class="composer-foot">
-        <span class="hint">Enter 发送 / Ctrl+Enter 换行 / 可直接粘贴图片或文件</span>
+        <span class="hint">{{ t('chat.enterHint') }}</span>
         <button class="send-btn" :disabled="!canSend" @click="doSend">
-          发送<span class="s-key">(S)</span>
+          {{ t('chat.send') }}<span class="s-key">(S)</span>
         </button>
       </div>
     </footer>
@@ -1678,6 +1680,9 @@ watch(
   padding: 4px 12px 10px;
 }
 .hint {
+  flex: 1;
+  min-width: 0;
+  padding-right: 8px;
   font-size: 11px;
   color: var(--c-weak);
 }

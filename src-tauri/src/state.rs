@@ -23,6 +23,9 @@ pub struct Config {
     /// 界面主题：system（跟随系统）/ light / dark
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// 界面语言：'zh-CN' / 'en'；空串表示未设置，由前端按系统语言探测
+    #[serde(default)]
+    pub lang: String,
     /// 端到端加密总开关：默认开启；关闭时消息按官方明文协议发送
     #[serde(default = "default_encrypt")]
     pub encrypt: bool,
@@ -50,6 +53,7 @@ impl Default for Config {
             download_dir: String::new(),
             encoding: default_encoding(),
             theme: default_theme(),
+            lang: String::new(),
             encrypt: default_encrypt(),
         }
     }
@@ -1253,6 +1257,7 @@ mod tests {
         let mut cfg = st.config();
         cfg.nickname = "测试昵称".into();
         cfg.group = "G1".into();
+        cfg.lang = "en".into();
         st.set_config(cfg);
         st.persist_config().unwrap();
 
@@ -1260,6 +1265,17 @@ mod tests {
         st2.load_config();
         assert_eq!(st2.config().nickname, "测试昵称");
         assert_eq!(st2.config().group, "G1");
+        assert_eq!(st2.config().lang, "en", "界面语言持久化");
+
+        // 旧版配置文件没有 lang 字段：回落空串（前端按系统语言探测）
+        let path = st.data_dir.join("config.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("lang");
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let st3 = AppState::new(st.data_dir.clone());
+        st3.load_config();
+        assert!(st3.config().lang.is_empty(), "缺失字段回落空串（跟随系统）");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 

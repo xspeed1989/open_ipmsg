@@ -35,6 +35,26 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// 界面文案二选一（config.lang 为空时按系统语言探测，与前端一致）：
+/// 托盘菜单、最小化提示等原生 UI 字符串走这里。
+fn ui_str(lang: &str, zh: &str, en: &str) -> String {
+    let use_en = if lang.eq_ignore_ascii_case("en") {
+        true
+    } else if lang.is_empty() {
+        // 未设置：跟随系统（对应前端 detectLocale：locale 以 zh 开头 → 简体中文）
+        !std::env::var_os("LANG")
+            .map(|l| l.to_string_lossy().to_lowercase().starts_with("zh"))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if use_en {
+        en.into()
+    } else {
+        zh.into()
+    }
+}
+
 /// 从托盘唤起主窗口：顺带通知前端「跳到最新的未读会话」。
 /// SNI 的回调跑在 DBus 线程上，这里统一回主线程操作窗口。
 ///
@@ -60,6 +80,9 @@ struct ConfigPatch {
     encoding: String,
     #[serde(default)]
     theme: Option<String>,
+    /// 界面语言：'zh-CN' / 'en'；省略时保留现值（旧前端兼容）
+    #[serde(default)]
+    lang: Option<String>,
     /// 加密开关；省略时保留现值（旧前端兼容）
     #[serde(default)]
     encrypt: Option<bool>,
@@ -88,6 +111,7 @@ async fn get_config(st: State<'_, SharedState>) -> Result<Value, String> {
         "download_dir": cfg.download_dir,
         "encoding": cfg.encoding,
         "theme": cfg.theme,
+        "lang": cfg.lang,
         "encrypt": cfg.encrypt,
         "hostname": hostname,
         "ips": ips,
@@ -120,6 +144,12 @@ async fn save_config(
             "light" => "light".into(),
             "dark" => "dark".into(),
             _ => "system".into(),
+        },
+        // 界面语言白名单；补丁未携带或值非法时保留现值
+        lang: match patch.lang.as_deref() {
+            Some("zh-CN") => "zh-CN".into(),
+            Some("en") => "en".into(),
+            _ => prev.lang,
         },
         // 加密开关：补丁未携带时保留现值，避免旧前端保存配置时误关加密
         encrypt: patch.encrypt.unwrap_or(prev.encrypt),
@@ -301,6 +331,8 @@ mod linux_tray {
 
     pub struct OimTray {
         pub app: tauri::AppHandle,
+        /// 界面语言（config.lang，空视为 zh-CN），决定菜单文案
+        pub lang: String,
         /// 闪烁时显示透明帧
         pub blank: bool,
         pub tip: String,
@@ -353,13 +385,13 @@ mod linux_tray {
         fn menu(&self) -> Vec<MenuItem<Self>> {
             vec![
                 StandardItem {
-                    label: "显示主窗口".into(),
+                    label: super::ui_str(&self.lang, "显示主窗口", "Show main window"),
                     activate: Box::new(|t: &mut Self| activate_from_tray(&t.app)),
                     ..Default::default()
                 }
                 .into(),
                 StandardItem {
-                    label: "刷新在线用户".into(),
+                    label: super::ui_str(&self.lang, "刷新在线用户", "Refresh online users"),
                     activate: Box::new(|t: &mut Self| {
                         let app = t.app.clone();
                         tauri::async_runtime::spawn(async move {
@@ -374,7 +406,7 @@ mod linux_tray {
                 .into(),
                 MenuItem::Separator,
                 StandardItem {
-                    label: "退出".into(),
+                    label: super::ui_str(&self.lang, "退出", "Quit"),
                     activate: Box::new(|t: &mut Self| t.app.exit(0)),
                     ..Default::default()
                 }
@@ -384,9 +416,10 @@ mod linux_tray {
     }
 
     /// 启动 SNI 托盘（失败时返回 false，调用方回退到 Tauri 自带托盘）
-    pub async fn spawn(app: tauri::AppHandle, tip: String) -> bool {
+    pub async fn spawn(app: tauri::AppHandle, tip: String, lang: String) -> bool {
         match (OimTray {
             app,
+            lang,
             blank: false,
             tip,
         })
@@ -944,6 +977,7 @@ pub fn run() {
                 encoding: "utf8".into(),
                 download_dir: String::new(),
                 theme: "system".into(),
+                lang: String::new(),
                 encrypt: true,
             });
             let _ctx = net::start_network(st.clone(), protocol::DEFAULT_PORT)
@@ -978,6 +1012,8 @@ pub fn run() {
 
             let st = Arc::new(AppState::new(data_dir));
             st.load_config();
+            // 界面语言：原生 UI（托盘菜单等）按 config.lang 取简中/英文
+            let ui_lang = st.config().lang.clone();
             // 恢复离线消息待投递队列（对方上线后自动重投）
             st.load_pending();
             // 恢复对端公钥缓存（加密会话重启后无需重新交换公钥）
@@ -1014,13 +1050,22 @@ pub fn run() {
                 Err(e) => {
                     use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
                     app.dialog()
-                        .message(format!(
-                            "端口 {} 被占用（{}）。\n本程序已做单实例互斥，若非本程序重复启动，\
-                             多半是机器上还运行着别的 IPMsg/飞秋类客户端，请先退出它。",
-                            protocol::DEFAULT_PORT, e
+                        .message(ui_str(
+                            &ui_lang,
+                            &format!(
+                                "端口 {} 被占用（{}）。\n本程序已做单实例互斥，若非本程序重复启动，\
+                                 多半是机器上还运行着别的 IPMsg/飞秋类客户端，请先退出它。",
+                                protocol::DEFAULT_PORT, e
+                            ),
+                            &format!(
+                                "Port {} is in use ({}).\nThis app already guards against duplicate \
+                                 instances; if this is not a second copy of the app, another IPMsg \
+                                 client is probably running — please quit it first.",
+                                protocol::DEFAULT_PORT, e
+                            ),
                         ))
                         .kind(MessageDialogKind::Error)
-                        .title("Open IPMsg 启动失败")
+                        .title(ui_str(&ui_lang, "Open IPMsg 启动失败", "Open IPMsg failed to start"))
                         .blocking_show();
                     std::process::exit(1);
                 }
@@ -1045,15 +1090,32 @@ pub fn run() {
             let sni_ok = tauri::async_runtime::block_on(linux_tray::spawn(
                 handle.clone(),
                 run_title.clone(),
+                ui_lang.clone(),
             ));
             #[cfg(not(target_os = "linux"))]
             let sni_ok = false;
 
-            let show_item =
-                MenuItem::with_id(&handle, "show", "显示主窗口", true, None::<&str>)?;
-            let refresh_item =
-                MenuItem::with_id(&handle, "refresh", "刷新在线用户", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(&handle, "quit", "退出", true, None::<&str>)?;
+            let show_item = MenuItem::with_id(
+                &handle,
+                "show",
+                ui_str(&ui_lang, "显示主窗口", "Show main window"),
+                true,
+                None::<&str>,
+            )?;
+            let refresh_item = MenuItem::with_id(
+                &handle,
+                "refresh",
+                ui_str(&ui_lang, "刷新在线用户", "Refresh online users"),
+                true,
+                None::<&str>,
+            )?;
+            let quit_item = MenuItem::with_id(
+                &handle,
+                "quit",
+                ui_str(&ui_lang, "退出", "Quit"),
+                true,
+                None::<&str>,
+            )?;
             let menu = MenuBuilder::new(&handle)
                 .items(&[&show_item, &refresh_item, &quit_item])
                 .build()?;
@@ -1111,11 +1173,20 @@ pub fn run() {
                 api.prevent_close();
                 if !HIDE_NOTIFIED.swap(true, Ordering::Relaxed) {
                     use tauri_plugin_notification::NotificationExt;
+                    let lang = window
+                        .app_handle()
+                        .state::<SharedState>()
+                        .config()
+                        .lang;
                     let _ = window
                         .notification()
                         .builder()
                         .title("Open IPMsg")
-                        .body("已最小化到托盘，右键托盘图标可退出")
+                        .body(ui_str(
+                            &lang,
+                            "已最小化到托盘，右键托盘图标可退出",
+                            "Minimized to tray; use the tray icon menu to quit",
+                        ))
                         .show();
                 }
             }

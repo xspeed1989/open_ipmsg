@@ -1,8 +1,9 @@
 <script setup>
-// 设置弹窗：昵称 / 群组 / 下载目录 / 主题 / 发送编码 / 消息加密 + 本机信息
+// 设置弹窗：昵称 / 群组 / 下载目录 / 语言 / 主题 / 发送编码 / 消息加密 + 本机信息
 import { reactive, watch, computed, ref } from 'vue'
 import { applyTheme, store, refreshConfig, refreshUsers, loadSessions } from '../store'
 import * as ipc from '../lib/ipc'
+import { t, SUPPORTED_LANGS, LANG_NAMES, setLocale, detectLocale } from '../lib/i18n'
 import { open as pickDialog } from '@tauri-apps/plugin-dialog'
 
 const form = reactive({
@@ -11,6 +12,7 @@ const form = reactive({
   download_dir: '',
   encoding: 'utf8',
   theme: 'system',
+  lang: 'zh-CN',
   // 加密默认开启：config 缺失该字段（旧版本后端）时也按开启处理
   encrypt: true,
 })
@@ -24,6 +26,7 @@ watch(
       form.download_dir = store.config.download_dir || ''
       form.encoding = store.config.encoding || 'utf8'
       form.theme = store.config.theme || 'system'
+      form.lang = store.config.lang || detectLocale()
       form.encrypt = store.config.encrypt !== false
     }
   },
@@ -50,14 +53,22 @@ async function copyFp() {
   }
 }
 
-// 选中即预览：不必按保存就能看到效果；取消关闭时再还原成已保存的主题
-watch(() => form.theme, (t) => applyTheme(t))
+// 选中即预览：语言/主题不必按保存就能看到效果；取消关闭时再还原成已保存的值
+watch(() => form.theme, (tv) => {
+  if (tv) applyTheme(tv)
+})
+watch(() => form.lang, (lv) => {
+  if (lv) setLocale(lv)
+})
 function restoreSavedTheme() {
   applyTheme(store.config?.theme)
 }
+function restoreSavedLang() {
+  setLocale(store.config?.lang || detectLocale())
+}
 
 async function chooseDir() {
-  const dir = await pickDialog({ directory: true, title: '选择接收文件的保存目录' })
+  const dir = await pickDialog({ directory: true, title: t('settings.pickDirTitle') })
   if (dir) form.download_dir = dir
 }
 
@@ -67,8 +78,8 @@ const importing = ref(false)
 async function importIpmsg() {
   const picked = await pickDialog({
     multiple: true,
-    title: '选择官方 IP Messenger 的日志数据库',
-    filters: [{ name: 'IPMsg 日志库（ipmsg.db）', extensions: ['db'] }],
+    title: t('settings.pickDbTitle'),
+    filters: [{ name: t('settings.dbFilter'), extensions: ['db'] }],
   })
   const paths = (Array.isArray(picked) ? picked : picked ? [picked] : []).filter(Boolean)
   if (!paths.length || importing.value) return
@@ -77,19 +88,21 @@ async function importIpmsg() {
     const r = await ipc.importIpmsgLogs(paths)
     await loadSessions()
     const lines = r.files.map((f) =>
-      f.ok ? `✔ ${f.path.split(/[\\/]/).pop()}：导入 ${f.imported} 条` : `✘ ${f.path}\n  ${f.error}`
+      f.ok
+        ? `${t('settings.importLineOk', { name: f.path.split(/[\\/]/).pop(), n: f.imported })}`
+        : `✘ ${f.path}\n  ${f.error}`
     )
     let msg =
       r.failed > 0
         ? `${lines.join('\n')}`
-        : `导入完成：共 ${r.total} 条消息` +
-          (r.skipped ? `（跳过 ${r.skipped} 条已存在/备忘录）` : '') +
-          (r.sessionsNew ? `，新增 ${r.sessionsNew} 个会话` : '') +
-          (r.mergedSessions ? `，按名称+主机归并 ${r.mergedSessions} 个重复会话` : '')
-    if (!r.total && !r.failed) msg += '\n没有新消息可导入。'
+        : t('settings.importDone', { total: r.total }) +
+          (r.skipped ? t('settings.importSkipped', { n: r.skipped }) : '') +
+          (r.sessionsNew ? t('settings.importNewSessions', { n: r.sessionsNew }) : '') +
+          (r.mergedSessions ? t('settings.importMerged', { n: r.mergedSessions }) : '')
+    if (!r.total && !r.failed) msg += t('settings.importNoNew')
     alert(msg)
   } catch (e) {
-    alert('导入失败：' + e)
+    alert(t('settings.alertImportFailed', { e }))
   } finally {
     importing.value = false
   }
@@ -98,12 +111,13 @@ async function importIpmsg() {
 function close() {
   if (!canClose.value) return
   restoreSavedTheme() // 放弃未保存的改动，主题跟着回退
+  restoreSavedLang() // 语言同样回退到已保存的值
   store.settingsOpen = false
 }
 
 async function save() {
   if (!form.nickname.trim()) {
-    alert('请填写昵称')
+    alert(t('settings.alertNickname'))
     return
   }
   const patch = {
@@ -112,6 +126,7 @@ async function save() {
     download_dir: form.download_dir.trim(),
     encoding: form.encoding,
     theme: form.theme,
+    lang: form.lang,
     encrypt: !!form.encrypt,
   }
   try {
@@ -121,7 +136,7 @@ async function save() {
     store.firstRun = false
     store.settingsOpen = false
   } catch (e) {
-    alert('保存失败：' + e)
+    alert(t('settings.alertSaveFailed', { e }))
   }
 }
 </script>
@@ -130,89 +145,92 @@ async function save() {
   <div class="overlay" @click.self="close">
     <div class="modal">
       <header>
-        <span>设置</span>
+        <span>{{ t('settings.title') }}</span>
         <button v-if="canClose" class="x" @click="close">✕</button>
       </header>
 
       <div class="body">
         <label class="field">
-          <span class="lab">昵称</span>
-          <input v-model="form.nickname" placeholder="在局域网内显示的名字" maxlength="32" spellcheck="false" />
+          <span class="lab">{{ t('settings.nickname') }}</span>
+          <input v-model="form.nickname" :placeholder="t('settings.nicknamePh')" maxlength="32" spellcheck="false" />
         </label>
         <label class="field">
-          <span class="lab">群组</span>
-          <input v-model="form.group" placeholder="如：研发部（可留空）" maxlength="32" spellcheck="false" />
+          <span class="lab">{{ t('settings.group') }}</span>
+          <input v-model="form.group" :placeholder="t('settings.groupPh')" maxlength="32" spellcheck="false" />
         </label>
         <label class="field">
-          <span class="lab">接收目录</span>
+          <span class="lab">{{ t('settings.downloadDir') }}</span>
           <div class="dir-row">
             <input v-model="form.download_dir" readonly class="dir-input" :title="form.download_dir" />
-            <button class="btn-plain" @click="chooseDir">选择…</button>
+            <button class="btn-plain" @click="chooseDir">{{ t('settings.choose') }}</button>
           </div>
         </label>
         <label class="field">
-          <span class="lab">外观主题</span>
-          <select v-model="form.theme">
-            <option value="system">跟随系统</option>
-            <option value="light">浅色</option>
-            <option value="dark">深色</option>
+          <span class="lab">{{ t('settings.language') }}</span>
+          <select v-model="form.lang">
+            <option v-for="l in SUPPORTED_LANGS" :key="l" :value="l">{{ LANG_NAMES[l] }}</option>
           </select>
         </label>
         <label class="field">
-          <span class="lab">发送编码</span>
+          <span class="lab">{{ t('settings.theme') }}</span>
+          <select v-model="form.theme">
+            <option value="system">{{ t('settings.themeSystem') }}</option>
+            <option value="light">{{ t('settings.themeLight') }}</option>
+            <option value="dark">{{ t('settings.themeDark') }}</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="lab">{{ t('settings.encoding') }}</span>
           <select v-model="form.encoding">
-            <option value="utf8">UTF-8（推荐，客户端间互通）</option>
-            <option value="gbk">GBK（兼容老版中文飞鸽）</option>
+            <option value="utf8">{{ t('settings.encodingUtf8') }}</option>
+            <option value="gbk">{{ t('settings.encodingGbk') }}</option>
           </select>
         </label>
 
         <div class="field">
-          <span class="lab">消息加密</span>
+          <span class="lab">{{ t('settings.encrypt') }}</span>
           <div class="enc-col">
             <div class="enc-line">
               <button type="button" class="switch" :class="{ on: form.encrypt }" role="switch"
-                :aria-checked="form.encrypt ? 'true' : 'false'" title="消息加密"
+                :aria-checked="form.encrypt ? 'true' : 'false'" :title="t('settings.encrypt')"
                 @click="form.encrypt = !form.encrypt">
                 <i class="knob"></i>
               </button>
-              <span class="enc-state">{{ form.encrypt ? '已开启' : '已关闭' }}</span>
+              <span class="enc-state">{{ form.encrypt ? t('settings.encryptOn') : t('settings.encryptOff') }}</span>
             </div>
-            <div class="enc-hint">关闭后与所有联系人使用明文通讯</div>
+            <div class="enc-hint">{{ t('settings.encryptHint') }}</div>
             <!-- 本机公钥指纹：与对端核对密钥用；点击整行复制 -->
-            <div v-if="store.config?.key_fp" class="fp-row" title="点击复制本机密钥指纹" @click="copyFp">
-              <span class="fp-lab">本机密钥指纹</span>
+            <div v-if="store.config?.key_fp" class="fp-row" :title="t('settings.fpTitle')" @click="copyFp">
+              <span class="fp-lab">{{ t('settings.fpLabel') }}</span>
               <code class="fp-val">{{ store.config.key_fp }}</code>
-              <span v-if="fpCopied" class="fp-copied">已复制</span>
+              <span v-if="fpCopied" class="fp-copied">{{ t('settings.fpCopied') }}</span>
             </div>
           </div>
         </div>
 
         <div class="selfinfo">
-          <div class="si-title">聊天记录</div>
+          <div class="si-title">{{ t('settings.chatRecords') }}</div>
           <div class="si-row" style="display:block">
             <button class="btn-plain" :disabled="importing" @click="importIpmsg">
-              {{ importing ? '导入中…' : '导入官方 IP Messenger 聊天记录…' }}
+              {{ importing ? t('settings.importing') : t('settings.importBtn') }}
             </button>
-            <div class="import-hint">
-              选择官方 IPMsg（v4.5+）的日志数据库 ipmsg.db，可多选；按对方 IP 归入对应会话，
-              附件仅记录文件名。可重复执行，不会产生重复记录。
-            </div>
+            <div class="import-hint">{{ t('settings.importHint') }}</div>
           </div>
         </div>
 
         <div class="selfinfo" style="margin-top:12px">
-          <div class="si-title">本机信息</div>
-          <div class="si-row"><span>主机名</span><b>{{ store.config?.hostname || '-' }}</b></div>
-          <div class="si-row"><span>IP 地址</span><b>{{ (store.config?.ips || []).join('，') || '-' }}</b></div>
-          <div class="si-row"><span>协议端口</span><b>UDP/TCP 2425</b></div>
+          <div class="si-title">{{ t('settings.selfInfo') }}</div>
+          <div class="si-row"><span>{{ t('settings.hostname') }}</span><b>{{ store.config?.hostname || '-' }}</b></div>
+          <div class="si-row"><span>{{ t('settings.ip') }}</span><b>{{ (store.config?.ips || []).join(t('sep.list')) || '-' }}</b></div>
+          <div class="si-row"><span>{{ t('settings.port') }}</span><b>UDP/TCP 2425</b></div>
         </div>
 
-        <p class="note">修改昵称/群组后会自动重新向局域网广播上线。</p>
+        <p class="note">{{ t('settings.note') }}</p>
       </div>
 
       <footer>
-        <button v-if="canClose" class="btn-plain" @click="close">取消</button>
-        <button class="btn-primary" @click="save">保存</button>
+        <button v-if="canClose" class="btn-plain" @click="close">{{ t('cancel') }}</button>
+        <button class="btn-primary" @click="save">{{ t('settings.save') }}</button>
       </footer>
     </div>
   </div>
@@ -276,10 +294,11 @@ header {
   margin-bottom: 12px;
 }
 .lab {
-  width: 64px;
+  min-width: 64px;
   flex: none;
   font-size: 13px;
   color: var(--c-text);
+  padding-right: 10px;
 }
 .field input,
 .field select {

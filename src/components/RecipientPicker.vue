@@ -2,10 +2,11 @@
 // 多选接收人弹窗（转发 / 批量发送共用）：只列在线用户，排除当前会话
 import { ref, computed } from 'vue'
 import { store, displayName } from '../store'
+import { t } from '../lib/i18n'
 import Avatar from './Avatar.vue'
 
 const props = defineProps({
-  title: { type: String, default: '选择接收人' },
+  title: { type: String, default: () => t('picker.defaultTitle') },
   /** 排除的会话 key（如当前会话，避免发给自己正在看的会话） */
   excludeKey: { type: String, default: '' },
 })
@@ -38,11 +39,11 @@ function cancel() {
     <div class="rp-box">
       <div class="rp-head">
         <span>{{ title }}</span>
-        <button class="rp-x" title="取消（Esc）" @click="cancel">✕</button>
+        <button class="rp-x" :title="t('picker.cancelEsc')" @click="cancel">✕</button>
       </div>
       <div class="rp-list">
         <div v-if="!candidates.length" class="rp-empty">
-          没有可选的在线用户
+          {{ t('picker.empty') }}
         </div>
         <div
           v-for="u in candidates"
@@ -60,9 +61,9 @@ function cancel() {
         </div>
       </div>
       <div class="rp-foot">
-        <button class="rp-cancel" @click="cancel">取消</button>
+        <button class="rp-cancel" @click="cancel">{{ t('cancel') }}</button>
         <button class="rp-ok" :disabled="!picked.size" @click="confirm">
-          发送（{{ picked.size }}）
+          {{ t('picker.send', { n: picked.size }) }}
         </button>
       </div>
     </div>
