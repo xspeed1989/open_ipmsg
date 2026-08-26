@@ -27,6 +27,10 @@ pub const CAPA_AES256: u32 = 0x0010_0000;
 pub const CAPA_CAPFILEENC: u32 = 0x0004_0000;
 pub const CAPA_SIGN_SHA1: u32 = 0x2000_0000;
 pub const CAPA_SIGN_SHA256: u32 = 0x4000_0000;
+/// 官方 IV 派生位（ipmsg.h）：置位时 CBC IV = 报文包号十进制 ASCII 左对齐
+/// + 剩余零（官方 sprintf(iv, "%u", packet_no)）；未置位 IV 全零。
+/// 官方客户端广告与消息都可能带此位（现场 65920006 含之），接收端必须支持。
+pub const CAPA_PACKETNO_IV: u32 = 0x0080_0000;
 
 pub const RSA_BITS: usize = 2048;
 /// 加密封包组合：RSA2048+AES256+SHA256
@@ -266,6 +270,7 @@ pub fn open_message(
     priv_kp: &KeyPair,
     extra: &str,
     peer_pub: Option<&RsaPublicKey>,
+    pkt_no: u32,
 ) -> Result<OpenMsg, String> {
     let segs: Vec<&str> = extra.split(':').collect();
     if !(3..=4).contains(&segs.len()) {
@@ -289,14 +294,27 @@ pub fn open_message(
         .map_err(|_| "会话钥解密失败（可能并非发给我方）".to_string())?;
     let ct = hex_decode_loose(segs[2]).ok_or("密文 hex 坏")?;
 
+    // IV：未带 PACKETNO_IV 位时为全零；带位时按官方用包号十进制 ASCII
+    // 左对齐（AES 16B / Blowfish 8B，剩余补零）
+    let mut iv_aes = [0u8; 16];
+    let mut iv_bf = [0u8; 8];
+    if capa & CAPA_PACKETNO_IV != 0 {
+        let s = pkt_no.to_string();
+        let b = s.as_bytes();
+        let n16 = b.len().min(16);
+        iv_aes[..n16].copy_from_slice(&b[..n16]);
+        let n8 = b.len().min(8);
+        iv_bf[..n8].copy_from_slice(&b[..n8]);
+    }
+
     let plain_full: Vec<u8> = if aes_mode {
         let k32: [u8; 32] = skey.try_into().map_err(|_| "AES 会话钥长度异常".to_string())?;
-        Aes256CbcDec::new_from_slices(&k32, &CBC_IV0_AES)
+        Aes256CbcDec::new_from_slices(&k32, &iv_aes)
             .map_err(|_| "AES 初始化失败".to_string())?
             .decrypt_padded_vec_mut::<Pkcs7>(&ct)
             .map_err(|_| "AES 解密失败（填充校验不过）".to_string())?
     } else {
-        BlowfishCbcDec::new_from_slices(&skey, &CBC_IV0_BLOWFISH)
+        BlowfishCbcDec::new_from_slices(&skey, &iv_bf)
             .map_err(|_| "Blowfish 会话钥/IV 异常".to_string())?
             .decrypt_padded_vec_mut::<Pkcs7>(&ct)
             .map_err(|_| "Blowfish 解密失败（填充校验不过）".to_string())?
@@ -359,8 +377,12 @@ pub fn seal_file_request(
 /// - 其它参数一律 Err（「不支持文件加密参数」）。
 ///
 /// 兼容 SHA-256 变体的历史/前向请求：open_message 按能力位自适应。
-pub fn open_file_request(priv_kp: &KeyPair, extra: &str) -> Result<(String, bool), String> {
-    let out = open_message(priv_kp, extra, None)?;
+pub fn open_file_request(
+    priv_kp: &KeyPair,
+    extra: &str,
+    pkt_no: u32,
+) -> Result<(String, bool), String> {
+    let out = open_message(priv_kp, extra, None, pkt_no)?;
     let inner = String::from_utf8_lossy(&out.plain).into_owned();
     let segs: Vec<&str> = inner.split(':').collect();
     let enc_body = if segs.last().copied() == Some("4000000") {
@@ -673,14 +695,56 @@ mod tests {
         let plain = b"hello\nworld\0report.zip:100:20:1:\x07";
         let sealed = seal_message(peer_pub, me, plain).unwrap();
         assert!(sealed.starts_with(&format!("{:X}:", CAPA_OUR_SEND)));
-        let out = open_message(&kp_b, &sealed, Some(&kp_a.public_key())).unwrap();
+        let out = open_message(&kp_b, &sealed, Some(&kp_a.public_key()), 0).unwrap();
         assert_eq!(out.plain, &plain[..]); // 含文件公告整体；明文以 \x07 结尾，无尾部 \0 可剥
                                            // （尾部 \0 剥离的覆盖见 open_supports_blowfish_combo 的 b"legacy\0"）
         assert!(out.sig_ok);
         // 解密本身只要求接收方私钥；无对端公钥时无法验签，sig_ok 保持 true（调用方记 diag）
-        let out_no_pp = open_message(&kp_b, &sealed, None).unwrap();
+        let out_no_pp = open_message(&kp_b, &sealed, None, 0).unwrap();
         assert_eq!(out_no_pp.plain, &plain[..]);
         assert!(out_no_pp.sig_ok);
+    }
+
+    /// 官方 PACKETNO_IV（ipmsg.h 0x00800000）：CBC IV = 报文包号十进制 ASCII
+    /// 左对齐 + 剩余零。官方客户端广告位含它（现场 65920006），其消息与文件
+    /// 请求可能带此位——接收端必须按包号派生 IV，否则首块乱、验签必败。
+    #[test]
+    fn open_message_respects_packetno_iv() {
+        let (kp_a, kp_b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
+        let plain = b"packetno-iv-test\0";
+        // 手工构造官方风格密文：IV = 包号 ASCII（10 位内），CBC AES256，带 SHA-256 签名
+        let mut rng = rand::thread_rng();
+        let skey: [u8; 32] = rand::random();
+        let ct_key = kp_b
+            .public_key()
+            .encrypt(&mut rng, Pkcs1v15Encrypt, &skey)
+            .unwrap();
+        let pkt_no: u32 = 987654321;
+        let mut iv = [0u8; 16];
+        let s = pkt_no.to_string();
+        iv[..s.len()].copy_from_slice(s.as_bytes());
+        let mut buf = plain.to_vec();
+        let ct = Aes256CbcEnc::new_from_slices(&skey, &iv)
+            .unwrap()
+            .encrypt_padded_vec_mut::<Pkcs7>(&mut buf);
+        let sk = rsa::pkcs1v15::SigningKey::<Sha256>::new(kp_a.priv_key.clone());
+        let sig = sk.sign_with_rng(&mut rng, plain).to_vec();
+        let capa = CAPA_RSA2048 | CAPA_AES256 | CAPA_SIGN_SHA256 | CAPA_PACKETNO_IV;
+        let extra = format!(
+            "{:X}:{}:{}:{}",
+            capa,
+            hex_lower(&ct_key),
+            hex_lower(&ct),
+            hex_lower(&sig)
+        );
+        // 正确包号：IV 对齐 → 全文还原 + 验签通过
+        let out = open_message(&kp_b, &extra, Some(&kp_a.public_key()), pkt_no).unwrap();
+        assert_eq!(out.plain, b"packetno-iv-test");
+        assert!(out.sig_ok);
+        // 错包号：IV 错 → 首块乱，验签失败（机制：sig_ok=false 而非 Err）
+        let out_bad = open_message(&kp_b, &extra, Some(&kp_a.public_key()), 1).unwrap();
+        assert!(!out_bad.sig_ok);
+        assert_ne!(out_bad.plain, b"packetno-iv-test");
     }
 
     #[test]
@@ -693,7 +757,7 @@ mod tests {
         let plain = b"legacy\0";
         let sealed = seal_message_compat_rsa1024_blowfish(&kp.public_key(), plain).unwrap();
         assert!(sealed.starts_with(&format!("{:X}:", CAPA_RSA1024 | CAPA_BLOWFISH128)));
-        let out = open_message(&kp, &sealed, None).unwrap();
+        let out = open_message(&kp, &sealed, None, 0).unwrap();
         assert_eq!(out.plain, b"legacy");
         assert_eq!(out.sig_ok, true); // 该组合无签名段
     }
@@ -707,7 +771,7 @@ mod tests {
         let mut bad_tail = sig[..sig.len() - 2].to_owned();
         bad_tail.push_str(if sig.ends_with("00") { "11" } else { "00" });
         let bad = format!("{}:{}", head, bad_tail);
-        let out = open_message(&kp_b, &bad, Some(&kp_a.public_key())).unwrap();
+        let out = open_message(&kp_b, &bad, Some(&kp_a.public_key()), 0).unwrap();
         assert!(!out.sig_ok);
     }
 
@@ -717,7 +781,7 @@ mod tests {
         // 若未来把验签对象误改成剥掉 \0 之后的明文（互操作回归），本测试必须失败。
         let (kp_a, kp_b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
         let sealed = seal_message(&kp_b.public_key(), &kp_a, b"x\0").unwrap();
-        let out = open_message(&kp_b, &sealed, Some(&kp_a.public_key())).unwrap();
+        let out = open_message(&kp_b, &sealed, Some(&kp_a.public_key()), 0).unwrap();
         assert!(out.sig_ok);
         assert_eq!(out.plain, b"x"); // 剥离只影响返回值，不影响验签对象
     }
@@ -729,7 +793,7 @@ mod tests {
         let (head, _) = sealed.rsplit_once(':').unwrap();
         // 签名段存在但不是合法 hex：有对端公钥时必须报 sig_ok=false，且不能致命
         let bad = format!("{}:zz", head);
-        let out = open_message(&kp_b, &bad, Some(&kp_a.public_key())).unwrap();
+        let out = open_message(&kp_b, &bad, Some(&kp_a.public_key()), 0).unwrap();
         assert!(!out.sig_ok);
     }
 
@@ -751,7 +815,7 @@ mod tests {
             hex_lower(&[0x42u8; 8]),
             hex_lower(&[0u8; 16])
         );
-        let err = open_message(&kp, &bogus, None).unwrap_err();
+        let err = open_message(&kp, &bogus, None, 0).unwrap_err();
         assert!(err.contains("不支持加密组合"));
     }
 
@@ -775,8 +839,8 @@ mod tests {
             s_max_nums.as_str(),
         ];
         for s in samples {
-            let _ = open_message(&kp, s, None);
-            let _ = open_message(&kp, s, Some(&kp.public_key()));
+            let _ = open_message(&kp, s, None, 0);
+            let _ = open_message(&kp, s, Some(&kp.public_key()), 0);
         }
     }
 
@@ -847,13 +911,13 @@ mod tests {
         // RSA2048|AES256|SIGN_SHA1 = 0x4|0x100000|0x20000000 = 0x20100004，
         // 正确前缀为 "20100004:"（与 Task 1 对 brief 数值笔误的处理先例一致）
         assert!(sealed.starts_with(&format!("{:X}:", CAPA_FILE_REQUEST)));
-        let (got, enc_body) = open_file_request(&b, &sealed).unwrap();
+        let (got, enc_body) = open_file_request(&b, &sealed, 0).unwrap();
         assert!(enc_body);
         assert_eq!(got, inner);
         // NOENC 变体
         let inner2 = "1f:2a:4000000";
         let (got2, enc2) =
-            open_file_request(&b, &seal_file_request(&b.public_key(), &a, 998, inner2).unwrap())
+            open_file_request(&b, &seal_file_request(&b.public_key(), &a, 998, inner2).unwrap(), 0)
                 .unwrap();
         assert!(!enc2);
         assert_eq!(got2, inner2);
@@ -866,7 +930,7 @@ mod tests {
         let inner = "1f:2a:4000000";
         let sealed = seal_message(&b.public_key(), &a, inner.as_bytes()).unwrap();
         assert!(sealed.starts_with(&format!("{:X}:", CAPA_OUR_SEND)));
-        let (got, enc_body) = open_file_request(&b, &sealed).unwrap();
+        let (got, enc_body) = open_file_request(&b, &sealed, 0).unwrap();
         assert!(!enc_body);
         assert_eq!(got, inner);
     }
@@ -875,7 +939,7 @@ mod tests {
     fn file_request_rejects_unknown_enc_param() {
         let (a, b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
         let sealed = seal_file_request(&b.public_key(), &a, 7, "1f:2a:777777").unwrap();
-        let err = open_file_request(&b, &sealed).unwrap_err();
+        let err = open_file_request(&b, &sealed, 0).unwrap_err();
         assert!(err.contains("不支持文件加密参数"));
     }
 
@@ -885,7 +949,7 @@ mod tests {
         let kp = KeyPair::generate().unwrap();
         let max_nums = format!("{:X}:{:x}:{:x}", u32::MAX, u64::MAX, u64::MAX);
         for s in ["", ":", "zz", "1:2", max_nums.as_str()] {
-            let _ = open_file_request(&kp, s);
+            let _ = open_file_request(&kp, s, 0);
         }
     }
 

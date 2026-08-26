@@ -527,12 +527,28 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                         &ctx.st.own_keypair(),
                         &String::from_utf8_lossy(&pkt.extra),
                         peer_pub.as_ref(),
+                        pkt.pkt_no,
                     ) {
                         Ok(m) => {
                             // 解包明文已剥掉密封时附加的尾部 \0（crypto::OpenMsg.plain），
                             // 直接换回原扩展部并清掉 ENCRYPTOPT，重构出等价明文报文；
                             // 其余命令标志（READCHECKOPT 等）原样保留，下游按普通
                             // 明文路径处理。
+                            let capa_head = String::from_utf8_lossy(&pkt.extra)
+                                .split(':')
+                                .next()
+                                .unwrap_or("")
+                                .to_string();
+                            let head = String::from_utf8_lossy(
+                                &m.plain[..m.plain.len().min(16)],
+                            )
+                            .into_owned();
+                            ctx.st.diag(&format!(
+                                "dec-msg {from} pkt={} capa={capa_head} len={} sig={} head={head:?}",
+                                pkt.pkt_no,
+                                m.plain.len(),
+                                m.sig_ok
+                            ));
                             pkt.extra = m.plain;
                             pkt.command &= !opt::ENCRYPTOPT;
                             enc_meta = Some(m.sig_ok);
@@ -1434,6 +1450,7 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
         let inner = match crypto::open_file_request(
             &ctx.st.own_keypair(),
             &String::from_utf8_lossy(&req.extra),
+            req.pkt_no,
         ) {
             Ok((inner, true)) => {
                 // enc_body：内层倒数第二段恒为 900000，末段是 64 位 hex 的 AES-256 钥

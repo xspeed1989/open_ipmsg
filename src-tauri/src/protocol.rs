@@ -71,8 +71,11 @@ pub mod opt {
     pub const ENCFILEOPT: u32 = 0x0000_0800;
     pub const CAPUTF8OPT: u32 = 0x0100_0000;
     /// 官方编码协商标志（ipmsg.h）：置位表示报文文本为 UTF-8，
-    /// 未置位表示本地代码页（中文系统为 GBK）
-    pub const UTF8OPT: u32 = 0x0080_0000;
+    /// 未置位表示本地代码页（中文系统为 GBK）。与 CAPUTF8OPT 同值
+    /// （官方对新旧位复用 0x01000000）；曾误用 0x00800000（那是官方
+    /// PACKETNO_IV 的位），导致官方客户端按本地码页解码我们发送的
+    /// UTF-8 文本 → 空白/乱码、以及我们漏认官方 UTF-8 报文（2026-08 现场）。
+    pub const UTF8OPT: u32 = 0x0100_0000;
     pub const CLIPBOARDOPT: u32 = 0x0800_0000;
     pub const FILEATTACHOPT: u32 = 0x0020_0000;
 }
