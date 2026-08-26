@@ -227,6 +227,8 @@ async function save() {
   align-items: center;
   justify-content: center;
   z-index: 100;
+  /* 弹窗贴边留白：小窗口时 max-height 以此为基准收缩（见 .modal） */
+  padding: 24px;
 }
 .modal {
   width: 440px;
@@ -234,9 +236,15 @@ async function save() {
   border-radius: 10px;
   box-shadow: 0 12px 40px var(--c-shadow);
   overflow: hidden;
+  /* 内容超高时收缩到视口内，body 区内部滚动，头部/底部按钮始终可见 */
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 48px);
+  max-height: calc(100dvh - 48px);
 }
 header {
   height: 44px;
+  flex: none;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -257,6 +265,9 @@ header {
   color: var(--c-text);
 }
 .body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
   padding: 16px 20px 6px;
 }
 .field {
@@ -409,6 +420,7 @@ header {
 }
 .si-row span {
   width: 64px;
+  flex: none;
   color: var(--c-sub);
 }
 .import-hint {
@@ -423,6 +435,7 @@ header {
   margin: 10px 0 8px;
 }
 footer {
+  flex: none;
   display: flex;
   justify-content: flex-end;
   gap: 10px;
