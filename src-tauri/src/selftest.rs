@@ -1012,7 +1012,7 @@ fn spawn_fake_peer(
             };
             let mut extra = "请收文件".as_bytes().to_vec();
             extra.push(0);
-            extra.extend_from_slice(entry.serialize().as_bytes());
+            extra.extend_from_slice(entry.serialize("utf8").as_bytes());
             let pkt = proto::Packet {
                 pkt_no: offer_pkt_no,
                 user: "假对端".into(),
@@ -1070,7 +1070,7 @@ fn spawn_fake_peer(
             };
             let mut extra = "看这张图".as_bytes().to_vec();
             extra.push(0);
-            extra.extend_from_slice(entry.serialize().as_bytes());
+            extra.extend_from_slice(entry.serialize("utf8").as_bytes());
             let pkt = proto::Packet {
                 pkt_no: img_pkt_no,
                 user: "假对端".into(),

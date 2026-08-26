@@ -245,6 +245,7 @@ pub async fn announce(ctx: &NetCtx) {
     let pkt = proto::Packet {
         extra: proto::build_entry_extra(&cfg.nickname, &cfg.group, &cfg.encoding),
         command: cmd::BR_ENTRY
+            | opt::CAPUTF8OPT // UTF-8 能力声明（官方 0x01000000；官方客户端据此决定使用 UTF-8）
             | if utf8 { opt::UTF8OPT } else { 0 }
             | entry_caps(&cfg),
         ..proto::Packet::new(0)
@@ -266,6 +267,7 @@ pub async fn announce_unicast(ctx: &NetCtx, addrs: &[SocketAddr]) {
     let pkt = proto::Packet {
         extra: proto::build_entry_extra(&cfg.nickname, &cfg.group, &cfg.encoding),
         command: cmd::BR_ENTRY
+            | opt::CAPUTF8OPT // UTF-8 能力声明（官方 0x01000000；官方客户端据此决定使用 UTF-8）
             | if utf8 { opt::UTF8OPT } else { 0 }
             | entry_caps(&cfg),
         ..proto::Packet::new(0)
@@ -440,6 +442,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             let ans = proto::Packet {
                 extra: proto::build_entry_extra(&cfg.nickname, &cfg.group, &cfg.encoding),
                 command: cmd::ANSENTRY
+                    | opt::CAPUTF8OPT
                     | if utf8 { opt::UTF8OPT } else { 0 }
                     | entry_caps(&cfg),
                 ..proto::Packet::new(0)
@@ -1033,7 +1036,7 @@ pub async fn send_message(
     let mut extra = proto::encode_out(text, &cfg.encoding);
     if !entries.is_empty() {
         extra.push(0);
-        let joined: Vec<String> = entries.iter().map(|e| e.serialize()).collect();
+        let joined: Vec<String> = entries.iter().map(|e| e.serialize(&cfg.encoding)).collect();
         extra.extend_from_slice(joined.join("\u{7}").as_bytes());
         // 与真实客户端样本一致：公告末尾保留一个尾部 \a 分隔符
         extra.push(0x07);
@@ -1054,7 +1057,17 @@ pub async fn send_message(
     let mut wire_extra = extra.clone();
     if cfg.encrypt {
         if let Some(pubk) = ctx.st.peer_pubkey(key) {
-            match crypto::seal_message(&pubk, &ctx.st.own_keypair(), &plain_payload(&extra)) {
+            // 现场诊断（2026-08 官方客户端互通排查）：出站加密前落盘实际
+            // 公告明文（含分隔与尾部 \0），用于与官方规范逐字节比对
+            let plain = plain_payload(&extra);
+            let plain_dbg: String = plain
+                .iter()
+                .map(|&b| if b == 0 { '·'.to_string() } else if b == 7 { "\\a".to_string() } else { (b as char).to_string() })
+                .collect::<Vec<_>>()
+                .join("");
+            ctx.st
+                .diag(&format!("send-plain {key} enc len={} body={plain_dbg}", plain.len()));
+            match crypto::seal_message(&pubk, &ctx.st.own_keypair(), &plain) {
                 Ok(sealed) => {
                     wire_extra = sealed.into_bytes();
                     enc = true;
@@ -1081,7 +1094,7 @@ pub async fn send_message(
     // 线路诊断：记录我方出站公告原始字节（与 diag.log 入站样本对照用）
     {
         use std::fmt::Write as _;
-        let raw = &pkt.extra[..pkt.extra.len().min(160)];
+        let raw = &pkt.extra[..pkt.extra.len().min(1600)];
         let mut hexs = String::with_capacity(raw.len() * 3);
         for b in raw {
             let _ = write!(hexs, "{b:02x} ");

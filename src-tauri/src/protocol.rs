@@ -70,12 +70,12 @@ pub mod opt {
     /// 与本文件既有 MULTICASTOPT 的并存正是官方语义。
     pub const ENCFILEOPT: u32 = 0x0000_0800;
     pub const CAPUTF8OPT: u32 = 0x0100_0000;
-    /// 官方编码协商标志（ipmsg.h）：置位表示报文文本为 UTF-8，
-    /// 未置位表示本地代码页（中文系统为 GBK）。与 CAPUTF8OPT 同值
-    /// （官方对新旧位复用 0x01000000）；曾误用 0x00800000（那是官方
-    /// PACKETNO_IV 的位），导致官方客户端按本地码页解码我们发送的
-    /// UTF-8 文本 → 空白/乱码、以及我们漏认官方 UTF-8 报文（2026-08 现场）。
-    pub const UTF8OPT: u32 = 0x0100_0000;
+    /// 官方编码协商标志（ipmsg.h L86 铁证）：**文本标志位 = 0x00800000**，
+    /// 置位表示本报文文本为 UTF-8，未置位表示本地代码页（中文系统为 GBK）。
+    /// 0x01000000（CAPUTF8OPT）只是 Entry 上的**能力声明**，不用于 SENDMSG
+    /// 文本判定——两者曾因 my 误改混淆（2026-08-26 恢复），官方客户端只认
+    /// 0x00800000，用错位会让其按 GBK 解我们的 UTF-8 内容 → 中文乱码。
+    pub const UTF8OPT: u32 = 0x0080_0000;
     pub const CLIPBOARDOPT: u32 = 0x0800_0000;
     pub const FILEATTACHOPT: u32 = 0x0020_0000;
 }
@@ -228,11 +228,14 @@ impl FileEntry {
     /// - 文件 ID 用十进制（对方方言；size/mtime/attr 用十六进制）
     /// - attr 后保留 `:` 空扩展段
     /// 注意调用方需在整条公告末尾追加一个 `\a` 分隔符（样本含尾部分隔符）
-    pub fn serialize(&self) -> String {
+    /// encoding：文件名按发送编码写入（utf8→UTF-8；gbk→GBK）。UTF-8 配置下
+    /// 报文带 UTF8OPT 标志、官方按 UTF-8 解；GBK 配置下不带标志、官方按本地
+    /// 码页解——两者都必须与正文编码一致，否则中文文件名乱码（2026-08 现场）。
+    pub fn serialize(&self, encoding: &str) -> String {
         format!(
             "{}:{}:{:x}:{:x}:{:x}:",
             self.id,
-            clean_filename(&self.name),
+            clean_filename_enc(&self.name, encoding),
             self.size,
             self.mtime,
             self.attr
@@ -240,13 +243,16 @@ impl FileEntry {
     }
 }
 
-fn clean_filename(s: &str) -> String {
-    s.chars()
+fn clean_filename_enc(s: &str, encoding: &str) -> String {
+    let s: String = s
+        .chars()
         .map(|c| match c {
             ':' | '\u{7}' | '\0' | '\r' | '\n' => '_',
             _ => c,
         })
-        .collect()
+        .collect();
+    // 非法字符清洗后再按发送编码转换（GBK 下不转会导致本地码页对端乱码）
+    String::from_utf8_lossy(&encode_out(&s, encoding)).into_owned()
 }
 
 /// 数字字段宽容解析。官方客户端 ID 与属性用十六进制书写、大小与时间用十进制，
@@ -450,9 +456,9 @@ mod tests {
         };
         let mut extra = "看看这两个文件".as_bytes().to_vec();
         extra.push(0);
-        extra.extend_from_slice(e1.serialize().as_bytes());
+        extra.extend_from_slice(e1.serialize("utf8").as_bytes());
         extra.push(0x07);
-        extra.extend_from_slice(e2.serialize().as_bytes());
+        extra.extend_from_slice(e2.serialize("utf8").as_bytes());
 
         let pkt = Packet {
             pkt_no: 7,
@@ -472,7 +478,7 @@ mod tests {
         // 线上格式与真实客户端方言一致：ID 十进制，size/mtime/attr 十六进制，
         // attr 后保留空扩展段（尾部冒号）
         assert_eq!(
-            e1.serialize(),
+            e1.serialize("utf8"),
             format!("1:报告 最终版.pdf:{:x}:{:x}:1:", 20480, 1700000000)
         );
     }
