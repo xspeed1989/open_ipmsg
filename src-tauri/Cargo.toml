@@ -65,6 +65,14 @@ rand = "0.8"
 [features]
 net_debug = []
 
+# tray-icon 0.24.x 在 Windows 用 CreateIcon 做「单色 mask + XOR」的经典图标，
+# 没有真 alpha 通道：全 0 像素的透明帧会被任务栏画成黑块/马赛克（闪烁帧 bug）。
+# 本地 vendor 一份，把 Windows 图标改成 CreateIconIndirect + DIB section 的
+# 32 位 alpha 图标（Electron/Chromium nativeImage 同款做法），透明帧才真正透明。
+# 改动仅限 vendor/tray-icon/src/platform_impl/windows/icon.rs。
+[patch.crates-io]
+tray-icon = { path = "vendor/tray-icon" }
+
 [profile.release]
 strip = true
 lto = true

@@ -463,32 +463,18 @@ mod linux_tray {
 const TRAY_SIZE: u32 = 64;
 const TRAY_IDLE: &[u8] = include_bytes!("../icons/tray.rgba");
 
-/// 空白帧的像素（RGBA）。为什么 Windows 上不能全 0：
+/// 全透明帧：与正常图标交替 = 微信那种「图标一闪一闪」。
 ///
-/// tray-icon 在 Windows 把 RGBA 交给 CreateIcon 做成「单色 AND mask + 32bpp XOR」
-/// 的经典图标（不是带 alpha 的 DIB 图标），任务栏按 mask 画：mask 位=0 时用 SRCAND
-/// 把像素刷成 0 再 SRCINVERT 画 XOR 位图（全 0 像素 = 黑），mask 位=1 才保留原像素
-/// （透明）。crate 每个像素算出一个 mask 字节 = alpha.wrapping_sub(255)：
-///   - alpha=0   → 0x01：每 8 个像素只有 1 个保留，其余画黑 —— 闪现帧变成一块
-///     黑色「马赛克」与图标交替（正是本 bug）；
-///   - alpha=254 → 0xFF：8 个 mask 位全 1，整帧走「保留原像素」分支，
-///     任务栏刷新该区域背景后再画，帧就真正不可见 = 微信式一闪一闪。
-/// macOS / Linux 走真 alpha 合成（NSImage / SNI 的 ARGB pixbuf），全 0 即可。
-#[cfg(target_os = "windows")]
-const TRAY_BLANK_PX: [u8; 4] = [0, 0, 0, 254];
-#[cfg(not(target_os = "windows"))]
-const TRAY_BLANK_PX: [u8; 4] = [0, 0, 0, 0];
-
-/// 全透明帧：与正常图标交替 = 微信那种「图标一闪一闪」
-static TRAY_BLANK: [u8; (TRAY_SIZE * TRAY_SIZE * 4) as usize] = {
-    let mut px = [0u8; (TRAY_SIZE * TRAY_SIZE * 4) as usize];
-    let mut i = 0;
-    while i < px.len() {
-        px[i] = TRAY_BLANK_PX[i % 4];
-        i += 1;
-    }
-    px
-};
+/// 为什么 Windows 上全 0 像素也能透明（曾在此踩过两次坑，已根治）：
+/// tray-icon 0.24.x 原本在 Windows 用 CreateIcon 做成「单色 AND mask + 32bpp XOR」
+/// 的经典图标，没有真 alpha 通道 —— 任务栏按 mask 绘制，全 0 像素的帧被画成
+/// 黑块/马赛克（alpha 全 0 走经典路径；alpha=254 会走合成路径变成近纯黑）。
+/// 现已在 vendor/tray-icon 里把 Windows 图标改成 CreateIconIndirect + DIB section
+/// 的 32 位 alpha 图标（Electron nativeImage 同款做法，见 Cargo.toml 的 patch 注释），
+/// 透明帧由 alpha 通道真正合成，全 0 像素即全透明。macOS / Linux 一直走真 alpha
+/// 合成（NSImage / SNI 的 ARGB pixbuf），同样全 0 即可。
+static TRAY_BLANK: [u8; (TRAY_SIZE * TRAY_SIZE * 4) as usize] =
+    [0u8; (TRAY_SIZE * TRAY_SIZE * 4) as usize];
 /// 闪烁间隔：与微信节奏接近
 const FLASH_INTERVAL_MS: u64 = 600;
 /// 当前是否处于闪烁状态（未读 > 0）
@@ -794,32 +780,19 @@ mod tests {
         assert!(!urlencode("x?y#z&w=1").contains(['?', '#', '&', '=']));
     }
 
-    /// Windows 闪现帧的马赛克回归测试：
-    /// 托盘图标在 Windows 走 tray-icon 的 CreateIcon 经典 mask 路径，
-    /// 每个像素的 mask 字节 = alpha.wrapping_sub(255)，mask 位=1 才保留原像素
-    /// （透明），=0 会刷黑画 XOR。所以空白帧像素必须让 mask 字节 = 0xFF
-    /// （alpha=254）；全 0 像素（mask 字节 0x01）会让每 8 个像素只留 1 个透明、
-    /// 其余画成黑，托盘里就是黑色马赛克与图标交替。
-    /// 另：macOS/Linux 是真 alpha 合成，空白帧仍应保持全 0。
+    /// Windows 闪现帧的回归测试（两轮实测后根治的结论）：
+    /// 托盘图标在 Windows 必须由「32 位 alpha 图标」（DIB section + alpha 通道）
+    /// 承载，透明帧才能真正透明。已在 vendor/tray-icon 的 windows/icon.rs 把
+    /// CreateIcon 经典图标改成 CreateIconIndirect + DIB section；这里守护
+    /// 空白帧本身必须保持全 0（真透明像素），防止再改成 alpha=254 之类
+    /// «接近黑» 的「假透明」。
     #[test]
-    fn tray_blank_pixel_keeps_windows_mask_fully_keep() {
-        let mask_byte = super::TRAY_BLANK_PX[3].wrapping_sub(u8::MAX);
-        #[cfg(target_os = "windows")]
-        assert_eq!(mask_byte, 0xFF, "Windows 空白帧 mask 必须全 1（透明）");
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = mask_byte;
-            assert_eq!(super::TRAY_BLANK_PX, [0, 0, 0, 0], "其他平台保持真全透明帧");
+    fn tray_blank_pixel_is_fully_transparent() {
+        assert_eq!(super::TRAY_BLANK.len(), (super::TRAY_SIZE * super::TRAY_SIZE * 4) as usize);
+        // 全 0：R、G、B、A 每个字节都必须为 0
+        for px in super::TRAY_BLANK.chunks_exact(4) {
+            assert_eq!(px, [0, 0, 0, 0], "空白帧必须是全透明像素");
         }
-        // 全 0 像素时 crate 给出的 mask 字节是 0x01 —— 即 bug 复现路径
-        assert_eq!(0u8.wrapping_sub(u8::MAX), 0x01);
-        // 且 TRAY_BLANK 里每个字节都被正确填充
-        assert_eq!(
-            super::TRAY_BLANK.len(),
-            (super::TRAY_SIZE * super::TRAY_SIZE * 4) as usize
-        );
-        assert_eq!(super::TRAY_BLANK[0], super::TRAY_BLANK_PX[0]);
-        assert_eq!(super::TRAY_BLANK[3], super::TRAY_BLANK_PX[3]);
     }
 }
 
