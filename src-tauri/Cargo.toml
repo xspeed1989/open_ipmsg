@@ -28,7 +28,7 @@ ksni = { version = "0.3.6", default-features = false, features = ["async-io"] }
 notify-rust = "4.18"
 
 [dependencies]
-tauri = { version = "2.11", features = ["tray-icon"] }
+tauri = { version = "2.11", features = ["tray-icon", "image-png"] }
 tauri-plugin-dialog = "2.7"
 tauri-plugin-opener = "2.5"
 tauri-plugin-notification = "2.3"

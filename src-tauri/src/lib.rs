@@ -459,7 +459,7 @@ SNI 注册失败（桌面没有 SNI 宿主，如部分 X11 轻量桌面）时回
 托盘：GTK 托盘连点击事件都没有，只能靠右键菜单。 */
 #[cfg(target_os = "linux")]
 mod linux_tray {
-    use super::{activate_from_tray, TRAY_IDLE, TRAY_SIZE};
+    use super::{activate_from_tray, tray_idle_image, TRAY_SIZE};
     use ksni::{
         menu::{StandardItem, MenuItem},
         Icon, ToolTip, Tray, TrayMethods,
@@ -500,7 +500,7 @@ mod linux_tray {
             let data = if self.blank {
                 vec![0u8; (TRAY_SIZE * TRAY_SIZE * 4) as usize]
             } else {
-                to_argb(TRAY_IDLE)
+                to_argb(tray_idle_image().rgba())
             };
             vec![Icon {
                 width: TRAY_SIZE as i32,
@@ -618,23 +618,39 @@ mod linux_tray {
 
 /* ---------- 托盘未读提示（闪烁） ---------- */
 
-/// 托盘两态图标：直接打包原始 RGBA 像素（64×64），
-/// 免去运行时 PNG 解码，也不必为此拉一个图像解码依赖。由 scripts/gen_icons.py 生成。
-const TRAY_SIZE: u32 = 64;
-const TRAY_IDLE: &[u8] = include_bytes!("../icons/tray.rgba");
-
-/// 全透明帧：与正常图标交替 = 微信那种「图标一闪一闪」。
+/// 托盘两态图标（PNG 资产，首次使用时解码一次并缓存）：
+/// - `tray.png`：正常图标（scripts/gen_icons.py 生成，64×64）；
+/// - `tray_blank.png`：全透明帧，与正常图标交替 = 微信那种「图标一闪一闪」。
 ///
-/// 为什么 Windows 上全 0 像素也能透明（曾在此踩过两次坑，已根治）：
+/// 为什么 Windows 上现在能靠全 0 像素的 PNG 帧透明（曾在此踩过两次坑）：
 /// tray-icon 0.24.x 原本在 Windows 用 CreateIcon 做成「单色 AND mask + 32bpp XOR」
-/// 的经典图标，没有真 alpha 通道 —— 任务栏按 mask 绘制，全 0 像素的帧被画成
-/// 黑块/马赛克（alpha 全 0 走经典路径；alpha=254 会走合成路径变成近纯黑）。
-/// 现已在 vendor/tray-icon 里把 Windows 图标改成 CreateIconIndirect + DIB section
-/// 的 32 位 alpha 图标（Electron nativeImage 同款做法，见 Cargo.toml 的 patch 注释），
-/// 透明帧由 alpha 通道真正合成，全 0 像素即全透明。macOS / Linux 一直走真 alpha
-/// 合成（NSImage / SNI 的 ARGB pixbuf），同样全 0 即可。
-static TRAY_BLANK: [u8; (TRAY_SIZE * TRAY_SIZE * 4) as usize] =
-    [0u8; (TRAY_SIZE * TRAY_SIZE * 4) as usize];
+/// 的经典图标，没有真 alpha 通道 —— 全 0 像素的帧被画成黑块/马赛克（alpha
+/// 全 0 走经典路径；调成 alpha=254 又走合成路径变成近纯黑）。现已在
+/// vendor/tray-icon 把 Windows 图标改成 CreateIconIndirect + DIB section 的
+/// 32 位 alpha 图标（Electron nativeImage 同款做法，见 Cargo.toml 的
+/// [patch.crates-io] 注释），透明帧由 alpha 通道真正合成；PNG 资产解码出的
+/// RGBA 与原生像素完全等价。macOS / Linux 一直走真 alpha 合成，同样全 0 即可。
+const TRAY_SIZE: u32 = 64;
+
+fn tray_idle_image() -> &'static tauri::image::Image<'static> {
+    static IMG: OnceLock<tauri::image::Image<'static>> = OnceLock::new();
+    IMG.get_or_init(|| {
+        let img = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))
+            .expect("内置托盘图标 tray.png 解码失败");
+        debug_assert_eq!((img.width(), img.height()), (TRAY_SIZE, TRAY_SIZE));
+        img
+    })
+}
+
+fn tray_blank_image() -> &'static tauri::image::Image<'static> {
+    static IMG: OnceLock<tauri::image::Image<'static>> = OnceLock::new();
+    IMG.get_or_init(|| {
+        let img = tauri::image::Image::from_bytes(include_bytes!("../icons/tray_blank.png"))
+            .expect("内置托盘空白帧 tray_blank.png 解码失败");
+        debug_assert_eq!((img.width(), img.height()), (TRAY_SIZE, TRAY_SIZE));
+        img
+    })
+}
 /// 闪烁间隔：与微信节奏接近
 const FLASH_INTERVAL_MS: u64 = 600;
 /// 当前是否处于闪烁状态（未读 > 0）
@@ -649,16 +665,18 @@ fn set_tray_frame(app: &tauri::AppHandle, blank: bool) {
         linux_tray::set_blank(blank);
         return;
     }
-    set_tray_icon(app, if blank { &TRAY_BLANK } else { TRAY_IDLE });
+    let img = if blank { tray_blank_image() } else { tray_idle_image() };
+    set_tray_icon(app, img);
 }
 
-fn set_tray_icon(app: &tauri::AppHandle, rgba: &'static [u8]) {
+fn set_tray_icon(app: &tauri::AppHandle, img: &'static tauri::image::Image<'static>) {
     // 闪烁循环跑在后台任务里，而托盘底层是 GTK/状态栏对象：
     // 一律回主线程改图标，避免跨线程操作 UI
     let app2 = app.clone();
+    let img = img.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(tray) = app2.tray_by_id("main-tray") {
-            let _ = tray.set_icon(Some(tauri::image::Image::new(rgba, TRAY_SIZE, TRAY_SIZE)));
+            let _ = tray.set_icon(Some(img));
         }
     });
 }
@@ -994,17 +1012,28 @@ mod tests {
         assert!(!urlencode("x?y#z&w=1").contains(['?', '#', '&', '=']));
     }
 
-    /// Windows 闪现帧的回归测试（两轮实测后根治的结论）：
-    /// 托盘图标在 Windows 必须由「32 位 alpha 图标」（DIB section + alpha 通道）
-    /// 承载，透明帧才能真正透明。已在 vendor/tray-icon 的 windows/icon.rs 把
-    /// CreateIcon 经典图标改成 CreateIconIndirect + DIB section；这里守护
-    /// 空白帧本身必须保持全 0（真透明像素），防止再改成 alpha=254 之类
-    /// «接近黑» 的「假透明」。
+    /// 托盘两态 PNG 资产回归测试：
+    /// - `tray.png` / `tray_blank.png` 必须能解码且是 64×64（阻止资产损坏/尺寸漂移）；
+    /// - 空白帧必须保持全 0（真透明像素），防止再改成 alpha=254 之类
+    ///   «接近黑» 的「假透明」。
+    ///   Windows 上全 0 像素的透明度由 vendor 修复后的 tray-icon DIB alpha
+    ///   图标保证（见 Cargo.toml [patch.crates-io] 注释与 vendor/tray-icon）。
     #[test]
-    fn tray_blank_pixel_is_fully_transparent() {
-        assert_eq!(super::TRAY_BLANK.len(), (super::TRAY_SIZE * super::TRAY_SIZE * 4) as usize);
+    fn tray_png_assets_decode_and_blank_is_transparent() {
+        let idle = super::tray_idle_image();
+        let blank = super::tray_blank_image();
+        assert_eq!(
+            (idle.width(), idle.height()),
+            (super::TRAY_SIZE, super::TRAY_SIZE),
+            "tray.png 必须是 64×64"
+        );
+        assert_eq!(
+            (blank.width(), blank.height()),
+            (super::TRAY_SIZE, super::TRAY_SIZE),
+            "tray_blank.png 必须是 64×64"
+        );
         // 全 0：R、G、B、A 每个字节都必须为 0
-        for px in super::TRAY_BLANK.chunks_exact(4) {
+        for px in blank.rgba().chunks_exact(4) {
             assert_eq!(px, [0, 0, 0, 0], "空白帧必须是全透明像素");
         }
     }
@@ -1108,8 +1137,9 @@ pub fn run() {
                 "Open IPMsg 托盘检测".into()
             }
             fn icon_pixmap(&self) -> Vec<Icon> {
-                let mut data = Vec::with_capacity(TRAY_IDLE.len());
-                for px in TRAY_IDLE.chunks_exact(4) {
+                let rgba = tray_idle_image().rgba();
+                let mut data = Vec::with_capacity(rgba.len());
+                for px in rgba.chunks_exact(4) {
                     data.extend_from_slice(&[px[3], px[0], px[1], px[2]]);
                 }
                 vec![Icon {
@@ -1383,7 +1413,7 @@ pub fn run() {
             let refresh_ctx = ctx.clone();
             if !sni_ok {
             TrayIconBuilder::with_id("main-tray")
-                .icon(tauri::image::Image::new(TRAY_IDLE, TRAY_SIZE, TRAY_SIZE))
+                .icon(tray_idle_image().clone())
                 .tooltip(&run_title)
                 .menu(&menu)
                 .show_menu_on_left_click(false)

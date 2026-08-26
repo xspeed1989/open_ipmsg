@@ -5,13 +5,13 @@
 字样直接点名 IP Messenger —— 24px 托盘尺寸下仍然认得出。
 字形是手绘几何（圆角矩形拼合），不依赖任何字体文件。
 
-托盘图标只出正常态 tray.png / tray.rgba；有新消息时的闪烁由 Rust 侧在
-「正常图标 ↔ 全透明帧」之间交替实现（与微信一致），透明帧无需生成文件。
+托盘图标出两态 PNG：正常态 tray.png 与全透明帧 tray_blank.png；有新消息时的
+闪烁由 Rust 侧在两者之间交替实现（与微信一致，Electron 同款「两张图来回换」）。
 透明帧要真正透明依赖 Windows 图标带真 alpha 通道：tray-icon 已 vendor 修复为
 CreateIconIndirect + DIB section（见 Cargo.toml 的 patch 注释与 vendor/tray-icon）。
 
 输出到 src-tauri/icons/: 32x32.png / 128x128.png / 128x128@2x.png / icon.png(512)
-            icon.ico / tray.png / tray.rgba
+            icon.ico / tray.png / tray_blank.png
 """
 import struct
 import zlib
@@ -195,16 +195,15 @@ def main():
         write_png(OUT / name, size, size, rendered[size])
     print("render icon.ico ...")
     write_ico(OUT / "icon.ico", {s: rendered[s] for s in (32, 128, 256)})
-    # 托盘两态：无未读 / 有未读（右上角红点）
-    # 同时输出 .rgba 原始像素：Rust 侧直接 include_bytes! 交给 tauri::image::Image::new，
-    # 运行时不用解码 PNG，也不必为此引入图像解码依赖
-    # 托盘图标：只出正常态，闪烁用的透明帧由 Rust 侧直接生成（全 0 像素）
-    # （Windows 上全 0 帧的透明度由 vendor 修复后的 tray-icon DIB 图标保证，
-    #   见 Cargo.toml [patch.crates-io] 的注释）
+    # 托盘两态 PNG：正常帧 tray.png + 全透明帧 tray_blank.png。
+    # Rust 侧启动时用 tauri::image::Image::from_bytes 解码并缓存（lib.rs 的
+    # tray_idle_image / tray_blank_image），闪烁 = 两帧交替。
+    # （Windows 上全 0 帧的透明度由 vendor 修复后的 tray-icon DIB alpha 图标
+    #   保证，见 Cargo.toml [patch.crates-io] 的注释）
     print("render tray ...")
     rgba = render(64)
     write_png(OUT / "tray.png", 64, 64, rgba)
-    (OUT / "tray.rgba").write_bytes(rgba)
+    write_png(OUT / "tray_blank.png", 64, 64, bytes(64 * 64 * 4))
     print("done ->", OUT)
 
 
