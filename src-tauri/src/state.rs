@@ -165,6 +165,8 @@ pub struct AppState {
     peer_plain: Mutex<HashSet<String>>,
     /// 对端 IP → 已发出的 GETPUBKEY 探测次数（仅内存态：重启即重置）
     probe_counts: Mutex<HashMap<String, u32>>,
+    /// 自愈重握手限频：IP → 最近一次触发时刻（秒）（任一端换钥后自动恢复用）
+    rehandshake_at: Mutex<HashMap<String, u64>>,
     /// 本机密钥对：懒加载生成 + ipmsg_key.json 持久化（进程内只生成一次）
     own_key: OnceLock<Arc<KeyPair>>,
     pub data_dir: PathBuf,
@@ -202,6 +204,7 @@ impl AppState {
             peer_crypto: Mutex::new(HashMap::new()),
             peer_plain: Mutex::new(HashSet::new()),
             probe_counts: Mutex::new(HashMap::new()),
+            rehandshake_at: Mutex::new(HashMap::new()),
             own_key: OnceLock::new(),
             data_dir,
             logs_dir,
@@ -575,6 +578,21 @@ impl AppState {
     /// 与规格的偏差：预算是纯内存计数，重启即满血重来；规格原文是
     /// 「对方重新上线广播后重置」。这里放宽为进程生命周期粒度 —— 不持久化
     /// 误标结果，对端真上线后一条 ENCRYPTOPT 报文即可重新握手。
+    /// 自愈重握手限频闸门：同 IP 每 REHANDSHAKE_INTERVAL 秒至多一次，
+    /// 避免对端换钥/缓存错乱时触发握手风暴
+    pub fn try_rehandshake_gate(&self, ip: &str) -> bool {
+        const REHANDSHAKE_INTERVAL: u64 = 10;
+        let now = now_secs();
+        let mut m = self.rehandshake_at.lock().unwrap();
+        match m.get(ip) {
+            Some(t) if now.saturating_sub(*t) < REHANDSHAKE_INTERVAL => false,
+            _ => {
+                m.insert(ip.to_string(), now);
+                true
+            }
+        }
+    }
+
     pub fn retire_probe_budget(&self, ip: &str) -> bool {
         if self.probe_count(ip) < PLAIN_PROBE_BUDGET {
             return false;

@@ -362,6 +362,36 @@ async fn send_getpubkey(ctx: &NetCtx, target: SocketAddr, cfg: &Config) {
         .diag(&format!("-> {target} GETPUBKEY 预握手 capa={capa:x} 第 {n} 次探测"));
 }
 
+/// 密钥自愈：任一端换了密钥对（更新/重装程序后 ipmsg_key.json 重新生成，
+/// 而对方缓存了旧公钥、且「有缓存不握手」导致持续用旧钥）时，入站消息
+/// 会出现「验签失败（我方缓存旧）」或「会话钥解不开（对方持我方旧钥）」。
+/// 此处双向刷新：GETPUBKEY 索取对方最新公钥更新我方缓存；主动 ANSPUBKEY
+/// 把我方最新公钥推给对方（官方协议应答报，对端按普通应答缓存，无害）。
+/// 限频由 AppState::try_rehandshake_gate（10s/IP）兜底。
+async fn crypto_rehandshake(ctx: &NetCtx, from: SocketAddr, key: &str, reason: &str) {
+    if !ctx.st.try_rehandshake_gate(key) {
+        return;
+    }
+    let cfg = ctx.st.config();
+    let capa = entry_caps(&cfg) | crypto::CAPA_OUR_SEND;
+    // 1) 索取对方最新公钥
+    let mut g = proto::Packet::new(cmd::GETPUBKEY);
+    g.extra = format!("{capa:x}").into_bytes();
+    let _ = ctx
+        .sock
+        .send_to(&g.encode(&my_user(&cfg), &my_host()), from)
+        .await;
+    // 2) 主动推送我方最新公钥（对方换钥后其缓存里可能还是我的旧钥）
+    let mut a = proto::Packet::new(cmd::ANSPUBKEY);
+    a.extra = crypto::build_anspubkey(capa, &ctx.st.own_keypair()).into_bytes();
+    let _ = ctx
+        .sock
+        .send_to(&a.encode(&my_user(&cfg), &my_host()), from)
+        .await;
+    ctx.st
+        .diag(&format!("-> {from} 密钥自愈重握手（{reason}）：GETPUBKEY + ANSPUBKEY"));
+}
+
 /* ================= 入站处理 ================= */
 
 async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
@@ -553,13 +583,21 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                                 m.plain.len(),
                                 m.sig_ok
                             ));
+                            // 验签失败但解密成功：最常见于对端换过密钥而缓存仍是旧钥
+                            // （「有缓存不握手」从不刷新）。触发双向自愈重握手。
+                            if !m.sig_ok && peer_pub.is_some() {
+                                crypto_rehandshake(ctx, from, &key, "sig=false").await;
+                            }
                             pkt.extra = m.plain;
                             pkt.command &= !opt::ENCRYPTOPT;
                             enc_meta = Some(m.sig_ok);
                         }
                         Err(e) => {
-                            // 无法解密的报文按垃圾丢弃（对端会重发或回退明文）
+                            // 无法解密的报文按垃圾丢弃（对端会重发或回退明文）；
+                            // 会话钥解不开 = 对方持我方的旧公钥签发——主动推送新钥
+                            // 并索取对方新钥（双向自愈）
                             ctx.st.diag(&format!("decrypt-fail {from}: {e}"));
+                            crypto_rehandshake(ctx, from, &key, "decrypt-fail").await;
                             return;
                         }
                     }
