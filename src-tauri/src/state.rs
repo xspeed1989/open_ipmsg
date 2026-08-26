@@ -82,6 +82,14 @@ pub struct SessionInfo {
     pub group: String,
     /// 该会话最近一条消息的时间戳
     pub last_ts: u64,
+    /// 未读入站消息数（read=false 的 in 记录）。
+    ///
+    /// 前端启动时用它补回「WebView 监听就绪前被丢弃的 msg-in 事件」：
+    /// 对端离线留言在我方上线瞬间重投即属此列——消息已落库，但事件没人
+    /// 接，红点/托盘闪烁因此缺失；摘要的未读数就是这个持久化状态的投影。
+    pub unread: u32,
+    /// 最近一条未读消息的时间戳（决定托盘唤起时跳到哪个会话）
+    pub unread_ts: u64,
 }
 
 /// 局域网内的对端用户
@@ -144,6 +152,16 @@ struct PeerKeyFile {
 
 const PEER_KEY_FILE_REV: u32 = 2;
 
+/// 读取 hidden_contacts.json（已删除会话 key 列表）；文件缺失/损坏时视为空。
+fn load_hidden_contacts(data_dir: &PathBuf) -> HashSet<String> {
+    if let Ok(bytes) = std::fs::read(data_dir.join("hidden_contacts.json")) {
+        if let Ok(list) = serde_json::from_slice::<Vec<String>>(&bytes) {
+            return list.into_iter().collect();
+        }
+    }
+    HashSet::new()
+}
+
 fn b64_encode(b: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(b)
@@ -180,6 +198,10 @@ pub struct AppState {
     rehandshake_at: Mutex<HashMap<String, u64>>,
     /// 本机密钥对：懒加载生成 + ipmsg_key.json 持久化（进程内只生成一次）
     own_key: OnceLock<Arc<KeyPair>>,
+    /// 被用户删除（隐藏）的会话 key 集合：微信式「删除会话」语义——
+    /// 删除后从列表消失（记录一并删除），对方再发消息时自动恢复。
+    /// 持久化到 hidden_contacts.json，重启不丢。
+    hidden_contacts: Mutex<HashSet<String>>,
     pub data_dir: PathBuf,
     pub logs_dir: PathBuf,
 }
@@ -231,6 +253,7 @@ impl AppState {
             probe_counts: Mutex::new(HashMap::new()),
             rehandshake_at: Mutex::new(HashMap::new()),
             own_key: OnceLock::new(),
+            hidden_contacts: Mutex::new(load_hidden_contacts(&data_dir)),
             data_dir,
             logs_dir,
         }
@@ -1030,6 +1053,7 @@ impl AppState {
     /// key/昵称/群组以记录内 peer 快照为准（迁移后已是纯 IP 键），
     /// 无快照时退化为文件名；时间为该会话最大消息 ts，倒序返回。
     /// 防御性跳过旧版 `<ipv4>_<port>` 命名（迁移遗漏时不当成会话）。
+    /// 被用户删除（隐藏）的会话直接排除——文件虽已删除，仍防御性过滤。
     pub fn list_sessions(&self) -> Vec<SessionInfo> {
         let _g = self.hist_lock.lock().unwrap();
         let Ok(rd) = std::fs::read_dir(&self.logs_dir) else {
@@ -1059,12 +1083,26 @@ impl AppState {
             let mut key = stem.clone();
             let (mut nickname, mut host, mut group) = (String::new(), String::new(), String::new());
             let mut last_ts = 0u64;
+            let mut unread = 0u32;
+            let mut unread_ts = 0u64;
             for line in content.lines() {
                 let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
                     continue;
                 };
-                if let Some(ts) = rec.get("ts").and_then(|v| v.as_u64()) {
-                    last_ts = last_ts.max(ts);
+                let ts = rec.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
+                if ts > last_ts {
+                    last_ts = ts;
+                }
+                // 未读统计放在 peer 快照解析之前：旧版缺 peer 字段的记录也参与
+                // 计数（会话归属由文件名确定），保证前端启动补数不遗漏。
+                // out 记录的 read 是「对端已读」，只有 in 记录参与。
+                if rec.get("dir").and_then(|v| v.as_str()) == Some("in")
+                    && !rec.get("read").and_then(|v| v.as_bool()).unwrap_or(false)
+                {
+                    unread += 1;
+                    if ts > unread_ts {
+                        unread_ts = ts;
+                    }
                 }
                 let Some(peer) = rec.get("peer") else {
                     continue;
@@ -1093,12 +1131,17 @@ impl AppState {
                     }
                 }
             }
+            if self.is_hidden(&key) {
+                continue;
+            }
             out.push(SessionInfo {
                 key,
                 nickname,
                 host,
                 group,
                 last_ts,
+                unread,
+                unread_ts,
             });
         }
         out.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
@@ -1115,6 +1158,50 @@ impl AppState {
             .unwrap_or(0);
         let _ = std::fs::remove_file(&path);
         n
+    }
+
+    /* ---------- 删除会话（微信式隐藏） ---------- */
+
+    fn hidden_path(&self) -> PathBuf {
+        self.data_dir.join("hidden_contacts.json")
+    }
+
+    /// 该会话是否已被用户删除（隐藏等待对方再来消息恢复）
+    pub fn is_hidden(&self, key: &str) -> bool {
+        self.hidden_contacts.lock().unwrap().contains(key)
+    }
+
+    fn persist_hidden(&self) {
+        let mut keys: Vec<String> =
+            self.hidden_contacts.lock().unwrap().iter().cloned().collect();
+        keys.sort();
+        if let Some(dir) = self.hidden_path().parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(
+            self.hidden_path(),
+            serde_json::to_vec_pretty(&keys).unwrap_or_default(),
+        );
+    }
+
+    /// 删除某会话（微信式）：记入隐藏集合并删除本地聊天记录，
+    /// 返回删掉的记录条数；对端再发消息时由 unhide_contact 恢复。
+    pub fn delete_contact(&self, key: &str) -> usize {
+        self.hidden_contacts.lock().unwrap().insert(key.to_string());
+        self.persist_hidden();
+        self.clear_history(key)
+    }
+
+    /// 对端发来新消息：把被删会话从隐藏集合移除并落盘。
+    /// 返回是否确实做过恢复（原本就在隐藏集合里）。
+    pub fn unhide_contact(&self, key: &str) -> bool {
+        let mut hidden = self.hidden_contacts.lock().unwrap();
+        if !hidden.remove(key) {
+            return false;
+        }
+        drop(hidden);
+        self.persist_hidden();
+        true
     }
 
     /// 启动时整理历史文件：合并同包号的入站重复记录、丢弃无法解析的坏行。
@@ -1537,6 +1624,49 @@ mod tests {
     }
 
     #[test]
+    fn delete_contact_hides_and_removes_history() {
+        let st = temp_state("del-contact");
+        st.log_record("10.0.0.9", &serde_json::json!({"dir":"in","pkt":1,"ts":1,"text":"a"}));
+        st.log_record("10.0.0.9", &serde_json::json!({"dir":"out","pkt":2,"ts":2,"text":"b"}));
+        assert_eq!(st.list_sessions().len(), 1);
+        assert!(!st.is_hidden("10.0.0.9"));
+
+        assert_eq!(st.delete_contact("10.0.0.9"), 2, "返回被删掉的记录条数");
+        assert!(st.is_hidden("10.0.0.9"));
+        assert!(st.list_sessions().is_empty(), "删除后会话不再出现在列表");
+        assert!(st.read_history("10.0.0.9", 10).is_empty(), "记录文件已删除");
+
+        // 对方重新发消息：历史重建，但列表仍隐藏（等待 unhide 恢复）
+        st.log_record("10.0.0.9", &serde_json::json!({"dir":"in","pkt":3,"ts":3,"text":"c"}));
+        assert!(st.list_sessions().is_empty(), "恢复前仍隐藏");
+
+        // 收到对方消息（unhide_contact）后会话重新出现
+        assert!(st.unhide_contact("10.0.0.9"));
+        assert!(!st.unhide_contact("10.0.0.9"), "未隐藏的会话恢复是空操作");
+        assert!(!st.is_hidden("10.0.0.9"));
+        assert_eq!(st.list_sessions().len(), 1, "恢复后重新出现在列表");
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn hidden_contacts_persist_across_reload() {
+        let dir = std::env::temp_dir().join(format!("oim-hidden-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let st = AppState::new(dir.clone());
+        st.log_record("192.168.1.5", &serde_json::json!({"dir":"in","pkt":1,"ts":1,"text":"a"}));
+        st.delete_contact("192.168.1.5");
+        assert!(st.is_hidden("192.168.1.5"));
+        drop(st);
+
+        // 重启：hidden_contacts.json 落盘，隐藏集合原样恢复
+        let st2 = AppState::new(dir.clone());
+        assert!(st2.is_hidden("192.168.1.5"));
+        assert!(st2.list_sessions().is_empty());
+        assert!(!st2.is_hidden("192.168.1.6"), "未删除的 key 不受影响");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn in_record_upsert_dedups_resends() {
         let st = temp_state("resend");
         let rec = serde_json::json!({
@@ -1559,6 +1689,50 @@ mod tests {
         assert_eq!(hist[0]["ts"], 100, "保留首次收到时间");
         assert!(hist[0]["text"].as_str().unwrap().contains("Delayed Send"));
         assert!(st.pending_receipts("k:1", &[500]).is_empty(), "重投不再回执");
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    /// 会话摘要未读统计：in 且 read=false 计数；out 记录、已读记录不计；
+    /// 无 read 字段的旧记录按未读处理（与前端 !m.read 语义一致）。
+    #[test]
+    fn session_summary_counts_unread_in_records() {
+        let st = temp_state("sesssum");
+        let rec = |pkt: u32, ts: u64, read: bool| {
+            serde_json::json!({
+                "dir": "in", "kind": "text", "pkt": pkt, "ts": ts, "read": read,
+                "peer": {"key": "10.0.0.9", "nickname": "阿九", "host": "h9"}
+            })
+        };
+        st.log_record("10.0.0.9", &rec(1, 100, false));
+        st.log_record("10.0.0.9", &rec(2, 200, false));
+        st.log_record("10.0.0.9", &rec(3, 300, true)); // 已读：不计
+        st.log_record("10.0.0.9", &serde_json::json!({
+            "dir": "out", "kind": "text", "pkt": 9, "ts": 400, "read": false,
+            "peer": {"key": "10.0.0.9", "nickname": "阿九", "host": "h9"}
+        }));
+        // 旧版记录没有 read 字段：视为未读
+        st.log_record("10.0.0.9", &serde_json::json!({
+            "dir": "in", "kind": "text", "pkt": 4, "ts": 250,
+            "peer": {"key": "10.0.0.9", "nickname": "阿九", "host": "h9"}
+        }));
+        let sess = st
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.key == "10.0.0.9")
+            .expect("会话摘要存在");
+        assert_eq!(sess.unread, 3, "入站未读 3 条（1、2、4），已读与出站不计");
+        assert_eq!(sess.unread_ts, 250, "未读时间戳取最新未读记录的 ts");
+        assert_eq!(sess.last_ts, 400, "last_ts 仍取全部记录最大 ts");
+
+        // 标记已读后摘要回落
+        st.mark_in_read("10.0.0.9", &[2, 4]);
+        let sess = st
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.key == "10.0.0.9")
+            .expect("会话摘要存在");
+        assert_eq!(sess.unread, 1, "标记已读后仅剩包号 1 未读");
+        assert_eq!(sess.unread_ts, 100);
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 

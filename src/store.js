@@ -7,7 +7,7 @@ import {
 } from '@tauri-apps/plugin-notification'
 import * as ipc from './lib/ipc'
 import { splitDelayedNote } from './lib/text'
-import { pickLatestUnread, pickLatestActive } from './lib/unread'
+import { pickLatestUnread, pickLatestActive, applyUnreadFromSessions } from './lib/unread'
 import { unreadReceiptPkts } from './lib/receipts'
 import { mergeSessions } from './lib/sessions'
 import { applyTheme } from './lib/theme'
@@ -136,6 +136,10 @@ export async function loadSessions() {
         }
       }
     }
+    // 启动补数：WebView 监听就绪前到达的消息（对端离线留言在我方上线瞬间
+    // 重投即属此列）事件会被丢弃，但后端已落库——用会话摘要的未读计数把
+    // 中栏红点与托盘闪烁补回来（只增不覆盖，重复调用安全）
+    applyUnreadFromSessions(store.unread, store.unreadTs, store.chats, store.sessions)
     mergeSessionList()
   } catch (e) {
     console.error('loadSessions failed', e)
@@ -213,6 +217,33 @@ export async function clearHistory(key) {
   delete store.unreadTs[key]
   delete store.lastTs[key]
   return n
+}
+
+/**
+ * 删除会话（微信式）：后端清掉本地记录并把联系人从列表隐藏，
+ * 对端再发消息时自动恢复并重新出现。前端同步清掉本地缓存、
+ * 未读角标与列表中的该联系人，并和过滤后的后端视图对齐。
+ */
+export async function deleteContact(key) {
+  if (!key) return
+  try {
+    await ipc.deleteContact(key)
+  } catch (e) {
+    console.error('delete_contact failed', e)
+  }
+  delete store.chats[key] // 历史缓存一并丢弃，避免重新打开时回显已删内容
+  delete store.unread[key]
+  delete store.unreadTs[key]
+  delete store.lastTs[key]
+  delete store.peerMeta[key]
+  delete store.userMap[key]
+  const ui = store.users.findIndex((u) => u.key === key)
+  if (ui >= 0) store.users.splice(ui, 1)
+  if (store.activeKey === key) store.activeKey = null
+  // 与后端视图对齐（get_users / list_sessions 已过滤被删联系人；
+  // 后端发的 users-updated 事件也会触发同样刷新，重复调用安全）
+  await loadUsers()
+  await loadSessions()
 }
 
 export async function openChat(key) {

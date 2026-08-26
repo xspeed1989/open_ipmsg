@@ -28,6 +28,10 @@ export const getHistory = (key, limit = 300) => invoke('get_history', { key, lim
 /** 发送文本消息，返回落库后的消息记录 */
 export const clearHistory = (key) => invoke('clear_history', { key })
 
+/** 删除某会话（微信式）：清掉本地记录并把联系人从列表隐藏；
+ *  对端再发消息时后端自动恢复。返回被删掉的记录条数 */
+export const deleteContact = (key) => invoke('delete_contact', { key })
+
 /** 全文搜索聊天记录；key 省略则搜索全部会话 */
 export const searchHistory = (query, key, limit) =>
   invoke('search_history', { query, key, limit })

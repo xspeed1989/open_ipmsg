@@ -55,6 +55,10 @@ const zh = {
   'list.noMatch': '没有匹配的聊天记录',
   'list.empty': '暂无会话',
   'list.emptySub': '请确认对方已运行 IPMsg 客户端（UDP 端口 2425），或点击聊天窗口右上角「刷新」重新广播',
+  'list.deleteSession': '删除会话',
+  'list.deleteTitle': '删除会话',
+  'list.deleteConfirm': '确定删除与「{who}」的会话吗？\n本地聊天记录将被删除且无法恢复（不影响对方）。对方再发消息时会重新出现。',
+  'list.deleteOk': '删除',
   // ---- 设置弹窗 ----
   'settings.title': '设置',
   'settings.language': '语言',
@@ -241,6 +245,10 @@ const en = {
   'list.noMatch': 'No matching chat history',
   'list.empty': 'No conversations',
   'list.emptySub': 'Make sure the other side is running an IPMsg client (UDP port 2425), or click "Refresh" at the top right of the chat window to re-announce',
+  'list.deleteSession': 'Delete conversation',
+  'list.deleteTitle': 'Delete conversation',
+  'list.deleteConfirm': 'Delete the conversation with "{who}"?\nLocal chat history will be deleted and cannot be recovered (does not affect the other side). It will reappear when they message you again.',
+  'list.deleteOk': 'Delete',
   // ---- 设置弹窗 ----
   'settings.title': 'Settings',
   'settings.language': 'Language',

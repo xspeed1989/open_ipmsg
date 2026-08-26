@@ -713,6 +713,13 @@ async fn handle_sendmsg(
         Vec::new()
     };
 
+    // 被用户删除（隐藏）的联系人主动发来消息：视为对方再来联系，
+    // 会话自动恢复（微信式删除语义），并让前端刷新列表把它放回来
+    if ctx.st.is_hidden(key) {
+        ctx.st.unhide_contact(key);
+        ctx.st.emit("users-updated", json!({}));
+    }
+
     let no_add_list = pkt.command & opt::NOADDLISTOPT != 0;
     if !no_add_list && !ctx.st.peers.lock().unwrap().contains_key(key) {
         // 陌生来源直接发消息：按包头注册用户

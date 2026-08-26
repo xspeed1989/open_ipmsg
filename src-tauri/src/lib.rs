@@ -203,7 +203,15 @@ async fn save_config(
 
 #[tauri::command]
 async fn get_users(st: State<'_, SharedState>) -> Result<Vec<PeerInfo>, String> {
-    let mut users: Vec<PeerInfo> = st.peers.lock().unwrap().values().cloned().collect();
+    // 排除被用户删除（隐藏）的联系人：对方的在线广播也不在列表里出现
+    let mut users: Vec<PeerInfo> = st
+        .peers
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|p| !st.is_hidden(&p.key))
+        .cloned()
+        .collect();
     users.sort_by(|a, b| {
         a.group
             .cmp(&b.group)
@@ -243,6 +251,16 @@ async fn search_history(
 #[tauri::command]
 async fn clear_history(st: State<'_, SharedState>, key: String) -> Result<usize, String> {
     Ok(st.clear_history(&key))
+}
+
+/// 删除某会话（微信式）：清掉本地记录并把联系人从列表隐藏，
+/// 对端再发消息时自动恢复。返回被删掉的记录条数。
+#[tauri::command]
+async fn delete_contact(st: State<'_, SharedState>, key: String) -> Result<usize, String> {
+    let n = st.delete_contact(&key);
+    // 通知前端刷新列表（在线用户过滤 + 离线会话过滤都由后端做）
+    st.emit("users-updated", json!({}));
+    Ok(n)
 }
 
 #[tauri::command]
@@ -1485,6 +1503,7 @@ pub fn run() {
             refresh_users,
             get_history,
             clear_history,
+            delete_contact,
             search_history,
             send_text,
             send_files,

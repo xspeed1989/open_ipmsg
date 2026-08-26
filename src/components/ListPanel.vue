@@ -1,7 +1,8 @@
 <script setup>
-// 中栏：联系人列表（按群组分组，固定显示，未读角标提示新消息）
-import { computed } from 'vue'
-import { store, openChat, onSearchInput, openHit, displayName, fmtTime } from '../store'
+// 中栏：联系人列表（按群组分组，固定显示，未读角标提示新消息；右键可删除会话）
+import { computed, ref, watch } from 'vue'
+import { confirm as confirmDialog } from '@tauri-apps/plugin-dialog'
+import { store, openChat, onSearchInput, openHit, displayName, fmtTime, deleteContact } from '../store'
 import { makeSnippet } from '../lib/text'
 import { t } from '../lib/i18n'
 import Avatar from './Avatar.vue'
@@ -49,6 +50,52 @@ const contactGroups = computed(() => {
 function openContact(u) {
   openChat(u.key)
 }
+
+/* ---------- 右键删除会话（微信式） ---------- */
+
+/** 右键菜单：{ x, y, key }；key 为待删除的联系人 */
+const ctxMenu = ref(null)
+const ctxMenuRef = ref(null)
+
+function openContactCtx(u, e) {
+  ctxMenu.value = {
+    x: Math.min(e.clientX, window.innerWidth - 140),
+    y: Math.min(e.clientY, window.innerHeight - 72),
+    key: u.key,
+  }
+}
+function closeCtx() {
+  ctxMenu.value = null
+}
+function onCtxMouseDown(e) {
+  const path = e.composedPath ? e.composedPath() : []
+  if (path.includes(ctxMenuRef.value)) return
+  closeCtx()
+}
+function onCtxKeyDown(e) {
+  if (e.key === 'Escape') closeCtx()
+}
+watch(ctxMenu, (open) => {
+  if (open) {
+    document.addEventListener('mousedown', onCtxMouseDown, true)
+    document.addEventListener('keydown', onCtxKeyDown)
+  } else {
+    document.removeEventListener('mousedown', onCtxMouseDown, true)
+    document.removeEventListener('keydown', onCtxKeyDown)
+  }
+})
+
+async function doDeleteContact() {
+  const key = ctxMenu.value?.key
+  if (!key) return
+  closeCtx()
+  const who = displayName(key)
+  const ok = await confirmDialog(
+    t('list.deleteConfirm', { who }),
+    { title: t('list.deleteTitle'), kind: 'warning', okLabel: t('list.deleteOk'), cancelLabel: t('cancel') }
+  )
+  if (ok) await deleteContact(key)
+}
 </script>
 
 <template>
@@ -82,6 +129,7 @@ function openContact(u) {
           :data-user-key="u.key"
           :class="{ active: store.activeKey === u.key, off: !u.online, 'drag-hover': store.dragHoverKey === u.key }"
           @click="openContact(u)"
+          @contextmenu.prevent="openContactCtx(u, $event)"
         >
           <div class="ava">
             <Avatar :name="u.nickname || u.user || '?'" :seed="u.key" :size="36" />
@@ -124,6 +172,16 @@ function openContact(u) {
         <p>{{ t('list.empty') }}</p>
         <p class="sub">{{ t('list.emptySub') }}</p>
       </div>
+    </div>
+
+    <!-- 右键菜单：删除会话 -->
+    <div
+      v-if="ctxMenu"
+      ref="ctxMenuRef"
+      class="ctx-menu"
+      :style="{ position: 'fixed', left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }"
+    >
+      <button class="ctx-item danger" @click="doDeleteContact">{{ t('list.deleteSession') }}</button>
     </div>
   </aside>
 </template>
@@ -268,5 +326,35 @@ function openContact(u) {
 .empty-tip .sub {
   font-size: 11.5px;
   color: var(--c-weak);
+}
+
+/* ---------- 右键菜单（删除会话） ---------- */
+.ctx-menu {
+  z-index: 40;
+  min-width: 96px;
+  padding: 4px;
+  background: var(--c-card);
+  border: 1px solid var(--c-hairline);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px var(--c-shadow);
+}
+.ctx-item {
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: 4px;
+  text-align: left;
+  font-size: 13px;
+  color: var(--c-text);
+}
+.ctx-item:hover {
+  background: var(--c-list-hover);
+}
+.ctx-item.danger {
+  color: var(--c-danger);
+}
+.ctx-item.danger:hover {
+  background: var(--c-danger);
+  color: var(--c-card);
 }
 </style>
