@@ -353,7 +353,7 @@ export async function downloadFile(msg, file) {
 }
 
 function onFileProgress(p) {
-  const { key, pkt, file_id: fileId, transferred, total, done, path, error } = p
+  const { key, pkt, file_id: fileId, transferred, total, done, path, error, enc } = p
   const chat = store.chats[key]
   if (!chat) return
   const msg = chat.msgs.find((m) => m.pkt === pkt && m.dir === 'in')
@@ -362,6 +362,8 @@ function onFileProgress(p) {
   if (!f) return
   f.transferred = transferred
   f.total = total || f.size
+  // 加密流下载标记：UI 据此区分「下载中（加密）」与「解密完成」状态
+  if (typeof enc === 'boolean') f.enc = enc
   if (error) {
     f.state = 'failed'
     f.error = error

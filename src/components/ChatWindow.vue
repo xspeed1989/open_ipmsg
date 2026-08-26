@@ -985,11 +985,12 @@ watch(
                           <a @click.prevent="downloadFile(v.m, f)">{{ t('chat.download') }}</a>
                         </template>
                         <template v-else-if="f.state === 'downloading'">
-                          <span>{{ progressLabel(f) }}</span>
+                          <span v-if="f.enc">{{ t('chat.downloadEnc') }} {{ progressLabel(f) }}</span>
+                          <span v-else>{{ progressLabel(f) }}</span>
                           <i v-if="f.total" class="bar"><i :style="{ width: pct(f) + '%' }"></i></i>
                         </template>
                         <template v-else-if="f.state === 'done'">
-                          <span class="ok">{{ f.dir_entry ? t('chat.folderSaved') : t('chat.saved') }}</span>
+                          <span class="ok">{{ f.enc ? t('chat.decrypted') : (f.dir_entry ? t('chat.folderSaved') : t('chat.saved')) }}</span>
                           <a @click.prevent="openFile(f.path)">{{ t('chat.open') }}</a>
                           <a @click.prevent="revealFile(f.path)">{{ t('chat.revealDir') }}</a>
                         </template>

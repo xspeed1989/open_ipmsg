@@ -1944,7 +1944,7 @@ pub async fn download_file_task(
 
     // 对端接受连接却不回数据，多半是请求里数字字段的进制不合它的口味：
     // 换一种方言重试，命中后记住，后续下载不再多花往返
-    let mut result = Ok(0u64);
+    let mut result: Result<(u64, bool), String> = Ok((0, false));
     for idx in ctx.st.dialect_order(&peer.ip, DIALECTS.len()) {
         let d = DIALECTS[idx];
         result = fetch_to_file(
@@ -1952,14 +1952,14 @@ pub async fn download_file_task(
         )
         .await;
         match &result {
-            Ok(0) => {
+            Ok((0, _)) => {
                 ctx.st.diag(&format!(
                     "dl-try {key} pkt={pkt_no} id={file_id:x} 方言#{idx}({d:?}) -> 0 字节，换下一种"
                 ));
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 continue;
             }
-            Ok(n) => {
+            Ok((n, _)) => {
                 ctx.st.remember_dialect(&peer.ip, idx);
                 ctx.st
                     .diag(&format!("dl-try {key} 方言#{idx} 命中，收到 {n} 字节"));
@@ -1970,7 +1970,7 @@ pub async fn download_file_task(
         }
     }
     match result {
-        Ok(0) => {
+        Ok((0, _)) => {
             // 对端接受了连接但没有回数据（部分私有实现的前置校验未通过）
             let _ = tokio::fs::remove_file(&tmp_path).await;
             ctx.st
@@ -1981,7 +1981,7 @@ pub async fn download_file_task(
             fail_download(ctx, key, pkt_no, file_id, &e);
             Err(e)
         }
-        Ok(total) if expect_size > 0 && total < expect_size => {
+        Ok((total, _)) if expect_size > 0 && total < expect_size => {
             // 连接中途断开：落盘半截文件会静默损坏，按失败处理
             let _ = tokio::fs::remove_file(&tmp_path).await;
             let e = format!("传输中断：只收到 {total}/{expect_size} 字节");
@@ -1990,19 +1990,20 @@ pub async fn download_file_task(
             fail_download(ctx, key, pkt_no, file_id, &e);
             Err(e)
         }
-        Ok(total) => {
+        Ok((total, enc)) => {
             // 重名判定推迟到落盘瞬间，避免并发下载抢同一个目标名
             let final_path = unique_path(&dir.join(&safe_name));
             std::fs::rename(&tmp_path, &final_path)
                 .map_err(|e| format!("保存文件失败: {e}"))?;
             ctx.st.diag(&format!(
-                "dl-done {key} pkt={pkt_no} id={file_id:x} -> {} ({total}B)",
+                "dl-done {key} pkt={pkt_no} id={file_id:x} -> {} ({total}B) enc={enc}",
                 final_path.display()
             ));
             ctx.st.emit(
                 "file-progress",
                 json!({"key": key, "pkt": pkt_no, "file_id": file_id,
                        "transferred": total, "total": total, "done": true,
+                       "enc": enc,
                        "path": final_path.to_string_lossy()}),
             );
             ctx.st.update_history_file(key, pkt_no, file_id, |f| {
@@ -2113,7 +2114,7 @@ async fn fetch_dir_tree(
     d: Dialect,
     tmp_root: &std::path::Path,
 ) -> Result<Option<u64>, String> {
-    let mut stream =
+    let (mut stream, _enc) =
         open_transfer(ctx, target, pkt_no, file_id, rid, cmd::GETDIRFILES, d, 0).await?;
     std::fs::create_dir_all(tmp_root).map_err(|e| format!("创建临时目录失败: {e}"))?;
 
@@ -2440,7 +2441,7 @@ pub(crate) async fn open_transfer(
     command: u32,
     d: Dialect,
     offset: u64,
-) -> Result<Box<dyn AsyncRead + Unpin + Send>, String> {
+) -> Result<(Box<dyn AsyncRead + Unpin + Send>, bool), String> {
     let cfg = ctx.st.config();
     let mut stream = tokio::time::timeout(Duration::from_secs(6), TcpStream::connect(target))
         .await
@@ -2520,10 +2521,13 @@ pub(crate) async fn open_transfer(
         .write_all(req.as_bytes())
         .await
         .map_err(|e| format!("发送请求失败: {e}"))?;
-    Ok(match enc {
-        Some((key, _)) => Box::new(crypto::EncStream::new(stream, &key, req_pkt_no, offset)),
-        None => Box::new(stream),
-    })
+    Ok((
+        match enc {
+            Some((key, _)) => Box::new(crypto::EncStream::new(stream, &key, req_pkt_no, offset)),
+            None => Box::new(stream),
+        },
+        enc.is_some(), // 是否加密流（UI 区分「下载/解密」状态）
+    ))
 }
 
 /// 下载失败的统一收尾：推事件 + 回写历史，避免卡片永远停在"下载中"
@@ -2550,9 +2554,10 @@ async fn fetch_to_file(
     expect_size: u64,
     d: Dialect,
     tmp: &std::path::Path,
-) -> Result<u64, String> {
-    // 目录流读取端可能是 TcpStream 或解密包装（open_transfer 决定）
-    let mut stream =
+) -> Result<(u64, bool), String> {
+    // 读取端可能是 TcpStream 或解密包装（open_transfer 决定）；enc 用于
+    // 前端区分「下载中（加密流）」与「解密完成」两个状态
+    let (mut stream, enc) =
         open_transfer(ctx, target, pkt_no, file_id, rid, cmd::GETFILEDATA, d, 0).await?;
 
     let mut file = tokio::fs::File::create(tmp)
@@ -2590,14 +2595,15 @@ async fn fetch_to_file(
             ctx.st.emit(
                 "file-progress",
                 json!({"key": key, "pkt": pkt_no, "file_id": file_id,
-                       "transferred": total, "total": expect_size, "done": false}),
+                       "transferred": total, "total": expect_size, "done": false,
+                       "enc": enc}),
             );
         }
     }
     file.flush().await.map_err(|e| format!("写入失败: {e}"))?;
     drop(file);
-    eprintln!("[download] 从 {target} 接收完成: {total} 字节");
-    Ok(total)
+    eprintln!("[download] 从 {target} 接收完成: {total} 字节 enc={enc}");
+    Ok((total, enc))
 }
 
 /// 目标路径已存在时追加 (1)/(2)…

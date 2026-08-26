@@ -815,11 +815,12 @@ async fn crypto_roundtrip() -> bool {
         )
         .await
         {
-            Ok(mut stream) => {
+            Ok((mut stream, enc)) => {
                 let mut rest = Vec::new();
                 let got =
                     tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut rest))
                         .await;
+                log.check("续传腿确认加密流（enc=true）", enc);
                 match got {
                     Ok(Ok(_)) => log.check(
                         &format!("断点续传：从偏移 {RESUME_OFF} 续取加密流且逐字节一致"),

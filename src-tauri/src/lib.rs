@@ -21,7 +21,10 @@ use tauri::{
 };
 // Linux 回退托盘（GTK）不投递任何点击事件，事件类型只在 Windows/macOS 用到
 #[cfg(not(target_os = "linux"))]
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+use tauri::tray::{MouseButton, TrayIconEvent};
+// MouseButtonState 只有 macOS 的手动双击判定用（Windows 走原生 DoubleClick）
+#[cfg(target_os = "macos")]
+use tauri::tray::MouseButtonState;
 
 type SharedState = Arc<AppState>;
 type SharedCtx = Arc<net::NetCtx>;
@@ -43,49 +46,21 @@ fn show_main_window(app: &tauri::AppHandle) {
 /// 为什么需要「重映射」：Wayland 合成器只给带 xdg-activation token 的请求
 /// 提层（协议规定 token 只能来自「用户与应用表面的交互」）；托盘/通知点击
 /// 来自 DBus，应用拿不到 token，gtk present / set_focus 会被合成器静默忽略 ──
-/// 表现就是「窗口隐藏时能显示、已可见被盖住时点托盘不置前」。解法：**可见但
-/// 不在前台的**窗口先 hide 再 show 重映射，合成器把重映射的窗口当新窗口重新
-/// 聚焦置前（KWin/GNOME 的 Wayland 实现行为一致，KDE Wayland 上实测有效），
-/// 代价至多一帧闪烁。窗口若本来就在最前则跳过重映射，只让前端切会话，不闪。
-/// 仅限 Wayland 会话（按 WAYLAND_DISPLAY 判定，对任何合成器生效）；
+/// 表现就是「窗口隐藏时能显示、已可见被盖住时点托盘不置前」。解法：可见的
+/// 窗口先 hide 再 show 重映射，合成器把重映射的窗口当新窗口重新聚焦置前
+/// （KWin/GNOME 的 Wayland 实现行为一致，KDE Wayland 上实测有效），代价至多
+/// 一帧闪烁。仅限 Wayland 会话（按 WAYLAND_DISPLAY 判定，对任何合成器生效）；
 /// X11 的 present 提层、Windows/macOS 路径完全不受影响。
 fn raise_main_window(app: &tauri::AppHandle) {
     #[cfg(target_os = "linux")]
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         if let Some(w) = app.get_webview_window("main") {
-            // 本来就在最前：重映射只会无谓闪烁；不可见/被盖住才需要重映射
-            // （判定用点击前的焦点采样，点托盘本身会抢走焦点，见 LAST_FOCUS_SAMPLE）
-            let visible = w.is_visible().unwrap_or(false);
-            let front = was_in_front_before_click();
-            eprintln!("[raise] visible={visible} front={front} (本次是否重映射: {})", visible && !front);
-            if visible && !front {
+            if w.is_visible().unwrap_or(false) {
                 let _ = w.hide();
             }
         }
     }
     show_main_window(app);
-}
-
-/// 焦点采样历史（Linux 下主线程每 250ms 更新一次，见 setup 里的采样循环）。
-/// 供「托盘点击前窗口是否本来就在最前」判定：**点托盘那一下，面板会把键盘
-/// 焦点从本窗口抢走**（Wayland wl_keyboard 离开应用表面）——无论用事件还是
-/// 点击后再查 is_focused，到双击处理器执行时窗口都已显示为“无焦点”，明明
-/// 在最前也被误判成「被盖住」，于是又 hide/show 重映射闪一下。用点击前
-/// 最近一次采样就不会被点击本身影响：采到 true 就是本来在最前。
-#[cfg(target_os = "linux")]
-static LAST_FOCUS_SAMPLE: std::sync::Mutex<Option<(bool, std::time::Instant)>> =
-    std::sync::Mutex::new(None);
-
-/// 「托盘点击前窗口是否本来就在最前」：最近一次采样为聚焦且不超过 2 秒
-/// （采样循环健在）即认为在最前；采不到/过期按「不在最前」处理（重映射，
-/// 安全方向——宁可多闪一次也不能点了不置前）。
-#[cfg(target_os = "linux")]
-fn was_in_front_before_click() -> bool {
-    let g = LAST_FOCUS_SAMPLE.lock().unwrap();
-    matches!(
-        *g,
-        Some((true, at)) if at.elapsed() < std::time::Duration::from_secs(2)
-    )
 }
 
 /// 界面文案二选一（config.lang 为空时按系统语言探测，与前端一致）：
@@ -361,6 +336,8 @@ async fn read_image_data(path: String) -> Result<Value, String> {
 /* ================= 托盘「双击」判定（SNI / macOS 没有双击事件） ================= */
 
 /// 两次单击判定为一次双击的最大间隔（毫秒）。
+/// 仅 SNI / macOS 模拟双击用；Windows 走原生 DoubleClick 事件，不编译
+#[cfg(not(target_os = "windows"))]
 const DOUBLE_CLICK_WINDOW_MS: u128 = 350;
 
 /// 单击 → 双击判定器：`feed(now)` 返回这次单击是否构成一次双击。
@@ -854,7 +831,9 @@ async fn clipboard_file_paths(app: tauri::AppHandle) -> Result<Vec<String>, Stri
     }
 }
 
-/// `file:///home/a%20b.txt` → `/home/a b.txt`；非 file 协议返回 None
+/// `file:///home/a%20b.txt` → `/home/a b.txt`；非 file 协议返回 None。
+/// 只服务 Linux 下读 GTK 剪贴板的 text/uri-list（Windows/macOS 走插件）。
+#[cfg(target_os = "linux")]
 fn file_uri_to_path(uri: &str) -> Option<String> {
     let rest = uri
         .strip_prefix("file://localhost")
@@ -983,6 +962,7 @@ mod tests {
     use super::urlencode;
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn file_uri_to_path_decodes() {
         use super::file_uri_to_path;
         assert_eq!(
@@ -1348,27 +1328,6 @@ pub fn run() {
 
             // 退出前广播 BR_EXIT（托盘退出 / 进程退出都会走到这里）
             let _ = EXIT_INFO.set((st.clone(), protocol::DEFAULT_PORT));
-
-            // Wayland：托盘点击会抢走窗口焦点，需要「点击前的焦点采样历史」
-            // 来判断窗口是否本来就在最前（见 LAST_FOCUS_SAMPLE），每 250ms 采样
-            #[cfg(target_os = "linux")]
-            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-                let h2 = handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    loop {
-                        let h3 = h2.clone();
-                        let _ = h2.run_on_main_thread(move || {
-                            if let Some(w) = h3.get_webview_window("main") {
-                                if let Ok(f) = w.is_focused() {
-                                    *LAST_FOCUS_SAMPLE.lock().unwrap() =
-                                        Some((f, std::time::Instant::now()));
-                                }
-                            }
-                        });
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    }
-                });
-            }
 
             app.manage(st);
             app.manage(ctx.clone());
