@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -197,6 +198,20 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/* ---------- 全局日志开关（--log 运行时参数） ---------- */
+
+/// 日志默认关闭；`--log` 参数启动（lib.rs run() 解析）或单实例回调转发时打开。
+/// 同时控制 diag.log 诊断文件（AppState::diag）与全部 stderr 传输日志（oim_log! 宏）。
+static LOG_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn log_enabled() -> bool {
+    LOG_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_log_enabled(on: bool) {
+    LOG_ENABLED.store(on, Ordering::Relaxed);
+}
+
 impl AppState {
     pub fn new(data_dir: PathBuf) -> Self {
         let logs_dir = data_dir.join("logs");
@@ -256,7 +271,11 @@ impl AppState {
 
     /// 线路诊断日志（数据目录/diag.log，超过 512KB 自动截断）。
     /// 记录入站报文摘要与文件传输失败原因，用于远程定位互通问题。
+    /// 日志默认关闭：`--log` 参数启动才写（见 LOG_ENABLED）。
     pub fn diag(&self, line: &str) {
+        if !log_enabled() {
+            return;
+        }
         use std::io::Write;
         static DIAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = DIAG_LOCK.lock().unwrap();
@@ -1346,6 +1365,36 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         AppState::new(dir)
+    }
+
+    /// 日志开关（--log 运行时参数）：
+    /// - 默认关闭：diag() 不创建、不写入诊断文件
+    /// - 打开后：diag() 写入 diag.log
+    /// - 再关闭：不再追加
+    #[test]
+    fn diag_respects_log_switch() {
+        let st = temp_state("diag");
+        std::fs::create_dir_all(&st.data_dir).unwrap();
+
+        // 默认关闭（与 --log 缺省一致）：不落盘
+        set_log_enabled(false);
+        st.diag("should-not-appear");
+        assert!(
+            !st.data_dir.join("diag.log").exists(),
+            "默认关闭时 diag.log 不应被创建"
+        );
+
+        // --log 打开：写入
+        set_log_enabled(true);
+        st.diag("hello-diag");
+        let content = std::fs::read_to_string(st.data_dir.join("diag.log")).unwrap();
+        assert!(content.contains("hello-diag"), "打开开关后记录应落盘");
+
+        // 关闭后不再追加
+        set_log_enabled(false);
+        st.diag("should-not-appear-2");
+        let content2 = std::fs::read_to_string(st.data_dir.join("diag.log")).unwrap();
+        assert!(!content2.contains("should-not-appear-2"), "关闭后不应再写");
     }
 
     #[test]

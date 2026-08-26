@@ -136,7 +136,7 @@ fn spawn_udp_loop(ctx: Arc<NetCtx>) {
                     });
                 }
                 Err(e) => {
-                    eprintln!("[udp] recv error: {e}");
+                    oim_log!("[udp] recv error: {e}");
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
@@ -399,7 +399,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
         return;
     };
     #[cfg(feature = "net_debug")]
-    eprintln!("[udp] <- {from} cmd={:#010x} user={:?} extra_len={}", pkt.command, pkt.user, pkt.extra.len());
+    oim_log!("[udp] <- {from} cmd={:#010x} user={:?} extra_len={}", pkt.command, pkt.user, pkt.extra.len());
     // 过滤自身广播回声（定向广播会被内核本地回投）
     if from.port() == ctx.port && local_ipv4_set().contains(&from.ip()) {
         return;
@@ -627,12 +627,12 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                 .parse::<u32>()
                 .ok();
             #[cfg(feature = "net_debug")]
-            eprintln!("[read] READMSG from {from} no={no:?}");
+            oim_log!("[read] READMSG from {from} no={no:?}");
             if let Some(no) = no {
                 if let Some(key) = resolve_session_key(ctx, from.ip()) {
                     let changed = ctx.st.mark_out_read(&key, no);
                     #[cfg(feature = "net_debug")]
-                    eprintln!("[read] key={key} changed={changed}");
+                    oim_log!("[read] key={key} changed={changed}");
                     if changed {
                         ctx.st.emit("msg-read", json!({"key": key, "pkt": no}));
                     }
@@ -855,7 +855,7 @@ async fn handle_sendmsg(
             if let Err(e) =
                 download_file_task(&tmp, &k2, pno, id, &name, &rid, size, is_dir).await
             {
-                eprintln!("[auto-dl] {k2} #{id} {name}: {e}");
+                oim_log!("[auto-dl] {k2} #{id} {name}: {e}");
             }
         });
     }
@@ -1423,7 +1423,7 @@ fn spawn_tcp_server(ctx: Arc<NetCtx>) {
         let listener = match TcpListener::bind(("0.0.0.0", ctx.port)).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("[tcp] bind {} failed: {e}", ctx.port);
+                oim_log!("[tcp] bind {} failed: {e}", ctx.port);
                 return;
             }
         };
@@ -1436,7 +1436,7 @@ fn spawn_tcp_server(ctx: Arc<NetCtx>) {
                     });
                 }
                 Err(e) => {
-                    eprintln!("[tcp] accept error: {e}");
+                    oim_log!("[tcp] accept error: {e}");
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 }
             }
@@ -1534,7 +1534,7 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
             Err(e) => {
                 // 解不开的请求直接断开不给任何反馈：可能是敌意探测，也可能
                 // 是对方还持着已被我们撤换的旧公钥
-                eprintln!("[tcp] {peer} 加密取文件请求解封失败: {e}");
+                oim_log!("[tcp] {peer} 加密取文件请求解封失败: {e}");
                 ctx.st.diag(&format!("tcp-enc-open-fail {peer}: {e}"));
                 return;
             }
@@ -1580,7 +1580,7 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
         }
     }
     let Some((path, size, is_dir)) = slot else {
-        eprintln!(
+        oim_log!(
             "[tcp] GETFILEDATA 未命中: from={peer} extra={:?} 候选pkt={pkt_cands:?} 候选id={fid_cands:?} 已提供={:?}",
             req.extra,
             ctx.st.offered.lock().unwrap().keys().take(8).collect::<Vec<_>>()
@@ -1592,7 +1592,7 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
         return;
     };
     let fname = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    eprintln!("[tcp] {peer} 请求{} {fname} (offset {offset})", if is_dir { "目录" } else { "文件" });
+    oim_log!("[tcp] {peer} 请求{} {fname} (offset {offset})", if is_dir { "目录" } else { "文件" });
     ctx.st.diag(&format!("tcp-hit {peer} file={fname} dir={is_dir} offset={offset}"));
 
     if is_dir {
@@ -1612,7 +1612,7 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
         let sent = serve_dir_stream(&mut w, &path, &fname).await;
         let _ = w.flush().await;
         let _ = w.shutdown().await;
-        eprintln!("[tcp] 已向 {peer} 发送目录 {fname}: {sent} 字节");
+        oim_log!("[tcp] 已向 {peer} 发送目录 {fname}: {sent} 字节");
         ctx.st.diag(&format!("tcp-sent-dir {peer} dir={fname} bytes={sent} enc={}", ctr_key.is_some()));
         return;
     }
@@ -1669,7 +1669,7 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
     let _ = w.flush().await;
     // 主动关闭写端：对端据此判断传输结束
     let _ = w.shutdown().await;
-    eprintln!("[tcp] 已向 {peer} 发送 {fname}: {sent} 字节");
+    oim_log!("[tcp] 已向 {peer} 发送 {fname}: {sent} 字节");
     ctx.st.diag(&format!("tcp-sent {peer} file={fname} bytes={sent}"));
 }
 
@@ -2513,7 +2513,7 @@ pub(crate) async fn open_transfer(
             }
         }
     }
-    eprintln!(
+    oim_log!(
         "[download] 连接 {target} 请求 cmd={command:#x} pkt={pkt_field} id={id_field} enc={}",
         enc.is_some()
     );
@@ -2602,7 +2602,7 @@ async fn fetch_to_file(
     }
     file.flush().await.map_err(|e| format!("写入失败: {e}"))?;
     drop(file);
-    eprintln!("[download] 从 {target} 接收完成: {total} 字节 enc={enc}");
+    oim_log!("[download] 从 {target} 接收完成: {total} 字节 enc={enc}");
     Ok((total, enc))
 }
 

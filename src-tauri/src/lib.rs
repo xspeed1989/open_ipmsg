@@ -1,5 +1,17 @@
 //! Tauri 应用层：命令注册、事件桥接、托盘、通知与生命周期。
 
+/// 受全局日志开关（state::LOG_ENABLED，`--log` 运行时参数）控制的 stderr 日志。
+/// 日志默认关闭：不带 `--log` 启动时，所有 oim_log! 一律静默；
+/// 带 `--log` 启动（或运行中通过单实例回调转发）后与原有 eprintln! 行为一致。
+#[macro_export]
+macro_rules! oim_log {
+    ($($arg:tt)*) => {
+        if $crate::state::log_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 mod crypto;
 mod ipmsg_import;
 mod net;
@@ -278,7 +290,7 @@ async fn download_file(
             )
             .await
         {
-            eprintln!("[download] {key} #{file_id} {name}: {e}");
+            oim_log!("[download] {key} #{file_id} {name}: {e}");
         }
     });
     Ok(())
@@ -555,7 +567,7 @@ mod linux_tray {
                 true
             }
             Err(e) => {
-                eprintln!("[tray] SNI 注册失败，回退到默认托盘: {e}");
+                oim_log!("[tray] SNI 注册失败，回退到默认托盘: {e}");
                 false
             }
         }
@@ -727,13 +739,13 @@ fn notify_message(
             .body(&body)
             .action("open", &ui_str(&lang, "打开", "Open"));
         let handle = n.show().map_err(|e| format!("通知发送失败: {e}"))?;
-        eprintln!("[notify] shown id={} key={}", handle.id(), key);
+        oim_log!("[notify] shown id={} key={}", handle.id(), key);
         // wait_for_action 会阻塞到通知被点击或关闭（守护进程超时/手动关掉也会
         // 触发关闭信号），放独立线程等，避免占住 tokio 的 blocking 线程池。
         // 点击通知 = raise_main_window（Wayland 重映射置前）+ 通知前端切会话。
         std::thread::spawn(move || {
             handle.wait_for_action(|action| {
-                eprintln!("[notify] clicked action={action} key={key}");
+                oim_log!("[notify] clicked action={action} key={key}");
                 if action == "default" || action == "open" {
                     let app2 = app.clone();
                     let key2 = key.clone();
@@ -1098,7 +1110,16 @@ async fn import_ipmsg_log(
 /* ================= 启动 ================= */
 
 pub fn run() {
+    // 日志默认关闭：--log 参数启动时打开（diag.log 诊断文件 + stderr 传输日志）。
+    // 解析放在最前面，保证后续任何模块（网络栈、托盘、单实例回调）都能看到开关。
+    if std::env::args().any(|a| a == "--log") {
+        state::set_log_enabled(true);
+    }
+
     if std::env::args().any(|a| a == "--selftest") {
+        // 自检内部强制开启日志：部分检查项断言 diag.log 内容
+        // （如「方言#0/方言#1 命中」的 TCP 下载落库标记），与现场 --log 环境一致
+        state::set_log_enabled(true);
         let ok = selftest::run();
         std::process::exit(if ok { 0 } else { 1 });
     }
@@ -1245,9 +1266,13 @@ pub fn run() {
     }
 
     tauri::Builder::default()
-        // 单实例互斥：再次启动时不再抢端口，而是把已运行的那个窗口唤到前台
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            eprintln!("[single-instance] 已有实例在运行，唤起既有窗口");
+        // 单实例互斥：再次启动时不再抢端口，而是把已运行的那个窗口唤到前台。
+        // 第二个实例带 --log 启动 → 立即给已运行实例打开日志开关（无需重启即可现场取证）
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if argv.iter().any(|a| a == "--log") {
+                state::set_log_enabled(true);
+            }
+            oim_log!("[single-instance] 已有实例在运行，唤起既有窗口");
             activate_from_tray(app);
         }))
         .plugin(tauri_plugin_dialog::init())
