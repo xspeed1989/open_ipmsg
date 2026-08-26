@@ -272,6 +272,9 @@ pub fn open_message(
     peer_pub: Option<&RsaPublicKey>,
     pkt_no: u32,
 ) -> Result<OpenMsg, String> {
+    // 官方扩展部按 C 字符串惯例带尾 '\0'（ANSPUBKEY/加密消息皆然，现场实测）；
+    // 不剥会使签名段 hex 变奇数长度、验签恒败（sig_ok=false）
+    let extra = extra.trim_end_matches('\0').trim();
     let segs: Vec<&str> = extra.split(':').collect();
     if !(3..=4).contains(&segs.len()) {
         return Err("报文段数非法（应为 3~4 段）".into());
@@ -784,6 +787,18 @@ mod tests {
         let out = open_message(&kp_b, &sealed, Some(&kp_a.public_key()), 0).unwrap();
         assert!(out.sig_ok);
         assert_eq!(out.plain, b"x"); // 剥离只影响返回值，不影响验签对象
+    }
+
+    #[test]
+    fn trailing_c_string_nul_on_extra_does_not_break_signature() {
+        // 官方扩展部带 C 字符串尾 \0（现场 2026-08 实测 10.200.230.3 "123" 消息）：
+        // 不剥会使签名段 hex 变 513 字符奇数长度 → 解码失败 → 验签恒败。
+        let (kp_a, kp_b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
+        let mut sealed = seal_message(&kp_b.public_key(), &kp_a, b"123\0").unwrap();
+        sealed.push('\0'); // 模拟官方线格式的尾 \0
+        let out = open_message(&kp_b, &sealed, Some(&kp_a.public_key()), 0).unwrap();
+        assert_eq!(out.plain, b"123");
+        assert!(out.sig_ok, "剥尾 \\0 后签名必须验证通过");
     }
 
     #[test]
