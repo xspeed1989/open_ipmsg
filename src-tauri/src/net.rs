@@ -64,7 +64,8 @@ fn local_ipv4_set() -> &'static std::collections::HashSet<IpAddr> {
 /// 广播/单播通告、ANSENTRY 应答、预握手 GETPUBKEY 扩展部共用这一口径（spec §5/§7）。
 fn entry_caps(cfg: &Config) -> u32 {
     if cfg.encrypt {
-        opt::ENCRYPTOPT | opt::CAPFILEENCOPT
+        // ENCEXTMSGOPT：官方 Entry 恒带（0x0fe40003 实测），声明支持加密扩展消息
+        opt::ENCRYPTOPT | opt::CAPFILEENCOPT | opt::ENCEXTMSGOPT
     } else {
         0
     }
@@ -1086,6 +1087,9 @@ pub async fn send_message(
         | if want_rcpt { opt::READCHECKOPT } else { 0 }
         | if entries.is_empty() { 0 } else { opt::FILEATTACHOPT }
         | if utf8 { opt::UTF8OPT } else { 0 }
+        // 加密公告必须带 ENCEXTMSGOPT：官方解密后只在此位下拆分附件段（spec §5），
+        // 缺位则对面只见文字、文件条目丢失（2026-08-26 官方客户端实测）
+        | if enc && !entries.is_empty() { opt::ENCEXTMSGOPT } else { 0 }
         | if enc { opt::ENCRYPTOPT } else { 0 };
     let mut pkt = proto::Packet::new(command).with_pkt_no(pkt_no);
     pkt.extra = wire_extra;
@@ -1226,7 +1230,10 @@ mod tests {
     #[test]
     fn entry_caps_follow_switch() {
         let mut cfg = crate::state::Config::default();
-        assert_eq!(super::entry_caps(&cfg), opt::ENCRYPTOPT | opt::CAPFILEENCOPT);
+        assert_eq!(
+            super::entry_caps(&cfg),
+            opt::ENCRYPTOPT | opt::CAPFILEENCOPT | opt::ENCEXTMSGOPT
+        );
         cfg.encrypt = false;
         assert_eq!(super::entry_caps(&cfg), 0);
     }

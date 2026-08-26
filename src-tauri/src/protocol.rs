@@ -62,6 +62,12 @@ pub mod opt {
     pub const READCHECKOPT: u32 = 0x0010_0000;
     pub const SECRETEXOPT: u32 = 0x0030_0000; // READCHECK|SECRET
     pub const ENCRYPTOPT: u32 = 0x0040_0000;
+    /// 加密扩展消息标志（官方 ipmsg.h = 0x04000000，spec §5 铁证）：
+    /// **加密文件公告必须带此位**——官方 DecryptMsg 只在带此位时才拆分
+    /// 附件段（exBuf）；不带则正文里 \0 之后的文件条目被丢弃 → 对面只见
+    /// 文字、附件消失（2026-08-26 官方客户端实测）。明文公告不受影响
+    /// （exStr 在 ResolveMsg 阶段即已拆分）。Entry 类报文亦带此位声明能力。
+    pub const ENCEXTMSGOPT: u32 = 0x0400_0000;
     /// 文件流加密能力广告位（spec §2 常量表）：上线类报文置位表示支持 TCP 文件流加密
     pub const CAPFILEENCOPT: u32 = 0x0004_0000;
     /// 文件流加密标志（官方 ipmsg.h L119 = 0x00000800）：GETFILEDATA/GETDIRFILES
