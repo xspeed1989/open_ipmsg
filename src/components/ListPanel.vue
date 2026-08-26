@@ -79,7 +79,7 @@ function openContact(u) {
           :key="u.key"
           class="row contact"
           :data-user-key="u.key"
-          :class="{ active: store.activeKey === u.key, off: !u.online }"
+          :class="{ active: store.activeKey === u.key, off: !u.online, 'drag-hover': store.dragHoverKey === u.key }"
           @click="openContact(u)"
         >
           <div class="ava">
@@ -191,6 +191,11 @@ function openContact(u) {
 }
 .row.active {
   background: var(--c-list-active);
+}
+/* 拖放文件时悬停命中的联系人：高亮提示松开后的落点会话 */
+.row.drag-hover {
+  background: var(--c-list-active);
+  box-shadow: inset 0 0 0 2px var(--c-accent);
 }
 .mid {
   flex: 1;

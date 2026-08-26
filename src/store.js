@@ -40,6 +40,8 @@ export const store = reactive({
   searching: false,
   /** 需要在聊天窗口里定位并高亮的消息：{ key, pkt, query } */
   locate: null,
+  /** 拖放文件时中栏正在悬停的联系人 key（中栏行高亮用；'' 表示不在联系人上） */
+  dragHoverKey: '',
   lastTs: {}, // key -> 最后消息时间戳
   windowFocused: true, // 主窗口是否聚焦（决定是否弹通知/自动已读）
 })

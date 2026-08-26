@@ -279,13 +279,24 @@ async function doSend() {
   }
 }
 
-/* ---------- 待发送附件（剪贴板图片 / 粘贴的文件） ----------
-   与微信一致：粘贴只进输入区上方的待发送列表，按 Enter 或点「发送」才真正发出；
+/* ---------- 待发送附件（剪贴板图片 / 粘贴的文件 / 拖入的文件） ----------
+   与微信一致：粘贴/拖入只进输入区上方的待发送列表，按 Enter 或点「发送」才真正发出；
+   待发送列表按会话独立保存（key -> 数组），切会话不串台，各自 Enter 各自发。
    每条未发送的附件都可以单独移除。条目两类：
      { kind:'img',  b64, mime, size, url, name }   —— 剪贴板截图，发送时落盘
      { kind:'file', path, name }                   —— 已有本地路径的文件
 */
-const pendingList = ref([])
+const pendingMap = ref({}) // key -> 该会话的待发送条目数组
+
+/** 取某会话的待发送条目数组（不存在则建空数组）；无会话返回空数组 */
+function pendingOf(key) {
+  if (!key) return []
+  if (!pendingMap.value[key]) pendingMap.value[key] = []
+  return pendingMap.value[key]
+}
+
+/** 当前会话的待发送列表（只读视图：模板用；改动一律走 pendingOf） */
+const pendingList = computed(() => pendingMap.value[store.activeKey] || [])
 
 function baseName(p) {
   return (p || '').split(/[\\/]/).pop() || p || ''
@@ -313,19 +324,23 @@ async function pendingToPaths(items) {
   return paths
 }
 
-/** 从待发送列表移除一条（未发送的文件可随时取消） */
+/**
+ * 从待发送列表移除一条（未发送的文件可随时取消）。
+ * pendingList 是当前会话的只读视图，这里直接改底层数组。
+ */
 function removePending(i) {
-  const it = pendingList.value[i]
+  const it = pendingOf(store.activeKey)[i]
   if (it?.url) URL.revokeObjectURL(it.url)
-  pendingList.value.splice(i, 1)
+  pendingOf(store.activeKey).splice(i, 1)
 }
 
-/** 清空待发送列表并释放预览 URL */
+/** 清空当前会话的待发送列表并释放预览 URL */
 function clearPending() {
-  for (const it of pendingList.value) {
+  const list = pendingOf(store.activeKey)
+  for (const it of list) {
     if (it.url) URL.revokeObjectURL(it.url)
   }
-  pendingList.value = []
+  list.splice(0)
 }
 
 /** 大数组分块转 base64，避免 String.fromCharCode 参数过多爆栈 */
@@ -346,7 +361,7 @@ async function takeImageFile(file) {
   }
   const buf = new Uint8Array(await file.arrayBuffer())
   const mime = file.type || 'image/png'
-  pendingList.value.push({
+  pendingOf(store.activeKey).push({
     kind: 'img',
     b64: bytesToB64(buf),
     mime,
@@ -379,7 +394,7 @@ async function onPaste(e) {
   const paths = parseFileUris(dt.getData('text/uri-list') || dt.getData('text/plain') || '')
   if (paths.length) {
     e.preventDefault()
-    pendingList.value.push(...pendingFileItems(paths))
+    pendingOf(store.activeKey).push(...pendingFileItems(paths))
     nextTick(() => ta.value?.focus())
     return
   }
@@ -406,10 +421,11 @@ async function onPaste(e) {
 
   // 3) 有内容没路径（Windows 资源管理器 / 邮件客户端）：落盘后进待发送列表
   try {
+    const pending = pendingOf(store.activeKey)
     for (const f of files) {
       const buf = new Uint8Array(await f.arrayBuffer())
       const path = await ipc.stagePastedFile(f.name || '粘贴文件', bytesToB64(buf))
-      pendingList.value.push({ kind: 'file', path, name: baseName(f.name || '粘贴文件') })
+      pending.push({ kind: 'file', path, name: baseName(f.name || '粘贴文件') })
     }
     nextTick(() => ta.value?.focus())
   } catch (err) {
@@ -432,7 +448,7 @@ function onPasteHotkey(e) {
       const native = await ipc.clipboardFilePaths()
       if (native?.length) {
         // 复制的文件路径：进待发送列表，不直接发
-        pendingList.value.push(...pendingFileItems(native))
+        pendingOf(store.activeKey).push(...pendingFileItems(native))
         nextTick(() => ta.value?.focus())
         return
       }
@@ -440,7 +456,7 @@ function onPasteHotkey(e) {
       const img = await ipc.clipboardImage()
       if (img?.b64) {
         const p = pendingImgFromB64(img.b64, img.mime, img.size)
-        pendingList.value.push({
+        pendingOf(store.activeKey).push({
           kind: 'img',
           b64: p.b64,
           mime: p.mime,
@@ -456,21 +472,41 @@ function onPasteHotkey(e) {
   }, 80)
 }
 
-/* ---------- 拖放文件发送 ----------
+/* ---------- 拖放文件（进待发送列表，不直接发送） ----------
    Tauri 下系统文件的拖放由原生层接管（webview 的 drop 事件拿不到文件路径），
-   必须用窗口的 onDragDropEvent，它给的是真实绝对路径，可直接交给 send_files。*/
+   必须用窗口的 onDragDropEvent，它给的是真实绝对路径。
+   拖到中栏某个联系人上 → 高亮该联系人，松开后打开对应会话并加入该会话的待发送列表；
+   拖到其余位置 → 加入当前会话的待发送列表（按 Enter 才真正发出）。*/
 const dragOver = ref(false)
-/** 拖放的落点对应的会话 key：悬停在左侧某个用户上就发给他，否则发给当前会话 */
-const dropTarget = ref('')
 let unlistenDrop = null
 
-/** 把拖放的物理坐标换算成页面元素，判断落点是不是左侧某个用户 */
+/* 拖放坐标的来源与单位因平台而异：
+   - Windows(WebView2)：ScreenToClient 结果是物理像素 → 需 / devicePixelRatio 得 CSS 像素
+   - Linux(WebKitGTK)：drag_motion 的 x,y 就是 widget 逻辑像素，等于 CSS 像素
+   - macOS(WKWebView)：draggingLocation 的 points，也是 CSS 像素
+   所以只对 Windows 做 DPR 缩放，否则高分屏/系统缩放下高亮会偏离鼠标位置。*/
+const DRAG_SCALE = /windows/i.test(navigator.userAgent) ? window.devicePixelRatio || 1 : 1
+
+/** 把拖放的 position 换算成 elementFromPoint 可用的 CSS 像素坐标 */
+function cssPoint(pos) {
+  if (!pos) return { x: 0, y: 0 }
+  return { x: pos.x / DRAG_SCALE, y: pos.y / DRAG_SCALE }
+}
+
+/** 把拖放的物理坐标换算成页面元素，判断落点是不是中栏某个联系人；
+ *  返回其 key，不在联系人上时返回空串（区别于「当前会话」兜底） */
 function keyAtPoint(pos) {
-  if (!pos) return store.activeKey || ''
-  const dpr = window.devicePixelRatio || 1
-  const el = document.elementFromPoint(pos.x / dpr, pos.y / dpr)
+  if (!pos) return ''
+  const p = cssPoint(pos)
+  const el = document.elementFromPoint(p.x, p.y)
   const row = el && el.closest ? el.closest('[data-user-key]') : null
-  return row?.dataset.userKey || store.activeKey || ''
+  return row?.dataset.userKey || ''
+}
+
+/** 把拖入的路径收进指定会话的待发送列表，等待用户按 Enter 发送 */
+function attachToPending(key, paths) {
+  if (!key || !paths?.length) return
+  pendingOf(key).push(...pendingFileItems(paths))
 }
 
 onMounted(async () => {
@@ -478,30 +514,29 @@ onMounted(async () => {
     unlistenDrop = await getCurrentWindow().onDragDropEvent(async ({ payload }) => {
       if (payload.type === 'over') {
         dragOver.value = true
-        dropTarget.value = keyAtPoint(payload.position)
+        // 拖动过程中实时更新中栏高亮：悬停到哪个联系人，哪一行亮
+        store.dragHoverKey = keyAtPoint(payload.position)
         return
       }
       if (payload.type !== 'drop') {
         dragOver.value = false
+        store.dragHoverKey = ''
         return
       }
-      const target = keyAtPoint(payload.position)
+      const hoverKey = keyAtPoint(payload.position)
       dragOver.value = false
+      store.dragHoverKey = ''
       const paths = (payload.paths || []).filter(Boolean)
       if (!paths.length) return
-      if (!target) {
-        alert('请先在左侧选择要发送给谁')
+      // 落点在联系人上 → 打开对应会话再附加；其余位置 → 当前会话的待发送列表
+      const key = hoverKey || store.activeKey
+      if (!key) {
+        alert('请先选择要发送给谁，或把文件拖到中栏的联系人上')
         return
       }
-      try {
-        // 文件与文件夹都走同一条附件通道（目录会以 GETDIRFILES 流发送）
-        await sendFiles(paths, target)
-        autoBottom = true
-        // 拖给的是别的联系人：切过去，让用户看到确实发出去了
-        if (target !== store.activeKey) await openChat(target)
-      } catch (e) {
-        alert('发送失败：' + e)
-      }
+      if (hoverKey && hoverKey !== store.activeKey) await openChat(hoverKey)
+      attachToPending(key, paths)
+      nextTick(() => ta.value?.focus())
     })
   } catch (e) {
     /* 拿不到窗口事件时静默降级：仍可用「发送文件」按钮 */
@@ -864,9 +899,10 @@ watch(
           <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" stroke="currentColor" stroke-width="1.8"
             stroke-linecap="round" />
         </svg>
-        <p v-if="dropTarget">松开即发送给「{{ displayName(dropTarget) }}」</p>
-        <p v-else>请先在左侧选择要发送给谁</p>
-        <span class="sub">支持多个文件与文件夹</span>
+        <p v-if="store.dragHoverKey">松开后打开「{{ displayName(store.dragHoverKey) }}」的会话并加入待发送</p>
+        <p v-else-if="activeUser">松开后加入待发送列表</p>
+        <p v-else>请先选择会话，或把文件拖到中栏的联系人上</p>
+        <span class="sub">支持多个文件与文件夹 · Enter 发送</span>
       </div>
     </div>
 
