@@ -40,6 +40,11 @@ export const sendFiles = (key, paths, text = '') => invoke('send_files', { key, 
 /** 按未读总数切换托盘图标（有未读时带红点角标） */
 export const setUnread = (total) => invoke('set_unread', { total })
 
+/** Linux 原生可点击通知：点击通知（正文/「打开」按钮）→ open-chat 事件 →
+ *  弹出主窗口并切到对应会话。Windows/macOS 仍走插件 sendNotification */
+export const notifyMessage = (key, title, body, lang) =>
+  invoke('notify_message', { key, title, body, lang })
+
 /** 读系统剪贴板里的文件列表（Linux 下 webview 拿不到，走原生 GTK 剪贴板） */
 export const clipboardFilePaths = () => invoke('clipboard_file_paths')
 
@@ -82,5 +87,7 @@ export const EVT = {
   fileProgress: 'file-progress',
   /** 从托盘唤起主窗口：跳到最新的未读会话 */
   openUnread: 'open-unread',
+  /** 点击系统通知（Linux 原生）：弹出主窗口并切到对应会话 */
+  openChat: 'open-chat',
   msgRead: 'msg-read',
 }

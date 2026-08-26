@@ -16,9 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tauri::{
     menu::{MenuBuilder, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    tray::TrayIconBuilder,
     Manager, RunEvent, State, WindowEvent,
 };
+// Linux 回退托盘（GTK）不投递任何点击事件，事件类型只在 Windows/macOS 用到
+#[cfg(not(target_os = "linux"))]
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 
 type SharedState = Arc<AppState>;
 type SharedCtx = Arc<net::NetCtx>;
@@ -33,6 +36,56 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
+}
+
+/// 把主窗口带到最前并聚焦（托盘/通知唤起统一走这里）。
+///
+/// 为什么需要「重映射」：Wayland 合成器只给带 xdg-activation token 的请求
+/// 提层（协议规定 token 只能来自「用户与应用表面的交互」）；托盘/通知点击
+/// 来自 DBus，应用拿不到 token，gtk present / set_focus 会被合成器静默忽略 ──
+/// 表现就是「窗口隐藏时能显示、已可见被盖住时点托盘不置前」。解法：**可见但
+/// 不在前台的**窗口先 hide 再 show 重映射，合成器把重映射的窗口当新窗口重新
+/// 聚焦置前（KWin/GNOME 的 Wayland 实现行为一致，KDE Wayland 上实测有效），
+/// 代价至多一帧闪烁。窗口若本来就在最前则跳过重映射，只让前端切会话，不闪。
+/// 仅限 Wayland 会话（按 WAYLAND_DISPLAY 判定，对任何合成器生效）；
+/// X11 的 present 提层、Windows/macOS 路径完全不受影响。
+fn raise_main_window(app: &tauri::AppHandle) {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        if let Some(w) = app.get_webview_window("main") {
+            // 本来就在最前：重映射只会无谓闪烁；不可见/被盖住才需要重映射
+            // （判定用点击前的焦点采样，点托盘本身会抢走焦点，见 LAST_FOCUS_SAMPLE）
+            let visible = w.is_visible().unwrap_or(false);
+            let front = was_in_front_before_click();
+            eprintln!("[raise] visible={visible} front={front} (本次是否重映射: {})", visible && !front);
+            if visible && !front {
+                let _ = w.hide();
+            }
+        }
+    }
+    show_main_window(app);
+}
+
+/// 焦点采样历史（Linux 下主线程每 250ms 更新一次，见 setup 里的采样循环）。
+/// 供「托盘点击前窗口是否本来就在最前」判定：**点托盘那一下，面板会把键盘
+/// 焦点从本窗口抢走**（Wayland wl_keyboard 离开应用表面）——无论用事件还是
+/// 点击后再查 is_focused，到双击处理器执行时窗口都已显示为“无焦点”，明明
+/// 在最前也被误判成「被盖住」，于是又 hide/show 重映射闪一下。用点击前
+/// 最近一次采样就不会被点击本身影响：采到 true 就是本来在最前。
+#[cfg(target_os = "linux")]
+static LAST_FOCUS_SAMPLE: std::sync::Mutex<Option<(bool, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// 「托盘点击前窗口是否本来就在最前」：最近一次采样为聚焦且不超过 2 秒
+/// （采样循环健在）即认为在最前；采不到/过期按「不在最前」处理（重映射，
+/// 安全方向——宁可多闪一次也不能点了不置前）。
+#[cfg(target_os = "linux")]
+fn was_in_front_before_click() -> bool {
+    let g = LAST_FOCUS_SAMPLE.lock().unwrap();
+    matches!(
+        *g,
+        Some((true, at)) if at.elapsed() < std::time::Duration::from_secs(2)
+    )
 }
 
 /// 界面文案二选一（config.lang 为空时按系统语言探测，与前端一致）：
@@ -58,13 +111,12 @@ fn ui_str(lang: &str, zh: &str, en: &str) -> String {
 /// 从托盘唤起主窗口：顺带通知前端「跳到最新的未读会话」。
 /// SNI 的回调跑在 DBus 线程上，这里统一回主线程操作窗口。
 ///
-/// 注意：Wayland/KWin 可能拒绝来自外部的 set_focus（防抢焦点）；前端收到
-/// open-unread 事件后会自己再 show/unminimize/setFocus 一次 —— 窗口自我激活
-/// 任何合成器都无条件允许，保证「窗口可见但被盖住」时点击托盘也能弹到最前面。
+/// 提层靠 raise_main_window 的重映射（Wayland）；前端收到 open-unread 后仍会
+/// 自己 show/unminimize/setFocus 一次作为第二道保险（X11 下 present 直接有效）。
 fn activate_from_tray(app: &tauri::AppHandle) {
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
-        show_main_window(&app2);
+        raise_main_window(&app2);
         use tauri::Emitter;
         let _ = app2.emit("open-unread", ());
     });
@@ -306,6 +358,90 @@ async fn read_image_data(path: String) -> Result<Value, String> {
     }))
 }
 
+/* ================= 托盘「双击」判定（SNI / macOS 没有双击事件） ================= */
+
+/// 两次单击判定为一次双击的最大间隔（毫秒）。
+const DOUBLE_CLICK_WINDOW_MS: u128 = 350;
+
+/// 单击 → 双击判定器：`feed(now)` 返回这次单击是否构成一次双击。
+///
+/// 需要模拟双击的平台：Linux SNI（StatusNotifierItem 协议只有 Activate
+/// 单击信号，没有双击）与 macOS 托盘（tray-icon 0.24 不投递 DoubleClick）。
+/// Windows 有原生 WM_LBUTTONDBLCLK，不走这里。
+///
+/// 语义（微信式）：单击本身没有任何动作，350ms 内连续两次单击才算双击。
+/// 判定成功后清空状态，避免三连击拆成「双击 + 单击」后残留旧时间戳。
+#[cfg(not(target_os = "windows"))]
+pub(crate) struct DoubleClickGate {
+    last: Option<std::time::Instant>,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl DoubleClickGate {
+    pub(crate) const fn new() -> Self {
+        Self { last: None }
+    }
+
+    /// 送入一次单击的时间点。返回是否构成双击（是则重置状态，可作为
+    /// 下一组双击的第一次单击）。
+    pub(crate) fn feed(&mut self, now: std::time::Instant) -> bool {
+        let double = match self.last {
+            Some(prev) => {
+                now.saturating_duration_since(prev).as_millis() <= DOUBLE_CLICK_WINDOW_MS
+            }
+            None => false,
+        };
+        self.last = if double { None } else { Some(now) };
+        double
+    }
+}
+
+/// 全局双击判定器：SNI 的回调跑在 DBus 线程、macOS 托盘事件跑在主线程，
+/// 用 Mutex 串行化（判定不依赖顺序，只依赖时间差）。
+#[cfg(not(target_os = "windows"))]
+static DOUBLE_CLICK_GATE: std::sync::Mutex<DoubleClickGate> =
+    std::sync::Mutex::new(DoubleClickGate::new());
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod gate_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn single_clicks_never_open() {
+        let mut g = DoubleClickGate::new();
+        let t = Instant::now();
+        assert!(!g.feed(t), "第一次单击不构成双击");
+        assert!(!g.feed(t + Duration::from_millis(400)), "间隔超窗的单击不算双击");
+        // 400ms 后的那次单击已成为新的「第一次」，再来一次相隔 400ms 的仍是单击
+        let t2 = t + Duration::from_millis(800);
+        assert!(!g.feed(t2));
+    }
+
+    #[test]
+    fn double_click_detected_and_resets() {
+        let mut g = DoubleClickGate::new();
+        let t = Instant::now();
+        assert!(!g.feed(t));
+        assert!(g.feed(t + Duration::from_millis(200)), "350ms 内第二次单击 = 双击");
+        // 判定成功后状态清空：1s 后的单击是下一组的第一下
+        assert!(!g.feed(t + Duration::from_millis(1000)));
+        assert!(g.feed(t + Duration::from_millis(1200)), "第二组双击仍能识别");
+    }
+
+    #[test]
+    fn window_boundary_is_inclusive() {
+        let mut g = DoubleClickGate::new();
+        let t = Instant::now();
+        assert!(!g.feed(t));
+        assert!(g.feed(t + Duration::from_millis(350)), "恰好在窗口内算双击");
+
+        let mut g2 = DoubleClickGate::new();
+        assert!(!g2.feed(t));
+        assert!(!g2.feed(t + Duration::from_millis(351)), "超过窗口 1ms 不算");
+    }
+}
+
 /* ================= Linux 托盘（自实现 StatusNotifierItem） =================
 
 Tauri 在 Linux 用的是 libappindicator：它只有菜单，**不投递任何点击事件**
@@ -314,10 +450,13 @@ Tauri 在 Linux 用的是 libappindicator：它只有菜单，**不投递任何�
 StatusNotifierItem —— KDE/XFCE 等宿主会对该对象调用 Activate。
 
 这里在 Linux 上同样自己注册 SNI（ksni），于是拿到了：
-  - 左键单击 → Activate → 唤起主窗口并跳到最新未读会话
+  - 左键单击 → Activate：协议里没有双击信号，用两次单击的间隔自己判定
+    （≤350ms 视为双击，唤起主窗口并跳到最新未读会话；单击无动作，微信式）
   - 悬停提示（含未读条数），libappindicator 下本来是没有的
   - 图标闪烁（更新图标即可）
-Windows/macOS 仍走 Tauri 自带托盘。 */
+Windows 走 tray-icon 的原生 DoubleClick 事件；macOS 用单击间隔模拟（同上）。
+SNI 注册失败（桌面没有 SNI 宿主，如部分 X11 轻量桌面）时回退到 Tauri 自带
+托盘：GTK 托盘连点击事件都没有，只能靠右键菜单。 */
 #[cfg(target_os = "linux")]
 mod linux_tray {
     use super::{activate_from_tray, TRAY_IDLE, TRAY_SIZE};
@@ -375,11 +514,19 @@ mod linux_tray {
                 ..Default::default()
             }
         }
-        /// 左键单击：这正是 libappindicator 给不了的能力
+        /// 左键单击：SNI 协议里没有双击信号，用两次 activate 的间隔自己判定
+        /// （双击判定器见 DOUBLE_CLICK_GATE）。微信式：单击无动作，双击才唤起。
         fn activate(&mut self, _x: i32, _y: i32) {
-            activate_from_tray(&self.app);
+            if super::DOUBLE_CLICK_GATE
+                .lock()
+                .unwrap()
+                .feed(std::time::Instant::now())
+            {
+                activate_from_tray(&self.app);
+            }
         }
         fn secondary_activate(&mut self, _x: i32, _y: i32) {
+            // 中键单击：快捷唤起（不属于左键连击，不参与双击判定）
             activate_from_tray(&self.app);
         }
         fn menu(&self) -> Vec<MenuItem<Self>> {
@@ -451,6 +598,19 @@ mod linux_tray {
         }
     }
 
+    /// 只切换图标帧（闪烁循环用）：不写 tip，避免旧未读数覆盖新提示
+    pub fn set_blank(blank: bool) {
+        if let Some(h) = HANDLE.get() {
+            let h = h.clone();
+            tauri::async_runtime::spawn(async move {
+                h.update(move |t: &mut OimTray| {
+                    t.blank = blank;
+                })
+                .await;
+            });
+        }
+    }
+
     pub fn is_active() -> bool {
         HANDLE.get().is_some()
     }
@@ -480,14 +640,15 @@ const FLASH_INTERVAL_MS: u64 = 600;
 /// 当前是否处于闪烁状态（未读 > 0）
 static FLASHING: AtomicBool = AtomicBool::new(false);
 
-/// 切换托盘图标（正常帧 / 透明帧）
-fn set_tray_frame(app: &tauri::AppHandle, blank: bool, tip: &str) {
+/// 切换托盘图标帧（正常帧 / 透明帧），**不改悬停提示**。
+/// 闪烁循环里每 600ms 用旧 tip 覆盖会把未读数卡在循环启动时的值
+/// （如一直显示「1 条未读」）——提示只由 set_unread 直接刷新。
+fn set_tray_frame(app: &tauri::AppHandle, blank: bool) {
     #[cfg(target_os = "linux")]
     if linux_tray::is_active() {
-        linux_tray::update(blank, tip.to_string());
+        linux_tray::set_blank(blank);
         return;
     }
-    let _ = tip;
     set_tray_icon(app, if blank { &TRAY_BLANK } else { TRAY_IDLE });
 }
 
@@ -527,21 +688,74 @@ async fn set_unread(app: tauri::AppHandle, total: u32) -> Result<(), String> {
         // 已经在闪就不再起第二个任务
         if !FLASHING.swap(true, Ordering::SeqCst) {
             let app2 = app.clone();
-            let tip2 = tip.clone();
             tauri::async_runtime::spawn(async move {
                 let mut blank = false;
                 while FLASHING.load(Ordering::SeqCst) {
                     blank = !blank;
-                    set_tray_frame(&app2, blank, &tip2);
+                    set_tray_frame(&app2, blank);
                     tokio::time::sleep(std::time::Duration::from_millis(FLASH_INTERVAL_MS)).await;
                 }
                 // 停止时一定回到正常图标，避免停在透明帧上（图标像消失了）
-                set_tray_frame(&app2, false, "");
+                set_tray_frame(&app2, false);
             });
         }
     } else {
         FLASHING.store(false, Ordering::SeqCst);
-        set_tray_frame(&app, false, &tip);
+        set_tray_frame(&app, false);
+    }
+    Ok(())
+}
+
+/// Linux 原生「可点击」消息通知：点击通知（正文或「打开」按钮）→ 前端收到
+/// open-chat 事件 → 弹出主窗口并切到对应会话。
+///
+/// 为什么不用 tauri-plugin-notification：它的 JS/Rust API 都没有「点击通知」
+/// 回调，点了没反应。这里直接用 notify-rust 发 DBus 通知 —— 通知守护进程
+/// 会把点击作为 ActionInvoked 送回（KDE/XFCE 点正文触发 default 动作；
+/// GNOME 不支持 default 动作，但「打开」按钮同样可用）。
+/// 仅 Linux 提供点击能力；Windows/macOS 的通知仍由前端走插件，不去抢
+/// 各自系统的通知注册（如 Windows 的 toast AUMID）。
+#[tauri::command]
+fn notify_message(
+    app: tauri::AppHandle,
+    key: String,
+    title: String,
+    body: String,
+    lang: String,
+) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut n = notify_rust::Notification::new();
+        n.appname("Open IPMsg")
+            .icon("open-ipmsg")
+            .summary(&title)
+            .body(&body)
+            .action("open", &ui_str(&lang, "打开", "Open"));
+        let handle = n.show().map_err(|e| format!("通知发送失败: {e}"))?;
+        eprintln!("[notify] shown id={} key={}", handle.id(), key);
+        // wait_for_action 会阻塞到通知被点击或关闭（守护进程超时/手动关掉也会
+        // 触发关闭信号），放独立线程等，避免占住 tokio 的 blocking 线程池。
+        // 点击通知 = raise_main_window（Wayland 重映射置前）+ 通知前端切会话。
+        std::thread::spawn(move || {
+            handle.wait_for_action(|action| {
+                eprintln!("[notify] clicked action={action} key={key}");
+                if action == "default" || action == "open" {
+                    let app2 = app.clone();
+                    let key2 = key.clone();
+                    let _ = app.run_on_main_thread(move || {
+                        raise_main_window(&app2);
+                        use tauri::Emitter;
+                        // payload 用 JSON 对象（与 msg-in 等事件一致）：字符串裸
+                        // payload 在事件桥里的序列化路径未经受验证，对象模式最稳
+                        let _ = app2.emit("open-chat", json!({"key": key2}));
+                    });
+                }
+            });
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (&app, &key, &title, &body, &lang);
     }
     Ok(())
 }
@@ -1105,6 +1319,27 @@ pub fn run() {
             // 退出前广播 BR_EXIT（托盘退出 / 进程退出都会走到这里）
             let _ = EXIT_INFO.set((st.clone(), protocol::DEFAULT_PORT));
 
+            // Wayland：托盘点击会抢走窗口焦点，需要「点击前的焦点采样历史」
+            // 来判断窗口是否本来就在最前（见 LAST_FOCUS_SAMPLE），每 250ms 采样
+            #[cfg(target_os = "linux")]
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                let h2 = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        let h3 = h2.clone();
+                        let _ = h2.run_on_main_thread(move || {
+                            if let Some(w) = h3.get_webview_window("main") {
+                                if let Ok(f) = w.is_focused() {
+                                    *LAST_FOCUS_SAMPLE.lock().unwrap() =
+                                        Some((f, std::time::Instant::now()));
+                                }
+                            }
+                        });
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                });
+            }
+
             app.manage(st);
             app.manage(ctx.clone());
 
@@ -1163,23 +1398,36 @@ pub fn run() {
                     "quit" => app.exit(0),
                     _ => {}
                 })
-                .on_tray_icon_event(|tray, event| {
-                    // 双击（以及 Windows/macOS 上的左键单击）唤起主窗口，
-                    // 并跳到最新的未读会话
-                    let hit = matches!(
-                        event,
-                        TrayIconEvent::DoubleClick {
-                            button: MouseButton::Left,
-                            ..
-                        } | TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            ..
-                        }
-                    );
-                    if hit {
-                        activate_from_tray(tray.app_handle());
+                .on_tray_icon_event(|_tray, event| {
+                    // 双击唤起主窗口（并跳到最新的未读会话），微信式：单击无动作。
+                    // Windows 有原生 DoubleClick 事件；macOS 的 tray-icon 只投递
+                    // 单击，用两次单击的间隔自己判定（见 DOUBLE_CLICK_GATE）。
+                    // Linux 回退托盘（GTK）不投递任何点击事件，双击判定在 SNI 里做。
+                    #[cfg(target_os = "windows")]
+                    if let TrayIconEvent::DoubleClick {
+                        button: MouseButton::Left,
+                        ..
+                    } = event
+                    {
+                        activate_from_tray(_tray.app_handle());
                     }
+                    #[cfg(target_os = "macos")]
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        if DOUBLE_CLICK_GATE
+                            .lock()
+                            .unwrap()
+                            .feed(std::time::Instant::now())
+                        {
+                            activate_from_tray(_tray.app_handle());
+                        }
+                    }
+                    #[cfg(target_os = "linux")]
+                    let _ = event;
                 })
                 .build(&handle)?;
             }
@@ -1209,8 +1457,8 @@ pub fn run() {
                         .title("Open IPMsg")
                         .body(ui_str(
                             &lang,
-                            "已最小化到托盘，右键托盘图标可退出",
-                            "Minimized to tray; use the tray icon menu to quit",
+                            "已最小化到托盘：双击托盘图标可打开主窗口，右键菜单可退出",
+                            "Minimized to tray: double-click the tray icon to open, right-click to quit",
                         ))
                         .show();
                 }
@@ -1231,6 +1479,7 @@ pub fn run() {
             clipboard_file_paths,
             clipboard_image,
             set_unread,
+            notify_message,
             download_file,
             read_image_data,
             open_image_viewer,

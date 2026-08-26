@@ -22,6 +22,10 @@ gdk = "0.18"
 # notify-rust 的 show() 就会走「新建多线程运行时再 block_on」的实现，
 # 从 Tauri 命令所在的 tokio worker 上调用会 panic（Cannot start a runtime from within a runtime）
 ksni = { version = "0.3.6", default-features = false, features = ["async-io"] }
+# 原生可点击通知：tauri-plugin-notification 没有「点击通知」回调（点了没反应），
+# 消息通知改由 notify-rust 直发 DBus，把点击（正文/「打开」按钮）转成 open-chat 事件。
+# 版本与默认特性跟随传递依赖（zbus + async-io，与 ksni 一致），不引入新的运行时
+notify-rust = "4.18"
 
 [dependencies]
 tauri = { version = "2.11", features = ["tray-icon"] }

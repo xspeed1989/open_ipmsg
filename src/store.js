@@ -7,7 +7,7 @@ import {
 } from '@tauri-apps/plugin-notification'
 import * as ipc from './lib/ipc'
 import { splitDelayedNote } from './lib/text'
-import { pickLatestUnread } from './lib/unread'
+import { pickLatestUnread, pickLatestActive } from './lib/unread'
 import { unreadReceiptPkts } from './lib/receipts'
 import { mergeSessions } from './lib/sessions'
 import { applyTheme } from './lib/theme'
@@ -261,8 +261,14 @@ function onMsgRead({ key, pkt }) {
 
 /* ---------------- 系统通知 ---------------- */
 
-async function notify(title, body) {
+async function notify(key, title, body) {
   try {
+    // Linux：走原生可点击通知（点击通知 → open-chat 事件 → 弹窗切到对应会话）。
+    // DBus 通知无需权限申请，绕开插件的权限检查直接发
+    if (/linux/i.test(navigator.userAgent)) {
+      await ipc.notifyMessage(key, title, body, store.config?.lang || '')
+      return
+    }
     let granted = await isPermissionGranted()
     if (!granted) granted = (await requestPermission()) === 'granted'
     if (granted) sendNotification({ title, body })
@@ -470,20 +476,37 @@ export async function boot() {
     } else if (!isRebroadcast) {
       store.unread[key] = (store.unread[key] || 0) + 1
       store.unreadTs[key] = msg.ts || Math.floor(Date.now() / 1000)
-      notify(displayName(key), previewText(msg))
+      notify(key, displayName(key), previewText(msg))
     }
   })
-  // 托盘唤起主窗口：有未读就直接进最新的那个会话。
-  // Wayland/KWin 会拒绝「外部激活」（DBus 托盘点过来的 set_focus 可能被忽略），
-  // 但窗口自己请求自己激活总是允许的 —— 所以这里由前端再次 show/unminimize/focus，
-  // 保证窗口已可见但被盖住时也能弹到最前面。
+  // 托盘唤起主窗口：跳到最新未读会话（没有未读就跳到最近活动的会话）。
+  // 切会话必须先做——show/setFocus 抛错不能挡住 openChat（Wayland 重映射后
+  // 窗口操作偶发异常会吞掉后面的代码，open-chat 曾踩过同一个坑）。
   await ipc.listenEvent(ipc.EVT.openUnread, async () => {
-    const w = getCurrentWindow()
-    await w.show()
-    await w.unminimize()
-    await w.setFocus()
-    const key = latestUnreadKey()
-    if (key) await openChat(key)
+    try {
+      const key = latestUnreadKey() || pickLatestActive(store.lastTs, store.unreadTs)
+      if (key) await openChat(key)
+      const w = getCurrentWindow()
+      await w.show()
+      await w.unminimize()
+      await w.setFocus()
+    } catch (e) {
+      console.error('open-unread failed', e)
+    }
+  })
+  // 点击系统通知（Linux 原生）：弹出主窗口并切到发出这条消息的会话。
+  // 注意：切会话必须先做——窗口 show/setFocus 若抛错不能挡住 openChat。
+  await ipc.listenEvent(ipc.EVT.openChat, async ({ key }) => {
+    try {
+      if (!key) return
+      await openChat(key)
+      const w = getCurrentWindow()
+      await w.show()
+      await w.unminimize()
+      await w.setFocus()
+    } catch (e) {
+      console.error('open-chat failed', e)
+    }
   })
   await ipc.listenEvent(ipc.EVT.msgRead, onMsgRead)
   await ipc.listenEvent(ipc.EVT.fileProgress, onFileProgress)
