@@ -42,3 +42,30 @@ export function pickLatestActive(lastTs = {}, unreadTs = {}) {
   }
   return best
 }
+
+/**
+ * 启动补数：把历史会话摘要里的未读计数并入未读表。
+ *
+ * WebView 监听就绪前到达的 msg-in 事件会被丢弃——对端离线留言在我方上线
+ * 瞬间重投（首投即落库、事件却没人接）就属此列，之后的同包号重投又会被
+ * 后端去重标记成 resend，前端因此永远收不到未读增量，红点与托盘闪烁缺失。
+ * 会话摘要的 unread 是后端持久化 read 标志的投影，用它把遗漏补回来：
+ * - 聊天已加载过的会话跳过：内存里已有这些消息（含乐观已读/实时计数）；
+ * - 未读表里已有计数的会话跳过：实时事件已经记过账，避免重复；
+ * 因此本函数只增不覆盖，多次调用（启动 + users-updated 刷新）都安全。
+ *
+ * @param {Record<string, number>} unread   key -> 未读数（原地修改）
+ * @param {Record<string, number>} unreadTs key -> 最近未读消息时间戳（原地修改）
+ * @param {Record<string, object>} chats    已加载的聊天表（key -> chat）
+ * @param {Array<object>} sessions list_sessions 返回的会话摘要
+ */
+export function applyUnreadFromSessions(unread, unreadTs, chats, sessions) {
+  for (const s of sessions || []) {
+    if (!s || !s.key || !s.unread) continue
+    if (chats?.[s.key]) continue
+    if (!unread[s.key]) {
+      unread[s.key] = s.unread
+      unreadTs[s.key] = s.unread_ts || 0
+    }
+  }
+}
