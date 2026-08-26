@@ -269,7 +269,7 @@ pub fn seal_message(pub_key: &RsaPublicKey, me: &KeyPair, plain: &[u8]) -> Resul
 pub fn open_message(
     priv_kp: &KeyPair,
     extra: &str,
-    peer_pub: Option<&RsaPublicKey>,
+    peer_pubs: &[RsaPublicKey],
     pkt_no: u32,
 ) -> Result<OpenMsg, String> {
     // 官方扩展部按 C 字符串惯例带尾 '\0'（ANSPUBKEY/加密消息皆然，现场实测）；
@@ -323,26 +323,40 @@ pub fn open_message(
             .map_err(|_| "Blowfish 解密失败（填充校验不过）".to_string())?
     };
 
-    // 签名校验：完整明文（含尾部 \0）
+    // 签名校验：完整明文（含尾部 \0）。候选公钥依次尝试（最新+上一把备选：
+    // 对端多客户端交替/多实例时任一命中即通过）；无候选（无法验签）→ true
     let mut sig_ok = true;
-    if let (Some(pp), Some(sig_hex)) = (peer_pub, segs.get(3)) {
-        sig_ok = match hex_decode_loose(sig_hex).and_then(|b| Signature::try_from(&b[..]).ok()) {
+    if let Some(sig_hex) = segs.get(3) {
+        sig_ok = if peer_pubs.is_empty() {
+            true // 无候选公钥：无法验签，保持可信（调用方记 diag）
+        } else {
+            match hex_decode_loose(sig_hex).and_then(|b| Signature::try_from(&b[..]).ok()) {
             Some(sig) => {
-                if capa & CAPA_SIGN_SHA256 != 0 {
-                    VerifyingKey::<Sha256>::new(pp.clone())
-                        .verify(&plain_full, &sig)
-                        .is_ok()
-                } else if capa & CAPA_SIGN_SHA1 != 0 {
-                    VerifyingKey::<Sha1>::new(pp.clone())
-                        .verify(&plain_full, &sig)
-                        .is_ok()
+                if capa & (CAPA_SIGN_SHA256 | CAPA_SIGN_SHA1) != 0 {
+                    let mut ok = false;
+                    for pp in peer_pubs {
+                        ok = if capa & CAPA_SIGN_SHA256 != 0 {
+                            VerifyingKey::<Sha256>::new(pp.clone())
+                                .verify(&plain_full, &sig)
+                                .is_ok()
+                        } else if capa & CAPA_SIGN_SHA1 != 0 {
+                            VerifyingKey::<Sha1>::new(pp.clone())
+                                .verify(&plain_full, &sig)
+                                .is_ok()
+                        } else {
+                            false
+                        };
+                        if ok {
+                            break;
+                        }
+                    }
+                    ok
                 } else {
-                    // 有签名段却没声明哈希算法：无法验证，按不可信处理
-                    false
+                    false // 有签名段却没声明哈希算法：无法验证，按不可信处理
                 }
             }
             None => false, // 签名段不是合法 hex
-        };
+        }};
     }
 
     let mut plain = plain_full;
@@ -385,7 +399,7 @@ pub fn open_file_request(
     extra: &str,
     pkt_no: u32,
 ) -> Result<(String, bool), String> {
-    let out = open_message(priv_kp, extra, None, pkt_no)?;
+    let out = open_message(priv_kp, extra, &[], pkt_no)?;
     let inner = String::from_utf8_lossy(&out.plain).into_owned();
     let segs: Vec<&str> = inner.split(':').collect();
     let enc_body = if segs.last().copied() == Some("4000000") {
@@ -698,12 +712,12 @@ mod tests {
         let plain = b"hello\nworld\0report.zip:100:20:1:\x07";
         let sealed = seal_message(peer_pub, me, plain).unwrap();
         assert!(sealed.starts_with(&format!("{:X}:", CAPA_OUR_SEND)));
-        let out = open_message(&kp_b, &sealed, Some(&kp_a.public_key()), 0).unwrap();
+        let out = open_message(&kp_b, &sealed, &[kp_a.public_key()], 0).unwrap();
         assert_eq!(out.plain, &plain[..]); // 含文件公告整体；明文以 \x07 结尾，无尾部 \0 可剥
                                            // （尾部 \0 剥离的覆盖见 open_supports_blowfish_combo 的 b"legacy\0"）
         assert!(out.sig_ok);
         // 解密本身只要求接收方私钥；无对端公钥时无法验签，sig_ok 保持 true（调用方记 diag）
-        let out_no_pp = open_message(&kp_b, &sealed, None, 0).unwrap();
+        let out_no_pp = open_message(&kp_b, &sealed, &[], 0).unwrap();
         assert_eq!(out_no_pp.plain, &plain[..]);
         assert!(out_no_pp.sig_ok);
     }
@@ -741,11 +755,11 @@ mod tests {
             hex_lower(&sig)
         );
         // 正确包号：IV 对齐 → 全文还原 + 验签通过
-        let out = open_message(&kp_b, &extra, Some(&kp_a.public_key()), pkt_no).unwrap();
+        let out = open_message(&kp_b, &extra, &[kp_a.public_key()], pkt_no).unwrap();
         assert_eq!(out.plain, b"packetno-iv-test");
         assert!(out.sig_ok);
         // 错包号：IV 错 → 首块乱，验签失败（机制：sig_ok=false 而非 Err）
-        let out_bad = open_message(&kp_b, &extra, Some(&kp_a.public_key()), 1).unwrap();
+        let out_bad = open_message(&kp_b, &extra, &[kp_a.public_key()], 1).unwrap();
         assert!(!out_bad.sig_ok);
         assert_ne!(out_bad.plain, b"packetno-iv-test");
     }
@@ -760,7 +774,7 @@ mod tests {
         let plain = b"legacy\0";
         let sealed = seal_message_compat_rsa1024_blowfish(&kp.public_key(), plain).unwrap();
         assert!(sealed.starts_with(&format!("{:X}:", CAPA_RSA1024 | CAPA_BLOWFISH128)));
-        let out = open_message(&kp, &sealed, None, 0).unwrap();
+        let out = open_message(&kp, &sealed, &[], 0).unwrap();
         assert_eq!(out.plain, b"legacy");
         assert_eq!(out.sig_ok, true); // 该组合无签名段
     }
@@ -774,8 +788,29 @@ mod tests {
         let mut bad_tail = sig[..sig.len() - 2].to_owned();
         bad_tail.push_str(if sig.ends_with("00") { "11" } else { "00" });
         let bad = format!("{}:{}", head, bad_tail);
-        let out = open_message(&kp_b, &bad, Some(&kp_a.public_key()), 0).unwrap();
+        let out = open_message(&kp_b, &bad, &[kp_a.public_key()], 0).unwrap();
         assert!(!out.sig_ok);
+    }
+
+    #[test]
+    fn signature_accepts_any_candidate_key() {
+        // 对端多客户端交替/多实例（2026-08-26 实测场景）：同一 IP 轮换密钥对
+        // 发言，缓存保留最新+上一把备选；任一候选命中即验签通过
+        let (kp_a, kp_b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
+        let kp_a_old = KeyPair::generate().unwrap();
+        let sealed = seal_message(&kp_b.public_key(), &kp_a, b"hi\0").unwrap();
+        // 候选 = [旧钥, 当前签名钥]（备选命中）
+        let out = open_message(
+            &kp_b,
+            &sealed,
+            &[kp_a_old.public_key(), kp_a.public_key()],
+            0,
+        )
+        .unwrap();
+        assert!(out.sig_ok);
+        // 候选都不匹配 → 验签失败
+        let out_bad = open_message(&kp_b, &sealed, &[kp_a_old.public_key()], 0).unwrap();
+        assert!(!out_bad.sig_ok);
     }
 
     #[test]
@@ -784,7 +819,7 @@ mod tests {
         // 若未来把验签对象误改成剥掉 \0 之后的明文（互操作回归），本测试必须失败。
         let (kp_a, kp_b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
         let sealed = seal_message(&kp_b.public_key(), &kp_a, b"x\0").unwrap();
-        let out = open_message(&kp_b, &sealed, Some(&kp_a.public_key()), 0).unwrap();
+        let out = open_message(&kp_b, &sealed, &[kp_a.public_key()], 0).unwrap();
         assert!(out.sig_ok);
         assert_eq!(out.plain, b"x"); // 剥离只影响返回值，不影响验签对象
     }
@@ -796,7 +831,7 @@ mod tests {
         let (kp_a, kp_b) = (KeyPair::generate().unwrap(), KeyPair::generate().unwrap());
         let mut sealed = seal_message(&kp_b.public_key(), &kp_a, b"123\0").unwrap();
         sealed.push('\0'); // 模拟官方线格式的尾 \0
-        let out = open_message(&kp_b, &sealed, Some(&kp_a.public_key()), 0).unwrap();
+        let out = open_message(&kp_b, &sealed, &[kp_a.public_key()], 0).unwrap();
         assert_eq!(out.plain, b"123");
         assert!(out.sig_ok, "剥尾 \\0 后签名必须验证通过");
     }
@@ -808,7 +843,7 @@ mod tests {
         let (head, _) = sealed.rsplit_once(':').unwrap();
         // 签名段存在但不是合法 hex：有对端公钥时必须报 sig_ok=false，且不能致命
         let bad = format!("{}:zz", head);
-        let out = open_message(&kp_b, &bad, Some(&kp_a.public_key()), 0).unwrap();
+        let out = open_message(&kp_b, &bad, &[kp_a.public_key()], 0).unwrap();
         assert!(!out.sig_ok);
     }
 
@@ -830,7 +865,7 @@ mod tests {
             hex_lower(&[0x42u8; 8]),
             hex_lower(&[0u8; 16])
         );
-        let err = open_message(&kp, &bogus, None, 0).unwrap_err();
+        let err = open_message(&kp, &bogus, &[], 0).unwrap_err();
         assert!(err.contains("不支持加密组合"));
     }
 
@@ -854,8 +889,8 @@ mod tests {
             s_max_nums.as_str(),
         ];
         for s in samples {
-            let _ = open_message(&kp, s, None, 0);
-            let _ = open_message(&kp, s, Some(&kp.public_key()), 0);
+            let _ = open_message(&kp, s, &[], 0);
+            let _ = open_message(&kp, s, &[kp.public_key()], 0);
         }
     }
 

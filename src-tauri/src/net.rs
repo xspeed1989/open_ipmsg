@@ -556,11 +556,11 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             if pkt.command & opt::ENCRYPTOPT != 0 {
                 let cfg = ctx.st.config();
                 if cfg.encrypt {
-                    let peer_pub = ctx.st.peer_pubkey(&key);
+                    let peer_pubs = ctx.st.peer_pubkeys(&key);
                     match crypto::open_message(
                         &ctx.st.own_keypair(),
                         &String::from_utf8_lossy(&pkt.extra),
-                        peer_pub.as_ref(),
+                        &peer_pubs,
                         pkt.pkt_no,
                     ) {
                         Ok(m) => {
@@ -585,7 +585,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                             ));
                             // 验签失败但解密成功：最常见于对端换过密钥而缓存仍是旧钥
                             // （「有缓存不握手」从不刷新）。触发双向自愈重握手。
-                            if !m.sig_ok && peer_pub.is_some() {
+                            if !m.sig_ok && !peer_pubs.is_empty() {
                                 crypto_rehandshake(ctx, from, &key, "sig=false").await;
                             }
                             pkt.extra = m.plain;

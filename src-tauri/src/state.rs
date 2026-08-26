@@ -115,6 +115,16 @@ pub const OFFER_TTL_SECS: u64 = 24 * 3600;
 
 type EventFn = Box<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 
+/// 对端密钥的内存缓存条目：最新公钥（加密/验签首选）+ 上一把（验签备选）。
+/// 备选解决多客户端交替/多实例场景：同一 IP 轮流用不同密钥对发言时，
+/// 缓存被覆盖导致验签随缓存浮动（2026-08-26 实测场景），保留上一把可
+/// 让两个密钥的签名都验证通过。备选不持久化（重启后由自愈重握手重新学习）。
+struct PeerCryptoEntry {
+    capa: u32,
+    pub_key: RsaPublicKey,
+    prev_key: Option<RsaPublicKey>,
+}
+
 /// peer_keys.json 单条记录：{ip: {capa, n_b64, e_b64}}
 #[derive(Serialize, Deserialize)]
 struct PeerKeyEntry {
@@ -159,8 +169,8 @@ pub struct AppState {
     /// 待投递的离线消息：会话 key → 队列（FIFO）
     pending_out: Mutex<HashMap<String, Vec<PendingOut>>>,
     on_event: Mutex<Option<EventFn>>,
-    /// 对端 IP →（最近一次 ANSPUBKEY 的能力位，对端公钥）；持久化到 peer_keys.json
-    peer_crypto: Mutex<HashMap<String, (u32, RsaPublicKey)>>,
+    /// 对端 IP → 密钥缓存（最新公钥 + 上一把备选）；持久化到 peer_keys.json（仅最新）
+    peer_crypto: Mutex<HashMap<String, PeerCryptoEntry>>,
     /// 已确认走明文协议的对端 IP（仅内存态：重启后重新协商）
     peer_plain: Mutex<HashSet<String>>,
     /// 对端 IP → 已发出的 GETPUBKEY 探测次数（仅内存态：重启即重置）
@@ -460,26 +470,87 @@ impl AppState {
         self.own_keypair().fingerprint()
     }
 
-    /// 对端最近一次公告的公钥（未缓存返回 None）
+    /// 对端最近一次公告的公钥（未缓存返回 None；发送加密用最新一把）
     pub fn peer_pubkey(&self, ip: &str) -> Option<RsaPublicKey> {
-        self.peer_crypto.lock().unwrap().get(ip).map(|(_, k)| k.clone())
+        self.peer_crypto.lock().unwrap().get(ip).map(|e| e.pub_key.clone())
     }
 
     /// 对端最近一次公告的能力位（未缓存返回 0）
     pub fn peer_capa(&self, ip: &str) -> u32 {
-        self.peer_crypto.lock().unwrap().get(ip).map(|(c, _)| *c).unwrap_or(0)
+        self.peer_crypto.lock().unwrap().get(ip).map(|e| e.capa).unwrap_or(0)
+    }
+
+    /// 验签候选公钥（最新在前、上一把备选在后）：多客户端交替/多实例场景下
+    /// 任一一把命中即验签通过
+    pub fn peer_pubkeys(&self, ip: &str) -> Vec<RsaPublicKey> {
+        let m = self.peer_crypto.lock().unwrap();
+        match m.get(ip) {
+            Some(e) => {
+                let mut v = vec![e.pub_key.clone()];
+                if let Some(p) = &e.prev_key {
+                    if p != &e.pub_key {
+                        v.push(p.clone());
+                    }
+                }
+                v
+            }
+            None => Vec::new(),
+        }
     }
 
     /// 缓存对端公钥并持久化到 peer_keys.json（重启不丢）
     pub fn remember_peer_key(&self, ip: &str, capa: u32, pubk: &RsaPublicKey) {
+        let (same_key, prev): (bool, Option<RsaPublicKey>) = {
+            let m = self.peer_crypto.lock().unwrap();
+            match m.get(ip) {
+                Some(e) => (&e.pub_key == pubk, e.prev_key.clone()),
+                None => (false, None),
+            }
+        };
+        if same_key {
+            // 同一把钥：只更新能力位（如应答重复），备选保持不变
+            let mut m = self.peer_crypto.lock().unwrap();
+            m.insert(ip.to_string(), PeerCryptoEntry {
+                capa,
+                pub_key: pubk.clone(),
+                prev_key: prev,
+            });
+            return;
+        }
+        let prev = if prev.is_none() {
+            let m = self.peer_crypto.lock().unwrap();
+            match m.get(ip) {
+                Some(e) => {
+                    use rsa::traits::PublicKeyParts;
+                    let old_fp = &e.pub_key.n().to_bytes_be()[..3];
+                    let new_fp = &pubk.n().to_bytes_be()[..3];
+                    self.diag(&format!(
+                        "peer-key-change {ip} capa={:X} 指纹 {old_fp:02x?} → {new_fp:02x?}（保留旧钥作备选）",
+                        capa
+                    ));
+                    Some(e.pub_key.clone()) // 旧钥降为备选
+                }
+                None => None,
+            }
+        } else {
+            prev
+        };
         {
             let mut m = self.peer_crypto.lock().unwrap();
-            m.insert(ip.to_string(), (capa, pubk.clone()));
+            m.insert(ip.to_string(), PeerCryptoEntry {
+                capa,
+                pub_key: pubk.clone(),
+                prev_key: prev.clone(),
+            });
             if m.len() > PEER_KEY_CAP {
                 // 防御性上限：异常洪泛时不无限膨胀。保留当前这条，其余清空，
                 // 避免把刚学到的对端也丢掉、或把空表写回磁盘
                 m.clear();
-                m.insert(ip.to_string(), (capa, pubk.clone()));
+                m.insert(ip.to_string(), PeerCryptoEntry {
+                    capa,
+                    pub_key: pubk.clone(),
+                    prev_key: prev,
+                });
             }
         }
         self.persist_peer_keys();
@@ -502,13 +573,13 @@ impl AppState {
         let data = self.peer_crypto.lock().unwrap();
         let keys: HashMap<String, PeerKeyEntry> = data
             .iter()
-            .map(|(ip, (capa, k))| {
+            .map(|(ip, e)| {
                 (
                     ip.clone(),
                     PeerKeyEntry {
-                        capa: *capa,
-                        n_b64: b64_encode(&k.n().to_bytes_be()),
-                        e_b64: b64_encode(&k.e().to_bytes_be()),
+                        capa: e.capa,
+                        n_b64: b64_encode(&e.pub_key.n().to_bytes_be()),
+                        e_b64: b64_encode(&e.pub_key.e().to_bytes_be()),
                     },
                 )
             })
@@ -545,7 +616,19 @@ impl AppState {
                 out.insert(ip, (ent.capa, pubk));
             }
         }
-        *self.peer_crypto.lock().unwrap() = out;
+        *self.peer_crypto.lock().unwrap() = out
+            .into_iter()
+            .map(|(ip, (capa, k))| {
+                (
+                    ip,
+                    PeerCryptoEntry {
+                        capa,
+                        pub_key: k,
+                        prev_key: None,
+                    },
+                )
+            })
+            .collect();
     }
 
     /// 标记该对端只走明文协议（仅内存态：重启后按报文重新协商）
