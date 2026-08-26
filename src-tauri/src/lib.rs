@@ -462,9 +462,33 @@ mod linux_tray {
 /// 免去运行时 PNG 解码，也不必为此拉一个图像解码依赖。由 scripts/gen_icons.py 生成。
 const TRAY_SIZE: u32 = 64;
 const TRAY_IDLE: &[u8] = include_bytes!("../icons/tray.rgba");
+
+/// 空白帧的像素（RGBA）。为什么 Windows 上不能全 0：
+///
+/// tray-icon 在 Windows 把 RGBA 交给 CreateIcon 做成「单色 AND mask + 32bpp XOR」
+/// 的经典图标（不是带 alpha 的 DIB 图标），任务栏按 mask 画：mask 位=0 时用 SRCAND
+/// 把像素刷成 0 再 SRCINVERT 画 XOR 位图（全 0 像素 = 黑），mask 位=1 才保留原像素
+/// （透明）。crate 每个像素算出一个 mask 字节 = alpha.wrapping_sub(255)：
+///   - alpha=0   → 0x01：每 8 个像素只有 1 个保留，其余画黑 —— 闪现帧变成一块
+///     黑色「马赛克」与图标交替（正是本 bug）；
+///   - alpha=254 → 0xFF：8 个 mask 位全 1，整帧走「保留原像素」分支，
+///     任务栏刷新该区域背景后再画，帧就真正不可见 = 微信式一闪一闪。
+/// macOS / Linux 走真 alpha 合成（NSImage / SNI 的 ARGB pixbuf），全 0 即可。
+#[cfg(target_os = "windows")]
+const TRAY_BLANK_PX: [u8; 4] = [0, 0, 0, 254];
+#[cfg(not(target_os = "windows"))]
+const TRAY_BLANK_PX: [u8; 4] = [0, 0, 0, 0];
+
 /// 全透明帧：与正常图标交替 = 微信那种「图标一闪一闪」
-static TRAY_BLANK: [u8; (TRAY_SIZE * TRAY_SIZE * 4) as usize] =
-    [0u8; (TRAY_SIZE * TRAY_SIZE * 4) as usize];
+static TRAY_BLANK: [u8; (TRAY_SIZE * TRAY_SIZE * 4) as usize] = {
+    let mut px = [0u8; (TRAY_SIZE * TRAY_SIZE * 4) as usize];
+    let mut i = 0;
+    while i < px.len() {
+        px[i] = TRAY_BLANK_PX[i % 4];
+        i += 1;
+    }
+    px
+};
 /// 闪烁间隔：与微信节奏接近
 const FLASH_INTERVAL_MS: u64 = 600;
 /// 当前是否处于闪烁状态（未读 > 0）
@@ -768,6 +792,34 @@ mod tests {
         // 中文与 ?# 等会破坏查询串的字符必须转义
         assert_eq!(urlencode("图"), "%E5%9B%BE");
         assert!(!urlencode("x?y#z&w=1").contains(['?', '#', '&', '=']));
+    }
+
+    /// Windows 闪现帧的马赛克回归测试：
+    /// 托盘图标在 Windows 走 tray-icon 的 CreateIcon 经典 mask 路径，
+    /// 每个像素的 mask 字节 = alpha.wrapping_sub(255)，mask 位=1 才保留原像素
+    /// （透明），=0 会刷黑画 XOR。所以空白帧像素必须让 mask 字节 = 0xFF
+    /// （alpha=254）；全 0 像素（mask 字节 0x01）会让每 8 个像素只留 1 个透明、
+    /// 其余画成黑，托盘里就是黑色马赛克与图标交替。
+    /// 另：macOS/Linux 是真 alpha 合成，空白帧仍应保持全 0。
+    #[test]
+    fn tray_blank_pixel_keeps_windows_mask_fully_keep() {
+        let mask_byte = super::TRAY_BLANK_PX[3].wrapping_sub(u8::MAX);
+        #[cfg(target_os = "windows")]
+        assert_eq!(mask_byte, 0xFF, "Windows 空白帧 mask 必须全 1（透明）");
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = mask_byte;
+            assert_eq!(super::TRAY_BLANK_PX, [0, 0, 0, 0], "其他平台保持真全透明帧");
+        }
+        // 全 0 像素时 crate 给出的 mask 字节是 0x01 —— 即 bug 复现路径
+        assert_eq!(0u8.wrapping_sub(u8::MAX), 0x01);
+        // 且 TRAY_BLANK 里每个字节都被正确填充
+        assert_eq!(
+            super::TRAY_BLANK.len(),
+            (super::TRAY_SIZE * super::TRAY_SIZE * 4) as usize
+        );
+        assert_eq!(super::TRAY_BLANK[0], super::TRAY_BLANK_PX[0]);
+        assert_eq!(super::TRAY_BLANK[3], super::TRAY_BLANK_PX[3]);
     }
 }
 

@@ -6,7 +6,9 @@
 字形是手绘几何（圆角矩形拼合），不依赖任何字体文件。
 
 托盘图标只出正常态 tray.png / tray.rgba；有新消息时的闪烁由 Rust 侧在
-「正常图标 ↔ 全透明帧」之间交替实现（与微信一致），透明帧无需生成文件。
+「正常图标 ↔ 全透明帧」之间交替实现（与微信一致）。透明帧无需生成文件；
+注意 Windows 上不能用全 0 像素（tray-icon 的 CreateIcon 经典 mask 路径会画成
+黑块马赛克），Rust 侧用 alpha=254 的像素做空白帧，详见 lib.rs 的 TRAY_BLANK_PX。
 
 输出到 src-tauri/icons/: 32x32.png / 128x128.png / 128x128@2x.png / icon.png(512)
             icon.ico / tray.png / tray.rgba
@@ -196,7 +198,8 @@ def main():
     # 托盘两态：无未读 / 有未读（右上角红点）
     # 同时输出 .rgba 原始像素：Rust 侧直接 include_bytes! 交给 tauri::image::Image::new，
     # 运行时不用解码 PNG，也不必为此引入图像解码依赖
-    # 托盘图标：只出正常态，闪烁用的透明帧由 Rust 侧直接生成（全 0 像素）
+    # 托盘图标：只出正常态，闪烁用的透明帧由 Rust 侧直接生成
+    # （Windows 上是 alpha=254 像素，见 lib.rs TRAY_BLANK_PX 注释）
     print("render tray ...")
     rgba = render(64)
     write_png(OUT / "tray.png", 64, 64, rgba)
