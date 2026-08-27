@@ -1,7 +1,7 @@
 # Maintainer: xspeed1989
 # 从源码构建的 Arch 包（AUR 风格）。若只想用现成二进制打包，见 scripts/build-arch.sh
 pkgname=open-ipmsg
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="局域网即时通讯客户端（IP Messenger 协议，UDP/TCP 2425）"
 arch=('x86_64')
