@@ -62,6 +62,9 @@ export const stagePastedFile = (name, b64) => invoke('stage_pasted_file', { name
 export const openImageViewer = (path, name) =>
   invoke('open_image_viewer', { path, name })
 
+/** 图片查看器「另存为」：把本地图片复制到用户选择的目标路径 */
+export const copyFileAs = (source, dest) => invoke('copy_file_as', { source, dest })
+
 /** 发送剪贴板图片（base64 原始数据，后端落盘后按附件公告） */
 export const sendClipboardImage = (key, text, b64, mime) =>
   invoke('send_clipboard_image', { key, text, b64, mime })

@@ -7,6 +7,8 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
+import { save as saveDialog } from '@tauri-apps/plugin-dialog'
+import { copyFileAs } from '../lib/ipc'
 import { t } from '../lib/i18n'
 
 const appWindow = getCurrentWindow()
@@ -30,6 +32,13 @@ const oneToOne = ref(1)
 const zoomed = computed(() => Math.abs(scale.value - 1) > 0.001)
 const pct = computed(() => Math.round((scale.value / oneToOne.value) * 100))
 
+/** 右键菜单：{ x, y }；菜单项：另存为 / 打开所在文件夹 */
+const ctxMenu = ref(null)
+const ctxMenuRef = ref(null)
+const saving = ref(false)
+const saved = ref(false)
+let savedTimer = null
+
 const style = computed(() => ({
   transform: `translate(${tx.value}px, ${ty.value}px) scale(${scale.value}) rotate(${rotate.value}deg)`,
   cursor: dragging.value ? 'grabbing' : zoomed.value ? 'grab' : 'zoom-in',
@@ -48,10 +57,13 @@ onMounted(async () => {
   }
   window.addEventListener('keydown', onKey)
   window.addEventListener('resize', measure)
+  document.addEventListener('mousedown', onDocMouseDown)
 })
 onUnmounted(() => {
+  clearTimeout(savedTimer)
   window.removeEventListener('keydown', onKey)
   window.removeEventListener('resize', measure)
+  document.removeEventListener('mousedown', onDocMouseDown)
 })
 
 /** 量出"适应窗口"下的显示尺寸，换算 1:1 需要的缩放倍数 */
@@ -64,7 +76,10 @@ function measure() {
 
 function onKey(e) {
   const k = e.key.toLowerCase()
-  if (e.key === 'Escape' || (k === 'w' && (e.ctrlKey || e.metaKey))) close()
+  if (e.key === 'Escape') {
+    // 菜单开着先关菜单（Esc 再按一次才关窗口）
+    ctxMenu.value ? closeCtx() : close()
+  } else if (k === 'w' && (e.ctrlKey || e.metaKey)) close()
   else if (e.key === '+' || e.key === '=') zoom(1.2)
   else if (e.key === '-') zoom(1 / 1.2)
   else if (e.key === '0') fit()
@@ -124,6 +139,60 @@ async function reveal() {
     /* 打开文件夹失败时忽略 */
   }
 }
+
+/* ---------- 右键菜单：另存为 / 打开所在文件夹 ---------- */
+function openCtx(e) {
+  saved.value = false
+  ctxMenu.value = {
+    x: Math.min(e.clientX, window.innerWidth - 140),
+    y: Math.min(e.clientY, window.innerHeight - 84),
+  }
+}
+function closeCtx() {
+  ctxMenu.value = null
+}
+/** 点击菜单以外任意处关闭（右键菜单本身除外） */
+function onDocMouseDown(e) {
+  const path = e.composedPath ? e.composedPath() : []
+  if (path.includes(ctxMenuRef.value)) return
+  closeCtx()
+}
+async function saveAs() {
+  if (saving.value || !ctxMenu.value) return
+  saving.value = true
+  try {
+    const dest = await saveDialog({
+      title: t('viewer.saveAs'),
+      defaultPath: name,
+      filters: [
+        {
+          name: 'Image',
+          extensions: ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'],
+        },
+      ],
+    })
+    if (!dest) {
+      closeCtx() // 用户取消
+      return
+    }
+    await copyFileAs(path, dest)
+    saved.value = true
+    clearTimeout(savedTimer)
+    savedTimer = setTimeout(() => {
+      saved.value = false
+      closeCtx()
+    }, 900)
+  } catch (e) {
+    closeCtx()
+    alert(t('viewer.saveFailed', { e }))
+  } finally {
+    saving.value = false
+  }
+}
+function revealInMenu() {
+  closeCtx()
+  reveal()
+}
 </script>
 
 <template>
@@ -144,7 +213,7 @@ async function reveal() {
       </div>
     </header>
 
-    <div class="stage" @wheel="onWheel" @mousedown="onDown" @dblclick="toggleZoom">
+    <div class="stage" @wheel="onWheel" @mousedown="onDown" @dblclick="toggleZoom" @contextmenu.prevent="openCtx">
       <p v-if="error" class="err">{{ error }}</p>
       <img
         v-else-if="src"
@@ -156,6 +225,19 @@ async function reveal() {
         @load="measure"
       />
       <p v-else class="loading">{{ t('viewer.loading') }}</p>
+    </div>
+
+    <!-- 右键菜单：另存为 / 打开所在文件夹 -->
+    <div
+      v-if="ctxMenu"
+      ref="ctxMenuRef"
+      class="ctx-menu"
+      :style="{ position: 'fixed', left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }"
+    >
+      <button class="ctx-item" :disabled="saving" @click="saveAs">
+        {{ saved ? t('viewer.saved') : t('viewer.saveAs') }}
+      </button>
+      <button class="ctx-item" @click="revealInMenu">{{ t('viewer.reveal') }}</button>
     </div>
   </div>
 </template>
@@ -239,5 +321,30 @@ async function reveal() {
 .loading {
   font-size: 13px;
   color: #999;
+}
+.ctx-menu {
+  z-index: 40;
+  min-width: 128px;
+  padding: 4px;
+  background: #262626;
+  border: 1px solid #000;
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+}
+.ctx-item {
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: 4px;
+  text-align: left;
+  font-size: 13px;
+  color: #ddd;
+}
+.ctx-item:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+.ctx-item:disabled {
+  opacity: 0.6;
 }
 </style>

@@ -198,6 +198,9 @@ const zh = {
   'viewer.rotate': '旋转 90° ( R )',
   'viewer.reveal': '所在文件夹',
   'viewer.close': '关闭 ( Esc )',
+  'viewer.saveAs': '另存为…',
+  'viewer.saved': '已保存',
+  'viewer.saveFailed': '保存失败：{e}',
   // ---- 转发/引用（发送文本里的本地标记） ----
   'forward.noContent': '没有可转发的内容',
   'forward.notDownloaded': '「{name}」尚未下载，无法转发',
@@ -388,6 +391,9 @@ const en = {
   'viewer.rotate': 'Rotate 90° ( R )',
   'viewer.reveal': 'Show in folder',
   'viewer.close': 'Close ( Esc )',
+  'viewer.saveAs': 'Save As…',
+  'viewer.saved': 'Saved',
+  'viewer.saveFailed': 'Failed to save: {e}',
   // ---- 转发/引用（发送文本里的本地标记） ----
   'forward.noContent': 'Nothing to forward',
   'forward.notDownloaded': '"{name}" hasn\'t been downloaded yet and can\'t be forwarded',

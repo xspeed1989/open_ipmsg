@@ -363,6 +363,29 @@ async fn read_image_data(path: String) -> Result<Value, String> {
     }))
 }
 
+/// 图片查看器「另存为」：把本地图片复制到用户选择的目标路径。
+/// 只允许复制已存在的常见图片文件（与 read_image_data 同一白名单），
+/// 目标路径由前端保存对话框给出。
+#[tauri::command]
+async fn copy_file_as(source: String, dest: String) -> Result<(), String> {
+    let src = std::path::Path::new(&source);
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp") {
+        return Err("不支持的图片类型".into());
+    }
+    if !src.is_file() {
+        return Err("图片文件不存在（可能已被移动或删除）".into());
+    }
+    tokio::fs::copy(src, &dest)
+        .await
+        .map_err(|e| format!("保存失败: {e}"))?;
+    Ok(())
+}
+
 /* ================= 托盘「双击」判定（SNI / macOS 没有双击事件） ================= */
 
 /// 两次单击判定为一次双击的最大间隔（毫秒）。
@@ -1515,6 +1538,7 @@ pub fn run() {
             notify_message,
             download_file,
             read_image_data,
+            copy_file_as,
             open_image_viewer,
             mark_read,
             mark_out_read,

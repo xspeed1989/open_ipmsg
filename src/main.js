@@ -4,6 +4,24 @@ import ImageViewer from './components/ImageViewer.vue'
 import { boot, refreshConfig } from './store'
 import './styles/global.css'
 
+// 屏蔽浏览器原生右键菜单（主窗口与图片查看器窗口都生效）：
+// - 消息气泡 / 联系人行的自绘菜单已 preventDefault，这里跳过不干扰；
+// - 可编辑元素（输入框 / 多行输入 / contenteditable）放行原生菜单，
+//   保证复制 / 剪切 / 粘贴等常用功能可用；
+// - 其余区域（空白、图片、面板…）一律不弹原生菜单。
+window.addEventListener('contextmenu', (e) => {
+  if (e.defaultPrevented) return
+  const el = e.target
+  if (
+    el &&
+    typeof el.closest === 'function' &&
+    el.closest('input, textarea, [contenteditable="true"], [contenteditable=""]')
+  ) {
+    return
+  }
+  e.preventDefault()
+})
+
 // 图片查看器是同一份前端的另一个入口（由 open_image_viewer 带查询串打开的独立窗口），
 // 它不需要网络栈事件，也不该重复初始化主界面状态
 const isViewer =
