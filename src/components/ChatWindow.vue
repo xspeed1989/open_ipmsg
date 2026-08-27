@@ -978,7 +978,9 @@ watch(
                       <span class="muted">{{ t('chat.histImport') }}</span>
                     </template>
                     <template v-else>
-                      <span>{{ fmtSize(f.size) }}</span>
+                      <!-- 文件夹不显示体积：对端（官方客户端/飞秋）公告文件夹大小恒为 0，
+                           显示 "0 B" 毫无意义；下载完成后有进度与「文件夹已保存」状态即可 -->
+                      <span v-if="!f.dir_entry">{{ fmtSize(f.size) }}</span>
                       <!-- 收到的文件 -->
                       <template v-if="v.m.dir === 'in'">
                         <template v-if="f.state === 'pending'">
