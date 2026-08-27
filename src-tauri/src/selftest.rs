@@ -15,6 +15,9 @@
 //!      密钥流对齐与偏移的十进制编码
 //!   5. 能力撤回：encrypt=false 的实例 C 以同一 IP 上线 → A 丢弃缓存 →
 //!      后续发送回退明文，C 落库 enc=false
+//! 第三个场景（离线文件投递）：实例 A 对不在线的 B 发送附件 → 入队（含路径）；
+//! B 上线后 A 经上线应答自动重投（带延迟尾注，重投时重新登记文件槽）→
+//! B 取回附件逐字节一致 → RECVMSG 确认后 A 清空待投递队列。
 //! 全部通过打印 PASS 行并以退出码 0 结束；任一失败打印 FAIL 且退出码非 0。
 
 use crate::net;
@@ -67,7 +70,8 @@ pub fn run() -> bool {
         .expect("tokio runtime");
     let plain_ok = rt.block_on(async_run());
     let crypto_ok = rt.block_on(crypto_roundtrip());
-    plain_ok && crypto_ok
+    let offline_ok = rt.block_on(offline_file_delivery());
+    plain_ok && crypto_ok && offline_ok
 }
 
 async fn free_udp_port() -> u16 {
@@ -1052,6 +1056,153 @@ fn finish_crypto(log: Log, base: &Path) -> bool {
         if ok { "全部通过 ✔" } else { "存在失败项 ✘" }
     );
     ok
+}
+
+fn finish_offline_file(log: Log, base: &Path) -> bool {
+    let ok = log.all_ok();
+    let _ = std::fs::remove_dir_all(base);
+    println!(
+        "== 离线文件投递场景{} ==",
+        if ok { "全部通过 ✔" } else { "存在失败项 ✘" }
+    );
+    ok
+}
+
+/// 离线文件投递：对方不在线时附件消息入队，对方上线后带延迟尾注重投，
+/// 文件槽在重投时登记，对端可正常取回；RECVMSG 确认后队列清空。
+async fn offline_file_delivery() -> bool {
+    let base =
+        std::env::temp_dir().join(format!("open-ipmsg-offline-file-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dir_a = base.join("a");
+    let dir_b = base.join("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let port_a = free_udp_port().await;
+    let port_b = free_udp_port().await;
+    // A 绑 127.0.0.1，B 绑 127.0.0.2：A 眼里 B 是 127.0.0.2，B 眼里 A 是 127.0.0.1
+    let key_b = "127.0.0.2";
+    let key_a = "127.0.0.1";
+    let mut log = Log(vec![]);
+
+    // 实例 A 先启动，B 不在线
+    let st_a = Arc::new(AppState::new(dir_a.clone()));
+    let mut cfg_a = Config::default();
+    cfg_a.nickname = "离线A".into();
+    cfg_a.group = "测试组".into();
+    cfg_a.encoding = "utf8".into();
+    cfg_a.download_dir = dir_a.join("dl").to_string_lossy().into_owned();
+    st_a.set_config(cfg_a);
+    let ctx_a = net::start_network_quiet(st_a.clone(), port_a)
+        .await
+        .expect("start A");
+
+    /* ---- 1. 对方离线：带附件消息入队（不再报错） ---- */
+    let content: Vec<u8> = (0..64_000u32).map(|i| (i % 251) as u8).collect();
+    let path = dir_a.join("offline_upload.bin");
+    std::fs::write(&path, &content).unwrap();
+    let rec = match net::send_message(
+        &ctx_a,
+        key_b,
+        "离线文件给你",
+        vec![path.to_string_lossy().into_owned()],
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("      A 离线发送错误: {e}");
+            log.check("对方离线时附件消息入队", false);
+            return finish_offline_file(log, &base);
+        }
+    };
+    log.check(
+        "对方离线：附件消息返回 queued 的 file 记录",
+        rec["queued"] == true && rec["kind"] == "file",
+    );
+    log.check(
+        "离线附件记录带文件条目（气泡可渲染）",
+        rec["files"].as_array().map(|a| a.len()) == Some(1)
+            && rec["files"][0]["name"] == "offline_upload.bin",
+    );
+    let queued = wait_for(1500, || st_a.pending_for(key_b).len() == 1).await;
+    log.check(
+        "离线附件进入待投递队列（含本地路径）",
+        queued && st_a.pending_for(key_b)[0].paths.len() == 1,
+    );
+
+    /* ---- 2. 附件路径不可读：报错而不是入队 ---- */
+    let bogus = dir_a.join("ghost.bin").to_string_lossy().into_owned();
+    match net::send_message(&ctx_a, key_b, "不存在的文件", vec![bogus]).await {
+        Err(e) if e.contains("无法读取文件") => log.check("离线附件：路径不可读直接报错", true),
+        other => log.check(
+            &format!("离线附件：路径不可读直接报错（实际 {other:?}）"),
+            false,
+        ),
+    }
+
+    /* ---- 3. B 上线：A 收到应答后自动重投 ---- */
+    let st_b = Arc::new(AppState::new(dir_b.clone()));
+    let mut cfg_b = Config::default();
+    cfg_b.nickname = "离线B".into();
+    cfg_b.group = "测试组".into();
+    cfg_b.encoding = "utf8".into();
+    cfg_b.download_dir = dir_b.join("dl").to_string_lossy().into_owned();
+    st_b.set_config(cfg_b);
+    let ctx_b = net::start_network_loopback(st_b.clone(), key_b.parse().unwrap(), port_b)
+        .await
+        .expect("start B");
+    let addr_b: SocketAddr = format!("{key_b}:{port_b}").parse().unwrap();
+    net::announce_unicast(&ctx_a, &[addr_b]).await;
+
+    // 对方在线的瞬间由上线应答触发重投（flush_pending_for），
+    // B 落库的记录应带延迟尾注与文件条目
+    let delivered = wait_for(5000, || {
+        st_b.read_history(key_a, 50).iter().any(|r| {
+            r["dir"] == "in"
+                && r["kind"] == "file"
+                && r["text"]
+                    .as_str()
+                    .map(|t| t.contains("Delayed Send"))
+                    .unwrap_or(false)
+                && r["files"].as_array().map(|a| a.len()) == Some(1)
+        })
+    })
+    .await;
+    log.check("B 上线后收到离线附件公告（延迟尾注 + 文件条目）", delivered);
+
+    /* ---- 4. B 从重投公告取回附件（验证重投时登记的文件槽可用） ---- */
+    let mut fetched_ok = false;
+    if let Some(rec) = st_b.read_history(key_a, 50).into_iter().find(|r| {
+        r["dir"] == "in"
+            && r["kind"] == "file"
+            && r["text"]
+                .as_str()
+                .map(|t| t.contains("Delayed Send"))
+                .unwrap_or(false)
+    }) {
+        let pkt = rec["pkt"].as_u64().unwrap_or(0) as u32;
+        let id = rec["files"][0]["id"].as_u64().unwrap_or(0) as u32;
+        let name = rec["files"][0]["name"]
+            .as_str()
+            .unwrap_or("offline_upload.bin")
+            .to_string();
+        match net::download_file_task(&ctx_b, key_a, pkt, id, &name, "", content.len() as u64, false)
+            .await
+        {
+            Ok(p) => fetched_ok = std::fs::read(&p).unwrap_or_default() == content,
+            Err(e) => {
+                eprintln!("      B 取回离线附件错误: {e}");
+            }
+        }
+    }
+    log.check("B 从重投公告取回附件且逐字节一致", fetched_ok);
+
+    /* ---- 5. 送达确认后队列清空 ---- */
+    let drained = wait_for(4000, || st_a.pending_for(key_b).is_empty()).await;
+    log.check("B 回 RECVMSG 确认后 A 清空待投递队列", drained);
+
+    finish_offline_file(log, &base)
 }
 
 /* ==================== 假对端实现 ==================== */

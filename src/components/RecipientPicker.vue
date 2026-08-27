@@ -1,5 +1,6 @@
 <script setup>
-// 多选接收人弹窗（转发 / 批量发送共用）：只列在线用户，排除当前会话
+// 多选接收人弹窗（转发 / 批量发送共用）：在线用户 ∪ 离线历史会话；
+// 离线也可选（文本/附件均走离线队列）；转发排除当前会话，批量发送默认预选当前会话
 import { ref, computed } from 'vue'
 import { store, displayName } from '../store'
 import { t } from '../lib/i18n'
@@ -7,16 +8,18 @@ import Avatar from './Avatar.vue'
 
 const props = defineProps({
   title: { type: String, default: () => t('picker.defaultTitle') },
-  /** 排除的会话 key（如当前会话，避免发给自己正在看的会话） */
+  /** 排除的会话 key（转发模式传当前会话，避免原消息重复转发回去） */
   excludeKey: { type: String, default: '' },
+  /** 批量发送模式预勾选的会话 key（当前会话）；须为在线用户，由调用方把关 */
+  preselectKey: { type: String, default: '' },
 })
 const emit = defineEmits(['confirm', 'cancel'])
 
-const picked = ref(new Set())
+const picked = ref(new Set(props.preselectKey ? [props.preselectKey] : []))
 
-/** 可选的用户：在线且不是当前会话 */
+/** 可选的用户：在线用户 ∪ 离线历史会话，且未被 excludeKey 排除（转发时即当前会话） */
 const candidates = computed(() =>
-  store.users.filter((u) => u.key && u.key !== props.excludeKey)
+  store.sessionList.filter((u) => u.key && u.key !== props.excludeKey)
 )
 
 function toggle(u) {
@@ -49,14 +52,17 @@ function cancel() {
           v-for="u in candidates"
           :key="u.key"
           class="rp-row"
-          :class="{ on: picked.has(u.key) }"
+          :class="{ on: picked.has(u.key), off: !u.online }"
           @click="toggle(u)"
         >
           <i class="rp-check">{{ picked.has(u.key) ? '✓' : '' }}</i>
           <Avatar :name="u.nickname || u.user || '?'" :seed="u.key" :size="30" />
           <div class="rp-mid">
-            <div class="rp-nick">{{ displayName(u.key) || u.key }}</div>
-            <div class="rp-sub">{{ u.host || '' }} · {{ u.ip || '' }}</div>
+            <div class="rp-nick">
+              {{ displayName(u.key) || u.key }}
+              <span v-if="!u.online" class="rp-offline">{{ t('offline') }}</span>
+            </div>
+            <div class="rp-sub">{{ u.host || u.ip || '' }}</div>
           </div>
         </div>
       </div>
@@ -128,8 +134,20 @@ function cancel() {
 .rp-row:hover {
   background: var(--c-list-hover);
 }
+.rp-row.off {
+  opacity: 0.6;
+}
 .rp-row.on {
   background: var(--c-list-active);
+}
+.rp-offline {
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--c-sub);
+  background: var(--c-hover);
+  vertical-align: 1px;
 }
 .rp-check {
   flex: none;

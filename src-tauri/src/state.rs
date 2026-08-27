@@ -71,6 +71,10 @@ pub struct PendingOut {
     pub text: String,
     /// 原始发送时间
     pub ts: u64,
+    /// 附件本地路径（离线文件消息也入队；投递时重新校验并登记文件槽）。
+    /// 旧版队列 JSON 没有此字段，serde default 保证兼容加载。
+    #[serde(default)]
+    pub paths: Vec<String>,
 }
 
 /// 历史会话摘要（中栏「离线会话」数据源）
@@ -1770,10 +1774,12 @@ mod tests {
             pkt: 777,
             text: "等你上线".into(),
             ts: 100,
+            paths: vec!["/tmp/a.zip".into(), "/tmp/docs".into()],
         }));
         let list = st.pending_for("10.0.0.9");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].pkt, 777);
+        assert_eq!(list[0].paths, vec!["/tmp/a.zip", "/tmp/docs"], "附件路径随队列持久化");
         assert!(st.pending_for("10.0.0.8").is_empty());
 
         // 重启（新实例读同一数据目录）后队列仍在
@@ -1782,6 +1788,7 @@ mod tests {
         let list2 = st2.pending_for("10.0.0.9");
         assert_eq!(list2.len(), 1, "重启不丢待投递");
         assert_eq!(list2[0].text, "等你上线");
+        assert_eq!(list2[0].paths.len(), 2, "重启后附件路径仍在");
 
         // 收到 RECVMSG 确认后出队
         assert!(st2.ack_pending("10.0.0.9", 777));
@@ -1789,6 +1796,24 @@ mod tests {
         let st3 = AppState::new(st.data_dir.clone());
         st3.load_pending();
         assert!(st3.pending_for("10.0.0.9").is_empty(), "确认后持久化移除");
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn pending_out_legacy_format_without_paths_loads() {
+        let st = temp_state("pending-legacy");
+        // 旧版队列 JSON 没有 paths 字段：必须能兼容加载（serde default 补空）
+        std::fs::create_dir_all(&st.data_dir).unwrap();
+        std::fs::write(
+            st.pending_path(),
+            r#"{"10.0.0.9":[{"key":"10.0.0.9","pkt":1,"text":"旧版","ts":1}]}"#,
+        )
+        .unwrap();
+        st.load_pending();
+        let list = st.pending_for("10.0.0.9");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].pkt, 1);
+        assert!(list[0].paths.is_empty(), "旧记录无附件字段，补空");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -1801,6 +1826,7 @@ mod tests {
                 pkt,
                 text: "x".into(),
                 ts: 1,
+                paths: vec![],
             });
         }
         let taken = st.take_pending("10.0.0.9");

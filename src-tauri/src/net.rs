@@ -234,10 +234,33 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
     let cfg = ctx.st.config();
     let utf8 = proto::is_utf8_mode(&cfg.encoding);
     for item in ctx.st.pending_for(key) {
+        // 附件消息：重投前重新校验文件并登记文件槽（复用直发路径）。
+        // 文件已丢失/不可读 → 该条无法投递，出队并记诊断（否则无限重试）。
+        let mut entries: Vec<proto::FileEntry> = Vec::new();
+        if !item.paths.is_empty() {
+            match register_offer_files(ctx, item.pkt, &item.paths) {
+                Ok((es, _)) => entries = es,
+                Err(e) => {
+                    ctx.st.diag(&format!(
+                        "-> {key} 离线附件消息 pkt={} 文件不可用，丢弃：{e}",
+                        item.pkt
+                    ));
+                    ctx.st.ack_pending(key, item.pkt);
+                    continue;
+                }
+            }
+        }
         let note = proto::fmt_delayed(item.ts);
         // 官方尾注：对端（含本客户端）据此显示「离线留言 · 原发送时间」
         let body = format!("{}\n----\n(IPMsg Delayed Send: {note} )", item.text);
-        let plain = proto::encode_out(&body, &cfg.encoding);
+        let mut plain = proto::encode_out(&body, &cfg.encoding);
+        if !entries.is_empty() {
+            // 附件段与直发同构：\0 分隔 + \a 连接 + 尾部 \a
+            plain.push(0);
+            let joined: Vec<String> = entries.iter().map(|e| e.serialize(&cfg.encoding)).collect();
+            plain.extend_from_slice(joined.join("\u{7}").as_bytes());
+            plain.push(0x07);
+        }
         // 重投时套用与直发一致的加密决策：此刻已缓存对方公钥就密封，
         // 否则保守明文。这里不触发握手、绝不阻塞重投——对方上线广播后
         // 预握手通常已完成，后续消息自然恢复加密。密封意外失败（如加注
@@ -263,8 +286,11 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
         };
         let command = cmd::SENDMSG
             | opt::SENDCHECKOPT
-            | opt::READCHECKOPT
+            | if entries.is_empty() { opt::READCHECKOPT } else { 0 }
+            | if entries.is_empty() { 0 } else { opt::FILEATTACHOPT }
             | if utf8 { opt::UTF8OPT } else { 0 }
+            // 加密附件公告需带 ENCEXTMSGOPT，与直发保持一致
+            | if enc && !entries.is_empty() { opt::ENCEXTMSGOPT } else { 0 }
             | if enc { opt::ENCRYPTOPT } else { 0 };
         let pkt = proto::Packet::new(command).with_pkt_no(item.pkt);
         let pkt = proto::Packet {
@@ -273,7 +299,11 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
         };
         let bytes = pkt.encode(&my_user(&cfg), &my_host());
         if ctx.sock.send_to(&bytes, target).await.is_ok() {
-            ctx.st.diag(&format!("-> {key} 离线消息重投 pkt={}（待 RECVMSG 确认）", item.pkt));
+            ctx.st.diag(&format!(
+                "-> {key} 离线消息重投 pkt={}（{} 附件项，待 RECVMSG 确认）",
+                item.pkt,
+                entries.len()
+            ));
         }
     }
 }
@@ -1039,6 +1069,125 @@ fn is_image_name(name: &str) -> bool {
 
 /* ================= 出站消息 ================= */
 
+/// 校验本地路径并生成公告条目（不登记文件槽，id 由调用方分配）。
+/// 目录体积递归计算（仅供展示与进度分母）；直发、离线入队共用。
+fn stat_file_entries(paths: &[String]) -> Result<Vec<proto::FileEntry>, String> {
+    let mut entries = Vec::with_capacity(paths.len());
+    for p in paths.iter() {
+        let path = PathBuf::from(p);
+        let meta = std::fs::metadata(&path)
+            .map_err(|e| format!("无法读取文件 {}: {e}", path.display()))?;
+        let is_dir = meta.is_dir();
+        if !meta.is_file() && !is_dir {
+            return Err(format!("不支持的文件类型：{}", path.display()));
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into());
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // 目录公告体积 = 递归总字节数（仅供对端展示进度，实际以流内容为准）
+        let size = if is_dir { dir_total_size(&path) } else { meta.len() };
+        entries.push(proto::FileEntry {
+            id: 0, // 调用方分配
+            raw_id: String::new(),
+            name,
+            size,
+            mtime,
+            attr: if is_dir { fileattr::DIR } else { fileattr::REGULAR },
+        });
+    }
+    Ok(entries)
+}
+
+/// 校验路径、分配文件 ID 并登记文件槽（直发与离线重投共用，必须在发包前完成，
+/// 对端可能立刻来取）。返回公告条目与已登记槽位（UDP 发送失败时回滚用）。
+fn register_offer_files(
+    ctx: &NetCtx,
+    pkt_no: u32,
+    paths: &[String],
+) -> Result<(Vec<proto::FileEntry>, Vec<(u32, u32)>), String> {
+    let stats = stat_file_entries(paths)?;
+    ctx.st.prune_offered();
+    let mut entries = Vec::with_capacity(stats.len());
+    let mut inserted = Vec::with_capacity(stats.len());
+    for (s, p) in stats.iter().zip(paths.iter()) {
+        let id = FILE_ID_SEQ.fetch_add(1, Ordering::Relaxed).max(1);
+        let mut e = s.clone();
+        e.id = id;
+        ctx.st.offered.lock().unwrap().insert(
+            (pkt_no, id),
+            OfferedFile {
+                path: PathBuf::from(p),
+                size: e.size,
+                is_dir: e.attr & 0xFF == fileattr::DIR,
+                ts: now_secs(),
+            },
+        );
+        entries.push(e);
+        inserted.push((pkt_no, id));
+    }
+    Ok((entries, inserted))
+}
+
+/// 对方离线时组装本地记录并入待投递队列（文本/附件通用）。
+/// 附件路径此刻校验存在性；文件槽与公告 ID 在重投时登记分配。
+fn offline_enqueue_record(
+    ctx: &NetCtx,
+    key: &str,
+    pkt_no: u32,
+    ts: u64,
+    text: &str,
+    paths: &[String],
+) -> Result<serde_json::Value, String> {
+    let mut entries = Vec::new();
+    if !paths.is_empty() {
+        let stats = stat_file_entries(paths)?;
+        for mut e in stats {
+            e.id = FILE_ID_SEQ.fetch_add(1, Ordering::Relaxed).max(1);
+            entries.push(e);
+        }
+    }
+    if ctx.st.enqueue_pending(PendingOut {
+        key: key.to_string(),
+        pkt: pkt_no,
+        text: text.to_string(),
+        ts,
+        paths: paths.to_vec(),
+    }) {
+        ctx.st.diag(&format!(
+            "-> {key} 离线消息入队 pkt={pkt_no}（附件 {} 项）",
+            paths.len()
+        ));
+    }
+    let kind = if entries.is_empty() { "text" } else { "file" };
+    let rec = json!({
+        "dir": "out",
+        "kind": kind,
+        "text": text,
+        "files": entries.iter().zip(paths.iter()).map(|(e, p)| json!({
+            "id": e.id, "name": e.name, "size": e.size, "path": p, "state": "queued",
+            "dir_entry": e.attr & 0xFF == fileattr::DIR,
+        })).collect::<Vec<_>>(),
+        "pkt": pkt_no,
+        "ts": ts,
+        "peer": {"key": key, "nickname": "", "host": "", "group": ""},
+        // 文件消息不请求已读回执（与直发一致）；文本保留回执
+        "rcpt": entries.is_empty(),
+        "read": false,
+        "queued": true,
+        // 入队时必然明文暂存；实际是否加密由重投时的 flush_pending_for 决定
+        "enc": false, "sig_ok": true,
+    });
+    ctx.st.log_record(key, &rec);
+    Ok(rec)
+}
+
 /// 发送文本/文件消息。paths 为空则纯文本。
 pub async fn send_message(
     ctx: &NetCtx,
@@ -1052,77 +1201,19 @@ pub async fn send_message(
 
     let peer = ctx.st.peers.lock().unwrap().get(key).cloned();
     let Some(peer) = peer else {
-        // 对方不在线：纯文本进入待投递队列（官方 IPMsg 语义，上线后自动重投，
-        // 以原包号发送并带延迟尾注）。文件消息必须对方在线（要注册文件槽并发公告）。
-        if !paths.is_empty() {
-            return Err("对方不在线或尚未发现".to_string());
-        }
-        let enqueued = ctx.st.enqueue_pending(PendingOut {
-            key: key.to_string(),
-            pkt: pkt_no,
-            text: text.to_string(),
-            ts,
-        });
-        let rec = json!({
-            "dir": "out", "kind": "text", "text": text, "pkt": pkt_no, "ts": ts,
-            "peer": {"key": key, "nickname": "", "host": "", "group": ""},
-            "rcpt": true, "read": false,
-            "queued": true,
-            // 入队时必然明文暂存；实际是否加密由重投时的 flush_pending_for 决定
-            "enc": false, "sig_ok": true,
-        });
-        ctx.st.log_record(key, &rec);
-        if enqueued {
-            ctx.st.diag(&format!("-> {key} 离线消息入队 pkt={pkt_no}"));
-        }
-        return Ok(rec);
+        // 对方不在线：文本与附件都进待投递队列（官方 IPMsg 语义，上线后自动
+        // 重投，以原包号发送并带延迟尾注）。队列只存本地路径，文件槽与公告
+        // ID 在重投时重新校验并登记（flush_pending_for）。
+        return offline_enqueue_record(ctx, key, pkt_no, ts, text, &paths);
     };
     let target = peer_addr(&peer).ok_or("无效的对方地址")?;
 
     // 注册文件槽必须在发包前完成（对端可能立刻来取）
-    let mut entries: Vec<proto::FileEntry> = Vec::new();
-    let mut inserted: Vec<(u32, u32)> = Vec::new();
-    ctx.st.prune_offered();
-    for p in paths.iter() {
-        let path = PathBuf::from(p);
-        let meta = std::fs::metadata(&path)
-            .map_err(|e| format!("无法读取文件 {}: {e}", path.display()))?;
-        let is_dir = meta.is_dir();
-        if !meta.is_file() && !is_dir {
-            return Err(format!("不支持的文件类型：{}", path.display()));
-        }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file".into());
-        let id = FILE_ID_SEQ.fetch_add(1, Ordering::Relaxed).max(1);
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // 目录公告体积 = 递归总字节数（仅供对端展示进度，实际以流内容为准）
-        let size = if is_dir { dir_total_size(&path) } else { meta.len() };
-        entries.push(proto::FileEntry {
-            id,
-            raw_id: String::new(),
-            name: name.clone(),
-            size,
-            mtime,
-            attr: if is_dir { fileattr::DIR } else { fileattr::REGULAR },
-        });
-        inserted.push((pkt_no, id));
-        ctx.st.offered.lock().unwrap().insert(
-            (pkt_no, id),
-            OfferedFile {
-                path,
-                size,
-                is_dir,
-                ts: now_secs(),
-            },
-        );
-    }
+    let (entries, inserted) = if paths.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        register_offer_files(ctx, pkt_no, &paths)?
+    };
 
     let mut extra = proto::encode_out(text, &cfg.encoding);
     if !entries.is_empty() {
@@ -1305,6 +1396,32 @@ mod tests {
             "10.0.0.3:50000",
             "投递地址 = 对端 IP + 最新一次报文的源端口，而不是假定对端监听固定端口"
         );
+    }
+
+    #[test]
+    fn stat_file_entries_checks_and_annotates_paths() {
+        let dir = std::env::temp_dir().join(format!("oim-stat-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+        std::fs::write(dir.join("sub/b.bin"), vec![0u8; 8]).unwrap();
+
+        let entries = stat_file_entries(&[
+            dir.join("a.txt").to_string_lossy().into_owned(),
+            dir.join("sub").to_string_lossy().into_owned(),
+        ])
+        .expect("存在即通过");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "a.txt");
+        assert_eq!(entries[0].size, 5);
+        assert_eq!(entries[0].attr & 0xFF, fileattr::REGULAR);
+        assert_eq!(entries[1].name, "sub");
+        assert_eq!(entries[1].size, 8, "目录体积 = 递归字节总数");
+        assert_eq!(entries[1].attr & 0xFF, fileattr::DIR);
+
+        // 不存在的路径必须报错（离线入队/重投前都会先校验）
+        assert!(stat_file_entries(&[dir.join("missing").to_string_lossy().into_owned()]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

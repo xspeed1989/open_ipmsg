@@ -1001,7 +1001,8 @@ watch(
                       </template>
                       <!-- 发出的文件 -->
                       <template v-else>
-                        <span class="ok">{{ t('chat.sent') }}</span>
+                        <span v-if="v.m.queued" class="muted">{{ t('chat.queuedNote') }}</span>
+                        <span v-else class="ok">{{ t('chat.sent') }}</span>
                         <a @click.prevent="revealFile(f.path)">{{ t('chat.revealDir') }}</a>
                       </template>
                     </template>
@@ -1041,11 +1042,12 @@ watch(
       <button class="ctx-item" @click="enterSelMode">{{ t('chat.multiSelect') }}</button>
     </div>
 
-    <!-- 转发 / 批量发送的接收人选择 -->
+    <!-- 转发（排除当前会话）/ 批量发送（默认含当前会话）的接收人选择 -->
     <RecipientPicker
       v-if="picker"
       :title="picker.mode === 'forward' ? t('chat.forwardTo') : t('chat.batchTo')"
-      :exclude-key="store.activeKey"
+      :exclude-key="picker.mode === 'forward' ? store.activeKey : ''"
+      :preselect-key="picker.mode === 'batch' && store.userMap[store.activeKey] ? store.activeKey : ''"
       @confirm="onPickerConfirm"
       @cancel="picker = null"
     />

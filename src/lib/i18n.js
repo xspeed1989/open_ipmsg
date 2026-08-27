@@ -106,7 +106,7 @@ const zh = {
   'settings.importNoNew': '\n没有新消息可导入。',
   // ---- 接收人选择弹窗 ----
   'picker.defaultTitle': '选择接收人',
-  'picker.empty': '没有可选的在线用户',
+  'picker.empty': '没有可选的会话',
   'picker.cancelEsc': '取消（Esc）',
   'picker.send': '发送（{n}）',
   // ---- 聊天窗口 ----
@@ -296,7 +296,7 @@ const en = {
   'settings.importNoNew': '\nNo new messages to import.',
   // ---- 接收人选择弹窗 ----
   'picker.defaultTitle': 'Select recipients',
-  'picker.empty': 'No online users available',
+  'picker.empty': 'No sessions available',
   'picker.cancelEsc': 'Cancel (Esc)',
   'picker.send': 'Send ({n})',
   // ---- 聊天窗口 ----
