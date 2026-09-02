@@ -171,8 +171,8 @@ pnpm tauri build            # 重新打包
 
 ```bash
 cd src-tauri
-cargo test                 # 协议编解码 / 状态管理单元测试（11 项）
-cargo run -- --selftest    # 无头互通自检（16 项 PASS）
+cargo test                 # 协议编解码 / 状态管理单元测试（121 项）
+cargo run -- --selftest    # 无头互通自检（113 项 PASS，含协议补齐全链路）
 ```
 
 `--selftest` 会在本机回环地址启动完整网络栈，并内置一个"假对端"完成：
