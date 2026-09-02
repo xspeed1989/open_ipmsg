@@ -60,15 +60,21 @@ fn local_ipv4_set() -> &'static std::collections::HashSet<IpAddr> {
 
 /* ================= 能力广告与上线通告 ================= */
 
-/// 上线类报文的能力位，受加密总开关控制：开 → ENCRYPTOPT|CAPFILEENCOPT，关 → 0。
+/// 上线类报文的能力位。
 /// 广播/单播通告、ANSENTRY 应答、预握手 GETPUBKEY 扩展部共用这一口径（spec §5/§7）。
+///
+/// - FILEATTACHOPT / CLIPBOARDOPT：与加密无关，只要 TCP 服务可用就声明
+///   （与官方 HostStatus() 一致）。官方 senddlg.cpp SendMsgSetUsers 只有在对端
+///   声明 CLIPBOARDOPT 时才把「粘贴图片」作为附件发出；不声明则撤销
+///   FILEATTACHOPT，图片丢失只剩空格占位——粘图互发必须声明。
+/// - ENCRYPTOPT / CAPFILEENCOPT / ENCEXTMSGOPT：受加密总开关控制（开 → 声明）。
 fn entry_caps(cfg: &Config) -> u32 {
+    let mut caps = opt::FILEATTACHOPT | opt::CLIPBOARDOPT;
     if cfg.encrypt {
         // ENCEXTMSGOPT：官方 Entry 恒带（0x0fe40003 实测），声明支持加密扩展消息
-        opt::ENCRYPTOPT | opt::CAPFILEENCOPT | opt::ENCEXTMSGOPT
-    } else {
-        0
+        caps |= opt::ENCRYPTOPT | opt::CAPFILEENCOPT | opt::ENCEXTMSGOPT;
     }
+    caps
 }
 
 /* ================= 广播目标计算 ================= */
@@ -888,6 +894,7 @@ async fn handle_sendmsg(
 
     let text_end = pkt.extra.iter().position(|&b| b == 0).unwrap_or(pkt.extra.len());
     let text = proto::decode_for_command(&pkt.extra[..text_end], pkt.command);
+
     let rec = json!({
         "dir": "in",
         "kind": kind,
@@ -1188,6 +1195,54 @@ fn offline_enqueue_record(
     Ok(rec)
 }
 
+/// 发送文本/附件消息（加密模式长文本自动分段）。
+///
+/// 密封报文有明文预算上限（3400B，见 crypto::MAX_PLAIN_FOR_SEAL）：单条
+/// 消息超出时不再整体失败，而是按字符边界切成多段、逐段独立发送（各自
+/// 包号/已读回执/气泡）。
+/// - 纯文本：每段 ≤ CHUNK_PLAIN_BUDGET；
+/// - 带附件：首段文本预算再扣掉文件条目段（attachment_text_budget），
+///   附件只挂在首段，其余段纯文本。
+/// 只在「加密开关开启 + 已缓存对方公钥」时切分——此时 `send_message`
+/// 必然走密封路径、存在预算约束；其余情况保持单条原样。
+/// 返回每条发送记录组成的数组（未分段时长度为 1），调用方（send_text /
+/// send_files / send_clipboard_image 命令）原样透传给前端逐条上屏。
+pub async fn send_message_multi(
+    ctx: &NetCtx,
+    key: &str,
+    text: &str,
+    paths: Vec<String>,
+) -> Result<Vec<Value>, String> {
+    let cfg = ctx.st.config();
+    // 与 send_message 的出站加密决策一致：encrypt 开启且已缓存对端公钥才会密封
+    let will_seal = cfg.encrypt && ctx.st.peer_pubkey(key).is_some();
+    let parts: Vec<String> = if !will_seal {
+        vec![text.to_string()]
+    } else if paths.is_empty() {
+        split_text_for_seal(text, &cfg.encoding).unwrap_or_else(|| vec![text.to_string()])
+    } else {
+        // 附件公告：条目段也占密封预算；先校验路径并据条目开销算出文本预算，
+        // 再按预算切分（首段带附件）。预算地板 64B：条目过大时退化为
+        // 「首段仅 64B 文本 + 附件」，避免无意义的一堆纯文本段。
+        let stats = stat_file_entries(&paths)?;
+        let budget = attachment_text_budget(&stats, &cfg.encoding).max(64);
+        let all = chunk_by_budget(text, &cfg.encoding, budget);
+        // 首段装得下全部文本就不拆（与纯文本路径一致：单条发出）
+        if all.len() <= 1 {
+            vec![text.to_string()]
+        } else {
+            all
+        }
+    };
+
+    let mut recs = Vec::with_capacity(parts.len());
+    for (i, part) in parts.iter().enumerate() {
+        let p = if i == 0 { paths.clone() } else { vec![] };
+        recs.push(send_message(ctx, key, part, p).await?);
+    }
+    Ok(recs)
+}
+
 /// 发送文本/文件消息。paths 为空则纯文本。
 pub async fn send_message(
     ctx: &NetCtx,
@@ -1375,6 +1430,80 @@ pub async fn mark_read_and_receipt(
 
 /* ================= 单元测试 ================= */
 
+// ---------------------------------------------------------------------------
+// 加密长文本自动分段
+// ---------------------------------------------------------------------------
+
+/// 单段文本按当前发送编码编码后的最大字节数。
+/// `seal_message` 的明文预算为 3400 字节（含尾部 \0，见 crypto::MAX_PLAIN_FOR_SEAL）；
+/// 这里留出离线延迟重投时官方尾注（约 45B）的余量，保证分段后的每一条在
+/// 离线补投追加尾注后仍能保持加密（不会降级明文）。
+pub const CHUNK_PLAIN_BUDGET: usize = 3300;
+
+/// 文本按当前发送编码超出密封预算时，返回按**字符边界**切好的分段
+/// （每段编码后 ≤ CHUNK_PLAIN_BUDGET 字节，拼接还原原文），否则返回 None。
+pub fn split_text_for_seal(text: &str, encoding: &str) -> Option<Vec<String>> {
+    // 逐字符编码：UTF-8 与 GBK 都是变长编码，必须按实际编码字节数累计，
+    // 且切分点只落在字符边界（绝不劈开多字节字符）。
+    let total: usize = text
+        .chars()
+        .map(|c| proto::encode_out(&c.to_string(), encoding).len())
+        .sum();
+    if total <= CHUNK_PLAIN_BUDGET {
+        return None;
+    }
+    Some(chunk_by_budget(text, encoding, CHUNK_PLAIN_BUDGET))
+}
+
+/// 离线延迟重投官方尾注的最大编码字节数
+/// （"\n----\n(IPMsg Delayed Send: MM/DD HH:MM )"，ASCII 各单位 1B，留余量）。
+pub const DELAYED_NOTE_BUDGET: usize = 48;
+
+/// 附件公告里条目段的编码字节数上界：Σ(条目序列化长度 + 1 条目间分隔符 \a)。
+/// 条目 id 按登记方 FILE_ID_SEQ 风格的 10 位十进制最坏情况估算（实际通常 9 位，
+/// 多算的 1 位就是余量）。
+pub fn entries_wire_bytes_upper(entries: &[proto::FileEntry], encoding: &str) -> usize {
+    let mut total = 0;
+    for e in entries {
+        let mut w = e.clone();
+        w.id = 1_000_000_000;
+        total += w.serialize(encoding).len() + 1;
+    }
+    total
+}
+
+/// 附件公告中**文本段**的最大字节数：密封明文预算（CHUNK_PLAIN_BUDGET）减去
+/// 条目段、正文/条目分隔符（正文后 \0 + 尾部 \a + 整体尾部 \0 共 3B）
+/// 与离线尾注余量；条目过大时饱和到 0。
+pub fn attachment_text_budget(entries: &[proto::FileEntry], encoding: &str) -> usize {
+    CHUNK_PLAIN_BUDGET
+        .saturating_sub(entries_wire_bytes_upper(entries, encoding) + 3 + DELAYED_NOTE_BUDGET)
+}
+
+/// 按任意字节预算把文本切成段（字符边界；每段编码后 ≤ budget，拼接还原原文）。
+/// 装得下时返回单元素；空文本返回空数组。
+pub fn chunk_by_budget(text: &str, encoding: &str, budget: usize) -> Vec<String> {
+    let encoded: Vec<Vec<u8>> = text
+        .chars()
+        .map(|c| proto::encode_out(&c.to_string(), encoding))
+        .collect();
+    let mut chunks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+    for (ch, bytes) in text.chars().zip(encoded) {
+        if cur_len > 0 && cur_len + bytes.len() > budget {
+            chunks.push(std::mem::take(&mut cur));
+            cur_len = 0;
+        }
+        cur.push(ch);
+        cur_len += bytes.len();
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1437,12 +1566,22 @@ mod tests {
     #[test]
     fn entry_caps_follow_switch() {
         let mut cfg = crate::state::Config::default();
+        // FILEATTACHOPT|CLIPBOARDOPT 恒声明（TCP 服务可达即声明，与官方 HostStatus
+        // 一致）；加密位随开关。CLIPBOARDOPT 是官方发送「粘贴图片」附件的先决条件
+        //（senddlg.cpp SendMsgSetUsers 对方无此位 → 撤销 FILEATTACHOPT）
         assert_eq!(
             super::entry_caps(&cfg),
-            opt::ENCRYPTOPT | opt::CAPFILEENCOPT | opt::ENCEXTMSGOPT
+            opt::ENCRYPTOPT
+                | opt::CAPFILEENCOPT
+                | opt::ENCEXTMSGOPT
+                | opt::FILEATTACHOPT
+                | opt::CLIPBOARDOPT
         );
         cfg.encrypt = false;
-        assert_eq!(super::entry_caps(&cfg), 0);
+        assert_eq!(
+            super::entry_caps(&cfg),
+            opt::FILEATTACHOPT | opt::CLIPBOARDOPT
+        );
     }
 
     /// 线上常量钉死：官方 ipmsg.h L119 ENCFILEOPT=0x800（与 MULTICASTOPT
@@ -1460,6 +1599,124 @@ mod tests {
             super::plain_payload(b"a\0f.zip:1:1:1:\x07"),
             b"a\0f.zip:1:1:1:\x07\0"
         );
+    }
+
+    #[test]
+    fn split_short_text_stays_single() {
+        assert_eq!(super::split_text_for_seal("你好 world", "utf8"), None);
+        assert_eq!(super::split_text_for_seal("", "gbk"), None);
+        // 恰好占满预算（单字节字符）也不拆
+        assert_eq!(
+            super::split_text_for_seal(&"a".repeat(super::CHUNK_PLAIN_BUDGET), "utf8"),
+            None
+        );
+    }
+
+    #[test]
+    fn split_long_text_preserves_content_and_budget() {
+        // 🌍=4B + 密=3B + a=1B + b=1B + c=1B → 10B/组 × 800 = 8000B > 3300
+        let s = "🌍密abc".repeat(800);
+        let chunks =
+            super::split_text_for_seal(&s, "utf8").expect("超预算应自动分段");
+        assert!(chunks.len() >= 2, "应拆成至少两段");
+        assert_eq!(chunks.concat(), s, "分段拼接必须完整还原原文");
+        for c in &chunks {
+            assert!(
+                proto::encode_out(c, "utf8").len() <= super::CHUNK_PLAIN_BUDGET,
+                "每段编码后不得超过预算"
+            );
+        }
+    }
+
+    #[test]
+    fn split_never_splits_multi_byte_char() {
+        // 中文字符 3B：3300 不是 3 的倍数，切分不能劈开汉字
+        let s = "密".repeat(1200); // 3600B > 3300
+        let chunks = super::split_text_for_seal(&s, "utf8").expect("应分段");
+        assert_eq!(chunks.concat(), s);
+        assert!(
+            chunks.iter().all(|c| c.chars().all(|ch| ch == '密')),
+            "禁止从多字节字符中间切开"
+        );
+    }
+
+    #[test]
+    fn split_gbk_uses_encoded_byte_budget() {
+        // GBK 下汉字 2B/字：4000B > 3300，须按 GBK 字节数切分
+        let s = "密".repeat(2000);
+        let chunks = super::split_text_for_seal(&s, "gbk").expect("应分段");
+        assert!(chunks.len() >= 2);
+        assert_eq!(chunks.concat(), s);
+        for c in &chunks {
+            assert!(proto::encode_out(c, "gbk").len() <= super::CHUNK_PLAIN_BUDGET);
+        }
+    }
+
+    #[test]
+    fn chunk_by_budget_respects_custom_budget() {
+        // 逐字符按预算切分、不劈字符
+        assert_eq!(
+            super::chunk_by_budget("abcd", "utf8", 3),
+            vec!["abc".to_string(), "d".to_string()]
+        );
+        // 中文 3B：预算 3 → 每段恰一字
+        assert_eq!(
+            super::chunk_by_budget("密密密", "utf8", 3),
+            vec!["密".to_string(), "密".to_string(), "密".to_string()]
+        );
+        // 装得下 → 单段
+        assert_eq!(super::chunk_by_budget("你好", "gbk", 4), vec!["你好".to_string()]);
+        // 空文本 → 空数组
+        assert!(super::chunk_by_budget("", "utf8", 3300).is_empty());
+    }
+
+    #[test]
+    fn entries_wire_bytes_upper_counts_serialize_plus_sep() {
+        let e = proto::FileEntry {
+            id: 0,
+            raw_id: String::new(),
+            name: "a.txt".into(),
+            size: 0,
+            mtime: 0,
+            attr: 0,
+        };
+        // id 按 10 位十进制占位：1000000000:a.txt:0:0:0: = 23B + 1 分隔符
+        assert_eq!(super::entries_wire_bytes_upper(&[e.clone()], "utf8"), 24);
+        assert_eq!(
+            super::entries_wire_bytes_upper(&[e.clone(), e], "utf8"),
+            48
+        );
+    }
+
+    #[test]
+    fn attachment_text_budget_accounts_overhead() {
+        // 无条目：3300 − 3 分隔符 − 48 尾注余量
+        assert_eq!(super::attachment_text_budget(&[], "utf8"), 3300 - 51);
+        let e = proto::FileEntry {
+            id: 0,
+            raw_id: String::new(),
+            name: "a.txt".into(),
+            size: 0,
+            mtime: 0,
+            attr: 0,
+        };
+        assert_eq!(
+            super::attachment_text_budget(&[e], "utf8"),
+            3300 - 51 - 24
+        );
+    }
+
+    #[test]
+    fn attachment_text_budget_saturates_when_entries_oversize() {
+        let e = proto::FileEntry {
+            id: 0,
+            raw_id: String::new(),
+            name: "x".repeat(100_000),
+            size: 0,
+            mtime: 0,
+            attr: 0,
+        };
+        assert_eq!(super::attachment_text_budget(&[e], "utf8"), 0);
     }
 
     #[test]

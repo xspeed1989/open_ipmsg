@@ -329,12 +329,14 @@ function isChatVisible(key) {
 }
 
 /** 发送文本到指定会话（转发/批量发送用）；对方离线时后端自动入队，返回的
- * 记录带 queued 标记，气泡上显示「离线留言·上线后自动投递」 */
+ * 记录带 queued 标记，气泡上显示「离线留言·上线后自动投递」。
+ * 后端返回记录**数组**：加密模式下长文本会自动拆成多条发送，每条一条记录、各自气泡。 */
 export async function sendTextTo(key, text) {
   if (!key || !text?.trim()) return null
-  const msg = await ipc.sendText(key, text)
-  await pushMsg(key, msg)
-  return msg
+  const msgs = await ipc.sendText(key, text)
+  const list = Array.isArray(msgs) ? msgs : [msgs] // 兼容旧后端单对象返回
+  for (const m of list) await pushMsg(key, m)
+  return list[list.length - 1] || null
 }
 
 /** 发送文本到当前会话 */
@@ -342,12 +344,15 @@ export async function sendText(text) {
   return sendTextTo(store.activeKey, text)
 }
 
-/** 发送文件/文件夹到指定会话；target 省略时发给当前会话（拖放到列表某个用户时指定目标） */
+/** 发送文件/文件夹到指定会话；target 省略时发给当前会话（拖放到列表某个用户时指定目标）。
+ * 后端返回记录**数组**：加密模式下附件公告的文本段超限会自动拆段——
+ * 首段带附件、其余段纯文本，每条一条记录、各自气泡。 */
 export async function sendFilesTo(key, paths, text = '') {
   if (!key || !paths?.length) return null
-  const msg = await ipc.sendFiles(key, paths, text)
-  await pushMsg(key, msg)
-  return msg
+  const msgs = await ipc.sendFiles(key, paths, text)
+  const list = Array.isArray(msgs) ? msgs : [msgs] // 兼容旧后端单对象返回
+  for (const m of list) await pushMsg(key, m)
+  return list[list.length - 1] || null
 }
 
 /** 发送文件/文件夹；target 省略时发给当前会话（拖放到列表某个用户时指定目标） */
@@ -355,12 +360,14 @@ export async function sendFiles(paths, target) {
   return sendFilesTo(target || store.activeKey, paths)
 }
 
-/** 发送剪贴板里的图片（对端按普通附件接收，本客户端内联显示） */
+/** 发送剪贴板里的图片（对端按普通附件接收，本客户端内联显示）。
+ * 同 sendFilesTo：附带长文本超限时后端自动拆段，按数组逐条上屏 */
 export async function sendClipboardImageTo(key, b64, mime, text = '') {
   if (!key || !b64) return null
-  const msg = await ipc.sendClipboardImage(key, text, b64, mime)
-  await pushMsg(key, msg)
-  return msg
+  const msgs = await ipc.sendClipboardImage(key, text, b64, mime)
+  const list = Array.isArray(msgs) ? msgs : [msgs]
+  for (const m of list) await pushMsg(key, m)
+  return list[list.length - 1] || null
 }
 
 /** 发送剪贴板里的图片到当前会话 */

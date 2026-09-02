@@ -265,7 +265,9 @@ async fn delete_contact(st: State<'_, SharedState>, key: String) -> Result<usize
 
 #[tauri::command]
 async fn send_text(ctx: State<'_, SharedCtx>, key: String, text: String) -> Result<Value, String> {
-    net::send_message(&ctx, &key, &text, vec![]).await
+    // 加密模式下长文本自动分段：返回记录**数组**（每段一条记录、独立气泡），
+    // 未分段时长度为 1。前端按数组逐条上屏。
+    Ok(json!(net::send_message_multi(&ctx, &key, &text, vec![]).await?))
 }
 
 #[tauri::command]
@@ -276,8 +278,12 @@ async fn send_files(
     text: Option<String>,
 ) -> Result<Value, String> {
     // 正文与附件同发（IPMsg 一条消息可同时带正文和附件）；
-    // 省略 text 时保持旧语义（纯附件），兼容旧前端
-    net::send_message(&ctx, &key, text.as_deref().unwrap_or(""), paths).await
+    // 省略 text 时保持旧语义（纯附件），兼容旧前端。
+    // 同 send_text：加密模式下附件公告的文本段超预算也会自动拆段——
+    // 首段带附件，其余段纯文本，统一返回记录数组。
+    Ok(json!(
+        net::send_message_multi(&ctx, &key, text.as_deref().unwrap_or(""), paths).await?
+    ))
 }
 
 #[tauri::command]
@@ -327,7 +333,12 @@ async fn send_clipboard_image(
     mime: String,
 ) -> Result<Value, String> {
     let path = net::stage_clipboard_image(&st.data_dir, &b64, &mime)?;
-    net::send_message(&ctx, &key, &text, vec![path.to_string_lossy().into_owned()]).await
+    // 与 send_files 一致：附件公告的文本段超预算自动拆段（首段带图片），
+    // 返回记录数组
+    Ok(json!(
+        net::send_message_multi(&ctx, &key, &text, vec![path.to_string_lossy().into_owned()])
+            .await?
+    ))
 }
 
 /// 读取本地图片并转为 base64 数据（供聊天内联预览）。

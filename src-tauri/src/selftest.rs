@@ -127,6 +127,7 @@ async fn async_run() -> bool {
     let shared = Arc::new(Mutex::new(PeerShared::default()));
     let img_pkt_no = proto::next_packet_no();
     let empty_pkt_no = proto::next_packet_no();
+    let clip_pkt_no = proto::next_packet_no();
     let peer_tasks = spawn_fake_peer(
         port_peer,
         port_app,
@@ -135,6 +136,7 @@ async fn async_run() -> bool {
         offer_pkt_no,
         img_pkt_no,
         empty_pkt_no,
+        clip_pkt_no,
     );
     println!("[..] 假对端已就绪 (端口 {port_peer})");
     // 假对端只绑定在 127.0.0.1，广播到不了它 —— 按真实场景做单播发现
@@ -437,6 +439,45 @@ async fn async_run() -> bool {
         log.check(
             "落盘图片保留 .png 扩展名（内联预览的前提）",
             saved.to_lowercase().ends_with(".png"),
+        );
+    }
+
+    /* ---- 4c2. 官方「粘贴图片」（FILEATTACHOPT+attr=0x20+ipmsgclip_s_*.png）自动接收 ---- */
+    let clip_seen = wait_for(8000, || {
+        st.read_history(&peer_key, 80).iter().any(|r| {
+            r["pkt"].as_u64() == Some(clip_pkt_no as u64)
+                && r["files"].as_array().is_some_and(|a| a.len() == 1)
+                && r["files"][0]["state"] == "done"
+        })
+    })
+    .await;
+    log.check(
+        "官方粘贴图片：attr=0x20(IPMSG_FILE_CLIPBOARD) 附件自动接收为已完成",
+        clip_seen,
+    );
+    if clip_seen {
+        let r = st
+            .read_history(&peer_key, 80)
+            .into_iter()
+            .find(|r| r["pkt"].as_u64() == Some(clip_pkt_no as u64))
+            .unwrap_or_default();
+        let p = r["files"][0]["path"].as_str().unwrap_or("");
+        let bytes = std::fs::read(p).unwrap_or_default();
+        log.check(
+            "官方粘贴图片字节与公告一致",
+            bytes.starts_with(b"\xFF\xD8\xFF\xE0clip-jpeg-content") && bytes.len() == 85,
+        );
+        log.check(
+            "官方粘贴图片保留 ipmsgclip 文件名与 .png 扩展名（内联预览的前提）",
+            p.to_lowercase().ends_with(".png")
+                && r["files"][0]["name"]
+                    .as_str()
+                    .map(|n| n.starts_with("ipmsgclip_s_"))
+                    .unwrap_or(false),
+        );
+        log.check(
+            "官方粘贴图片消息正文与附件同屏",
+            r["text"] == "粘贴的图片" && r["kind"] == "file",
         );
     }
 
@@ -794,6 +835,97 @@ async fn crypto_roundtrip() -> bool {
     })
     .await;
     log.check("B 解密落库：文本一致且 enc=true、sig_ok=true", got_in_b);
+
+    /* ---- 2b. 长文本自动分段：整段超出密封明文预算（3400B）时自动拆条
+           发送，每条独立包号且全部加密；B 收到后能按序拼接还原原文 ---- */
+    let text_long = format!("长文本分段测试：{}结尾", "密".repeat(1800)); // ≈5400B+
+    match net::send_message_multi(&ctx_a, key_b, &text_long, vec![]).await {
+        Ok(recs) => {
+            // 在线直发记录无 queued 字段；用 as_bool 判“非离线入队”
+            let all_enc = !recs.is_empty()
+                && recs
+                    .iter()
+                    .all(|r| r["dir"] == "out" && r["enc"] == true
+                        && r.get("queued").and_then(|v| v.as_bool()).unwrap_or(false) == false);
+            log.check(
+                "A 长文本自动分段：返回 ≥2 条 out 记录且全部密文发出",
+                recs.len() >= 2 && all_enc,
+            );
+        }
+        Err(e) => {
+            eprintln!("      A 长文本发送错误: {e}");
+            log.check("A 长文本自动分段：返回 ≥2 条 out 记录且全部密文发出", false);
+        }
+    }
+    let got_long_b = wait_for(4000, || {
+        let incoming: Vec<String> = st_b
+            .read_history(key, 100)
+            .iter()
+            .filter(|r| r["dir"] == "in" && r["enc"] == true)
+            .filter_map(|r| r["text"].as_str().map(String::from))
+            .collect();
+        incoming.join("").contains(&text_long)
+    })
+    .await;
+    log.check(
+        "B 收到全部分段并还原长文本（每段独立解密 enc=true）",
+        got_long_b,
+    );
+
+    /* ---- 2c. 附件 + 长文本：首段带附件、其余纯文本分段，全部密文 ---- */
+    let attach_path = dir_a.join("long_attach.bin");
+    std::fs::write(&attach_path, vec![0x5Au8; 12345]).unwrap();
+    let text_attach = format!("附件长文本：{}结尾", "密".repeat(1800));
+    let recs_attach = match net::send_message_multi(
+        &ctx_a,
+        key_b,
+        &text_attach,
+        vec![attach_path.to_string_lossy().into_owned()],
+    )
+    .await
+    {
+        Ok(recs) => recs,
+        Err(e) => {
+            eprintln!("      A 附件+长文本发送错误: {e}");
+            vec![]
+        }
+    };
+    let ok_attach = recs_attach.len() >= 2
+        && recs_attach[0]["files"].as_array().is_some_and(|f| !f.is_empty())
+        && recs_attach.iter().all(|r| {
+            r["dir"] == "out"
+                && r["enc"] == true
+                && r.get("queued").and_then(|v| v.as_bool()).unwrap_or(false) == false
+        });
+    log.check(
+        "A 附件+长文本：首段带附件、共 ≥2 条且全部密文发出",
+        ok_attach,
+    );
+    let attach_pkt = recs_attach
+        .first()
+        .and_then(|r| r["pkt"].as_u64())
+        .unwrap_or(0) as u32;
+    let got_attach_b = wait_for(4000, || {
+        let hist = st_b.read_history(key, 100);
+        let has_announce = hist.iter().any(|r| {
+            r["dir"] == "in"
+                && r["pkt"].as_u64() == Some(attach_pkt as u64)
+                && r["enc"] == true
+                && r["files"].as_array().is_some_and(|f| !f.is_empty())
+        });
+        let texts: String = hist
+            .iter()
+            .filter(|r| r["dir"] == "in" && r["enc"] == true)
+            .filter_map(|r| r["text"].as_str().map(String::from))
+            .collect::<Vec<_>>()
+            .join("");
+        has_announce && texts.contains(&text_attach)
+    })
+    .await;
+    log.check(
+        "B 解密附件公告（带文件条目）并收到全部分段还原长文本",
+        got_attach_b,
+    );
 
     /* ---- 3. 反向 B→A 同样断言 ---- */
     let text_ba = "密文互发：B 回 A";
@@ -1215,6 +1347,7 @@ fn spawn_fake_peer(
     offer_pkt_no: u32,
     img_pkt_no: u32,
     empty_pkt_no: u32,
+    clip_pkt_no: u32,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut tasks = Vec::new();
 
@@ -1312,6 +1445,44 @@ fn spawn_fake_peer(
             extra.extend_from_slice(entry.serialize("utf8").as_bytes());
             let pkt = proto::Packet {
                 pkt_no: img_pkt_no,
+                user: "假对端".into(),
+                host: "fake-host".into(),
+                command: cmd::SENDMSG | opt::FILEATTACHOPT,
+                extra,
+            };
+            let _ = ps.send_to(&pkt.encode("假对端", "fake-host"), target).await;
+        }
+    }));
+
+    /* -- 官方「粘贴图片」：FILEATTACHOPT + attr=0x20(IPMSG_FILE_CLIPBOARD) + ipmsgclip_s_*.png
+            官方 5.8.6 senddlg.cpp：粘贴图片按普通附件公告（clipCnt 项），文件名
+            ipmsgclip_s_<id>_<pos>.png、attr=IPMSG_FILE_CLIPBOARD(0x20)、公告尾附
+            IPMSG_FILE_CLIPBOARDPOS=pos 扩展段。前提是对方 Entry 声明 CLIPBOARDOPT。 -- */
+    tasks.push(tokio::spawn({
+        let ps = ps.clone();
+        let clip_bytes = {
+            let mut v = b"\xFF\xD8\xFF\xE0clip-jpeg-content".to_vec();
+            v.extend_from_slice(&(0..64u8).collect::<Vec<_>>());
+            v
+        };
+        async move {
+            tokio::time::sleep(Duration::from_millis(570)).await;
+            let target: SocketAddr = format!("127.0.0.1:{port_app}").parse().unwrap();
+            let entry = proto::FileEntry {
+                id: 14,
+                raw_id: String::new(),
+                name: "ipmsgclip_s_14_0.png".into(),
+                size: clip_bytes.len() as u64,
+                mtime: 123,
+                // 官方 IPMSG_FILE_CLIPBOARD=0x20；公告格式 id:name:size:mtime:attr:8=pos:
+                attr: 0x20,
+            };
+            let mut extra = "粘贴的图片".as_bytes().to_vec();
+            extra.push(0);
+            extra.extend_from_slice(entry.serialize("utf8").as_bytes());
+            extra.extend_from_slice(b":8=0"); // IPMSG_FILE_CLIPBOARDPOS 扩展段
+            let pkt = proto::Packet {
+                pkt_no: clip_pkt_no,
                 user: "假对端".into(),
                 host: "fake-host".into(),
                 command: cmd::SENDMSG | opt::FILEATTACHOPT,
@@ -1516,15 +1687,24 @@ fn spawn_fake_peer(
                 let pkt_val = fields
                     .next()
                     .and_then(|f| u32::from_str_radix(f.trim(), 16).ok())
-                    .filter(|p| *p == offer_pkt_no || *p == img_pkt_no || *p == empty_pkt_no);
+                    .filter(|p| {
+                        *p == offer_pkt_no || *p == img_pkt_no || *p == empty_pkt_no || *p == clip_pkt_no
+                    });
                 if pkt_val.is_none() {
                     let _ = stream.shutdown().await;
                     return;
                 }
+                let clip_content: Vec<u8> = {
+                    let mut v = b"\xFF\xD8\xFF\xE0clip-jpeg-content".to_vec();
+                    v.extend_from_slice(&(0..64u8).collect::<Vec<_>>());
+                    v
+                };
                 let body = if req.command & 0xFF == cmd::GETDIRFILES {
                     fake_dir_stream()
                 } else if pkt_val == Some(empty_pkt_no) {
                     Vec::new() // 空文件：0 字节内容
+                } else if pkt_val == Some(clip_pkt_no) {
+                    clip_content
                 } else {
                     content
                 };

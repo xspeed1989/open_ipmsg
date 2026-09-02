@@ -14,6 +14,7 @@
 | 用户发现 | BR_ENTRY 广播上线、ANSENTRY 应答、BR_EXIT 下线、45s 周期刷新、30min 超时清理 |
 | 即时消息 | SENDMSG 文本收发、陌生来源自动注册、UDP 去重 |
 | 文件传输 | 多文件附件（FILEATTACHOPT）、TCP GETFILEDATA 流式传输、断点偏移、进度事件、断点重试 |
+| 剪贴板图片 | 兼容官方客户端「粘贴图片」（FILEATTACHOPT + IPMSG_FILE_CLIPBOARD 附件 ipmsgclip_s_*.png），自动接收后聊天内直接预览 |
 | 已读回执 | 发送自动携带 READCHECKOPT；对端查看后回 READMSG，气泡显示「已读/未读」 |
 | 在线状态 | 联系人列表头像绿点·灰点，聊天窗口顶部在线/离线标签 |
 | 系统托盘 | 关闭窗口最小化到托盘（微信式），左键唤起主窗口，菜单：显示/刷新/退出 |
@@ -179,6 +180,10 @@ BR_EXIT 下线广播，全部通过后退出码为 0。
 
 ## 兼容性说明
 - 与官方 IPMsg v2/v3 及主流开源实现（golang-ipmsg、iptux 等）在同一网段可直接互discover、互发消息与文件
+- 官方客户端「粘贴图片」（剪贴板里复制截图后 Ctrl+V 发送）把图片作为
+  IPMSG_FILE_CLIPBOARD 附件（文件名 ipmsgclip_s_*.png、attr=0x20）随 FILEATTACHOPT 公告发送，
+  且必须在对端 Entry 声明 IPMSG_CLIPBOARDOPT 能力位后才会发出（senddlg.cpp 的撤回逻辑）——
+  本客户端已声明该能力位并自动接收，聊天内直接预览
 - 老版中文客户端默认 GBK 编码：接收方向自动识别无需设置；若对方显示乱码，将「设置 → 发送编码」切换为 GBK
 - 协议加密已实现且与官方 v3/v4 规格一致：双方均支持时消息与文件传输自动加密，
   任一方不支持（或关闭）则该对端自动回退明文；设置页可查看本机密钥指纹供双方核对

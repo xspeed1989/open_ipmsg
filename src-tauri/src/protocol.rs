@@ -517,6 +517,25 @@ mod tests {
     }
 
     #[test]
+    fn file_entries_official_clipboard_image() {
+        // 官方 5.8.6「粘贴图片」公告（share.cpp EncodeMsg 实测格式）：
+        //   id:ipmsgclip_s_<id>_<pos>.png:size:mtime:attr(0x20):8=<pos>:\a
+        // attr=IPMSG_FILE_CLIPBOARD(0x20)，扩展段 IPMSG_FILE_CLIPBOARDPOS=8
+        // 必须正确解析出名字/扩展名与属性，接收侧才能按图片自动接收内联预览
+        let raw = b"\x000e:ipmsgclip_s_14_0.png:55:7b:20:8=0:\x07".to_vec();
+        let fs = parse_file_entries(&raw);
+        assert_eq!(fs.len(), 1);
+        assert_eq!(fs[0].id, 0x0e);
+        assert_eq!(fs[0].name, "ipmsgclip_s_14_0.png");
+        assert_eq!(fs[0].size, 0x55);
+        assert_eq!(fs[0].attr & 0xFF, 0x20, "IPMSG_FILE_CLIPBOARD");
+        assert!(
+            fs[0].name.to_lowercase().ends_with(".png"),
+            "粘贴图片必须保留 .png 扩展名（内联预览前提）"
+        );
+    }
+
+    #[test]
     fn entry_extra_roundtrip() {
         let extra = build_entry_extra("小明", "研发部", "utf8");
         let (nick, group) = parse_entry_extra(&extra, true);
