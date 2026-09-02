@@ -13,6 +13,7 @@ macro_rules! oim_log {
 }
 
 mod crypto;
+mod ipdict;
 mod ipmsg_import;
 mod net;
 mod protocol;
@@ -125,6 +126,30 @@ struct ConfigPatch {
     /// 加密开关；省略时保留现值（旧前端兼容）
     #[serde(default)]
     encrypt: Option<bool>,
+    /// 不在模式开关/文本；省略保留现值
+    #[serde(default)]
+    absence_enabled: Option<bool>,
+    #[serde(default)]
+    absence_text: Option<String>,
+    /// 密码功能与本地口令；省略保留现值
+    #[serde(default)]
+    password_use: Option<bool>,
+    #[serde(default)]
+    password: Option<String>,
+    /// NAT 代理 / 成员主地址（"ip:port" 或裸 ip）；空串=关闭
+    #[serde(default)]
+    agent_addr: Option<String>,
+    #[serde(default)]
+    master_addr: Option<String>,
+    /// 是否允许对方向我们索取主机列表
+    #[serde(default)]
+    allow_send_list: Option<bool>,
+    /// IPDict 能力位
+    #[serde(default)]
+    ipdict_enabled: Option<bool>,
+    /// 成员主模式：off / user / master
+    #[serde(default)]
+    dir_mode: Option<String>,
 }
 
 /// 配置 + 本机信息（前端设置页展示）
@@ -192,12 +217,27 @@ async fn save_config(
         },
         // 加密开关：补丁未携带时保留现值，避免旧前端保存配置时误关加密
         encrypt: patch.encrypt.unwrap_or(prev.encrypt),
+        // 新协议能力字段：补丁未携带保留现值（旧前端兼容）
+        absence_enabled: patch.absence_enabled.unwrap_or(prev.absence_enabled),
+        absence_text: patch.absence_text.unwrap_or(prev.absence_text),
+        password_use: patch.password_use.unwrap_or(prev.password_use),
+        password: patch.password.unwrap_or(prev.password),
+        agent_addr: patch.agent_addr.unwrap_or(prev.agent_addr),
+        master_addr: patch.master_addr.unwrap_or(prev.master_addr),
+        allow_send_list: patch.allow_send_list.unwrap_or(prev.allow_send_list),
+        ipdict_enabled: patch.ipdict_enabled.unwrap_or(prev.ipdict_enabled),
+        dir_mode: patch.dir_mode.unwrap_or(prev.dir_mode),
     };
+    let absence_changed = cfg.absence_enabled != prev.absence_enabled;
     st.set_config(cfg.clone());
     st.persist_config().map_err(|e| e.to_string())?;
     let _ = std::fs::create_dir_all(&cfg.download_dir);
     // 身份变化，立即重新广播
     net::announce(&ctx).await;
+    // 不在模式开关变化：广播 BR_ABSENCE（官方 MENU_ABSENCE 语义）
+    if absence_changed {
+        net::announce_absence(&ctx).await;
+    }
     Ok(())
 }
 
@@ -225,6 +265,80 @@ async fn get_users(st: State<'_, SharedState>) -> Result<Vec<PeerInfo>, String> 
 async fn refresh_users(ctx: State<'_, SharedCtx>) -> Result<(), String> {
     net::announce(&ctx).await;
     Ok(())
+}
+
+/// 不在模式开关（官方 MENU_ABSENCE 语义：广播 BR_ABSENCE + ABSENCEOPT）
+#[tauri::command]
+async fn set_absence(
+    ctx: State<'_, SharedCtx>,
+    st: State<'_, SharedState>,
+    on: bool,
+    text: Option<String>,
+) -> Result<(), String> {
+    let old = st.set_absence(on, text.as_deref().unwrap_or(""));
+    net::announce_absence(&ctx).await;
+    if old != on {
+        // 状态变化也通知前端（列表离开标记）
+        st.emit("users-updated", json!({}));
+    }
+    Ok(())
+}
+
+/// 撤回我方发出的某条文本消息（DELMSG 封书破弃语义）
+#[tauri::command]
+async fn recall_message(
+    ctx: State<'_, SharedCtx>,
+    key: String,
+    pkt: u32,
+) -> Result<(), String> {
+    net::recall_message(&ctx, &key, pkt).await
+}
+
+/// 广播群发（BROADCASTOPT 同报）
+#[tauri::command]
+async fn broadcast_message(ctx: State<'_, SharedCtx>, text: String) -> Result<(), String> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("不能发送空消息".into());
+    }
+    net::broadcast_message(&ctx, &text).await
+}
+
+/// 多选群发（MULTICASTOPT）：同一条文本发往多个会话
+#[tauri::command]
+async fn send_multicast(
+    ctx: State<'_, SharedCtx>,
+    keys: Vec<String>,
+    text: String,
+) -> Result<Value, String> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("不能发送空消息".into());
+    }
+    Ok(json!(net::multicast_message(&ctx, &keys, &text).await?))
+}
+
+/// 封书/密码锁开封（校验密码后补发已读回执）
+#[tauri::command]
+async fn unlock_message(
+    ctx: State<'_, SharedCtx>,
+    key: String,
+    pkt: u32,
+    password: Option<String>,
+) -> Result<(), String> {
+    net::unlock_message(&ctx, &key, pkt, password).await
+}
+
+/// 主动索取对端不在通知文（GETABSENCEINFO）
+#[tauri::command]
+async fn get_absence_info(ctx: State<'_, SharedCtx>, key: String) -> Result<(), String> {
+    net::request_absence_info(&ctx, &key).await
+}
+
+/// 主动发起主机列表交换（BR_ISGETLIST → GETLIST → ANSLIST）
+#[tauri::command]
+async fn request_hostlist(ctx: State<'_, SharedCtx>) -> Result<(), String> {
+    net::request_hostlist(&ctx).await
 }
 
 #[tauri::command]
@@ -264,10 +378,32 @@ async fn delete_contact(st: State<'_, SharedState>, key: String) -> Result<usize
 }
 
 #[tauri::command]
-async fn send_text(ctx: State<'_, SharedCtx>, key: String, text: String) -> Result<Value, String> {
+async fn send_text(
+    ctx: State<'_, SharedCtx>,
+    key: String,
+    text: String,
+    // 封书（SECRETEXOPT）
+    secret: Option<bool>,
+    // 密码锁（PASSWORDOPT）
+    password: Option<bool>,
+) -> Result<Value, String> {
     // 加密模式下长文本自动分段：返回记录**数组**（每段一条记录、独立气泡），
     // 未分段时长度为 1。前端按数组逐条上屏。
-    Ok(json!(net::send_message_multi(&ctx, &key, &text, vec![]).await?))
+    Ok(json!(
+        net::send_message_multi_opts(
+            &ctx,
+            &key,
+            &text,
+            vec![],
+            net::MsgSendOpts {
+                secret: secret.unwrap_or(false),
+                password: password.unwrap_or(false),
+                multicast: false,
+                clip_pos: None,
+            },
+        )
+        .await?
+    ))
 }
 
 #[tauri::command]
@@ -276,13 +412,27 @@ async fn send_files(
     key: String,
     paths: Vec<String>,
     text: Option<String>,
+    secret: Option<bool>,
+    password: Option<bool>,
 ) -> Result<Value, String> {
     // 正文与附件同发（IPMsg 一条消息可同时带正文和附件）；
     // 省略 text 时保持旧语义（纯附件），兼容旧前端。
     // 同 send_text：加密模式下附件公告的文本段超预算也会自动拆段——
     // 首段带附件，其余段纯文本，统一返回记录数组。
     Ok(json!(
-        net::send_message_multi(&ctx, &key, text.as_deref().unwrap_or(""), paths).await?
+        net::send_message_multi_opts(
+            &ctx,
+            &key,
+            text.as_deref().unwrap_or(""),
+            paths,
+            net::MsgSendOpts {
+                secret: secret.unwrap_or(false),
+                password: password.unwrap_or(false),
+                multicast: false,
+                clip_pos: None,
+            },
+        )
+        .await?
     ))
 }
 
@@ -335,9 +485,17 @@ async fn send_clipboard_image(
     let path = net::stage_clipboard_image(&st.data_dir, &b64, &mime)?;
     // 与 send_files 一致：附件公告的文本段超预算自动拆段（首段带图片），
     // 返回记录数组
+    // 官方「粘贴图片」语义：公告首条附件带 FILE_CLIPBOARD+CLIPBOARDPOS，
+    // 对端（官方 v4/v5 客户端）直接在消息内内嵌显示图片
     Ok(json!(
-        net::send_message_multi(&ctx, &key, &text, vec![path.to_string_lossy().into_owned()])
-            .await?
+        net::send_message_multi_opts(
+            &ctx,
+            &key,
+            &text,
+            vec![path.to_string_lossy().into_owned()],
+            net::MsgSendOpts { clip_pos: Some(0), ..Default::default() },
+        )
+        .await?
     ))
 }
 
@@ -1301,6 +1459,7 @@ pub fn run() {
                 theme: "system".into(),
                 lang: String::new(),
                 encrypt: true,
+                ..Config::default()
             });
             let _ctx = net::start_network(st.clone(), protocol::DEFAULT_PORT)
                 .await
@@ -1554,7 +1713,14 @@ pub fn run() {
             mark_read,
             mark_out_read,
             list_sessions,
-            import_ipmsg_log
+            import_ipmsg_log,
+            set_absence,
+            recall_message,
+            broadcast_message,
+            send_multicast,
+            unlock_message,
+            get_absence_info,
+            request_hostlist
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

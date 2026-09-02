@@ -22,6 +22,28 @@ export const listSessions = () => invoke('list_sessions')
 /** 重新广播上线（BR_ENTRY） */
 export const refreshUsers = () => invoke('refresh_users')
 
+/** 不在模式开关（BR_ABSENCE + ABSENCEOPT；text 为空保留现值） */
+export const setAbsence = (on, text) => invoke('set_absence', { on, text })
+
+/** 撤回我方发出的某条文本消息（DELMSG） */
+export const recallMessage = (key, pkt) => invoke('recall_message', { key, pkt })
+
+/** 广播群发（BROADCASTOPT 同报） */
+export const broadcastMessage = (text) => invoke('broadcast_message', { text })
+
+/** 多选群发（MULTICASTOPT）：同一条文本发往多个会话 */
+export const sendMulticast = (keys, text) => invoke('send_multicast', { keys, text })
+
+/** 封书/密码锁开封（密码锁场景校验 password） */
+export const unlockMessage = (key, pkt, password = null) =>
+  invoke('unlock_message', { key, pkt, password })
+
+/** 主动索取对端不在通知文（GETABSENCEINFO） */
+export const getAbsenceInfo = (key) => invoke('get_absence_info', { key })
+
+/** 主动发起主机列表交换（BR_ISGETLIST） */
+export const requestHostlist = () => invoke('request_hostlist')
+
 /** 读取某会话历史记录 */
 export const getHistory = (key, limit = 300) => invoke('get_history', { key, limit })
 
@@ -36,10 +58,12 @@ export const deleteContact = (key) => invoke('delete_contact', { key })
 export const searchHistory = (query, key, limit) =>
   invoke('search_history', { query, key, limit })
 
-export const sendText = (key, text) => invoke('send_text', { key, text })
+export const sendText = (key, text, secret = false, password = false) =>
+  invoke('send_text', { key, text, secret, password })
 
 /** 发送附件（多个文件路径）+ 可选正文，一条消息同时携带；返回消息记录 */
-export const sendFiles = (key, paths, text = '') => invoke('send_files', { key, paths, text })
+export const sendFiles = (key, paths, text = '', secret = false, password = false) =>
+  invoke('send_files', { key, paths, text, secret, password })
 
 /** 按未读总数切换托盘图标（有未读时带红点角标） */
 export const setUnread = (total) => invoke('set_unread', { total })
@@ -97,4 +121,10 @@ export const EVT = {
   /** 点击系统通知（Linux 原生）：弹出主窗口并切到对应会话 */
   openChat: 'open-chat',
   msgRead: 'msg-read',
+  /** 对端撤回消息（DELMSG） */
+  msgRecalled: 'msg-recalled',
+  /** 封书/密码锁开封 */
+  msgUnlocked: 'msg-unlocked',
+  /** 对端不在通知文（GETABSENCEINFO 应答） */
+  absenceInfo: 'absence-info',
 }

@@ -30,6 +30,43 @@ pub struct Config {
     /// 端到端加密总开关：默认开启；关闭时消息按官方明文协议发送
     #[serde(default = "default_encrypt")]
     pub encrypt: bool,
+    /// 不在模式：开启后 Entry 系报文带 ABSENCEOPT，收到消息自动回不在通知文
+    #[serde(default)]
+    pub absence_enabled: bool,
+    /// 不在通知文（自动应答与 GETABSENCEINFO 的返回内容）
+    #[serde(default = "default_absence_text")]
+    pub absence_text: String,
+    /// 密码功能总开关（官方 PasswordUse）：开启后发送可选「密码」档，
+    /// 收到的密码消息必须先输入本机设置的密码才能查看
+    #[serde(default)]
+    pub password_use: bool,
+    /// 本机密码（官方 PasswordStr 语义：双方约定同一口令）
+    #[serde(default)]
+    pub password: String,
+    /// NAT 中继代理地址（AGENT 协议；空 = 不用代理）。格式 "ip:port" 或裸 IP（默认端口）
+    #[serde(default)]
+    pub agent_addr: String,
+    /// 成员主（DIR_MASTER）地址；空 = 不启用目录服务。格式同 agent_addr
+    #[serde(default)]
+    pub master_addr: String,
+    /// 是否允许对方向我们索取主机列表（官方 AllowSendList）
+    #[serde(default = "default_true")]
+    pub allow_send_list: bool,
+    /// 是否声明 IPDict 能力位（v5 并存格式；默认开，协议层无害）
+    #[serde(default = "default_true")]
+    pub ipdict_enabled: bool,
+    /// 成员主目录服务模式：off（关闭）/ user（作为成员，POLL master_addr）/
+    /// master（作为成员主，汇总并分发全网列表）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dir_mode: String,
+}
+
+fn default_absence_text() -> String {
+    "我现在不在，有事留言。".into()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_theme() -> String {
@@ -56,6 +93,15 @@ impl Default for Config {
             theme: default_theme(),
             lang: String::new(),
             encrypt: default_encrypt(),
+            absence_enabled: false,
+            absence_text: default_absence_text(),
+            password_use: false,
+            password: String::new(),
+            agent_addr: String::new(),
+            master_addr: String::new(),
+            allow_send_list: default_true(),
+            ipdict_enabled: default_true(),
+            dir_mode: String::new(),
         }
     }
 }
@@ -111,6 +157,15 @@ pub struct PeerInfo {
     pub host: String,
     pub user: String,
     pub last_seen: u64,
+    /// 不在模式（Entry 系报文带 ABSENCEOPT）
+    #[serde(default)]
+    pub absence: bool,
+    /// 对方不在通知文（GETABSENCEINFO 取到后缓存）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absence_text: Option<String>,
+    /// 对方客户端版本串（Entry ulist 扩展 VS: 行）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vs: Option<String>,
 }
 
 /// 我们发出、等待对端来取的文件
@@ -121,6 +176,38 @@ pub struct OfferedFile {
     pub is_dir: bool,
     /// 登记时刻，用于过期清理
     pub ts: u64,
+    /// 公告是否按 UTF-8 发出：对端取文件请求应带 UTF8OPT（官方 §3-9），
+    /// 目录流内的文件名编码据此决定
+    pub utf8: bool,
+}
+
+/// 在线消息的送达重发队列项（官方 §4-12「確認・リトライ」：
+/// 带 SENDCHECKOPT 的消息在确认超时后重发同一包号，累计若干次后放弃）。
+#[derive(Clone, Debug)]
+pub struct RetryOut {
+    pub key: String,
+    pub pkt: u32,
+    pub text: String,
+    pub paths: Vec<String>,
+    /// 首次登记的文件条目（ID 必须原样复用，重投公告与首投一致）
+    pub entries: Vec<crate::protocol::FileEntry>,
+    pub ts: u64,
+    pub attempts: u32,
+}
+
+/// 成员主（DIR_MASTER）一侧的成员登记：POLL 成员与其代理角色
+#[derive(Clone, Debug)]
+pub struct DirMember {
+    pub key: String,
+    /// 成员最近一次 POLL 的源端口（DIR_PACKET 分发目标）
+    pub port: u16,
+    pub last_poll: u64,
+    /// 被任命为代理广播的时长（秒，官方 AGS 键）
+    pub agent_secs: u64,
+    /// 该成员报告的本段网络（ADDR/MASK，如 "192.168.1.0/24"）
+    pub seg: String,
+    /// 是否已被任命为代理广播（DIR_BROADCAST 已发出）
+    pub is_agent: bool,
 }
 
 /// 文件槽保留时长：对端可能延迟很久才来取，但也不能无限累积
@@ -206,6 +293,26 @@ pub struct AppState {
     /// 删除后从列表消失（记录一并删除），对方再发消息时自动恢复。
     /// 持久化到 hidden_contacts.json，重启不丢。
     hidden_contacts: Mutex<HashSet<String>>,
+    /// 在线消息送达重发队列：(会话 key, 包号) → 重发项（RECVMSG 确认后移除）
+    retry_out: Mutex<HashMap<(String, u32), RetryOut>>,
+    /// 成员主登记（DIR_MASTER 服务端一侧）：成员 IP → 登记
+    dir_members: Mutex<HashMap<String, DirMember>>,
+    /// 会话 key → 已缓存的对端不在通知文（GETABSENCEINFO 结果；BR_ABSENCE
+    /// 重新通告清掉，避免展示过期内容）
+    peer_absence: Mutex<HashMap<String, String>>,
+    /// 主机列表获取窗口（unix 秒截止）：窗口内收到 OKGETLIST 才发起 GETLIST
+    /// （官方 entryStartTime 窗口同款节流；启动与手动刷新时重开窗口）
+    hostlist_window: Mutex<Option<u64>>,
+    /// 成员主（DIR_MASTER）维护的全网主机列表（IPDict 主机字典条目）
+    master_hosts: Mutex<Vec<crate::ipdict::Dict>>,
+    /// 成员侧：作为代理（agent）的有效期截止（master IP → unix 秒；
+    /// DIR_POLLAGENT 的 AGS 秒数；期间本段 entry 事件转发 master）
+    agent_until: Mutex<HashMap<String, u64>>,
+    /// 中继代理（AGENT 协议）两侧登记：
+    /// - 客户端侧：会话 key（NAT 对端 ip）→ 我方向其发应答所用代理地址
+    relay_agent: Mutex<HashMap<String, std::net::SocketAddr>>,
+    /// - 代理侧：来源 ip → 真实对端地址（转发 AGENT_PACKET 的目标）
+    relay_peers: Mutex<HashMap<String, std::net::SocketAddr>>,
     pub data_dir: PathBuf,
     pub logs_dir: PathBuf,
 }
@@ -258,6 +365,14 @@ impl AppState {
             rehandshake_at: Mutex::new(HashMap::new()),
             own_key: OnceLock::new(),
             hidden_contacts: Mutex::new(load_hidden_contacts(&data_dir)),
+            retry_out: Mutex::new(HashMap::new()),
+            dir_members: Mutex::new(HashMap::new()),
+            peer_absence: Mutex::new(HashMap::new()),
+            hostlist_window: Mutex::new(None),
+            master_hosts: Mutex::new(Vec::new()),
+            agent_until: Mutex::new(HashMap::new()),
+            relay_agent: Mutex::new(HashMap::new()),
+            relay_peers: Mutex::new(HashMap::new()),
             data_dir,
             logs_dir,
         }
@@ -808,6 +923,238 @@ impl AppState {
         changed
     }
 
+    /* ---------- 在线消息送达重发（官方 §4-12 確認・リトライ） ---------- */
+
+    /// 登记一条在线发送、等待 RECVMSG 确认的消息（仅纯文本，附件重发语义
+    /// 复杂且公告/槽位需一致，暂不重发附件）。
+    pub fn enqueue_retry(&self, item: RetryOut) {
+        let mut map = self.retry_out.lock().unwrap();
+        map.insert((item.key.clone(), item.pkt), item);
+    }
+
+    /// 某会话的所有待确认消息（副本）
+    pub fn retry_for(&self, key: &str) -> Vec<RetryOut> {
+        self.retry_out
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((k, _), _)| k == key)
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    /// RECVMSG 确认：出队重发项，返回是否有变更
+    pub fn ack_retry(&self, key: &str, pkt: u32) -> bool {
+        let mut map = self.retry_out.lock().unwrap();
+        map.remove(&(key.to_string(), pkt)).is_some()
+    }
+
+    /// 重发次数 +1；超过上限返回 false（调用方出队放弃）
+    pub fn bump_retry(&self, key: &str, pkt: u32) -> bool {
+        let mut map = self.retry_out.lock().unwrap();
+        match map.get_mut(&(key.to_string(), pkt)) {
+            Some(item) => {
+                item.attempts += 1;
+                item.attempts <= crate::net::RETRY_MAX
+            }
+            None => false,
+        }
+    }
+
+    /// 清理某会话全部重发项（对端离线/退场时）
+    pub fn clear_retry(&self, key: &str) {
+        let mut map = self.retry_out.lock().unwrap();
+        map.retain(|(k, _), _| k != key);
+    }
+
+    /// 全部待确认重发项的会话 key（去重）
+    pub fn retry_keys(&self) -> Vec<String> {
+        let map = self.retry_out.lock().unwrap();
+        let mut keys: Vec<String> = map.keys().map(|(k, _)| k.clone()).collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// 更新重发项的最近发送时刻（timestamp 复用 ts 字段）
+    pub fn touch_retry_sent(&self, key: &str, pkt: u32, now: u64) {
+        let mut map = self.retry_out.lock().unwrap();
+        if let Some(item) = map.get_mut(&(key.to_string(), pkt)) {
+            item.ts = now;
+        }
+    }
+
+    /// 对端离线（BR_EXIT）：未确认的在线消息转入待投递队列（对方回来补投）
+    pub fn demote_retry_to_pending(&self, key: &str) {
+        let items: Vec<RetryOut> = self.retry_for(key);
+        if items.is_empty() {
+            return;
+        }
+        for it in items {
+            self.enqueue_pending(PendingOut {
+                key: key.to_string(),
+                pkt: it.pkt,
+                text: it.text.clone(),
+                ts: it.ts,
+                paths: it.paths.clone(),
+            });
+        }
+        self.clear_retry(key);
+    }
+
+    /* ---------- 主机列表窗口（BR_ISGETLIST/OKGETLIST/GETLIST/ANSLIST） ---------- */
+
+    pub fn open_hostlist_window(&self, secs: u64) {
+        *self.hostlist_window.lock().unwrap() = Some(now_secs() + secs);
+    }
+
+    pub fn hostlist_window_open(&self) -> bool {
+        match *self.hostlist_window.lock().unwrap() {
+            Some(until) => now_secs() < until,
+            None => false,
+        }
+    }
+
+    /* ---------- 成员主（DIR_MASTER）全网主机列表 ---------- */
+
+    pub fn master_hosts(&self) -> Vec<crate::ipdict::Dict> {
+        self.master_hosts.lock().unwrap().clone()
+    }
+
+    /// 合并一批评点到的全网主机（按 IPAD 去重替换）；返回变更数
+    pub fn merge_master_hosts(&self, hosts: &[crate::ipdict::Dict]) -> usize {
+        let mut map = self.master_hosts.lock().unwrap();
+        let mut changed = 0;
+        for h in hosts {
+            let ip = h
+                .get_str(crate::ipdict::DICT_IPAD)
+                .unwrap_or("")
+                .to_string();
+            if ip.is_empty() {
+                continue;
+            }
+            let before = map.len();
+            map.retain(|m| m.get_str(crate::ipdict::DICT_IPAD) != Some(ip.as_str()));
+            map.push(h.clone());
+            if map.len() != before || !map.iter().any(|m| m == h) {
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    /* ---------- 成员侧 agent 有效期（DIR_POLLAGENT 的 AGS） ---------- */
+
+    pub fn set_agent_until(&self, master_ip: &str, secs_from_now: u64) {
+        self.agent_until
+            .lock()
+            .unwrap()
+            .insert(master_ip.to_string(), now_secs() + secs_from_now);
+    }
+
+    pub fn agent_active(&self, master_ip: &str) -> bool {
+        match self.agent_until.lock().unwrap().get(master_ip) {
+            Some(until) => now_secs() < *until,
+            None => false,
+        }
+    }
+
+    /* ---------- AGENT 中继登记 ---------- */
+
+    /// 客户端侧：记下「与 key 会话的应答要走 agent 中转」
+    pub fn remember_relay_agent(&self, key: &str, agent: std::net::SocketAddr) {
+        self.relay_agent
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), agent);
+    }
+
+    pub fn relay_agent(&self, key: &str) -> Option<std::net::SocketAddr> {
+        self.relay_agent.lock().unwrap().get(key).copied()
+    }
+
+    /// 代理侧：登记发来 AGENT_PACKET 的真实对端地址（转发目标）
+    pub fn remember_relay_peer(&self, ip: &str, addr: std::net::SocketAddr) {
+        self.relay_peers
+            .lock()
+            .unwrap()
+            .insert(ip.to_string(), addr);
+    }
+
+    pub fn relay_peer(&self, ip: &str) -> Option<std::net::SocketAddr> {
+        self.relay_peers.lock().unwrap().get(ip).copied()
+    }
+
+    /* ---------- 不在模式 / 密码 ---------- */
+
+    /// 设置不在模式并返回旧值（调用方负责广播 BR_ABSENCE）
+    pub fn set_absence(&self, on: bool, text: &str) -> bool {
+        let mut cfg = self.config.lock().unwrap();
+        let old = cfg.absence_enabled;
+        cfg.absence_enabled = on;
+        if !text.trim().is_empty() {
+            cfg.absence_text = text.trim().to_string();
+        }
+        drop(cfg);
+        let _ = self.persist_config();
+        old
+    }
+
+    /// 缓存对端不在通知文；同 key 覆盖。返回旧值
+    pub fn set_peer_absence(&self, key: &str, text: &str) -> Option<String> {
+        self.peer_absence
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), text.to_string())
+    }
+
+    pub fn peer_absence_of(&self, key: &str) -> Option<String> {
+        self.peer_absence.lock().unwrap().get(key).cloned()
+    }
+
+    /// 对端退出（BR_EXIT）或重新通告时（BR_ABSENCE 无不在标记）清除缓存
+    pub fn clear_peer_absence(&self, key: &str) {
+        self.peer_absence.lock().unwrap().remove(key);
+    }
+
+    /* ---------- 成员主登记（DIR_MASTER） ---------- */
+
+    pub fn upsert_dir_member(&self, m: DirMember) {
+        self.dir_members.lock().unwrap().insert(m.key.clone(), m);
+    }
+
+    pub fn dir_member(&self, key: &str) -> Option<DirMember> {
+        self.dir_members.lock().unwrap().get(key).cloned()
+    }
+
+    pub fn dir_members_snapshot(&self) -> Vec<DirMember> {
+        self.dir_members
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn remove_dir_member(&self, key: &str) {
+        self.dir_members.lock().unwrap().remove(key);
+    }
+
+    /// 成员主模式下冷超时的 POLL 成员清理（返回被清理的 key）
+    pub fn prune_dir_members(&self, timeout_secs: u64) -> Vec<String> {
+        let now = now_secs();
+        let mut map = self.dir_members.lock().unwrap();
+        let stale: Vec<String> = map
+            .iter()
+            .filter(|(_, m)| now.saturating_sub(m.last_poll) > timeout_secs)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &stale {
+            map.remove(k);
+        }
+        stale
+    }
+
     /* ---------- 聊天记录 ---------- */
 
     /// 启动迁移：旧版会话键是 `ip:端口`，历史文件因此叫 `<ip>_<端口>.jsonl`。
@@ -1300,7 +1647,15 @@ impl AppState {
             };
             let need = rec.get("need_read").and_then(|v| v.as_bool()).unwrap_or(false);
             let read = rec.get("read").and_then(|v| v.as_bool()).unwrap_or(false);
-            if want.contains(&pkt) && need && !read && !out.contains(&pkt) {
+            let secret = rec.get("secret").and_then(|v| v.as_bool()).unwrap_or(false);
+            let locked = rec.get("locked").and_then(|v| v.as_bool()).unwrap_or(false)
+                || (secret
+                    && !rec
+                        .get("unlocked")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false));
+            // 封书/密码锁未开封的消息不发已读回执（官方 recvdlg 开封才回 READMSG）
+            if want.contains(&pkt) && need && !read && !locked && !out.contains(&pkt) {
                 out.push(pkt);
             }
         }
@@ -1391,6 +1746,35 @@ impl AppState {
         );
     }
 
+    /// 按包号定位某条记录并就地改写（撤回标记、开封/解锁标记等）
+    pub fn update_history_pkt(
+        &self,
+        key: &str,
+        pkt: u32,
+        mutate: impl Fn(&mut serde_json::Value),
+    ) -> bool {
+        self.rewrite_history(
+            key,
+            |rec| rec.get("pkt").and_then(|v| v.as_u64()) == Some(pkt as u64),
+            mutate,
+        )
+    }
+
+    /// 读取一条记录里需要回执的标记（撤回/封书/密码锁等展示用）
+    pub fn find_history_pkt(&self, key: &str, pkt: u32) -> Option<serde_json::Value> {
+        self.find_in_record(key, pkt)
+    }
+
+    /// 历史里是否存在包含指定文本的记录（自检断言用）
+    pub fn history_contains_text(&self, key: &str, text: &str) -> bool {
+        self.read_history(key, 500).iter().any(|r| {
+            r.get("text")
+                .and_then(|v| v.as_str())
+                .map(|t| t.contains(text))
+                .unwrap_or(false)
+        })
+    }
+
     /// 标记入站消息为已读（本地状态）
     pub fn mark_in_read(&self, key: &str, pkts: &[u32]) {
         let set: std::collections::HashSet<u32> = pkts.iter().copied().collect();
@@ -1425,6 +1809,19 @@ impl AppState {
             })
             .last()?;
         Some(last)
+    }
+
+    /// 按包号查任意方向记录（撤回/开封等校验用；find_in_record 只查入站）
+    pub fn find_history_any(&self, key: &str, pkt: u32) -> Option<serde_json::Value> {
+        use std::io::BufRead;
+        let path = self.log_path(key);
+        let f = std::fs::File::open(&path).ok()?;
+        std::io::BufReader::new(f)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+            .filter(|rec| rec.get("pkt").and_then(|v| v.as_u64()) == Some(pkt as u64))
+            .last()
     }
 
     /// 标记出站消息已被对端已读（收到 READMSG 回执），返回是否有变更
@@ -1891,6 +2288,9 @@ mod tests {
             host: "pc-wang".into(),
             user: "wang".into(),
             last_seen: 0,
+            absence: false,
+            absence_text: None,
+            vs: None,
         }));
         let t0 = now_secs();
         assert!(!st.upsert_peer(PeerInfo {
@@ -1903,6 +2303,9 @@ mod tests {
             user: String::new(),
             // last_seen 由 upsert 统一盖为当前时间，注入值会被覆盖
             last_seen: 5,
+            absence: false,
+            absence_text: None,
+            vs: None,
         }));
         let peers = st.peers.lock().unwrap();
         assert_eq!(peers.len(), 1, "同 IP 不同源端口只允许一条记录");
@@ -2143,3 +2546,5 @@ mod tests {
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 }
+
+

@@ -331,9 +331,9 @@ function isChatVisible(key) {
 /** 发送文本到指定会话（转发/批量发送用）；对方离线时后端自动入队，返回的
  * 记录带 queued 标记，气泡上显示「离线留言·上线后自动投递」。
  * 后端返回记录**数组**：加密模式下长文本会自动拆成多条发送，每条一条记录、各自气泡。 */
-export async function sendTextTo(key, text) {
+export async function sendTextTo(key, text, secret = false, password = false) {
   if (!key || !text?.trim()) return null
-  const msgs = await ipc.sendText(key, text)
+  const msgs = await ipc.sendText(key, text, secret, password)
   const list = Array.isArray(msgs) ? msgs : [msgs] // 兼容旧后端单对象返回
   for (const m of list) await pushMsg(key, m)
   return list[list.length - 1] || null
@@ -347,9 +347,9 @@ export async function sendText(text) {
 /** 发送文件/文件夹到指定会话；target 省略时发给当前会话（拖放到列表某个用户时指定目标）。
  * 后端返回记录**数组**：加密模式下附件公告的文本段超限会自动拆段——
  * 首段带附件、其余段纯文本，每条一条记录、各自气泡。 */
-export async function sendFilesTo(key, paths, text = '') {
+export async function sendFilesTo(key, paths, text = '', secret = false, password = false) {
   if (!key || !paths?.length) return null
-  const msgs = await ipc.sendFiles(key, paths, text)
+  const msgs = await ipc.sendFiles(key, paths, text, secret, password)
   const list = Array.isArray(msgs) ? msgs : [msgs] // 兼容旧后端单对象返回
   for (const m of list) await pushMsg(key, m)
   return list[list.length - 1] || null
@@ -373,6 +373,54 @@ export async function sendClipboardImageTo(key, b64, mime, text = '') {
 /** 发送剪贴板里的图片到当前会话 */
 export async function sendClipboardImage(b64, mime, text = '') {
   return sendClipboardImageTo(store.activeKey, b64, mime, text)
+}
+
+/* ---------------- 撤回 / 开封 / 不在 / 广播 / 群发 ---------------- */
+
+/** 撤回我方发出的文本消息（DELMSG）：本地记录标记 recalled，气泡替换占位 */
+export async function recallMsg(key, pkt) {
+  await ipc.recallMessage(key, pkt)
+  const chat = store.chats[key]
+  const m = chat?.msgs.find((x) => x.dir === 'out' && x.pkt === pkt)
+  if (m) m.recalled = true
+}
+
+/** 封书/密码锁开封（密码锁场景校验输入） */
+export async function unlockMsg(key, pkt, password = null) {
+  await ipc.unlockMessage(key, pkt, password)
+  const chat = store.chats[key]
+  const m = chat?.msgs.find((x) => x.pkt === pkt)
+  if (m) {
+    m.unlocked = true
+    m.locked = false
+    m.read = true // 开封即已读（后端同时补发 READMSG）
+  }
+}
+
+/** 不在模式开关（BR_ABSENCE + ABSENCEOPT） */
+export function setAbsence(on, text) {
+  return ipc.setAbsence(on, text)
+}
+
+/** 广播群发（BROADCASTOPT 同报；本地不留历史） */
+export function broadcastTo(text) {
+  return ipc.broadcastMessage(text)
+}
+
+/** 多选群发（MULTICASTOPT）：同一条文本发往多个会话 */
+export async function sendMulticastTo(keys, text) {
+  if (!keys?.length || !text?.trim()) return
+  await ipc.sendMulticast(keys, text.trim())
+}
+
+/** 主动索取对端不在通知文 */
+export function getAbsenceInfoFor(key) {
+  return ipc.getAbsenceInfo(key)
+}
+
+/** 主动发起主机列表交换（BR_ISGETLIST → ANSLIST） */
+export function requestHostlist() {
+  return ipc.requestHostlist()
 }
 
 /** 发起文件下载；进度通过 file-progress 事件回填 */
@@ -550,6 +598,25 @@ export async function boot() {
   })
   await ipc.listenEvent(ipc.EVT.msgRead, onMsgRead)
   await ipc.listenEvent(ipc.EVT.fileProgress, onFileProgress)
+  await ipc.listenEvent(ipc.EVT.msgRecalled, ({ key, pkt }) => {
+    const chat = store.chats[key]
+    const m = chat?.msgs.find((x) => x.pkt === pkt)
+    if (m) m.recalled = true
+    delete store.unread[key]
+    delete store.unreadTs[key]
+  })
+  await ipc.listenEvent(ipc.EVT.msgUnlocked, ({ key, pkt }) => {
+    const chat = store.chats[key]
+    const m = chat?.msgs.find((x) => x.pkt === pkt)
+    if (m) {
+      m.unlocked = true
+      m.locked = false
+      m.read = true
+    }
+  })
+  await ipc.listenEvent(ipc.EVT.absenceInfo, ({ key, text }) => {
+    if (store.userMap[key]) store.userMap[key].absence_text = text
+  })
 
   // 未读总数变化 → 托盘图标在「有新消息（红点角标）」与「无消息」之间切换
   watch(

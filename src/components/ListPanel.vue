@@ -2,7 +2,7 @@
 // 中栏：联系人列表（按群组分组，固定显示，未读角标提示新消息；右键可删除会话）
 import { computed, ref, watch } from 'vue'
 import { confirm as confirmDialog } from '@tauri-apps/plugin-dialog'
-import { store, openChat, onSearchInput, openHit, displayName, fmtTime, deleteContact } from '../store'
+import { store, openChat, onSearchInput, openHit, displayName, fmtTime, deleteContact, getAbsenceInfoFor } from '../store'
 import { makeSnippet } from '../lib/text'
 import { t } from '../lib/i18n'
 import Avatar from './Avatar.vue'
@@ -136,7 +136,11 @@ async function doDeleteContact() {
             <i class="status-dot" :class="u.online ? 'on' : 'off'" :title="u.online ? t('online') : t('offline')"></i>
           </div>
           <div class="mid">
-            <div class="r1 ellipsis">{{ u.nickname || u.user || t('unknownUser') }}</div>
+            <div class="r1 ellipsis">
+              {{ u.nickname || u.user || t('unknownUser') }}
+              <span v-if="u.online && u.absence" class="away-tag" :title="u.absence_text || t('chat.leave')"
+  @click.stop="getAbsenceInfoFor(u.key).catch(() => {})">{{ t('chat.leave') }}</span>
+            </div>
             <div class="r2 ellipsis">{{ u.host || '' }}{{ u.ip ? ' · ' + u.ip : '' }}{{ u.group ? ' · ' + u.group : '' }}</div>
           </div>
           <div class="right">
@@ -287,6 +291,17 @@ async function doDeleteContact() {
 }
 .ava {
   position: relative;
+}
+.away-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  font-size: 10px;
+  line-height: 15px;
+  color: var(--c-text-3, #999);
+  border: 1px solid var(--c-border, #d0d0d0);
+  border-radius: 4px;
+  vertical-align: 1px;
 }
 .status-dot {
   position: absolute;

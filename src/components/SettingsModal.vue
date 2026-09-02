@@ -15,6 +15,15 @@ const form = reactive({
   lang: 'zh-CN',
   // 加密默认开启：config 缺失该字段（旧版本后端）时也按开启处理
   encrypt: true,
+  absence_enabled: false,
+  absence_text: '',
+  password_use: false,
+  password: '',
+  agent_addr: '',
+  master_addr: '',
+  allow_send_list: true,
+  ipdict_enabled: true,
+  dir_mode: 'off',
 })
 
 watch(
@@ -28,6 +37,15 @@ watch(
       form.theme = store.config.theme || 'system'
       form.lang = store.config.lang || detectLocale()
       form.encrypt = store.config.encrypt !== false
+      form.absence_enabled = !!store.config.absence_enabled
+      form.absence_text = store.config.absence_text || ''
+      form.password_use = !!store.config.password_use
+      form.password = store.config.password || ''
+      form.agent_addr = store.config.agent_addr || ''
+      form.master_addr = store.config.master_addr || ''
+      form.allow_send_list = store.config.allow_send_list !== false
+      form.ipdict_enabled = store.config.ipdict_enabled !== false
+      form.dir_mode = store.config.dir_mode || 'off'
     }
   },
   { immediate: true }
@@ -128,6 +146,15 @@ async function save() {
     theme: form.theme,
     lang: form.lang,
     encrypt: !!form.encrypt,
+    absence_enabled: !!form.absence_enabled,
+    absence_text: form.absence_text.trim(),
+    password_use: !!form.password_use,
+    password: form.password,
+    agent_addr: form.agent_addr.trim(),
+    master_addr: form.master_addr.trim(),
+    allow_send_list: !!form.allow_send_list,
+    ipdict_enabled: !!form.ipdict_enabled,
+    dir_mode: form.dir_mode,
   }
   try {
     await ipc.saveConfig(patch)
@@ -205,6 +232,68 @@ async function save() {
               <code class="fp-val">{{ store.config.key_fp }}</code>
               <span v-if="fpCopied" class="fp-copied">{{ t('settings.fpCopied') }}</span>
             </div>
+          </div>
+        </div>
+
+        <div class="selfinfo">
+          <div class="si-title">IPMsg 协议扩展</div>
+          <div class="si-row adv-col">
+            <label class="adv-line">
+              <button type="button" class="switch" :class="{ on: form.absence_enabled }" role="switch"
+                :aria-checked="form.absence_enabled ? 'true' : 'false'" @click="form.absence_enabled = !form.absence_enabled">
+                <i class="knob"></i>
+              </button>
+              <span class="lab">{{ t('settings.absence') }}</span>
+            </label>
+            <input v-if="form.absence_enabled" v-model="form.absence_text" class="adv-input"
+              :placeholder="t('settings.absenceText')" maxlength="120" spellcheck="false" />
+            <div class="import-hint">{{ t('settings.absenceHint') }}</div>
+          </div>
+          <div class="si-row adv-col">
+            <label class="adv-line">
+              <button type="button" class="switch" :class="{ on: form.password_use }" role="switch"
+                :aria-checked="form.password_use ? 'true' : 'false'" @click="form.password_use = !form.password_use">
+                <i class="knob"></i>
+              </button>
+              <span class="lab">{{ t('settings.passwordUse') }}</span>
+            </label>
+            <input v-if="form.password_use" v-model="form.password" class="adv-input" type="password"
+              :placeholder="t('settings.password')" maxlength="64" spellcheck="false" />
+            <div class="import-hint">{{ t('settings.passwordHint') }}</div>
+          </div>
+          <div class="si-row adv-col">
+            <span class="lab">{{ t('settings.agentAddr') }}</span>
+            <input v-model="form.agent_addr" class="adv-input" placeholder="ip:2425（留空关闭）" spellcheck="false" />
+            <div class="import-hint">{{ t('settings.agentHint') }}</div>
+          </div>
+          <div class="si-row adv-col">
+            <span class="lab">{{ t('settings.dirMode') }}</span>
+            <select v-model="form.dir_mode" class="adv-input">
+              <option value="off">{{ t('settings.dirModeOff') }}</option>
+              <option value="user">{{ t('settings.dirModeUser') }}</option>
+              <option value="master">{{ t('settings.dirModeMaster') }}</option>
+            </select>
+            <input v-if="form.dir_mode === 'user'" v-model="form.master_addr" class="adv-input"
+              :placeholder="t('settings.masterAddr')" spellcheck="false" />
+            <div class="import-hint">{{ t('settings.dirHint') }}</div>
+          </div>
+          <div class="si-row adv-col">
+            <label class="adv-line">
+              <button type="button" class="switch" :class="{ on: form.allow_send_list }" role="switch"
+                :aria-checked="form.allow_send_list ? 'true' : 'false'" @click="form.allow_send_list = !form.allow_send_list">
+                <i class="knob"></i>
+              </button>
+              <span class="lab">{{ t('settings.allowSendList') }}</span>
+            </label>
+          </div>
+          <div class="si-row adv-col">
+            <label class="adv-line">
+              <button type="button" class="switch" :class="{ on: form.ipdict_enabled }" role="switch"
+                :aria-checked="form.ipdict_enabled ? 'true' : 'false'" @click="form.ipdict_enabled = !form.ipdict_enabled">
+                <i class="knob"></i>
+              </button>
+              <span class="lab">{{ t('settings.ipdict') }}</span>
+            </label>
           </div>
         </div>
 

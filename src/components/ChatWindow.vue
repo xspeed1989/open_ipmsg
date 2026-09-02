@@ -6,7 +6,7 @@ import * as ipc from '../lib/ipc'
 import {
   store, sendText, sendFiles, sendFilesTo, downloadFile, clearHistory,
   openChat, displayName, dayLabel, fmtTime, fmtSize, refreshUsers, splitDelayedNote,
-  sendTextTo,
+  sendTextTo, recallMsg, unlockMsg, broadcastTo, sendMulticastTo,
 } from '../store'
 import { parseFileUris, highlightParts } from '../lib/text'
 import { computePopupPosition } from '../lib/popup'
@@ -138,6 +138,59 @@ function startForward() {
   picker.value = { mode: 'forward', payload }
 }
 
+
+/* ---------- 封书 / 密码锁 ---------- */
+const secretOn = ref(false) // 封书（SECRETEXOPT）
+const pwdOn = ref(false) // 密码锁（PASSWORDOPT，仅密码功能开启时显示）
+
+/** 开封：封书直接开；密码锁需输入本机密码 */
+async function doUnlock(m) {
+  if (!store.activeKey) return
+  if (m.locked) {
+    const pw = window.prompt ? window.prompt(t('chat.pwdPrompt')) : ''
+    if (pw === null) return
+    try {
+      await unlockMsg(store.activeKey, m.pkt, pw || null)
+      alert(t('chat.unlockedOk'))
+    } catch (e) {
+      alert(t('chat.unlockFail', { e }))
+    }
+    return
+  }
+  try {
+    await unlockMsg(store.activeKey, m.pkt, null)
+  } catch (e) {
+    alert(e)
+  }
+}
+
+/* ---------- 广播 / 群发 ---------- */
+function startBroadcast() {
+  const text = draft.value.trim()
+  if (!text) {
+    alert(t('chat.alertFillContent'))
+    return
+  }
+  broadcastTo(text)
+    .then(() => alert(t('chat.broadcastSent')))
+    .catch((e) => alert(t('chat.alertSendFailed', { e })))
+}
+function startMulticast() {
+  if (!canSend.value) {
+    alert(t('chat.alertFillContent'))
+    return
+  }
+  picker.value = { mode: 'multicast', payload: null }
+}
+
+/* ---------- 撤回 ---------- */
+function startRecall() {
+  const m = ctxMenu.value?.msg
+  if (!m || !store.activeKey) return
+  closeCtx()
+  recallMsg(store.activeKey, m.pkt).catch((e) => alert(e))
+}
+
 function startBatch() {
   if (!store.activeKey) {
     alert(t('chat.alertSelectSession'))
@@ -231,6 +284,8 @@ async function onPickerConfirm(keys) {
       if (p.mode === 'forward') {
         if (p.payload.kind === 'text') await sendTextTo(k, p.payload.text)
         else await sendFilesTo(k, p.payload.paths)
+      } else if (p.mode === 'multicast') {
+        await sendTextTo(k, draft.value.replace(/\n{3,}/g, '\n\n').trimEnd())
       } else {
         const text = draft.value.replace(/\n{3,}/g, '\n\n').trimEnd()
         if (paths) await sendFilesTo(k, paths, text)
@@ -266,14 +321,17 @@ async function doSend() {
     replyTarget.value = null
   }
   try {
+    const opts = { secret: secretOn.value, password: pwdOn.value }
     if (pendingList.value.length) {
       // 待发送附件与随行文字一并发出（IPMsg 的一条消息可同时带正文和附件）
       const paths = await pendingToPaths(pendingList.value)
-      await sendFilesTo(store.activeKey, paths, text)
+      await sendFilesTo(store.activeKey, paths, text, opts.secret, opts.password)
       clearPending()
     } else {
-      await sendText(text)
+      await sendTextTo(store.activeKey, text, opts.secret, opts.password)
     }
+    secretOn.value = false
+    pwdOn.value = false
     draft.value = ''
     autoBottom = true
   } catch (e) {
@@ -942,7 +1000,14 @@ watch(
             <i v-if="selMode" class="sel-check" :class="{ on: selected.has(v.m) }" @click.stop="toggleSel(v.m)"></i>
             <div class="bubble" :class="{ file: v.m.kind === 'file' }"
               @contextmenu.prevent="selMode ? null : openCtx(v.m, $event)">
-              <div v-if="bodyOf(v.m)" class="b-text">
+              <div v-if="v.m.recalled" class="b-text recalled">{{ t('chat.recalledTip') }}</div>
+              <div v-else-if="(v.m.locked || (v.m.secret && !v.m.unlocked))" class="b-text locked">
+                <span class="lock-ico">🔒</span>
+                <template v-if="v.m.locked && !v.m.unlocked">{{ t('chat.pwdLocked') }}</template>
+                <template v-else>{{ t('chat.secretSealed') }}</template>
+                <button class="unlock-btn" @click.stop="doUnlock(v.m)">{{ t('chat.unlock') }}</button>
+              </div>
+              <div v-else-if="bodyOf(v.m)" class="b-text">
                 <template v-if="hlQuery">
                   <span v-for="(p, i) in textParts(v.m)" :key="i" :class="{ hl: p.hit }">{{ p.text }}</span>
                 </template>
@@ -1041,13 +1106,15 @@ watch(
       <button class="ctx-item" @click="copyMsg">{{ t('chat.copy') }}</button>
       <button class="ctx-item" @click="startReply">{{ t('chat.reply') }}</button>
       <button class="ctx-item" @click="startForward">{{ t('chat.forward') }}</button>
+      <button v-if="ctxMenu.msg?.dir === 'out' && ctxMenu.msg?.kind === 'text' && !ctxMenu.msg?.recalled"
+        class="ctx-item danger" @click="startRecall">{{ t('chat.recall') }}</button>
       <button class="ctx-item" @click="enterSelMode">{{ t('chat.multiSelect') }}</button>
     </div>
 
     <!-- 转发（排除当前会话）/ 批量发送（默认含当前会话）的接收人选择 -->
     <RecipientPicker
       v-if="picker"
-      :title="picker.mode === 'forward' ? t('chat.forwardTo') : t('chat.batchTo')"
+      :title="picker.mode === 'forward' ? t('chat.forwardTo') : picker.mode === 'multicast' ? t('chat.multicastTo') : t('chat.batchTo')"
       :exclude-key="picker.mode === 'forward' ? store.activeKey : ''"
       :preselect-key="picker.mode === 'batch' && store.userMap[store.activeKey] ? store.activeKey : ''"
       @confirm="onPickerConfirm"
@@ -1104,11 +1171,30 @@ watch(
               stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
           </svg>
         </button>
-        <button class="disabled" :title="t('chat.screenshotSoon')" disabled>
+        <button v-if="store.config?.password_use" :class="{ on: pwdOn }" :title="t('chat.pwdLock')" @click="pwdOn = !pwdOn">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-            <rect x="3" y="6" width="18" height="14" rx="2" stroke="currentColor" stroke-width="1.6" />
-            <path d="M8 6l1.5-2.5h5L16 6" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
-            <circle cx="12" cy="13" r="3.4" stroke="currentColor" stroke-width="1.6" />
+            <rect x="5" y="11" width="14" height="9" rx="2" stroke="currentColor" stroke-width="1.6" />
+            <path d="M8 11V8a4 4 0 0 1 8 0v3" stroke="currentColor" stroke-width="1.6" />
+            <circle cx="12" cy="15.5" r="1.2" fill="currentColor" />
+          </svg>
+        </button>
+        <button :class="{ on: secretOn }" :title="t('chat.secretSend')" @click="secretOn = !secretOn">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+            <rect x="4.5" y="10.5" width="15" height="9" rx="2" stroke="currentColor" stroke-width="1.6" />
+            <path d="M9 10.5V7.5a3 3 0 0 1 6 0v3" stroke="currentColor" stroke-width="1.6" />
+            <path d="M12 14v2.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+          </svg>
+        </button>
+        <button :title="t('chat.broadcast')" @click="startBroadcast">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="2" fill="currentColor" />
+            <path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4M4.9 4.9a10 10 0 0 0 0 14.2M19.1 4.9a10 10 0 0 1 0 14.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+          </svg>
+        </button>
+        <button :title="t('chat.multicast')" @click="startMulticast">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 3" />
+            <path d="M9.2 9.2a4 4 0 0 0 0 5.6M14.8 9.2a4 4 0 0 1 0 5.6M6.6 6.6a7 7 0 0 0 0 10.8M17.4 6.6a7 7 0 0 1 0 10.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
           </svg>
         </button>
       </div>
@@ -1659,6 +1745,9 @@ watch(
   display: flex;
   align-items: center;
   justify-content: center;
+}
+.toolbar button.on {
+  color: var(--c-accent, #07c160);
 }
 .toolbar button:hover:not(.disabled) {
   background: var(--c-hover);

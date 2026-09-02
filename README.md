@@ -14,13 +14,20 @@
 | 用户发现 | BR_ENTRY 广播上线、ANSENTRY 应答、BR_EXIT 下线、45s 周期刷新、30min 超时清理 |
 | 即时消息 | SENDMSG 文本收发、陌生来源自动注册、UDP 去重 |
 | 文件传输 | 多文件附件（FILEATTACHOPT）、TCP GETFILEDATA 流式传输、断点偏移、进度事件、断点重试 |
-| 剪贴板图片 | 兼容官方客户端「粘贴图片」（FILEATTACHOPT + IPMSG_FILE_CLIPBOARD 附件 ipmsgclip_s_*.png），自动接收后聊天内直接预览 |
+| 剪贴板图片 | 官方「粘贴图片」双向兼容：我方发送按 FILE_CLIPBOARD+CLIPBOARDPOS+ipmsgclip_s_* 命名（官方对端消息内内嵌显示）；接收官方贴图自动内联预览 |
 | 已读回执 | 发送自动携带 READCHECKOPT；对端查看后回 READMSG，气泡显示「已读/未读」 |
 | 在线状态 | 联系人列表头像绿点·灰点，聊天窗口顶部在线/离线标签 |
 | 系统托盘 | 关闭窗口最小化到托盘（微信式），左键唤起主窗口，菜单：显示/刷新/退出 |
 | 消息通知 | 未聚焦时来消息弹系统通知（tauri-plugin-notification） |
 | 聊天记录 | 每个会话一个 JSONL 文件，按会话加载最近记录；下载/已读状态回写 |
 | 群组 | 上线时广播所在群组，联系人列表按群组分栏展示 |
+| 不在模式 | BR_ABSENCE+ABSENCEOPT 广播「离开」、自动回复不在通知文、GETABSENCEINFO/SENDABSENCEINFO 索取与应答 |
+| 撤回/封书 | DELMSG 撤回自己发出的文本消息；SECRETEXOPT 封书（对方点开查看后才回已读）；PASSWORDOPT 密码锁 |
+| 广播/群发 | BROADCASTOPT 全网同报（不回执）；MULTICASTOPT 多选群发 |
+| 主机列表 | BR_ISGETLIST/OKGETLIST/GETLIST/ANSLIST 主机列表交换（含官方 htons 端口小端怪癖兼容） |
+| 成员主 | DIR_MASTER 目录服务：成员 POLL / 代理广播 / DIR_PACKET 全网列表分发（IPDict + RSA2048/SHA256 签名） |
+| NAT 代理 | AGENT 协议中继（AGENT_REQ/ANSREQ/PACKET），配置代理地址后消息经代理转发 |
+| IPv6 | ff15::979 / ff02::1 组播成员发现（无 IPv6 环境自动降级纯 IPv4） |
 | 编码 | 发送可选 UTF-8 / GBK（兼容老版中文飞鸽）；接收自动识别 UTF-8/GBK |
 | 多语言 | 界面支持简体中文 / English，设置页切换（选中即预览、持久化到 config.json）；语言名以各自语言显示 |
 | 其他 | 表情面板、联系人未读角标、搜索、自定义接收目录、文件管理器定位 |
@@ -29,10 +36,14 @@
 
 ```
 报文格式   "1:包编号:用户名:主机名:命令字:附加数据"
-命令       BR_ENTRY / ANSENTRY / BR_EXIT / BR_ABSENCE / SENDMSG / READMSG
-           GETINFO→SENDINFO / RELEASEFILES / GETFILEDATA
+命令       BR_ENTRY / ANSENTRY / BR_EXIT / BR_ABSENCE / SENDMSG / READMSG / DELMSG
+           GETINFO→SENDINFO / GETABSENCEINFO→SENDABSENCEINFO / RELEASEFILES
+           GETFILEDATA / GETDIRFILES / BR_ISGETLIST / OKGETLIST / GETLIST / ANSLIST
+           GETPUBKEY / ANSPUBKEY / ANSREADMSG / ANSPUBKEY / AGENT_* / DIR_*（IPDict）
            （基本命令按低 8 位匹配，选项标志位于 bit8 以上）
-选项       FILEATTACHOPT / READCHECKOPT / AUTORETOPT / NOADDLISTOPT 等
+选项       FILEATTACHOPT / READCHECKOPT / AUTORETOPT / NOADDLISTOPT / SENDCHECKOPT
+           BROADCASTOPT / MULTICASTOPT / SECRETEXOPT / PASSWORDOPT / ABSENCEOPT
+           CAPIPDICTOPT / DIR_MASTER / UTF8OPT / CAPUTF8OPT 等
 已读流程   发送端置 READCHECKOPT → 接收端用户查看后回 READMSG(原包号) →
            发送端标记「已读」；对方离线时仅本地标记
 文件项     id:name:size:mtime:attr（ID 与 attr 十六进制、size/mtime 十进制，
@@ -42,7 +53,8 @@
 已实现（v4 协议加密，默认开启，设置页可关）：RSA-2048 密钥协商（GETPUBKEY/ANSPUBKEY）、
 消息体加密（AES-256-CBC + SHA-256 签名，含文件公告元数据）、TCP 文件流加密
 （AES-CTR，下载方发起）；对端不支持加密时自动回退明文，互通零感知。
-仍暂未实现：目录递归传输（GETDIRFILES 发送目录会提示暂不支持——接收方向已支持）、保密消息。
+目录递归传输（GETDIRFILES）收发双向已实现。其余协议面见功能表（不在模式、
+撤回/封书/密码、广播/群发、主机列表、成员主、NAT 代理、IPv6 组播均可用）。
 
 ## 目录结构
 
@@ -207,5 +219,6 @@ BR_EXIT 下线广播，全部通过后退出码为 0。
 ## Roadmap
 
 - [x] RSA-2048/AES 密钥协商与加密消息（GETPUBKEY/ANSPUBKEY）+ TCP 文件流加密
-- [ ] 文件夹递归传输（GETDIRFILES）
-- [ ] 开机自启、截图发送、广播群发模式
+- [x] 文件夹递归传输（GETDIRFILES，收发双向）
+- [x] 广播群发模式（BROADCASTOPT 全网同报）
+- [ ] 开机自启、截图发送

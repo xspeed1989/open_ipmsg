@@ -92,6 +92,13 @@ impl KeyPair {
         out
     }
 
+    /// 公钥指数（65537）
+    pub fn public_exponent(&self) -> u32 {
+        use rsa::traits::PublicKeyParts;
+        let b = self.priv_key.e().to_bytes_be();
+        b.iter().fold(0u32, |acc, &x| (acc << 8) | x as u32)
+    }
+
     pub fn exponent_be(&self) -> Vec<u8> {
         use rsa::traits::PublicKeyParts;
         self.priv_key.e().to_bytes_be()
@@ -107,6 +114,30 @@ impl KeyPair {
             .collect::<Vec<_>>()
             .join(":")
     }
+
+    /// RSA-SHA256 签名（PKCS#1 v1.5；成员主协议 DIR 报文签名用）
+    pub fn sign_sha256(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+        use rsa::pkcs1v15::SigningKey;
+        use sha2::Sha256;
+        let sk = SigningKey::<Sha256>::new(self.priv_key.clone());
+        let sig = sk
+            .sign_with_rng(&mut rand::thread_rng(), data)
+            .to_vec();
+        Ok(sig)
+    }
+}
+
+/// RSA-SHA256 验签（PKCS#1 v1.5；见 KeyPair::sign_sha256）
+pub fn verify_sha256(pubk: &RsaPublicKey, data: &[u8], sig: &[u8]) -> bool {
+    use rsa::pkcs1v15::{Signature, VerifyingKey};
+    use rsa::signature::Verifier;
+    use sha2::Sha256;
+    let Ok(sig) = Signature::try_from(sig) else {
+        return false;
+    };
+    VerifyingKey::<Sha256>::new(pubk.clone())
+        .verify(data, &sig)
+        .is_ok()
 }
 
 /// 小写 hex 编码（ANSPUBKEY 的 E/N 段）

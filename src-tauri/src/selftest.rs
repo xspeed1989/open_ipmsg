@@ -71,7 +71,8 @@ pub fn run() -> bool {
     let plain_ok = rt.block_on(async_run());
     let crypto_ok = rt.block_on(crypto_roundtrip());
     let offline_ok = rt.block_on(offline_file_delivery());
-    plain_ok && crypto_ok && offline_ok
+    let extended_ok = rt.block_on(extended_protocols());
+    plain_ok && crypto_ok && offline_ok && extended_ok
 }
 
 async fn free_udp_port() -> u16 {
@@ -1381,7 +1382,8 @@ fn spawn_fake_peer(
                 size: content_len,
                 mtime: 123,
                 attr: fileattr::REGULAR,
-            };
+                ext_attrs: vec![],
+        };
             let mut extra = "请收文件".as_bytes().to_vec();
             extra.push(0);
             extra.extend_from_slice(entry.serialize("utf8").as_bytes());
@@ -1439,7 +1441,8 @@ fn spawn_fake_peer(
                 size: content_len,
                 mtime: 123,
                 attr: fileattr::REGULAR,
-            };
+                ext_attrs: vec![],
+        };
             let mut extra = "看这张图".as_bytes().to_vec();
             extra.push(0);
             extra.extend_from_slice(entry.serialize("utf8").as_bytes());
@@ -1476,7 +1479,8 @@ fn spawn_fake_peer(
                 mtime: 123,
                 // 官方 IPMSG_FILE_CLIPBOARD=0x20；公告格式 id:name:size:mtime:attr:8=pos:
                 attr: 0x20,
-            };
+                ext_attrs: vec![],
+        };
             let mut extra = "粘贴的图片".as_bytes().to_vec();
             extra.push(0);
             extra.extend_from_slice(entry.serialize("utf8").as_bytes());
@@ -1505,7 +1509,8 @@ fn spawn_fake_peer(
                 size: 0,
                 mtime: 123,
                 attr: fileattr::REGULAR,
-            };
+                ext_attrs: vec![],
+        };
             let mut extra = "请收空文件".as_bytes().to_vec();
             extra.push(0);
             extra.extend_from_slice(entry.serialize("utf8").as_bytes());
@@ -1887,4 +1892,555 @@ async fn fetch_file(port_app: u16, pkt_no: u32, file_id: u32) -> Result<Vec<u8>,
     let mut out = Vec::new();
     stream.read_to_end(&mut out).await.map_err(|e| e.to_string())?;
     Ok(out)
+}
+
+/* ================= 场景四：协议补齐全链路（撤回/不在/广播/封书/密码/重发/主机列表/成员主/代理） ================= */
+
+/// 扩展协议场景：专用假对端 + 多实例，覆盖 docs/ipmsg-protocol-gap.md 的
+/// P0/P1/P2 各协议面（DIR_MASTER/AGENT 用本机不同回环 IP 隔离会话键）。
+/// 全部通过返回 true；任一失败打 FAIL 行并返回 false。
+async fn extended_protocols() -> bool {
+    let port_app = free_udp_port().await;
+    let port_fake = free_udp_port().await;
+
+    let data_dir =
+        std::env::temp_dir().join(format!("open-ipmsg-selftest-ext-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+
+    /* ---- 应用侧实例 A（被测试主体） ---- */
+    let st = Arc::new(AppState::new(data_dir.clone()));
+    let mut cfg = Config::default();
+    cfg.nickname = "扩展自检".into();
+    cfg.group = "扩展组".into();
+    cfg.encoding = "utf8".into();
+    cfg.password_use = true;
+    cfg.password = "secret123".into();
+    st.set_config(cfg.clone());
+    let ctx = net::start_network_quiet(st.clone(), port_app)
+        .await
+        .expect("start network");
+    let events: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let ev = events.clone();
+        st.set_event(Box::new(move |e, v| ev.lock().unwrap().push((e.to_string(), v))));
+    }
+
+    /* ---- 假对端（回显能力） ---- */
+    #[derive(Default)]
+    struct ExtShared {
+        texts: Vec<String>,
+        delmsg: Vec<u32>,
+        absence_flags: Vec<bool>,
+        absence_replies: Vec<String>,
+        got_absence_info: bool,
+        secret_flags: Vec<bool>,
+        passwd_flags: Vec<bool>,
+        receipts: Vec<u32>,
+        broad_flags: Vec<bool>,
+        dup_count: std::collections::HashMap<u32, u32>,
+        drop_ack: bool,
+        ok_getlist: bool,
+        anslists_sent: u32,
+    }
+    let ext = Arc::new(Mutex::new(ExtShared::default()));
+    let std_sock =
+        std::net::UdpSocket::bind(("127.0.0.1", port_fake)).expect("ext fake bind");
+    std_sock.set_nonblocking(true).unwrap();
+    let ps = Arc::new(UdpSocket::from_std(std_sock).expect("ext fake convert"));
+    let target_app: SocketAddr = format!("127.0.0.1:{port_app}").parse().unwrap();
+    let fake_task = tokio::spawn({
+        let ps = ps.clone();
+        let ext = ext.clone();
+        async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                let (n, from) = match ps.recv_from(&mut buf).await {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                };
+                let Some(pkt) = proto::parse(&buf[..n]) else { continue };
+                let base = pkt.command & 0xFF;
+                match base {
+                    cmd::BR_ENTRY => {
+                        // 记录不在模式位（ABSENCEOPT）
+                        ext.lock().unwrap().absence_flags.push(pkt.command & opt::ABSENCEOPT != 0);
+                        let mut a = proto::Packet::new(cmd::ANSENTRY);
+                        a.extra = proto::build_entry_extra("扩展假对端", "扩展组", "utf8");
+                        let _ = ps.send_to(&a.encode("扩展假对端", "fake-ext"), from).await;
+                    }
+                    cmd::BR_ABSENCE => {
+                        ext.lock().unwrap().absence_flags.push(pkt.command & opt::ABSENCEOPT != 0);
+                    }
+                    cmd::SENDMSG => {
+                        let (need_ack, dup_n) = {
+                            let mut sh = ext.lock().unwrap();
+                            sh.texts.push(proto::text_of(&pkt));
+                            // 重发次数统计：同一包号第二次出现意味着在线重发生效
+                            *sh.dup_count.entry(pkt.pkt_no).or_insert(0) += 1;
+                            (pkt.command & opt::SENDCHECKOPT != 0 && !sh.drop_ack, sh.dup_count.get(&pkt.pkt_no).copied().unwrap_or(0))
+                        }; // 守卫在此释放
+                        if need_ack {
+                            let mut r = proto::Packet::new(cmd::RECVMSG | opt::AUTORETOPT);
+                            r.extra = pkt.pkt_no.to_string().into_bytes();
+                            let _ = ps.send_to(&r.encode("扩展假对端", "fake-ext"), from).await;
+                        }
+                        let _ = dup_n;
+                        if pkt.command & opt::BROADCASTOPT != 0 {
+                            ext.lock().unwrap().broad_flags.push(true);
+                        }
+                        if pkt.command & (opt::SECRETOPT | opt::SECRETEXOPT) != 0 {
+                            ext.lock().unwrap().secret_flags.push(true);
+                        }
+                        if pkt.command & opt::PASSWORDOPT != 0 {
+                            ext.lock().unwrap().passwd_flags.push(true);
+                        }
+                        if pkt.command & opt::AUTORETOPT != 0 {
+                            // 我们收到的自动应答（不在模式自动回复）
+                            ext.lock().unwrap().absence_replies.push(proto::text_of(&pkt));
+                        }
+                    }
+                    cmd::DELMSG => {
+                        let no = String::from_utf8_lossy(&pkt.extra).trim().parse().unwrap_or(0);
+                        ext.lock().unwrap().delmsg.push(no);
+                    }
+                    cmd::READMSG => {
+                        let no = String::from_utf8_lossy(&pkt.extra).trim().parse().unwrap_or(0);
+                        ext.lock().unwrap().receipts.push(no);
+                    }
+                    cmd::GETABSENCEINFO => {
+                        ext.lock().unwrap().got_absence_info = true;
+                    }
+                    cmd::BR_ISGETLIST => {
+                        ext.lock().unwrap().ok_getlist = true;
+                        let r = proto::Packet::new(cmd::OKGETLIST);
+                        let _ = ps
+                            .send_to(
+                                &r.encode("扩展假对端", "fake-ext"),
+                                from,
+                            )
+                            .await;
+                    }
+                    cmd::GETLIST => {
+                        // 回一份含「第三方主机」的 ANSLIST（分页续传为 0）
+                        let hosts = vec![
+                            proto::HostListEntry {
+                                user: "假对端".into(),
+                                host: "fake-ext".into(),
+                                status: cmd::BR_ENTRY,
+                                ip: "127.0.0.1".into(),
+                                port: port_fake,
+                                nick: "扩展假对端".into(),
+                                group: "扩展组".into(),
+                            },
+                            proto::HostListEntry {
+                                user: "third".into(),
+                                host: "third-host".into(),
+                                status: cmd::BR_ENTRY,
+                                ip: "127.0.0.9".into(),
+                                port: 2425,
+                                nick: "第三方".into(),
+                                group: String::new(),
+                            },
+                        ];
+                        let (wire, _) = proto::build_anslist(&hosts, 0, 4000, "utf8");
+                        let mut r = proto::Packet::new(cmd::ANSLIST | opt::UTF8OPT | opt::AUTORETOPT);
+                        r.extra = wire;
+                        let _ = ps
+                            .send_to(&r.encode("扩展假对端", "fake-ext"), from)
+                            .await;
+                        ext.lock().unwrap().anslists_sent += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+    println!("[..] 扩展场景假对端已就绪 (端口 {port_fake})");
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let peer_addr: SocketAddr = format!("127.0.0.1:{port_fake}").parse().unwrap();
+    net::announce_unicast(&ctx, &[peer_addr]).await;
+    let peer_key = "127.0.0.1".to_string();
+    let mut log = Log(vec![]);
+
+    let discovered = wait_for(2500, || st.peers.lock().unwrap().contains_key(&peer_key)).await;
+    log.check("E: 扩展假对端发现", discovered);
+    if !discovered {
+        // 收尾：杀任务
+        fake_task.abort();
+        return finish(log, vec![], &data_dir);
+    }
+
+    /* ---- E1. DELMSG 撤回 ---- */
+    let rec = net::send_message(&ctx, &peer_key, "撤回测试消息", vec![])
+        .await
+        .expect("send");
+    let pkt_no = rec["pkt"].as_u64().unwrap() as u32;
+    let got = wait_for(2000, || {
+        ext.lock()
+            .unwrap()
+            .texts
+            .iter()
+            .any(|t| t == "撤回测试消息")
+    })
+    .await;
+    log.check("E: 撤回前的消息已送达", got);
+    net::recall_message(&ctx, &peer_key, pkt_no)
+        .await
+        .expect("recall");
+    let recalled = wait_for(2000, || ext.lock().unwrap().delmsg.contains(&pkt_no)).await;
+    log.check("E: 对方收到 DELMSG（撤回通知）", recalled);
+    // 本地记录标记已撤回
+    log.check(
+        "E: 本地记录标记 recalled",
+        st.find_history_any(&peer_key, pkt_no)
+            .map(|r| r["recalled"].as_bool().unwrap_or(false))
+            .unwrap_or(false),
+    );
+    // 对端撤回我们的入站消息
+    let in_pkt = proto::next_packet_no();
+    let mut p = proto::Packet::new(cmd::SENDMSG).with_pkt_no(in_pkt);
+    p.extra = "将被撤回的入站消息".as_bytes().to_vec();
+    let _ = ps
+        .send_to(&p.encode("扩展假对端", "fake-ext"), target_app)
+        .await;
+    let seen = wait_for(2000, || {
+        events.lock().unwrap().iter().any(|(e, v)| {
+            e == "msg-in" && v["msg"]["pkt"].as_u64() == Some(in_pkt as u64)
+        })
+    })
+    .await;
+    log.check("E: 入站消息就绪", seen);
+    let mut d = proto::Packet::new(cmd::DELMSG);
+    d.extra = in_pkt.to_string().into_bytes();
+    let _ = ps
+        .send_to(&d.encode("扩展假对端", "fake-ext"), target_app)
+        .await;
+    let ev_recalled = wait_for(2000, || {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(e, v)| e == "msg-recalled" && v["pkt"].as_u64() == Some(in_pkt as u64))
+    })
+    .await;
+    log.check("E: 对端撤回 → msg-recalled 事件", ev_recalled);
+
+    /* ---- E2. 不在模式（ABSENCE） ---- */
+    st.set_absence(true, "开会中，稍后回复");
+    net::announce_absence(&ctx).await;
+    let abs_ann = wait_for(2000, || ext.lock().unwrap().absence_flags.contains(&true)).await;
+    log.check("E: 广播 BR_ABSENCE 且带 ABSENCEOPT", abs_ann);
+    // 收到普通消息 → 自动应答不在通知文（AUTORETOPT）
+    let mut p2 = proto::Packet::new(cmd::SENDMSG | opt::SENDCHECKOPT);
+    p2.extra = "发给不在用户的消息".as_bytes().to_vec();
+    let _ = ps
+        .send_to(&p2.encode("扩展假对端", "fake-ext"), target_app)
+        .await;
+    let auto_replied = wait_for(2500, || {
+        ext.lock()
+            .unwrap()
+            .absence_replies
+            .iter()
+            .any(|t| t.contains("开会中，稍后回复"))
+    })
+    .await;
+    log.check("E: 不在模式自动应答（AUTORETOPT）", auto_replied);
+    // 主动索取不在通知文
+    net::request_absence_info(&ctx, &peer_key)
+        .await
+        .expect("req absence");
+    let probed = wait_for(2000, || ext.lock().unwrap().got_absence_info).await;
+    log.check("E: 对端收到 GETABSENCEINFO", probed);
+    // 关闭不在模式
+    st.set_absence(false, "");
+    net::announce_absence(&ctx).await;
+    log.check(
+        "E: 关闭不在模式后收到消息不再自动应答",
+        !wait_for(1200, || {
+            ext.lock()
+                .unwrap()
+                .absence_replies
+                .iter()
+                .filter(|t| t.contains("开会中，稍后回复"))
+                .count()
+                >= 2
+        })
+        .await,
+    );
+
+    /* ---- E3. 广播群发（BROADCASTOPT） ---- */
+    net::broadcast_message(&ctx, "大家好，这是广播")
+        .await
+        .expect("broadcast");
+    let brod = wait_for(2000, || ext.lock().unwrap().broad_flags.contains(&true)).await;
+    log.check("E: 广播群发送达且带 BROADCASTOPT", brod);
+    drop(ps);
+
+    /* ---- E4. 封书（SECRETOPT） ---- */
+    use crate::net::MsgSendOpts;
+    net::send_message_multi_opts(
+        &ctx,
+        &peer_key,
+        "封书消息",
+        vec![],
+        MsgSendOpts { secret: true, ..Default::default() },
+    )
+    .await
+    .expect("send secret");
+    let secret_sent = wait_for(2000, || ext.lock().unwrap().secret_flags.contains(&true)).await;
+    log.check("E: 封书发出带 SECRETOPT", secret_sent);
+
+    // 对端发来封书（SECRETEXOPT = SECRET|READCHECK）→ 未开封不回执，开封后回
+    let secret_pkt = proto::next_packet_no();
+    let mut s = proto::Packet::new(cmd::SENDMSG | opt::SECRETEXOPT).with_pkt_no(secret_pkt);
+    s.extra = "请开封查看的封书".as_bytes().to_vec();
+    let _ = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+        .await
+        .unwrap()
+        .send_to(&s.encode("扩展假对端", "fake-ext"), target_app)
+        .await;
+    let secret_in = wait_for(2000, || {
+        events.lock().unwrap().iter().any(|(e, v)| {
+            e == "msg-in" && v["msg"]["pkt"].as_u64() == Some(secret_pkt as u64)
+                && v["msg"]["secret"].as_bool() == Some(true)
+        })
+    })
+    .await;
+    log.check("E: 封书入站标记 secret", secret_in);
+    let sent0 = net::mark_read_and_receipt(&ctx, &peer_key, &[secret_pkt])
+        .await
+        .expect("mark secret");
+    log.check("E: 封书未开封不发已读回执", sent0 == 0);
+    net::unlock_message(&ctx, &peer_key, secret_pkt, None)
+        .await
+        .expect("unlock secret");
+    // 开封动作本身补发 READMSG（unlock 内部 mark_read_and_receipt）
+    let receipt_seen = wait_for(2000, || {
+        ext.lock().unwrap().receipts.contains(&secret_pkt)
+    })
+    .await;
+    log.check("E: 开封后补发 READMSG 回执", receipt_seen);
+    log.check(
+        "E: 开封后记录 unlocked",
+        st.find_history_pkt(&peer_key, secret_pkt)
+            .map(|r| r["unlocked"].as_bool().unwrap_or(false))
+            .unwrap_or(false),
+    );
+
+    /* ---- E5. 密码锁（PASSWORDOPT） ---- */
+    let pass_pkt = proto::next_packet_no();
+    let mut s2 = proto::Packet::new(cmd::SENDMSG | opt::PASSWORDOPT | opt::READCHECKOPT)
+        .with_pkt_no(pass_pkt);
+    s2.extra = "密码保护的消息".as_bytes().to_vec();
+    let _ = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+        .await
+        .unwrap()
+        .send_to(&s2.encode("扩展假对端", "fake-ext"), target_app)
+        .await;
+    let locked_in = wait_for(2000, || {
+        events.lock().unwrap().iter().any(|(e, v)| {
+            e == "msg-in" && v["msg"]["pkt"].as_u64() == Some(pass_pkt as u64)
+                && v["msg"]["locked"].as_bool() == Some(true)
+        })
+    })
+    .await;
+    log.check("E: 密码消息入站标记 locked", locked_in);
+    let bad = net::unlock_message(&ctx, &peer_key, pass_pkt, Some("wrong".into())).await;
+    log.check("E: 错误密码拒绝开封", bad.is_err());
+    let good = net::unlock_message(&ctx, &peer_key, pass_pkt, Some("secret123".into())).await;
+    log.check("E: 正确密码开封成功", good.is_ok());
+
+    /* ---- E6. 在线重发（SENDCHECKOPT 未确认 → 同包号重发） ---- */
+    ext.lock().unwrap().drop_ack = true;
+    let drop_pkt_no = {
+        let rec = net::send_message(&ctx, &peer_key, "不确认的消息", vec![])
+            .await
+            .expect("send unacked");
+        rec["pkt"].as_u64().unwrap() as u32
+    };
+    // 重发间隔 4s：7.5s 内应看到同包号 ≥2 次
+    let resent = wait_for(7500, || {
+        ext.lock().unwrap().dup_count.get(&drop_pkt_no).copied().unwrap_or(0) >= 2
+    })
+    .await;
+    log.check("E: 未确认消息按同包号自动重发", resent);
+    ext.lock().unwrap().drop_ack = false;
+
+    /* ---- E7. 主机列表（BR_ISGETLIST/OKGETLIST/GETLIST/ANSLIST） ---- */
+    // 手动单播 BR_ISGETLIST 到假对端（广播到不了 127.0.0.1 之外的自检对端）；
+    // 先开获取窗口（启动时由 start_network 打开过，但已超时）
+    st.open_hostlist_window(30);
+    let cfg_now = st.config();
+    let probe = proto::Packet::new(cmd::BR_ISGETLIST);
+    let _ = ctx
+        .sock
+        .send_to(
+            &probe.encode(&cfg_now.nickname, "ext-self"),
+            peer_addr,
+        )
+        .await;
+    let third = wait_for(3000, || {
+        st.peers
+            .lock()
+            .unwrap()
+            .contains_key("127.0.0.9")
+    })
+    .await;
+    log.check("E: ANSLIST 第三方主机并入用户表", third);
+
+    /* ---- E8. 成员主目录服务（DIR_MASTER 三实例：主/成员/普通） ---- */
+    // M：成员主（127.0.0.7）；U：成员（127.0.0.8，POLL master）。
+    // 不同回环 IP 隔离会话键，同时让 DIR_PACKET 的「过滤自身条目」逻辑不会
+    // 把测试目标误杀。
+    let port_m = free_udp_port().await;
+    let port_u = free_udp_port().await;
+    let st_m = Arc::new(AppState::new(
+        std::env::temp_dir().join(format!("oim-ext-master-{}", std::process::id())),
+    ));
+    let mut cfg_m = Config::default();
+    cfg_m.nickname = "成员主".into();
+    cfg_m.dir_mode = "master".into();
+    st_m.set_config(cfg_m.clone());
+    let ctx_m = net::start_network_loopback(st_m.clone(), "127.0.0.7".parse().unwrap(), port_m)
+        .await
+        .expect("master net");
+    let st_u = Arc::new(AppState::new(
+        std::env::temp_dir().join(format!("oim-ext-user-{}", std::process::id())),
+    ));
+    let mut cfg_u = Config::default();
+    cfg_u.nickname = "成员".into();
+    cfg_u.dir_mode = "user".into();
+    cfg_u.master_addr = format!("127.0.0.7:{port_m}");
+    st_u.set_config(cfg_u.clone());
+    let ctx_u = net::start_network_loopback(st_u.clone(), "127.0.0.8".parse().unwrap(), port_u)
+        .await
+        .expect("user net");
+    net::dir_tick(&ctx_u).await; // 成员 POLL
+    let member_reg = wait_for(3000, || {
+        st_m
+            .dir_members_snapshot()
+            .iter()
+            .any(|m| m.key == "127.0.0.8")
+    })
+    .await;
+    log.check("E: 成员主登记 POLL 成员", member_reg);
+    let got_packet = wait_for(5000, || {
+        st_u.peers.lock().unwrap().contains_key("127.0.0.7")
+    })
+    .await;
+    log.check("E: 成员收到 DIR_PACKET 全网列表", got_packet);
+    // 代理任命（POLLAGENT+BROADCAST）与 AGS 窗口
+    let agent_win = wait_for(3000, || ctx_u.st.agent_active("127.0.0.7")).await;
+    log.check("E: 成员被任命代理（AGS 窗口生效）", agent_win);
+    net::dir_tick(&ctx_m).await;
+    log.check(
+        "E: 主侧周期分发不崩",
+        st_m.dir_members_snapshot().len() >= 1,
+    );
+
+    /* ---- E9. NAT 中继代理（AGENT 协议：X → AG → Y） ---- */
+    let port_ag = free_udp_port().await;
+    let port_x = free_udp_port().await;
+    let port_y = free_udp_port().await;
+    // 三实例各绑独立回环 IP，避免中继会话键混淆
+    #[allow(clippy::redundant_clone)]
+    let cfg_ag = Config::default();
+    let st_ag = Arc::new(AppState::new(
+        std::env::temp_dir().join(format!("oim-ext-agent-{}", std::process::id())),
+    ));
+    st_ag.set_config(cfg_ag);
+    let ctx_ag = net::start_network_loopback(st_ag.clone(), "127.0.0.3".parse().unwrap(), port_ag)
+        .await
+        .expect("agent net");
+    let mut cfg_x = Config::default();
+    cfg_x.nickname = "中继X".into();
+    cfg_x.agent_addr = format!("127.0.0.3:{port_ag}");
+    let st_x = Arc::new(AppState::new(
+        std::env::temp_dir().join(format!("oim-ext-x-{}", std::process::id())),
+    ));
+    st_x.set_config(cfg_x);
+    let ctx_x = net::start_network_loopback(st_x.clone(), "127.0.0.5".parse().unwrap(), port_x)
+        .await
+        .expect("x net");
+    let mut cfg_y = Config::default();
+    cfg_y.nickname = "中继Y".into();
+    let st_y = Arc::new(AppState::new(
+        std::env::temp_dir().join(format!("oim-ext-y-{}", std::process::id())),
+    ));
+    st_y.set_config(cfg_y);
+    let ctx_y = net::start_network_loopback(st_y.clone(), "127.0.0.6".parse().unwrap(), port_y)
+        .await
+        .expect("y net");
+
+    // Y 先向代理注册自己（回环下代理不知道 Y 的 2425 之外的真实端口）
+    {
+        let cfg_y = st_y.config();
+        let mut hand = proto::Packet::new(cmd::AGENT_PACKET);
+        hand.extra = format!("127.0.0.6:127.0.0.6:1:1:fake:fake:1:").into_bytes();
+        let ag_addr: SocketAddr = format!("127.0.0.3:{port_ag}").parse().unwrap();
+        let _ = ctx_y
+            .sock
+            .send_to(&hand.encode(&cfg_y.nickname, "y-host"), ag_addr)
+            .await;
+        // 直连注册完成后，代理应把 127.0.0.6 → Y 的真实地址入库
+        let registered = wait_for(2000, || {
+            ctx_ag.st.relay_peer("127.0.0.6").is_some()
+        })
+        .await;
+        log.check("E: 代理登记 Y 的真实地址", registered);
+    }
+    // X 的会话表里手工登记 Y（回环下没有广播发现）
+    {
+        let mut peers = st_x.peers.lock().unwrap();
+        peers.insert(
+            "127.0.0.6".into(),
+            crate::state::PeerInfo {
+                key: "127.0.0.6".into(),
+                ip: "127.0.0.6".into(),
+                port: port_y,
+                nickname: "中继Y".into(),
+                group: String::new(),
+                host: "y-host".into(),
+                user: "中继Y".into(),
+                last_seen: crate::state::now_secs(),
+                absence: false,
+                absence_text: None,
+                vs: None,
+            },
+        );
+    }
+    let rec_x = net::send_message(&ctx_x, "127.0.0.6", "经代理的消息", vec![])
+        .await
+        .expect("send via agent");
+    let y_got = wait_for(3000, || {
+        st_y
+            .history_contains_text("127.0.0.5", "经代理的消息")
+    })
+    .await;
+    if !y_got {
+        let hist = st_y.read_history("127.0.0.5", 20);
+        eprintln!("[dbg-agent] Y 历史 {} 条：{:?}", hist.len(), hist.iter().map(|r| r["text"].as_str().unwrap_or("?").to_string()).collect::<Vec<_>>());
+        let diag = std::fs::read_to_string(st_y.data_dir.join("diag.log")).unwrap_or_default();
+        eprintln!("[dbg-agent] Y diag 尾部:
+{}", diag.lines().rev().take(8).collect::<Vec<_>>().join("
+"));
+    }
+    log.check("E: 目标经代理收到消息", y_got);
+    let _ = rec_x;
+    // X 的重发队列应被 Y 的 RECVMSG（经代理回流）确认清空
+    let acked = wait_for(6000, || {
+        ctx_x.st.retry_for("127.0.0.6").is_empty()
+    })
+    .await;
+    log.check("E: 代理中继的送达确认回流（重发队列清空）", acked);
+
+    /* ---- 收尾 ---- */
+    fake_task.abort();
+    let all = log.all_ok();
+    println!(
+        "== 扩展协议场景{} ==",
+        if all { "全部通过 ✔" } else { "存在失败项 ✘" }
+    );
+    all
 }

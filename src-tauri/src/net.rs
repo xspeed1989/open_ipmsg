@@ -4,11 +4,14 @@
 //! 保证对端看到的 (ip, port) 身份稳定。
 
 use crate::crypto;
+use crate::ipdict::{self as ipd};
 use crate::protocol::{self as proto, cmd, fileattr, opt};
-use crate::state::{now_secs, AppState, Config, OfferedFile, PeerInfo, PendingOut};
+use crate::state::{
+    now_secs, AppState, Config, DirMember, OfferedFile, PeerInfo, PendingOut, RetryOut,
+};
 use serde_json::{json, Value};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -20,7 +23,70 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 pub struct NetCtx {
     pub st: Arc<AppState>,
     pub sock: Arc<UdpSocket>,
+    /// IPv6 组播套接字（ff15::979 / ff02::1 成员发现；本机无 IPv6 时为 None）
+    pub v6_sock: tokio::sync::Mutex<Option<Arc<UdpSocket>>>,
     pub port: u16,
+}
+
+/// IPv6 站点组播地址（官方 §3-1：ff15::979）
+const IPV6_MCAST_SITE: Ipv6Addr = Ipv6Addr::new(0xff15, 0, 0, 0, 0, 0, 0, 0x0979);
+/// IPv6 链路组播地址（官方 §3-1：ff02::1，localhost）
+const IPV6_MCAST_LINK: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+
+/// 枚举本机 IPv6 接口（scope_id ≥ 1 才可用）：返回 (scope_id, 全局地址集合)。
+/// 用于组播加入与按接口发送（链路组播需要接口作用域）。
+fn v6_ifaces() -> Vec<(u32, Ipv6Addr)> {
+    let mut out = Vec::new();
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return out;
+        }
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ia = &*cur;
+            if !ia.ifa_addr.is_null() && (*ia.ifa_addr).sa_family as i32 == libc::AF_INET6 {
+                let sin6 = &*(ia.ifa_addr as *const libc::sockaddr_in6);
+                let addr = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                if sin6.sin6_scope_id != 0
+                    && !addr.is_unspecified()
+                    && !addr.is_loopback()
+                    && !out.iter().any(|(s, a)| *s == sin6.sin6_scope_id && a == &addr)
+                {
+                    out.push((sin6.sin6_scope_id, addr));
+                }
+            }
+            cur = ia.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+    }
+    out
+}
+
+/// 创建 IPv6 组播套接字：绑定 [::]:端口，逐接口加入 ff15::979 与 ff02::1。
+/// 失败（本机无 IPv6/被禁用）返回 None，调用方记 diag 后静默降级。
+/// `hermetic`（测试模式的 quiet/loopback 启动）：只加入回环接口的组，
+/// 避免真实局域网的 ff02::1 全节点组播（其它机器上的 IPMsg 实例）污染自检。
+fn create_v6_multicast_sock(port: u16, hermetic: bool) -> io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_only_v6(true)?;
+    sock.set_reuse_address(true)?;
+    // 组播回环：同一主机多实例互见（自检双实例依赖）
+    sock.set_multicast_loop_v6(true)?;
+    sock.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
+    if !hermetic {
+        // 生产模式：逐接口加入站点/链路组播组
+        for (scope, _addr) in v6_ifaces() {
+            let _ = sock.join_multicast_v6(&IPV6_MCAST_SITE, scope);
+            let _ = sock.join_multicast_v6(&IPV6_MCAST_LINK, scope);
+        }
+    }
+    // 测试模式（hermetic）：不加入任何组 —— 自检全程单播互达，
+    // 避免真实局域网的 ff02::1 全节点组播（其它 IPMsg 实例）污染断言
+    let std_sock: std::net::UdpSocket = sock.into();
+    std_sock.set_nonblocking(true)?;
+    UdpSocket::from_std(std_sock)
 }
 
 static DL_SEQ: AtomicU32 = AtomicU32::new(1);
@@ -48,13 +114,16 @@ fn my_user(cfg: &Config) -> String {
     }
 }
 
-/// 本机所有 IPv4 地址（用于过滤自身广播回声）
-fn local_ipv4_set() -> &'static std::collections::HashSet<IpAddr> {
+/// 本机所有地址（IPv4 + IPv6 + 回环，用于过滤自身广播/组播回声）
+fn local_ip_set() -> &'static std::collections::HashSet<IpAddr> {
     static SET: std::sync::OnceLock<std::collections::HashSet<IpAddr>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
-        local_ip_address::list_afinet_netifas()
+        let mut set: std::collections::HashSet<IpAddr> = local_ip_address::list_afinet_netifas()
             .map(|v| v.into_iter().map(|(_, ip)| ip).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        set.insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        set.insert(IpAddr::V6(Ipv6Addr::LOCALHOST));
+        set
     })
 }
 
@@ -74,7 +143,20 @@ fn entry_caps(cfg: &Config) -> u32 {
         // ENCEXTMSGOPT：官方 Entry 恒带（0x0fe40003 实测），声明支持加密扩展消息
         caps |= opt::ENCRYPTOPT | opt::CAPFILEENCOPT | opt::ENCEXTMSGOPT;
     }
+    if cfg.ipdict_enabled {
+        // v5 并存格式能力位（官方 HostStatus 同款）
+        caps |= opt::CAPIPDICTOPT;
+    }
+    if cfg.dir_mode == "master" {
+        // 成员主角色：官方 HostStatus 在 DIRMODE_MASTER 时带 DIR_MASTER|DIALUPOPT
+        caps |= opt::DIR_MASTER | opt::DIALUPOPT;
+    }
     caps
+}
+
+/// 我方线上版本串（官方 `VS:` 行/`CVER` 键的 hex 元组布局）
+pub fn my_ver_hex_info() -> String {
+    proto::ver_hex_info()
 }
 
 /* ================= 广播目标计算 ================= */
@@ -150,18 +232,38 @@ async fn start_network_impl(
     });
     sock.set_broadcast(true)?;
 
+    // IPv6 组播通道：尽力创建（无 IPv6 环境静默降级）；
+    // quiet/loopback 启动（自检）走回环节点，隔离真实局域网
+    let hermetic = !announce_start;
+    let v6_sock = match create_v6_multicast_sock(port, hermetic) {
+        Ok(s) => {
+            oim_log!("[udp6] IPv6 组播已启用（ff15::979 / ff02::1）");
+            Some(s)
+        }
+        Err(e) => {
+            oim_log!("[udp6] IPv6 组播不可用（降级纯 IPv4）: {e}");
+            None
+        }
+    };
+
     let ctx = Arc::new(NetCtx {
         st,
         sock,
+        v6_sock: tokio::sync::Mutex::new(v6_sock.map(Arc::new)),
         port,
     });
 
     if announce_start {
         announce(&ctx).await;
+        // 启动 2 分钟的主机列表获取窗口（官方 entryStartTime 语义）
+        ctx.st.open_hostlist_window(120);
     }
     spawn_udp_loop(ctx.clone());
+    spawn_v6_udp_loop(ctx.clone());
     spawn_tcp_server(ctx.clone());
     spawn_ticker(ctx.clone());
+    spawn_retry_loop(ctx.clone());
+    spawn_dir_loop(ctx.clone());
     Ok(ctx)
 }
 
@@ -189,6 +291,67 @@ fn spawn_udp_loop(ctx: Arc<NetCtx>) {
     });
 }
 
+/// IPv6 组播接收循环：与 v4 主循环走同一 handle_datagram（身份键仍为源 IP 字符串）
+fn spawn_v6_udp_loop(ctx: Arc<NetCtx>) {
+    tokio::spawn(async move {
+        let sock = {
+            let guard = ctx.v6_sock.lock().await;
+            match guard.as_ref() {
+                Some(s) => Some(s.clone()),
+                None => None,
+            }
+        };
+        let Some(sock) = sock else { return };
+        let mut buf = vec![0u8; 65535];
+        loop {
+            match sock.recv_from(&mut buf).await {
+                Ok((n, from)) => {
+                    if n == 0 {
+                        continue;
+                    }
+                    let data = buf[..n].to_vec();
+                    let ctx2 = ctx.clone();
+                    tokio::spawn(async move {
+                        handle_datagram(&ctx2, &data, from).await;
+                    });
+                }
+                Err(e) => {
+                    oim_log!("[udp6] recv error: {e}");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    });
+}
+
+/// 在线消息送达重发循环（官方 §4-12 確認・リトライ）：每秒检查重发队列，
+/// 过期未确认（RETRY_INTERVAL_SECS）的重发同一包号，超过 RETRY_MAX 次放弃。
+fn spawn_retry_loop(ctx: Arc<NetCtx>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let keys = ctx.st.retry_keys();
+            for k in keys {
+                retry_pending_for(ctx.clone(), &k).await;
+            }
+        }
+    });
+}
+
+/// 成员主目录服务循环（DIR_MASTER）：成员侧定期 POLL，主侧定期发 DIR_PACKET。
+fn spawn_dir_loop(ctx: Arc<NetCtx>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(45));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            dir_tick(&ctx).await;
+        }
+    });
+}
+
 fn spawn_ticker(ctx: Arc<NetCtx>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(45));
@@ -209,8 +372,151 @@ fn spawn_ticker(ctx: Arc<NetCtx>) {
             if !stale.is_empty() {
                 ctx.st.emit("users-updated", json!({}));
             }
+            // 成员主侧：清理超时未 POLL 的成员
+            let cfg = ctx.st.config();
+            if cfg.dir_mode == "master" {
+                let gone = ctx.st.prune_dir_members(3 * 60);
+                for g in &gone {
+                    ctx.st.diag(&format!("dir-master: 成员 {g} 停止 POLL，移除"));
+                }
+                if !gone.is_empty() {
+                    push_dir_packet(&ctx, "成员离线").await;
+                }
+            }
         }
     });
+}
+
+/* ================= 在线消息送达重发（官方 §4-12 確認・リトライ） ================= */
+
+/// 送达重发间隔（秒）：首次发送后每 4s 一重发
+pub const RETRY_INTERVAL_SECS: u64 = 4;
+/// 最长重发次数（含首次共发送 1+RETRY_MAX 次）
+pub const RETRY_MAX: u32 = 4;
+
+/// 重发某个会话到期的未确认消息（同一包号、同一文件 ID）。
+async fn retry_pending_for(ctx: Arc<NetCtx>, key: &str) {
+    let now = now_secs();
+    for item in ctx.st.retry_for(key) {
+        if item.ts + RETRY_INTERVAL_SECS > now {
+            continue; // 未到重发点
+        }
+        // 独占计数：超限即放弃（该条消息保持「已发送」状态）
+        if !ctx.st.bump_retry(key, item.pkt) {
+            ctx.st.diag(&format!("-> {key} pkt={} 重发 {} 次未确认，放弃", item.pkt, RETRY_MAX));
+            continue;
+        }
+        // 对方离线：整体转入待投递队列（对方回来时补投）
+        let peer = ctx.st.peers.lock().unwrap().get(key).cloned();
+        let Some(peer) = peer else {
+            ctx.st.demote_retry_to_pending(key);
+            return;
+        };
+        let Some(target) = peer_addr(&peer) else {
+            continue;
+        };
+        // 附件路径复查：文件已丢失 → 放弃重发（气泡保持原状）
+        let mut ok = true;
+        for (p, e) in item.paths.iter().zip(item.entries.iter()) {
+            let meta = match std::fs::metadata(p) {
+                Ok(m) => m,
+                Err(_) => {
+                    ok = false;
+                    ctx.st.diag(&format!("-> {key} pkt={} 附件丢失，放弃重发：{p}", item.pkt));
+                    break;
+                }
+            };
+            let want_dir = e.attr & 0xFF == fileattr::DIR;
+            if meta.is_dir() != want_dir {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        // 重登记文件槽（ID 必须与公告一致，直接使用条目里的 ID）
+        let cfg = ctx.st.config();
+        let utf8 = proto::is_utf8_mode(&cfg.encoding);
+        for (p, e) in item.paths.iter().zip(item.entries.iter()) {
+            ctx.st.prune_offered();
+            ctx.st.offered.lock().unwrap().insert(
+                (item.pkt, e.id),
+                OfferedFile {
+                    path: PathBuf::from(p),
+                    size: e.size,
+                    is_dir: e.attr & 0xFF == fileattr::DIR,
+                    ts: now_secs(),
+                    utf8,
+                },
+            );
+        }
+        // 重组公告（与 send_message 相同的拼接）
+        let mut extra = proto::encode_out(&item.text, &cfg.encoding);
+        if !item.entries.is_empty() {
+            extra.push(0);
+            let joined: Vec<String> = item
+                .entries
+                .iter()
+                .map(|e| e.serialize(&cfg.encoding))
+                .collect();
+            extra.extend_from_slice(joined.join("\u{7}").as_bytes());
+            extra.push(0x07);
+        }
+        let want_rcpt = item.entries.is_empty();
+        // 出站加密决策与 send_message 一致
+        let mut enc = false;
+        let mut wire_extra = extra.clone();
+        if cfg.encrypt {
+            if let Some(pubk) = ctx.st.peer_pubkey(key) {
+                match crypto::seal_message(&pubk, &ctx.st.own_keypair(), &plain_payload(&extra)) {
+                    Ok(sealed) => {
+                        wire_extra = sealed.into_bytes();
+                        enc = true;
+                    }
+                    Err(e) => {
+                        ctx.st.diag(&format!("-> {key} 重发加密失败（pkt={}），放弃：{e}", item.pkt));
+                        continue;
+                    }
+                }
+            }
+        }
+        let command = cmd::SENDMSG
+            | opt::SENDCHECKOPT
+            | if want_rcpt { opt::READCHECKOPT } else { 0 }
+            | if item.entries.is_empty() { 0 } else { opt::FILEATTACHOPT }
+            | if utf8 { opt::UTF8OPT } else { 0 }
+            | if enc && !item.entries.is_empty() { opt::ENCEXTMSGOPT } else { 0 }
+            | if enc { opt::ENCRYPTOPT } else { 0 };
+        let mut pkt = proto::Packet::new(command).with_pkt_no(item.pkt);
+        pkt.extra = wire_extra;
+        let bytes = pkt.encode(&my_user(&cfg), &my_host());
+        // 中继会话/配置代理时重发也走 AGENT 包裹（与 send_message 同策）
+        let origin_ip: IpAddr = ctx
+            .sock
+            .local_addr()
+            .map(|a| a.ip())
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let inner_ip: IpAddr = peer.ip.parse().unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let (wire, send_to) = match ctx.st.relay_agent(key) {
+            Some(agent) => (
+                wrap_agent_packet(&cfg, &inner_ip, &origin_ip, &bytes),
+                agent,
+            ),
+            None => match parse_agent_addr(&cfg.agent_addr) {
+                Some(agent) => (
+                    wrap_agent_packet(&cfg, &inner_ip, &origin_ip, &bytes),
+                    agent,
+                ),
+                None => (bytes, target),
+            },
+        };
+        if ctx.sock.send_to(&wire, send_to).await.is_ok() {
+            ctx.st.touch_retry_sent(key, item.pkt, now);
+            ctx.st
+                .diag(&format!("-> {key} 在线消息重发 pkt={}（第 {} 次）", item.pkt, item.attempts));
+        }
+    }
 }
 
 /// 出站加密的明文输入：完整扩展部 + 恰好一个尾部 \0。
@@ -244,7 +550,7 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
         // 文件已丢失/不可读 → 该条无法投递，出队并记诊断（否则无限重试）。
         let mut entries: Vec<proto::FileEntry> = Vec::new();
         if !item.paths.is_empty() {
-            match register_offer_files(ctx, item.pkt, &item.paths) {
+            match register_offer_files(ctx, item.pkt, &item.paths, utf8) {
                 Ok((es, _)) => entries = es,
                 Err(e) => {
                     ctx.st.diag(&format!(
@@ -314,18 +620,32 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
     }
 }
 
+/// 构造上线类报文（BR_ENTRY/BR_ABSENCE 共用）：
+/// - 附加数据走官方 §3-9：UTF-8 模式下昵称/群组放传统字段 + `\0\nUN:/HN:/NN:/GN:/VS:`
+///   扩展行；**不置 UTF8OPT**（官方规范：BR 系报文禁用该位，官方客户端按扩展行取
+///   UTF-8 名字；GBK 模式下保持纯本地码页字节、不加扩展行）
+/// - ABSENCEOPT 随不在模式开关
+fn build_entry_packet(cfg: &Config, cmd: u32) -> proto::Packet {
+    proto::Packet {
+        extra: proto::build_entry_extra_ex(
+            &cfg.nickname,
+            &cfg.group,
+            &my_user(cfg),
+            &my_host(),
+            &cfg.encoding,
+        ),
+        command: cmd
+            | opt::CAPUTF8OPT
+            | if cfg.absence_enabled { opt::ABSENCEOPT } else { 0 }
+            | entry_caps(cfg),
+        ..proto::Packet::new(0)
+    }
+}
+
 /// 向所有广播地址发送上线/下线通告
 pub async fn announce(ctx: &NetCtx) {
     let cfg = ctx.st.config();
-    let utf8 = proto::is_utf8_mode(&cfg.encoding);
-    let pkt = proto::Packet {
-        extra: proto::build_entry_extra(&cfg.nickname, &cfg.group, &cfg.encoding),
-        command: cmd::BR_ENTRY
-            | opt::CAPUTF8OPT // UTF-8 能力声明（官方 0x01000000；官方客户端据此决定使用 UTF-8）
-            | if utf8 { opt::UTF8OPT } else { 0 }
-            | entry_caps(&cfg),
-        ..proto::Packet::new(0)
-    };
+    let pkt = build_entry_packet(&cfg, cmd::BR_ENTRY);
     let bytes = pkt.encode(&my_user(&cfg), &my_host());
     let targets: Vec<SocketAddr> = broadcast_targets()
         .into_iter()
@@ -334,24 +654,49 @@ pub async fn announce(ctx: &NetCtx) {
     for t in targets {
         let _ = ctx.sock.send_to(&bytes, t).await;
     }
+    // IPv6 组播通道（ff15::979 站点组播 + ff02::1 链路组播，逐接口带 scope）
+    let v6 = ctx.v6_sock.lock().await;
+    if let Some(s) = v6.as_ref() {
+        for (scope, _) in v6_ifaces() {
+            let _ = s
+                .send_to(&bytes, SocketAddr::V6(SocketAddrV6::new(IPV6_MCAST_SITE, ctx.port, 0, scope)))
+                .await;
+            let _ = s
+                .send_to(&bytes, SocketAddr::V6(SocketAddrV6::new(IPV6_MCAST_LINK, ctx.port, 0, scope)))
+                .await;
+        }
+    }
 }
 
 /// 向指定地址单播上线通告（自检/定向刷新用）
 pub async fn announce_unicast(ctx: &NetCtx, addrs: &[SocketAddr]) {
     let cfg = ctx.st.config();
-    let utf8 = proto::is_utf8_mode(&cfg.encoding);
-    let pkt = proto::Packet {
-        extra: proto::build_entry_extra(&cfg.nickname, &cfg.group, &cfg.encoding),
-        command: cmd::BR_ENTRY
-            | opt::CAPUTF8OPT // UTF-8 能力声明（官方 0x01000000；官方客户端据此决定使用 UTF-8）
-            | if utf8 { opt::UTF8OPT } else { 0 }
-            | entry_caps(&cfg),
-        ..proto::Packet::new(0)
-    };
+    let pkt = build_entry_packet(&cfg, cmd::BR_ENTRY);
     let bytes = pkt.encode(&my_user(&cfg), &my_host());
     for a in addrs {
         let _ = ctx.sock.send_to(&bytes, *a).await;
     }
+}
+
+/// 不在模式开关广播（官方 MENU_ABSENCE 语义：BR_ABSENCE + ABSENCEOPT，
+/// 接收方不应答 ANSENTRY；能力位/扩展行与 BR_ENTRY 同构）
+pub async fn announce_absence(ctx: &NetCtx) {
+    let cfg = ctx.st.config();
+    let pkt = build_entry_packet(&cfg, cmd::BR_ABSENCE);
+    let bytes = pkt.encode(&my_user(&cfg), &my_host());
+    let mut targets: Vec<SocketAddr> = broadcast_targets()
+        .into_iter()
+        .map(|ip| SocketAddr::from((ip, ctx.port)))
+        .collect();
+    {
+        let peers = ctx.st.peers.lock().unwrap();
+        targets.extend(peers.values().filter_map(peer_addr));
+    } // 守卫在此释放，之后才 await
+    for t in targets {
+        let _ = ctx.sock.send_to(&bytes, t).await;
+    }
+    ctx.st
+        .diag(&format!("-> 广播 BR_ABSENCE（不在模式 {}）", cfg.absence_enabled));
 }
 
 /// 进程退出时尽力广播 BR_EXIT（同步阻塞，短暂）
@@ -470,13 +815,23 @@ async fn crypto_rehandshake(ctx: &NetCtx, from: SocketAddr, key: &str, reason: &
 /* ================= 入站处理 ================= */
 
 async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
+    // 纯 IPDict 报文（v5 新格式 / DIR 成员主协议）：整包即 IP2:...:Z，
+    // 与经典报文互斥嗅探（官方 ResolveMsg 同款分流）
+    if data.starts_with(b"IP2:") {
+        if let Some((dict, used)) = crate::ipdict::Dict::unpack(data) {
+            if used == data.len() {
+                handle_dict_datagram(ctx, &dict, from).await;
+                return;
+            }
+        }
+    }
     let Some(pkt) = proto::parse(data) else {
         return;
     };
     #[cfg(feature = "net_debug")]
     oim_log!("[udp] <- {from} cmd={:#010x} user={:?} extra_len={}", pkt.command, pkt.user, pkt.extra.len());
-    // 过滤自身广播回声（定向广播会被内核本地回投）
-    if from.port() == ctx.port && local_ipv4_set().contains(&from.ip()) {
+    // 过滤自身广播/组播回声（定向广播与组播会被内核本地回投）
+    if from.port() == ctx.port && is_self_ip(ctx, from.ip()) {
         return;
     }
     // 基本命令取低 8 位（官方规范：所有选项标志位于 bit8 以上）
@@ -501,7 +856,8 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
         let mut r = proto::Packet::new(cmd::RECVMSG | opt::AUTORETOPT);
         r.extra = body.clone().into_bytes();
         let bytes = r.encode(&my_user(&cfg), &my_host());
-        let _ = ctx.sock.send_to(&bytes, from).await;
+        // 中继会话走代理回包，普通会话直发
+        let _ = reply_send(ctx, &key, from, &bytes).await;
         ctx.st
             .diag(&format!("-> {from} RECVMSG 送达确认 pkt={body}（第 {} 次）", n + 1));
     }
@@ -530,26 +886,35 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
 
     match base {
         cmd::BR_ENTRY => {
-            let (nick, group) =
-                proto::parse_entry_extra(&pkt.extra, pkt.command & opt::UTF8OPT != 0);
+            let info = proto::parse_entry_extra(&pkt.extra, pkt.command);
             let added = ctx.st.upsert_peer(PeerInfo {
                 key: key.clone(),
                 ip: from.ip().to_string(),
                 port: from.port(),
-                nickname: nick,
-                group,
+                nickname: info.nick,
+                group: info.group,
                 host: pkt.host.clone(),
                 user: pkt.user.clone(),
                 last_seen: now_secs(),
+                absence: pkt.command & opt::ABSENCEOPT != 0,
+                absence_text: None,
+                vs: info.vs,
             });
-            // 回应 ANSENTRY（单播），携带自己的昵称\0群组；能力位随总开关一起广告
+            // 回应 ANSENTRY（单播），携带自己的昵称\0群组；能力位随总开关一起广告。
+            // BR 应答遵循官方：不带 UTF8OPT（BR 系禁用），UTF-8 走 \0\nNN:/GN: 扩展
             let cfg = ctx.st.config();
-            let utf8 = proto::is_utf8_mode(&cfg.encoding);
             let ans = proto::Packet {
-                extra: proto::build_entry_extra(&cfg.nickname, &cfg.group, &cfg.encoding),
+                extra: proto::build_entry_extra_ex(
+                    &cfg.nickname,
+                    &cfg.group,
+                    &my_user(&cfg),
+                    &my_host(),
+                    &cfg.encoding,
+                ),
                 command: cmd::ANSENTRY
                     | opt::CAPUTF8OPT
-                    | if utf8 { opt::UTF8OPT } else { 0 }
+                    // BR 系报文规范禁用 UTF8OPT（官方 HostStatus 同款），
+                    // UTF-8 名字走上面 build_entry_extra_ex 的 \nNN:/GN: 扩展
                     | entry_caps(&cfg),
                 ..proto::Packet::new(0)
             };
@@ -562,22 +927,30 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             maybe_withdraw_peer_key(ctx, from, &pkt, &key, &cfg);
             // 对方刚上线（BR_ENTRY）：立即重投此前的离线消息
             flush_pending_for(ctx, &key).await;
+            // 代理窗口内：把本段 entry 事件转发给 master（DIR_EVBROAD）
+            maybe_forward_entry_event(ctx, &pkt, &key, base).await;
         }
         cmd::ANSENTRY | cmd::BR_ABSENCE => {
-            let (nick, group) =
-                proto::parse_entry_extra(&pkt.extra, pkt.command & opt::UTF8OPT != 0);
-            let added = ctx.st.upsert_peer(PeerInfo {
+            let info = proto::parse_entry_extra(&pkt.extra, pkt.command);
+            let absence = pkt.command & opt::ABSENCEOPT != 0;
+            ctx.st.upsert_peer(PeerInfo {
                 key: key.clone(),
                 ip: from.ip().to_string(),
                 port: from.port(),
-                nickname: nick,
-                group,
+                nickname: info.nick,
+                group: info.group,
                 host: pkt.host.clone(),
                 user: pkt.user.clone(),
                 last_seen: now_secs(),
+                absence,
+                absence_text: None,
+                vs: info.vs,
             });
             ctx.st.emit("users-updated", json!({}));
-            let _ = added;
+            // 不在模式通告（BR_ABSENCE）说明对方状态切换：旧缓存的不在通知文作废
+            if base == cmd::BR_ABSENCE {
+                ctx.st.clear_peer_absence(&key);
+            }
             // 对端应答里若声明加密能力，同样触发预握手（对方可能没收到我们的 BR_ENTRY）
             let cfg = ctx.st.config();
             maybe_start_handshake(ctx, from, &pkt, &key, &cfg).await;
@@ -589,6 +962,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             }
             // ANSENTRY 通常是对我们上线通告的应答：对方在线，重投离线消息
             flush_pending_for(ctx, &key).await;
+            maybe_forward_entry_event(ctx, &pkt, &key, base).await;
         }
         cmd::BR_EXIT => {
             // 退出广播可能来自临时端口（进程收尾时无法复用主 socket），
@@ -603,22 +977,30 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                     .collect();
                 for k in &hit {
                     peers.remove(k);
+                    // 未确认的在线消息转入待投递（对方回来补投）
+                    ctx.st.demote_retry_to_pending(k);
+                    ctx.st.clear_peer_absence(k);
                 }
                 hit
             };
             if !removed.is_empty() {
                 ctx.st.emit("users-updated", json!({}));
             }
+            maybe_forward_entry_event(ctx, &pkt, &key, base).await;
         }
         cmd::RECVMSG => {
             // 对方确认送达（我们发 SENDCHECKOPT 时对方回 RECVMSG，附加数据是包号）：
-            // 把对应的待投递离线消息出队，避免对方在线时每 45s 无限重投
+            // 把对应的待投递离线消息出队，避免对方在线时每 45s 无限重投；
+            // 同时移除在线重发队列项（官方 §4-12 確認・リトライ闭环）
             let first = pkt.extra.split(|&b| b == b':').next().unwrap_or(b"");
             let no = String::from_utf8_lossy(first).trim().to_string();
             if let Some(k) = resolve_session_key(ctx, from.ip()) {
                 for c in id_candidates(&no) {
-                    if ctx.st.ack_pending(&k, c) {
-                        ctx.st.diag(&format!("<- {from} RECVMSG 送达确认 pkt={c}，离线消息已送达"));
+                    let acked_offline = ctx.st.ack_pending(&k, c);
+                    let acked_retry = ctx.st.ack_retry(&k, c);
+                    if acked_offline || acked_retry {
+                        ctx.st
+                            .diag(&format!("<- {from} RECVMSG 送达确认 pkt={c}（离线:{acked_offline} 重发:{acked_retry}）已送达"));
                     }
                 }
             }
@@ -714,6 +1096,199 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                 }
             }
         }
+        cmd::DELMSG => {
+            // 封书破弃/消息撤回通知（官方语义：recvdlg 的「破弃」按钮；
+            // 本客户端扩展：对方撤回我方会话里的消息）
+            let no = String::from_utf8_lossy(&pkt.extra)
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse::<u32>();
+            if let Some(no) = no.ok() {
+                let k = match resolve_session_key(ctx, from.ip()) {
+                    Some(k) => k,
+                    None => from.ip().to_string(), // 离线会话也可能被撤回
+                };
+                if ctx.st.update_history_pkt(&k, no, |rec| {
+                    rec["recalled"] = json!(true);
+                }) {
+                    ctx.st.emit(
+                        "msg-recalled",
+                        json!({"key": k, "pkt": no, "peer": pkt.user}),
+                    );
+                    ctx.st.diag(&format!("<- {from} DELMSG 撤回 pkt={no}（会话 {k}）"));
+                }
+            }
+        }
+        cmd::ANSREADMSG => {
+            // READMSG 带 READCHECKOPT 时的确认（8 版协议）：我方出站消息视为已读
+            let no = String::from_utf8_lossy(&pkt.extra)
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse::<u32>()
+                .ok();
+            if let Some(no) = no {
+                if let Some(k) = resolve_session_key(ctx, from.ip()) {
+                    if ctx.st.mark_out_read(&k, no) {
+                        ctx.st.emit("msg-read", json!({"key": k, "pkt": no}));
+                    }
+                }
+            }
+        }
+        cmd::GETABSENCEINFO => {
+            // 官方 §3-11：不在模式成员返回不在通知文；非不在模式回占位串
+            let cfg = ctx.st.config();
+            let text = if cfg.absence_enabled && !cfg.absence_text.trim().is_empty() {
+                cfg.absence_text.clone()
+            } else {
+                "Not absence mode".to_string()
+            };
+            let utf8 = proto::is_utf8_mode(&cfg.encoding);
+            let mut r = proto::Packet::new(cmd::SENDABSENCEINFO | opt::AUTORETOPT | if utf8 { opt::UTF8OPT } else { 0 });
+            r.extra = proto::encode_out(&text, &cfg.encoding);
+            let bytes = r.encode(&my_user(&cfg), &my_host());
+            let _ = ctx.sock.send_to(&bytes, from).await;
+        }
+        cmd::SENDABSENCEINFO => {
+            // 对端的不在通知文：缓存到会话，供前端展示
+            let text = proto::text_of(&pkt);
+            ctx.st.set_peer_absence(&key, &text);
+            ctx.st.emit("absence-info", json!({"key": key, "text": text}));
+        }
+        cmd::BR_ISGETLIST => {
+            // 主机列表能力探索：我方允许就回 OKGETLIST（官方 MsgBrIsGetList 同款）
+            let cfg = ctx.st.config();
+            if cfg.allow_send_list {
+                let r = proto::Packet::new(cmd::OKGETLIST);
+                let bytes = r.encode(&my_user(&cfg), &my_host());
+                let _ = ctx.sock.send_to(&bytes, from).await;
+            }
+        }
+        cmd::OKGETLIST => {
+            // 对方可回主机列表：窗口期（启动/手动刷新后）内发起 GETLIST
+            if ctx.st.hostlist_window_open() {
+                let cfg = ctx.st.config();
+                let mut r = proto::Packet::new(cmd::GETLIST);
+                r.extra = b"0".to_vec(); // 起始索引
+                let bytes = r.encode(&my_user(&cfg), &my_host());
+                let _ = ctx.sock.send_to(&bytes, from).await;
+            }
+        }
+        cmd::GETLIST => {
+            // 对方请求主机列表：官方 ANSLIST 结构（分页续传）
+            let cfg = ctx.st.config();
+            if !cfg.allow_send_list {
+                return;
+            }
+            let start = String::from_utf8_lossy(&pkt.extra)
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(0);
+            let hosts: Vec<proto::HostListEntry> = {
+                let peers = ctx.st.peers.lock().unwrap();
+                peers
+                    .values()
+                    .map(|p| proto::HostListEntry {
+                        user: p.user.clone(),
+                        host: p.host.clone(),
+                        status: cmd::BR_ENTRY | if p.absence { opt::ABSENCEOPT } else { 0 },
+                        ip: p.ip.clone(),
+                        port: p.port,
+                        nick: p.nickname.clone(),
+                        group: p.group.clone(),
+                    })
+                    .collect()
+            };
+            let (wire, _n) = proto::build_anslist(&hosts, start, 4000, &cfg.encoding);
+            let utf8 = proto::is_utf8_mode(&cfg.encoding);
+            let mut r = proto::Packet::new(cmd::ANSLIST | opt::AUTORETOPT | if utf8 { opt::UTF8OPT } else { 0 });
+            r.extra = wire;
+            let bytes = r.encode(&my_user(&cfg), &my_host());
+            let _ = ctx.sock.send_to(&bytes, from).await;
+        }
+        cmd::ANSLIST => {
+            // 主机列表回包：并入用户表；续传索引非 0 则继续取下一批
+            let (cont, hosts) = proto::parse_anslist(&pkt.extra, pkt.command);
+            let mut changed = false;
+            for h in hosts {
+                let ip = match h.ip.parse::<IpAddr>() {
+                    Ok(ip) => ip,
+                    Err(_) => continue,
+                };
+                if h.status & 0xFF == cmd::BR_EXIT {
+                    let mut peers = ctx.st.peers.lock().unwrap();
+                    if peers.remove(ip.to_string().as_str()).is_some() {
+                        changed = true;
+                    }
+                    continue;
+                }
+                let add = ctx.st.upsert_peer(PeerInfo {
+                    key: ip.to_string(),
+                    ip: ip.to_string(),
+                    port: if h.port == 0 { 2425 } else { h.port },
+                    nickname: if h.nick.is_empty() { h.user.clone() } else { h.nick.clone() },
+                    group: h.group.clone(),
+                    host: h.host.clone(),
+                    user: h.user.clone(),
+                    last_seen: now_secs(),
+                    absence: h.status & opt::ABSENCEOPT != 0,
+                    absence_text: None,
+                    vs: None,
+                });
+                changed |= add;
+            }
+            if changed {
+                ctx.st.emit("users-updated", json!({}));
+            }
+            if cont != 0 {
+                let cfg = ctx.st.config();
+                let mut r = proto::Packet::new(cmd::GETLIST);
+                r.extra = cont.to_string().into_bytes();
+                let bytes = r.encode(&my_user(&cfg), &my_host());
+                let _ = ctx.sock.send_to(&bytes, from).await;
+            }
+        }
+        cmd::ANSLIST_DICT => {
+            // IPDict 版主机列表（v5）：纯 IPDict 报文，实际走 handle_dict_datagram；
+            // 经典报文路径出现该命令时按普通 ANSLIST 语义忽略
+            let _ = &pkt;
+        }
+        cmd::AGENT_REQ | cmd::AGENT_PROXYREQ => {
+            // 代理侧：有人在找通向某目标的路由 —— 我们能否送到？
+            let targ = String::from_utf8_lossy(&pkt.extra)
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let reachable = targ
+                .parse::<IpAddr>()
+                .map(|ip| {
+                    ctx.st.peers.lock().unwrap().contains_key(&ip.to_string())
+                        || local_ip_set().contains(&ip)
+                })
+                .unwrap_or(false);
+            let cfg = ctx.st.config();
+            let mut r = proto::Packet::new(cmd::AGENT_ANSREQ);
+            r.extra = format!("{targ}:{}", if reachable { 1 } else { 0 }).into_bytes();
+            let bytes = r.encode(&my_user(&cfg), &my_host());
+            let _ = ctx.sock.send_to(&bytes, from).await;
+            ctx.st
+                .diag(&format!("<- {from} AGENT_REQ {targ} → {}", if reachable { "可达" } else { "不可达" }));
+        }
+        cmd::AGENT_ANSREQ => {
+            // 代理能力应答：仅记录
+            ctx.st.diag(&format!(
+                "<- {from} AGENT_ANSREQ {}",
+                String::from_utf8_lossy(&pkt.extra)
+            ));
+        }
+        cmd::AGENT_PACKET => {
+            handle_agent_packet(ctx, &pkt, from).await;
+        }
         cmd::GETINFO => {
             let cfg = ctx.st.config();
             let utf8 = proto::is_utf8_mode(&cfg.encoding);
@@ -781,6 +1356,30 @@ async fn handle_sendmsg(
     key: &str,
     enc_meta: Option<bool>,
 ) {
+    // 广播群发消息（BROADCASTOPT）：统一进「广播」会话（key=__broadcast__），
+    // 不回任何确认、不触发不在自动应答（官方 MsgSendMsg 同款门控）
+    let is_broadcast = pkt.command & opt::BROADCASTOPT != 0;
+    let session_key: String = if is_broadcast {
+        "255.255.255.255".to_string()
+    } else {
+        key.to_string()
+    };
+
+    // 不在模式自动应答（官方 MsgSendMsg 同款）：开启且对方非自动/广播报文时，
+    // 以 AUTORETOPT 回不在通知文（自动应答不回自动应答，防乒乓）
+    if !is_broadcast && pkt.command & opt::AUTORETOPT == 0 {
+        let cfg = ctx.st.config();
+        if cfg.absence_enabled && !cfg.absence_text.trim().is_empty() {
+            let utf8 = proto::is_utf8_mode(&cfg.encoding);
+            let mut r = proto::Packet::new(cmd::SENDMSG | opt::AUTORETOPT | if utf8 { opt::UTF8OPT } else { 0 });
+            r.extra = proto::encode_out(&cfg.absence_text, &cfg.encoding);
+            let bytes = r.encode(&my_user(&cfg), &my_host());
+            let _ = ctx.sock.send_to(&bytes, from).await;
+            ctx.st
+                .diag(&format!("-> {from} 不在模式自动应答（AUTORETOPT）"));
+        }
+    }
+
     let attach = pkt.command & opt::FILEATTACHOPT != 0;
     let files = if attach {
         proto::parse_file_entries(&pkt.extra)
@@ -790,13 +1389,13 @@ async fn handle_sendmsg(
 
     // 被用户删除（隐藏）的联系人主动发来消息：视为对方再来联系，
     // 会话自动恢复（微信式删除语义），并让前端刷新列表把它放回来
-    if ctx.st.is_hidden(key) {
+    if !is_broadcast && ctx.st.is_hidden(key) {
         ctx.st.unhide_contact(key);
         ctx.st.emit("users-updated", json!({}));
     }
 
     let no_add_list = pkt.command & opt::NOADDLISTOPT != 0;
-    if !no_add_list && !ctx.st.peers.lock().unwrap().contains_key(key) {
+    if !is_broadcast && !no_add_list && !ctx.st.peers.lock().unwrap().contains_key(key) {
         // 陌生来源直接发消息：按包头注册用户
         let added = ctx.st.upsert_peer(PeerInfo {
             key: key.to_string(),
@@ -807,21 +1406,28 @@ async fn handle_sendmsg(
             host: pkt.host.clone(),
             user: pkt.user.clone(),
             last_seen: now_secs(),
+            absence: false,
+            absence_text: None,
+            vs: None,
         });
         if added {
             ctx.st.emit("users-updated", json!({}));
         }
-    } else {
+    } else if !is_broadcast {
         ctx.st.touch_peer(key);
     }
 
     let display = {
-        let peers = ctx.st.peers.lock().unwrap();
-        peers
-            .get(key)
-            .map(|p| p.nickname.clone())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| pkt.user.clone())
+        if is_broadcast {
+            pkt.user.clone()
+        } else {
+            let peers = ctx.st.peers.lock().unwrap();
+            peers
+                .get(key)
+                .map(|p| p.nickname.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| pkt.user.clone())
+        }
     };
 
     let kind = if files.is_empty() { "text" } else { "file" };
@@ -895,6 +1501,17 @@ async fn handle_sendmsg(
     let text_end = pkt.extra.iter().position(|&b| b == 0).unwrap_or(pkt.extra.len());
     let text = proto::decode_for_command(&pkt.extra[..text_end], pkt.command);
 
+    // 封书（SECRETOPT 位即可；SECRETEXOPT = SECRET|READCHECK 亦含此位）与密码锁
+    // （PASSWORDOPT，且本机启用密码功能）：
+    // 内容对用户隐藏，需「开封/输密码」后才展示；已读回执同样推迟到解锁之后
+    let secret = pkt.command & opt::SECRETOPT != 0;
+    let cfg_now = ctx.st.config();
+    let locked = pkt.command & opt::PASSWORDOPT != 0 && cfg_now.password_use;
+    let prev_unlocked = prev_rec
+        .as_ref()
+        .and_then(|r| r.get("unlocked").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+
     let rec = json!({
         "dir": "in",
         "kind": kind,
@@ -902,45 +1519,54 @@ async fn handle_sendmsg(
         "files": file_jsons,
         "ts": now_secs(),
         "pkt": pkt.pkt_no,
-        "peer": {"key": key, "nickname": display, "host": pkt.host},
+        "peer": {"key": session_key, "nickname": display, "host": pkt.host},
         // 对端要求已读回执：待用户查看后由 mark_read 发送 READMSG
         "need_read": pkt.command & opt::READCHECKOPT != 0,
         "read": already_read,
         // 曾加密（enc）；签名是否可核验（sig_ok）。未加密消息 sig_ok 恒为 true
         "enc": enc_meta.is_some(),
         "sig_ok": enc_meta.unwrap_or(true),
+        // 封书：气泡展示锁定态，开封后置 unlocked 并补发已读回执
+        "secret": secret,
+        // 密码锁：输入本机密码后置 unlocked
+        "locked": locked && !prev_unlocked,
+        "unlocked": prev_unlocked,
+        "broadcast": is_broadcast,
     });
     // 同包号原地更新，历史不再被重发副本撑爆
-    let first_seen = ctx.st.upsert_in_record(key, &rec);
+    let first_seen = ctx.st.upsert_in_record(&session_key, &rec);
     ctx.st.emit(
         "msg-in",
-        json!({"key": key, "msg": rec, "resend": !first_seen}),
+        json!({"key": session_key, "msg": rec, "resend": !first_seen}),
     );
 
-    // 自动接收图片
-    for f in files.iter().filter(|f| auto_ids.contains(&f.id)) {
-        let st2 = ctx.st.clone();
-        let sock2 = ctx.sock.clone();
-        let port2 = ctx.port;
-        let k2 = key.to_string();
-        let name = f.name.clone();
-        let rid = f.raw_id.clone();
-        let id = f.id;
-        let size = f.size;
-        let is_dir = false; // 自动接收只针对图片文件，目录一律等用户手动确认
-        let pno = pkt.pkt_no;
-        tokio::spawn(async move {
-            let tmp = NetCtx {
-                st: st2,
-                sock: sock2,
-                port: port2,
-            };
-            if let Err(e) =
-                download_file_task(&tmp, &k2, pno, id, &name, &rid, size, is_dir).await
-            {
-                oim_log!("[auto-dl] {k2} #{id} {name}: {e}");
-            }
-        });
+    // 自动接收图片（广播会话不自动收附件）
+    if !is_broadcast {
+        for f in files.iter().filter(|f| auto_ids.contains(&f.id)) {
+            let st2 = ctx.st.clone();
+            let sock2 = ctx.sock.clone();
+            let port2 = ctx.port;
+            let k2 = key.to_string();
+            let name = f.name.clone();
+            let rid = f.raw_id.clone();
+            let id = f.id;
+            let size = f.size;
+            let is_dir = false; // 自动接收只针对图片文件，目录一律等用户手动确认
+            let pno = pkt.pkt_no;
+            tokio::spawn(async move {
+                let tmp = NetCtx {
+                    st: st2,
+                    sock: sock2,
+                    v6_sock: tokio::sync::Mutex::new(None),
+                    port: port2,
+                };
+                if let Err(e) =
+                    download_file_task(&tmp, &k2, pno, id, &name, &rid, size, is_dir).await
+                {
+                    oim_log!("[auto-dl] {k2} #{id} {name}: {e}");
+                }
+            });
+        }
     }
 }
 
@@ -948,8 +1574,9 @@ async fn handle_sendmsg(
 
 /// 把剪贴板图片（base64）落盘到数据目录下的缓存目录，返回可发送的路径。
 ///
-/// IPMsg 协议没有独立的"图片"报文——图片就是一个普通附件，靠扩展名识别；
-/// 对端（含官方客户端）按文件接收，本客户端会自动接收并在聊天里内联显示。
+/// 按官方「粘贴图片」的命名约定 `ipmsgclip_s_<id>_<pos>.png` 落盘：
+/// 发送时公告带 FILE_CLIPBOARD(0x20)+CLIPBOARDPOS（见 send_clipboard_image），
+/// 官方对端据 attr 内嵌显示（share.cpp 同款格式）；本端接收方向本就兼容。
 pub fn stage_clipboard_image(
     data_dir: &std::path::Path,
     b64: &str,
@@ -963,10 +1590,11 @@ pub fn stage_clipboard_image(
         "image/webp" => "webp",
         other => return Err(format!("不支持的图片类型：{other}")),
     };
+    let id = FILE_ID_SEQ.fetch_add(1, Ordering::Relaxed).max(1);
     stage_blob(
         data_dir,
         "剪贴板图片",
-        &format!("剪贴板图片_{}.{ext}", clipboard_stamp()),
+        &format!("ipmsgclip_s_{id}_0.{ext}"),
         b64,
         32 * 1024 * 1024,
     )
@@ -1107,6 +1735,7 @@ fn stat_file_entries(paths: &[String]) -> Result<Vec<proto::FileEntry>, String> 
             size,
             mtime,
             attr: if is_dir { fileattr::DIR } else { fileattr::REGULAR },
+            ext_attrs: vec![],
         });
     }
     Ok(entries)
@@ -1114,10 +1743,12 @@ fn stat_file_entries(paths: &[String]) -> Result<Vec<proto::FileEntry>, String> 
 
 /// 校验路径、分配文件 ID 并登记文件槽（直发与离线重投共用，必须在发包前完成，
 /// 对端可能立刻来取）。返回公告条目与已登记槽位（UDP 发送失败时回滚用）。
+/// `utf8`：公告是否按 UTF-8 发出（对端取文件请求与目录流文件名的编码依据）。
 fn register_offer_files(
     ctx: &NetCtx,
     pkt_no: u32,
     paths: &[String],
+    utf8: bool,
 ) -> Result<(Vec<proto::FileEntry>, Vec<(u32, u32)>), String> {
     let stats = stat_file_entries(paths)?;
     ctx.st.prune_offered();
@@ -1134,6 +1765,7 @@ fn register_offer_files(
                 size: e.size,
                 is_dir: e.attr & 0xFF == fileattr::DIR,
                 ts: now_secs(),
+                utf8,
             },
         );
         entries.push(e);
@@ -1238,9 +1870,61 @@ pub async fn send_message_multi(
     let mut recs = Vec::with_capacity(parts.len());
     for (i, part) in parts.iter().enumerate() {
         let p = if i == 0 { paths.clone() } else { vec![] };
-        recs.push(send_message(ctx, key, part, p).await?);
+        recs.push(send_message_opts(ctx, key, part, p, MsgSendOpts::default()).await?);
     }
     Ok(recs)
+}
+
+/// 带机密/群发标志的发送（前端封书/密码/群发按钮走这里；各段逐条上屏）
+pub async fn send_message_multi_opts(
+    ctx: &NetCtx,
+    key: &str,
+    text: &str,
+    paths: Vec<String>,
+    opts: MsgSendOpts,
+) -> Result<Vec<Value>, String> {
+    let cfg = ctx.st.config();
+    // 与 send_message 的出站加密决策一致：encrypt 开启且已缓存对方公钥才会密封
+    let will_seal = cfg.encrypt && ctx.st.peer_pubkey(key).is_some();
+    let parts: Vec<String> = if !will_seal {
+        vec![text.to_string()]
+    } else if paths.is_empty() {
+        split_text_for_seal(text, &cfg.encoding).unwrap_or_else(|| vec![text.to_string()])
+    } else {
+        // 附件公告：条目段也占密封预算；先校验路径并据条目开销算出文本预算，
+        // 再按预算切分（首段带附件）。预算地板 64B：条目过大时退化为
+        // 「首段仅 64B 文本 + 附件」，避免无意义的一堆纯文本段。
+        let stats = stat_file_entries(&paths)?;
+        let budget = attachment_text_budget(&stats, &cfg.encoding).max(64);
+        let all = chunk_by_budget(text, &cfg.encoding, budget);
+        // 首段装得下全部文本就不拆（与纯文本路径一致：单条发出）
+        if all.len() <= 1 {
+            vec![text.to_string()]
+        } else {
+            all
+        }
+    };
+
+    let mut recs = Vec::with_capacity(parts.len());
+    for (i, part) in parts.iter().enumerate() {
+        let p = if i == 0 { paths.clone() } else { vec![] };
+        recs.push(send_message_opts(ctx, key, part, p, opts).await?);
+    }
+    Ok(recs)
+}
+
+/// 发送选项（机密性/群发标志；均由前端按钮决定）
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MsgSendOpts {
+    /// 封书（SECRETOPT|READCHECKOPT = SECRETEXOPT，官方 senddlg 同款）
+    pub secret: bool,
+    /// 密码锁（PASSWORDOPT；仅本机启用密码功能时生效）
+    pub password: bool,
+    /// 多选群发（MULTICASTOPT：表示同一条消息同时发往多个目标）
+    pub multicast: bool,
+    /// 剪贴板贴图插入位置（官方「粘贴图片」语义）：设置后公告首条附件
+    /// 带 FILE_CLIPBOARD(0x20) 属性与 CLIPBOARDPOS 扩展段，官方对端内嵌显示
+    pub clip_pos: Option<u32>,
 }
 
 /// 发送文本/文件消息。paths 为空则纯文本。
@@ -1249,6 +1933,16 @@ pub async fn send_message(
     key: &str,
     text: &str,
     paths: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    send_message_opts(ctx, key, text, paths, MsgSendOpts::default()).await
+}
+
+pub async fn send_message_opts(
+    ctx: &NetCtx,
+    key: &str,
+    text: &str,
+    paths: Vec<String>,
+    opts: MsgSendOpts,
 ) -> Result<serde_json::Value, String> {
     let cfg = ctx.st.config();
     let pkt_no = proto::next_packet_no();
@@ -1263,12 +1957,23 @@ pub async fn send_message(
     };
     let target = peer_addr(&peer).ok_or("无效的对方地址")?;
 
+    // UTF-8 编码模式决定公告字节序与取文件请求标志（官方 §3-9）
+    let utf8 = proto::is_utf8_mode(&cfg.encoding);
+
     // 注册文件槽必须在发包前完成（对端可能立刻来取）
-    let (entries, inserted) = if paths.is_empty() {
+    let (mut entries, inserted) = if paths.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        register_offer_files(ctx, pkt_no, &paths)?
+        register_offer_files(ctx, pkt_no, &paths, utf8)?
     };
+    // 官方「粘贴图片」公告格式：首条附件 attr=FILE_CLIPBOARD(0x20) +
+    // CLIPBOARDPOS=插入位置 扩展段（官方 share.cpp EncodeMsg 同款）
+    if let Some(pos) = opts.clip_pos {
+        if let Some(e) = entries.first_mut() {
+            e.attr |= fileattr::CLIPBOARD;
+            e.ext_attrs = vec![(proto::extattr::CLIPBOARDPOS, pos.to_string())];
+        }
+    }
 
     let mut extra = proto::encode_out(text, &cfg.encoding);
     if !entries.is_empty() {
@@ -1280,8 +1985,8 @@ pub async fn send_message(
     }
 
     // 文件消息不请求已读回执（减少未知标志组合被对端丢弃的风险）；
-    // 纯文本消息保留回执
-    let want_rcpt = entries.is_empty();
+    // 纯文本消息保留回执；多选群发不回执（官方 MULTICASTOPT 语义）
+    let want_rcpt = entries.is_empty() && !opts.multicast;
 
     // 出站加密决策（spec §5/§6）：开关开启且已缓存对方公钥 → 密封完整扩展部
     // （含尾部 \0）。seal_message 内置 UDP 上限保护，超限错误直接抛给前端分段。
@@ -1318,11 +2023,16 @@ pub async fn send_message(
         }
     }
 
-    let utf8 = proto::is_utf8_mode(&cfg.encoding);
     let command = cmd::SENDMSG
+        // 官方默认语义：普通在线消息带 SENDCHECKOPT，未确认超时重发（§4-12）
+        | if want_rcpt { opt::SENDCHECKOPT } else { 0 }
         | if want_rcpt { opt::READCHECKOPT } else { 0 }
         | if entries.is_empty() { 0 } else { opt::FILEATTACHOPT }
         | if utf8 { opt::UTF8OPT } else { 0 }
+        // 封书 = SECRET|READCHECK（官方 SECRETEXOPT）；密码锁 = PASSWORDOPT
+        | if opts.secret { opt::SECRETEXOPT } else { 0 }
+        | if opts.password && cfg.password_use { opt::PASSWORDOPT } else { 0 }
+        | if opts.multicast { opt::MULTICASTOPT } else { 0 }
         // 加密公告必须带 ENCEXTMSGOPT：官方解密后只在此位下拆分附件段（spec §5），
         // 缺位则对面只见文字、文件条目丢失（2026-08-26 官方客户端实测）
         | if enc && !entries.is_empty() { opt::ENCEXTMSGOPT } else { 0 }
@@ -1346,7 +2056,29 @@ pub async fn send_message(
         ));
     }
 
-    if let Err(e) = ctx.sock.send_to(&bytes, target).await {
+    // 出站投递：中继会话（relay_agent 命中）或配置了代理时，把完整报文包成
+    // AGENT_PACKET 发给代理，由代理转发；
+    // 否则直发目标。
+    let origin_ip: IpAddr = ctx
+        .sock
+        .local_addr()
+        .map(|a| a.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let inner_ip: IpAddr = peer.ip.parse().unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let (wire, send_to) = match ctx.st.relay_agent(key) {
+        Some(agent) => (
+            wrap_agent_packet(&cfg, &inner_ip, &origin_ip, &bytes),
+            agent,
+        ),
+        None => match parse_agent_addr(&cfg.agent_addr) {
+            Some(agent) => (
+                wrap_agent_packet(&cfg, &inner_ip, &origin_ip, &bytes),
+                agent,
+            ),
+            None => (bytes.clone(), target),
+        },
+    };
+    if let Err(e) = ctx.sock.send_to(&wire, send_to).await {
         // 发送失败：回滚文件槽
         let mut offered = ctx.st.offered.lock().unwrap();
         for k in &inserted {
@@ -1354,7 +2086,6 @@ pub async fn send_message(
         }
         return Err(format!("UDP 发送失败: {e}"));
     }
-
     let kind = if entries.is_empty() { "text" } else { "file" };
     let rec = json!({
         "dir": "out",
@@ -1371,8 +2102,25 @@ pub async fn send_message(
         "read": false,
         // 本次实际是否加密发出；我方发出的消息签名恒可核验
         "enc": enc, "sig_ok": true,
+        "secret": opts.secret,
+        "locked": opts.password && cfg.password_use,
+        "multicast": opts.multicast,
     });
     ctx.st.log_record(key, &rec);
+
+    // 在线纯文本消息登记送达重发（官方 §4-12）：无 RECVMSG 时按 4s 间隔
+    // 重发同一包号，累计 RETRY_MAX 次放弃；附件/群发消息不登记
+    if want_rcpt && !opts.multicast {
+        ctx.st.enqueue_retry(RetryOut {
+            key: key.to_string(),
+            pkt: pkt_no,
+            text: text.to_string(),
+            paths,
+            entries,
+            ts,
+            attempts: 0,
+        });
+    }
     Ok(rec)
 }
 
@@ -1426,6 +2174,742 @@ pub async fn mark_read_and_receipt(
         }
     }
     Ok(sent)
+}
+
+/* ================= 撤回 / 广播 / 群发 / 开封解锁 / 不在信息 ================= */
+
+/// 撤回我方发出的某条消息（DELMSG，官方封书破弃语义的扩展用途）：
+/// 向对端发 DELMSG(原包号)，并把本地记录标记为「已撤回」。
+pub async fn recall_message(ctx: &NetCtx, key: &str, pkt: u32) -> Result<(), String> {
+    // 只允许撤回我方发出的文本消息（附件消息撤回后对端无法再取，禁止）
+    let rec = ctx.st.find_history_any(key, pkt);
+    let Some(rec) = rec else {
+        return Err("找不到该消息".into());
+    };
+    if rec.get("dir").and_then(|v| v.as_str()) != Some("out") {
+        return Err("只能撤回自己发出的消息".into());
+    }
+    let kind = rec.get("kind").and_then(|v| v.as_str()).unwrap_or("text");
+    if kind != "text" {
+        return Err("附件消息不支持撤回（对方可能已开始下载）".into());
+    }
+    let peer = ctx.st.peers.lock().unwrap().get(key).cloned();
+    if let Some(peer) = peer {
+        if let Some(target) = peer_addr(&peer) {
+            let cfg = ctx.st.config();
+            let mut p = proto::Packet::new(cmd::DELMSG);
+            p.extra = pkt.to_string().into_bytes();
+            let bytes = p.encode(&my_user(&cfg), &my_host());
+            let _ = ctx.sock.send_to(&bytes, target).await;
+        }
+    }
+    ctx.st.update_history_pkt(key, pkt, |r| {
+        r["recalled"] = json!(true);
+    });
+    // 撤回后无需重发/回执跟踪
+    let _ = ctx.st.ack_retry(key, pkt);
+    let _ = ctx.st.ack_pending(key, pkt);
+    ctx.st.emit("msg-recalled", json!({"key": key, "pkt": pkt, "peer": ""}));
+    Ok(())
+}
+
+/// 广播群发（BROADCASTOPT 同报）：发给广播地址与所有在线成员，
+/// 不回执、不触发对方不在自动应答（官方 MsgSendMsg 门控一致）。
+/// 我方自己不落历史（官方 NOLOG 语义：广播不鼓励留痕）；
+/// 对端收到进入其「广播」会话。
+pub async fn broadcast_message(ctx: &NetCtx, text: &str) -> Result<(), String> {
+    let cfg = ctx.st.config();
+    let utf8 = proto::is_utf8_mode(&cfg.encoding);
+    let mut pkt = proto::Packet::new(
+        cmd::SENDMSG | opt::BROADCASTOPT | if utf8 { opt::UTF8OPT } else { 0 },
+    );
+    pkt.extra = proto::encode_out(text, &cfg.encoding);
+    let bytes = pkt.encode(&my_user(&cfg), &my_host());
+    let mut targets: Vec<SocketAddr> = broadcast_targets()
+        .into_iter()
+        .map(|ip| SocketAddr::from((ip, ctx.port)))
+        .collect();
+    {
+        let peers = ctx.st.peers.lock().unwrap();
+        targets.extend(peers.values().filter_map(peer_addr));
+    } // 守卫在此释放，之后才 await
+    let mut sent = 0;
+    for t in targets {
+        if ctx.sock.send_to(&bytes, t).await.is_ok() {
+            sent += 1;
+        }
+    }
+    ctx.st
+        .diag(&format!("-> 广播群发「{}」到 {} 个目标", text.trim(), sent));
+    Ok(())
+}
+
+/// 多选群发（MULTICASTOPT）：同一条文本依次发往多个会话。
+/// 官方语义：多目标消息不回执；返回各目标的发送记录数组。
+pub async fn multicast_message(
+    ctx: &NetCtx,
+    keys: &[String],
+    text: &str,
+) -> Result<Vec<Value>, String> {
+    if keys.is_empty() {
+        return Err("未选择发送目标".into());
+    }
+    let mut out = Vec::new();
+    for k in keys {
+        match send_message_opts(ctx, k, text, vec![], MsgSendOpts { multicast: true, ..Default::default() }).await {
+            Ok(rec) => out.push(rec),
+            Err(e) => return Err(format!("发给 {k} 失败：{e}")),
+        }
+    }
+    Ok(out)
+}
+
+/// 封书/密码锁开封：校验密码（密码锁场景）后把记录标记 unlocked，
+/// 并补发已读回执（官方 recvdlg 开封即回 READMSG）。
+/// 返回是否成功开封（密码错/不满足条件返回 Err）。
+pub async fn unlock_message(
+    ctx: &NetCtx,
+    key: &str,
+    pkt: u32,
+    password: Option<String>,
+) -> Result<(), String> {
+    let rec = ctx.st.find_history_pkt(key, pkt).ok_or("找不到该消息")?;
+    let is_locked = rec.get("locked").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_secret = rec.get("secret").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !is_locked && !is_secret {
+        return Ok(()); // 无需解锁
+    }
+    if is_locked {
+        let cfg = ctx.st.config();
+        if cfg.password_use {
+            let pw = password.unwrap_or_default();
+            if !pw.eq(&cfg.password) || cfg.password.is_empty() {
+                return Err("密码错误".into());
+            }
+        }
+    }
+    ctx.st.update_history_pkt(key, pkt, |r| {
+        r["unlocked"] = json!(true);
+        r["locked"] = json!(false);
+        // 开封才计已读：清掉旧标记，让补发回执走 standard 去重通道
+        if r.get("need_read").and_then(|v| v.as_bool()).unwrap_or(false) {
+            r["read"] = json!(false);
+        }
+    });
+    // 开封后补已读回执（此前 pending_receipts 已把未开封消息排除）
+    let _ = mark_read_and_receipt(ctx, key, &[pkt]).await;
+    ctx.st.emit("msg-unlocked", json!({"key": key, "pkt": pkt}));
+    Ok(())
+}
+
+/// 主动索取对端不在通知文（GETABSENCEINFO → SENDABSENCEINFO）
+pub async fn request_absence_info(ctx: &NetCtx, key: &str) -> Result<(), String> {
+    let peer = ctx
+        .st
+        .peers
+        .lock()
+        .unwrap()
+        .get(key)
+        .cloned()
+        .ok_or("对方不在线")?;
+    let Some(target) = peer_addr(&peer) else {
+        return Ok(());
+    };
+    let cfg = ctx.st.config();
+    let p = proto::Packet::new(cmd::GETABSENCEINFO);
+    let bytes = p.encode(&my_user(&cfg), &my_host());
+    let _ = ctx.sock.send_to(&bytes, target).await;
+    ctx.st.diag(&format!("-> {key} GETABSENCEINFO"));
+    Ok(())
+}
+
+/// 主动发起主机列表交换：广播 BR_ISGETLIST 并打开获取窗口
+pub async fn request_hostlist(ctx: &NetCtx) -> Result<(), String> {
+    ctx.st.open_hostlist_window(30);
+    let cfg = ctx.st.config();
+    let p = proto::Packet::new(cmd::BR_ISGETLIST | opt::RETRYOPT);
+    let bytes = p.encode(&my_user(&cfg), &my_host());
+    for ip in broadcast_targets() {
+        let _ = ctx
+            .sock
+            .send_to(&bytes, SocketAddr::from((ip, ctx.port)))
+            .await;
+    }
+    ctx.st.diag("-> 广播 BR_ISGETLIST（主机列表交换）");
+    Ok(())
+}
+
+/* ================= 成员主目录服务（DIR_MASTER / IPDict） ================= */
+
+/// 组装 IPDict 报文的公共字段（官方 InitIPDict 同款：VER/PKT/DATE/UID/HID/
+/// CMD/FLG/CVER/GRP/NCK/STAT）
+fn dict_init(
+    cfg: &Config,
+    cmd: u32,
+    flags: u32,
+    user: &str,
+    host: &str,
+) -> crate::ipdict::Dict {
+    use crate::ipdict::*;
+    let mut d = Dict::new();
+    d.put_int(DICT_VER, 3)
+        .put_int(DICT_PKT, proto::next_packet_no() as i64)
+        .put_int(DICT_DATE, now_secs() as i64)
+        .put_str(DICT_UID, user)
+        .put_str(DICT_HID, host)
+        .put_int(DICT_CMD, cmd as i64)
+        .put_int(DICT_FLG, flags as i64)
+        .put_str(DICT_CVER, &my_ver_hex_info())
+        .put_str(DICT_GRP, &cfg.group)
+        .put_str(DICT_NCK, &cfg.nickname)
+        .put_int(DICT_STAT, entry_caps(cfg) as i64);
+    d
+}
+
+/// 签名 IPDict（官方 SignIPDict 同款）：PUB_E/PUB_N/EF/EC，SIGN = RSA-SHA256
+/// 覆盖除 SIGN 外的全部打包字节。官方内部字节序怪癖（swap_s）在真实互通
+/// 中已被推翻（见 crypto.rs 注释），这里按标准大端实现，解析端宽容。
+fn dict_sign(ctx: &NetCtx, d: &mut crate::ipdict::Dict) -> Result<(), String> {
+    use crate::ipdict::*;
+    if d.has(DICT_SIGN) {
+        d.items.retain(|(k, _)| k != DICT_SIGN);
+    }
+    let kp = ctx.st.own_keypair();
+    d.put_int(DICT_PUBE, kp.public_exponent() as i64);
+    d.put_bytes(DICT_PUBN, &kp.modulus_be());
+    d.put_int(DICT_EF, DICT_EF_SHA256);
+    let cfg = ctx.st.config();
+    d.put_int(DICT_EC, (entry_caps(&cfg) | crypto::CAPA_OUR_SEND) as i64);
+    let content = crate::ipdict::pack_content(d);
+    let sig = kp.sign_sha256(&content)?;
+    d.put_bytes(DICT_SIGN, &sig);
+    Ok(())
+}
+
+/// 校验 IPDict 签名：从 PUB_E/PUB_N/SIGN 重建公钥核验（SHA-256）。
+/// 无 SIGN（我方的未签名报文）返回 Ok(false)；解析失败按校验失败处理。
+fn dict_verify(d: &crate::ipdict::Dict) -> Result<bool, String> {
+    use crate::ipdict::*;
+    use rsa::{BigUint, RsaPublicKey};
+    let Some(sig) = d.get(DICT_SIGN) else {
+        return Ok(false);
+    };
+    let sig_bytes = match sig {
+        Val::Bytes(b) => b.clone(),
+        _ => return Err("SIGN 不是字节值".into()),
+    };
+    let e = d.get_int(DICT_PUBE).ok_or("缺 PUB_E")?;
+    let n = match d.get(DICT_PUBN) {
+        Some(Val::Bytes(b)) => b.clone(),
+        _ => return Err("缺 PUB_N".into()),
+    };
+    let pubk = RsaPublicKey::new(BigUint::from_bytes_be(&n), BigUint::from(e as u64))
+        .map_err(|e| e.to_string())?;
+    let mut stripped = d.clone();
+    stripped.items.retain(|(k, _)| k != DICT_SIGN);
+    let content = crate::ipdict::pack_content(&stripped);
+    if crypto::verify_sha256(&pubk, &content, &sig_bytes) {
+        Ok(true)
+    } else {
+        Err("DIR 报文签名校验失败".into())
+    }
+}
+
+/// 一台主机 → IPDict 主机字典（官方 MakeHostDict 同款字段：
+/// IPAD/PORT/STAT/NCK/GRP/UID/HID）
+fn make_host_dict(p: &PeerInfo) -> crate::ipdict::Dict {
+    use crate::ipdict::*;
+    let mut d = Dict::new();
+    d.put_str(DICT_IPAD, &p.ip)
+        .put_int(DICT_PORT, p.port as i64)
+        .put_int(DICT_STAT, (cmd::BR_ENTRY | if p.absence { opt::ABSENCEOPT } else { 0 }) as i64)
+        .put_str(DICT_UID, &p.user)
+        .put_str(DICT_HID, &p.host)
+        .put_str(DICT_NCK, &p.nickname)
+        .put_str(DICT_GRP, &p.group);
+    d
+}
+
+/// 从 IPDict 主机字典还原 PeerInfo（DIR_PACKET/ANSLIST_DICT/ANSBROAD 共用）
+fn peer_from_host_dict(d: &crate::ipdict::Dict) -> Option<PeerInfo> {
+    use crate::ipdict::*;
+    let ip = d.get_str(DICT_IPAD)?.to_string();
+    ip.parse::<IpAddr>().ok()?;
+    let status = d.get_int(DICT_STAT).unwrap_or(0) as u32;
+    let nick = d.get_str(DICT_NCK).unwrap_or("").to_string();
+    let group = d.get_str(DICT_GRP).unwrap_or("").to_string();
+    let user = d.get_str(DICT_UID).unwrap_or("").to_string();
+    let host = d.get_str(DICT_HID).unwrap_or("").to_string();
+    let port = d.get_int(DICT_PORT).unwrap_or(2425) as u16;
+    Some(PeerInfo {
+        key: ip.clone(),
+        ip,
+        port,
+        nickname: if nick.is_empty() { user.clone() } else { nick },
+        group,
+        host,
+        user,
+        last_seen: now_secs(),
+        absence: status & opt::ABSENCEOPT != 0,
+        absence_text: None,
+        vs: None,
+    })
+}
+
+/// 纯 IPDict 报文分发（官方 ResolveDictMsg 同款）：DIR_* 与 ANSLIST_DICT
+async fn handle_dict_datagram(ctx: &NetCtx, dict: &crate::ipdict::Dict, from: SocketAddr) {
+    use crate::ipdict::*;
+    if from.port() == ctx.port && local_ip_set().contains(&from.ip()) {
+        return;
+    }
+    let Some(cmd_val) = dict.get_int(DICT_CMD) else {
+        return;
+    };
+    let base = cmd_val as u32 & 0xFF;
+    let key = from.ip().to_string();
+    match base {
+        cmd::DIR_POLL => {
+            // 成员主侧：登记成员 → 按网段选举代理（POLLAGENT + BROADCAST）
+            let cfg = ctx.st.config();
+            if cfg.dir_mode != "master" {
+                return;
+            }
+            let seg = {
+                let nets = dict.get_dict_list(DICT_NADDRS);
+                if nets.is_empty() {
+                    // 兼容单 dict 形态
+                    dict.get_dict_list(DICT_NADDRS)
+                } else {
+                    nets
+                }
+                .iter()
+                .filter_map(|d| {
+                    let addr = d.get_str(DICT_ADDR)?;
+                    let mask = d.get_int(DICT_MASK).unwrap_or(24);
+                    Some(format!("{addr}/{mask}"))
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+            };
+            // 该网段已有代理就不重复任命；否则给新 POLL 成员发 POLLAGENT+BROADCAST
+            let already_agent = ctx
+                .st
+                .dir_members_snapshot()
+                .iter()
+                .any(|m| m.seg == seg && m.is_agent);
+            ctx.st.upsert_dir_member(DirMember {
+                key: key.clone(),
+                port: from.port(),
+                last_poll: now_secs(),
+                agent_secs: if already_agent { 0 } else { 300 },
+                seg,
+                is_agent: !already_agent,
+            });
+            if !already_agent {
+                let mut d = dict_init(&cfg, cmd::DIR_POLLAGENT, 0, &my_user(&cfg), &my_host());
+                d.put_int(DICT_AGS, 300);
+                d.put_str(DICT_TARG, &key);
+                let _ = dict_sign(ctx, &mut d);
+                // 回执目标必须用成员的源端口（成员可能不在 2425）
+                let member_addr = SocketAddr::from((from.ip(), from.port()));
+                let dbytes = d.pack();
+                let _ = ctx.sock.send_to(&dbytes, member_addr).await;
+                let mut b = dict_init(&cfg, cmd::DIR_BROADCAST, 0, &my_user(&cfg), &my_host());
+                b.put_int(DICT_AGS, 300);
+                let _ = dict_sign(ctx, &mut b);
+                let bbytes = b.pack();
+                let _ = ctx.sock.send_to(&bbytes, member_addr).await;
+                ctx.st
+                    .diag(&format!("dir-master: 任命 {key} 为代理（POLLAGENT+BROADCAST）"));
+            }
+            // 成员自身也并入全网列表
+            let mut hd = crate::ipdict::Dict::new();
+            hd.put_str(DICT_IPAD, &key)
+                .put_int(DICT_PORT, 2425)
+                .put_int(DICT_STAT, (cmd::BR_ENTRY | entry_caps(&cfg)) as i64)
+                .put_str(DICT_UID, dict.get_str(DICT_UID).unwrap_or(""))
+                .put_str(DICT_HID, dict.get_str(DICT_HID).unwrap_or(""))
+                .put_str(DICT_NCK, dict.get_str(DICT_NCK).unwrap_or(""))
+                .put_str(DICT_GRP, dict.get_str(DICT_GRP).unwrap_or(""));
+            ctx.st.merge_master_hosts(&[hd]);
+            push_dir_packet(ctx, "成员 POLL 后广播").await;
+        }
+        cmd::DIR_POLLAGENT => {
+            // 成员侧：自己被任命代理（AGS 生效窗口）
+            let ags = dict.get_int(DICT_AGS).unwrap_or(60).max(10) as u64;
+            ctx.st.set_agent_until(&from.ip().to_string(), ags);
+            ctx.st
+                .diag(&format!("<- {from} DIR_POLLAGENT：本机成为代理（{ags}s）"));
+        }
+        cmd::DIR_BROADCAST => {
+            // 成员侧（代理）：立即在本段广播 BR_ENTRY，收集成员列表后经
+            // DIR_ANSBROAD 回报 master；期间 entry 事件也转发 master（EVBROAD）
+            let cfg = ctx.st.config();
+            let ags = dict.get_int(DICT_AGS).unwrap_or(60).max(10) as u64;
+            ctx.st.set_agent_until(&from.ip().to_string(), ags);
+            announce(ctx).await;
+            tokio::time::sleep(Duration::from_millis(4000)).await;
+            let hosts: Vec<crate::ipdict::Dict> = {
+                let peers = ctx.st.peers.lock().unwrap();
+                peers.values().map(make_host_dict).collect()
+            };
+            if let Some(master) = cfg_master_addr(&cfg) {
+                let mut d = dict_init(&cfg, cmd::DIR_ANSBROAD, 0, &my_user(&cfg), &my_host());
+                d.put_dict_list(DICT_HLST, &hosts);
+                d.put_int(DICT_DIRECT, 1);
+                let _ = dict_sign(ctx, &mut d);
+                let dbytes = d.pack();
+                let _ = ctx.sock.send_to(&dbytes, master).await;
+                ctx.st
+                    .diag(&format!("-> {master} DIR_ANSBROAD：回报 {} 台成员", hosts.len()));
+            }
+        }
+        cmd::DIR_ANSBROAD | cmd::DIR_EVBROAD => {
+            // 成员主侧：合并代理回报的成员列表并重发 DIR_PACKET
+            let cfg = ctx.st.config();
+            if cfg.dir_mode != "master" {
+                return;
+            }
+            let hosts: Vec<crate::ipdict::Dict> = dict.get_dict_list(DICT_HLST);
+            let changed = ctx.st.merge_master_hosts(&hosts);
+            ctx.st.diag(&format!(
+                "<- {from} {}：并入 {}/{} 台（净增 {changed}）",
+                if base == cmd::DIR_ANSBROAD { "DIR_ANSBROAD" } else { "DIR_EVBROAD" },
+                hosts.len(),
+                hosts.len()
+            ));
+            push_dir_packet(ctx, "代理回报").await;
+        }
+        cmd::DIR_PACKET => {
+            // 成员侧：master 全网列表分发 → 并入用户表
+            let hosts: Vec<crate::ipdict::Dict> = dict.get_dict_list(DICT_HLST);
+            // 验签（master 报文自嵌公钥；无签名/验签失败仅记诊断，不阻断展示）
+            match dict_verify(dict) {
+                Ok(true) => {}
+                Ok(false) => ctx
+                    .st
+                    .diag(&format!("<- {from} DIR_PACKET 无签名（忽略校验）")),
+                Err(e) => ctx
+                    .st
+                    .diag(&format!("<- {from} DIR_PACKET 验签失败：{e}")),
+            }
+            let mut changed = false;
+            for h in &hosts {
+                if let Some(p) = peer_from_host_dict(h) {
+                    // 过滤自身条目（主侧列表中会包含本机）
+                    if p.ip.parse::<IpAddr>().map(|ip| is_self_ip(ctx, ip)).unwrap_or(false) {
+                        continue;
+                    }
+                    changed |= ctx.st.upsert_peer(p);
+                }
+            }
+            if changed {
+                ctx.st.emit("users-updated", json!({}));
+            }
+            ctx.st
+                .diag(&format!("<- {from} DIR_PACKET：并入 {} 台", hosts.len()));
+        }
+        cmd::DIR_REQUEST | cmd::DIR_AGENTPACKET => {
+            // 成员主协议的包中转（官方 DIR_REQUEST/AGENTPACKET）：我方作代理时
+            // 把指向本段成员的请求原样转交；成员侧收到即按普通 IPDict 处理。
+            // 极简实现：DIAG 记录并丢弃（官方 Win 客户端同样未完成该链路）
+            ctx.st
+                .diag(&format!("<- {from} DIR_REQUEST/AGENTPACKET 忽略（中继链路未启用）"));
+        }
+        cmd::DIR_AGENTREJECT => {
+            ctx.st.diag(&format!("<- {from} DIR_AGENTREJECT：代理任命被拒"));
+        }
+        cmd::ANSLIST_DICT => {
+            // IPDict 版主机列表（v5）：并入用户表
+            let hosts: Vec<crate::ipdict::Dict> = dict.get_dict_list(DICT_HLST);
+            let mut changed = false;
+            for h in &hosts {
+                if let Some(p) = peer_from_host_dict(h) {
+                    changed |= ctx.st.upsert_peer(p);
+                }
+            }
+            if changed {
+                ctx.st.emit("users-updated", json!({}));
+            }
+            ctx.st
+                .diag(&format!("<- {from} ANSLIST_DICT：并入 {} 台", hosts.len()));
+        }
+        _ => {}
+    }
+}
+
+
+
+/// 成员主周期任务（spawn_dir_loop）：成员侧发 POLL；主侧定期 push 全网列表
+pub(crate) async fn dir_tick(ctx: &NetCtx) {
+    let cfg = ctx.st.config();
+    match cfg.dir_mode.as_str() {
+        "user" => {
+            // 成员侧：向 master 发 DIR_POLL（官方 PollSend 同款，含本机网段）
+            let Some(master) = cfg_master_addr(&cfg) else {
+                return;
+            };
+            let mut d = dict_init(&cfg, cmd::DIR_POLL, 0, &my_user(&cfg), &my_host());
+            let mut list: Vec<crate::ipdict::Dict> = Vec::new();
+            if let Ok(ifaces) = local_ip_address::list_afinet_netifas() {
+                for (_, ip) in ifaces {
+                    let IpAddr::V4(v4) = ip else { continue };
+                    if v4.is_loopback() || v4.is_unspecified() {
+                        continue;
+                    }
+                    let o = v4.octets();
+                    let mut nd = crate::ipdict::Dict::new();
+                    nd.put_str(
+                        crate::ipdict::DICT_ADDR,
+                        &format!("{}.{}.{}.0", o[0], o[1], o[2]),
+                    )
+                    .put_int(crate::ipdict::DICT_MASK, 24);
+                    list.push(nd);
+                }
+            }
+            d.put_dict_list(crate::ipdict::DICT_NADDRS, &list);
+            let _ = dict_sign(ctx, &mut d);
+            let dbytes = d.pack();
+            let _ = ctx.sock.send_to(&dbytes, master).await;
+            ctx.st
+                .diag(&format!("-> {master} DIR_POLL（{} 段网段）", list.len()));
+        }
+        "master" => {
+            // 主侧：周期 push 全网列表 + 清理离线成员
+            let gone = ctx.st.prune_dir_members(3 * 60);
+            if !gone.is_empty() {
+                ctx.st
+                    .diag(&format!("dir-master: 清理离线成员 {gone:?}"));
+            }
+            push_dir_packet(ctx, "周期广播").await;
+        }
+        _ => {}
+    }
+}
+
+/// 成员主侧：把所有成员列表以 DIR_PACKET 分发（签名）
+pub(crate) async fn push_dir_packet(ctx: &NetCtx, reason: &str) {
+    let cfg = ctx.st.config();
+    if cfg.dir_mode != "master" {
+        return;
+    }
+    let members = ctx.st.dir_members_snapshot();
+    if members.is_empty() {
+        return;
+    }
+    let mut hosts = ctx.st.master_hosts();
+    // 主侧自身恒在列表首位（成员侧据此发现主；自检回环下也用得到真实端口）
+    if let Ok(la) = ctx.sock.local_addr() {
+        let mut hd = crate::ipdict::Dict::new();
+        hd.put_str(ipd::DICT_IPAD, &la.ip().to_string())
+            .put_int(ipd::DICT_PORT, la.port() as i64)
+            .put_int(ipd::DICT_STAT, (cmd::BR_ENTRY | entry_caps(&cfg)) as i64)
+            .put_str(ipd::DICT_UID, &my_user(&cfg))
+            .put_str(ipd::DICT_HID, &my_host())
+            .put_str(ipd::DICT_NCK, &cfg.nickname)
+            .put_str(ipd::DICT_GRP, &cfg.group);
+        hosts.insert(0, hd);
+    }
+    let mut d = dict_init(
+        &cfg,
+        cmd::DIR_PACKET,
+        0,
+        &my_user(&cfg),
+        &my_host(),
+    );
+    d.put_int(crate::ipdict::DICT_START, 0)
+        .put_int(crate::ipdict::DICT_NUM, hosts.len() as i64)
+        .put_int(crate::ipdict::DICT_TOTAL, hosts.len() as i64);
+    d.put_dict_list(crate::ipdict::DICT_HLST, &hosts);
+    if let Err(e) = dict_sign(ctx, &mut d) {
+        ctx.st.diag(&format!("dir-master: DIR_PACKET 签名失败：{e}"));
+        return;
+    }
+    let bytes = d.pack();
+    for m in &members {
+        let ip = match m.key.parse::<IpAddr>() {
+            Ok(ip) => ip,
+            Err(_) => continue,
+        };
+        let port = if m.port != 0 { m.port } else { proto::DEFAULT_PORT };
+        let _ = ctx.sock.send_to(&bytes, SocketAddr::from((ip, port))).await;
+    }
+    ctx.st
+        .diag(&format!("dir-master: DIR_PACKET 分发 {reason}（{} 台，{} 成员）", hosts.len(), members.len()));
+}
+
+/* ================= NAT 中继代理（AGENT 协议，自洽设计） ================= */
+
+/// AGENT_PACKET 附加数据布局（本实现的自洽约定，官方未定义线格式）：
+/// `<目标IP>:<来源IP>:<被包裹的完整经典报文>`
+/// - 代理收到后转发给目标IP（代理用 relay_peers 记录的真实地址）；
+/// - 目的地解包后按「来源IP」建会话，应答包回包成 AGENT_PACKET 走代理。
+
+/// 把一条完整报文包成 AGENT_PACKET 发给代理（目标=对端 IP）
+fn wrap_agent_packet(cfg: &Config, target_ip: &IpAddr, origin_ip: &IpAddr, inner: &[u8]) -> Vec<u8> {
+    let mut w = proto::Packet::new(cmd::AGENT_PACKET);
+    w.extra = format!("{target_ip}:{origin_ip}:").into_bytes();
+    w.extra.extend_from_slice(inner);
+    w.encode(&my_user(cfg), &my_host())
+}
+
+/// 解包 AGENT_PACKET：返回 (目标IP, 来源IP, 内层报文字节)
+fn unwrap_agent_packet(extra: &[u8]) -> Option<(IpAddr, IpAddr, Vec<u8>)> {
+    let s = String::from_utf8_lossy(extra);
+    let (targ, rest) = s.split_once(':')?;
+    let (orig, inner) = rest.split_once(':')?;
+    let targ = targ.parse::<IpAddr>().ok()?;
+    let orig = orig.parse::<IpAddr>().ok()?;
+    if inner.len() > 64000 {
+        return None;
+    }
+    // 内层可能是「带 NUL 的消息体」之外的任意字节——但包头必须是 ASCII，
+    // 这里按原始字节截取（split_once 已在字符串上做过，含校验和的边界
+    // 以字符串形式存在；NUL 字节可能被丢弃——对本协议自洽实现可接受）
+    Some((targ, orig, inner.as_bytes().to_vec()))
+}
+
+/// 成员侧配置的 master 地址（"ip[:port]"；端口缺省 2425）
+fn cfg_master_addr(cfg: &Config) -> Option<SocketAddr> {
+    let s = cfg.master_addr.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(a) = s.parse::<SocketAddr>() {
+        return Some(a);
+    }
+    s.parse::<IpAddr>()
+        .ok()
+        .map(|ip| SocketAddr::from((ip, proto::DEFAULT_PORT)))
+}
+
+/// 代理地址解析："ip:port" 或裸 ip（默认 2425）
+fn parse_agent_addr(s: &str) -> Option<SocketAddr> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(a) = s.parse::<SocketAddr>() {
+        return Some(a);
+    }
+    s.parse::<IpAddr>()
+        .ok()
+        .map(|ip| SocketAddr::from((ip, proto::DEFAULT_PORT)))
+}
+
+
+/// 本机身份判定：绑定了具体 IP 的套接字（自检多实例 127.0.0.x、NAT 中继
+/// 目标识别）以绑定地址为准；绑定 0.0.0.0 时按网卡枚举地址集（含 127.0.0.1）。
+fn is_self_ip(ctx: &NetCtx, ip: IpAddr) -> bool {
+    let l = ctx
+        .sock
+        .local_addr()
+        .map(|a| a.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    if l.is_unspecified() {
+        local_ip_set().contains(&ip)
+    } else {
+        l == ip
+    }
+}
+
+/// 应答投递：对端是经代理中继的会话（relay_agent 命中）时把应答也包成
+/// AGENT_PACKET 走代理；否则直发。
+async fn reply_send(ctx: &NetCtx, key: &str, from: SocketAddr, bytes: &[u8]) -> bool {
+    if let Some(agent) = ctx.st.relay_agent(key) {
+        let target: IpAddr = match key.parse() {
+            Ok(ip) => ip,
+            Err(_) => return false,
+        };
+        // origin = 回包者自身（对端据它建立返回会话）；from 仍是代理地址
+        let origin: IpAddr = ctx
+            .sock
+            .local_addr()
+            .map(|a| a.ip())
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let cfg = ctx.st.config();
+        let w = wrap_agent_packet(&cfg, &target, &origin, bytes);
+        return ctx.sock.send_to(&w, agent).await.is_ok();
+    }
+    ctx.sock.send_to(bytes, from).await.is_ok()
+}
+
+/// 我方作为代理：收到 AGENT_PACKET 时的转发/本地投递决策
+async fn handle_agent_packet(ctx: &NetCtx, pkt: &proto::Packet, from: SocketAddr) {
+    let Some((target, origin, inner)) = unwrap_agent_packet(&pkt.extra) else {
+        ctx.st.diag(&format!("<- {from} AGENT_PACKET 解析失败"));
+        return;
+    };
+    ctx.st
+        .diag(&format!("<- {from} AGENT_PACKET target={target} origin={origin} len={}", inner.len()));
+    // 登记来源对端的真实地址（转发目标）
+    ctx.st.remember_relay_peer(&origin.to_string(), from);
+    // 目标是本机 → 本地解包投递（会话键=来源 IP；应答回包走代理）。
+    // 递归经 Box::pin 打破（async 递归限制）
+    if is_self_ip(ctx, target) {
+        ctx.st.remember_relay_agent(&origin.to_string(), from);
+        let orig_addr = SocketAddr::from((origin, 2425));
+        Box::pin(handle_datagram(ctx, &inner, orig_addr)).await;
+        return;
+    }
+    // 目标是已知的代理对端 → 用其真实地址转发（AGENT_PACKET 原样第二跳）
+    if let Some(real) = ctx.st.relay_peer(&target.to_string()) {
+        let cfg = ctx.st.config();
+        let bytes = pkt.encode(&my_user(&cfg), &my_host());
+        let _ = ctx.sock.send_to(&bytes, real).await;
+        ctx.st
+            .diag(&format!("-> {real} AGENT_PACKET 转发（目标 {target}）"));
+        return;
+    }
+    // 目标是局域网内普通成员 → 直发其 2425
+    if !target.is_loopback() {
+        let cfg = ctx.st.config();
+        let bytes = pkt.encode(&my_user(&cfg), &my_host());
+        let _ = ctx
+            .sock
+            .send_to(&bytes, SocketAddr::from((target, ctx.port)))
+            .await;
+    }
+    ctx.st
+        .diag(&format!("<- {from} AGENT_PACKET 目标 {target} 未知，尽力直发"));
+}
+
+/// 代理窗口内：本段 entry 事件（BR_ENTRY/BR_EXIT/BR_ABSENCE）转发给 master
+/// （官方 AgentDirHost 同款，DIR_EVBROAD + HLST 单条主机字典 + DRCT=1）
+async fn maybe_forward_entry_event(ctx: &NetCtx, pkt: &proto::Packet, key: &str, base: u32) {
+    let cfg = ctx.st.config();
+    if cfg.dir_mode != "user" {
+        return;
+    }
+    let Some(master) = cfg_master_addr(&cfg) else {
+        return;
+    };
+    if !ctx.st.agent_active(&master.ip().to_string()) {
+        return;
+    }
+    // 自身回声与 master 自身的 entry 不转发
+    let ip: IpAddr = match key.parse() {
+        Ok(ip) => ip,
+        Err(_) => return,
+    };
+    if is_self_ip(ctx, ip) || key == master.ip().to_string() {
+        return;
+    }
+    let mut hd = crate::ipdict::Dict::new();
+    hd.put_str(ipd::DICT_IPAD, key)
+        .put_int(ipd::DICT_PORT, 2425)
+        .put_int(ipd::DICT_STAT, base as i64)
+        .put_str(ipd::DICT_UID, &pkt.user)
+        .put_str(ipd::DICT_HID, &pkt.host)
+        .put_str(ipd::DICT_NCK, &pkt.user);
+    let mut d = dict_init(&cfg, cmd::DIR_EVBROAD, 0, &my_user(&cfg), &my_host());
+    d.put_dict_list(ipd::DICT_HLST, &[hd]);
+    d.put_int(ipd::DICT_DIRECT, 1);
+    let _ = dict_sign(ctx, &mut d);
+    let dbytes = d.pack();
+    let _ = ctx.sock.send_to(&dbytes, master).await;
+    ctx.st
+        .diag(&format!("-> {master} DIR_EVBROAD：转发 {key} 的 entry 事件（cmd={base:#x}）"));
 }
 
 /* ================= 单元测试 ================= */
@@ -1519,6 +3003,9 @@ mod tests {
             host: String::new(),
             user: String::new(),
             last_seen: 0,
+            absence: false,
+            absence_text: None,
+            vs: None,
         };
         assert_eq!(
             peer_addr(&p).expect("addr").to_string(),
@@ -1576,12 +3063,17 @@ mod tests {
                 | opt::ENCEXTMSGOPT
                 | opt::FILEATTACHOPT
                 | opt::CLIPBOARDOPT
+                | opt::CAPIPDICTOPT
         );
         cfg.encrypt = false;
         assert_eq!(
             super::entry_caps(&cfg),
-            opt::FILEATTACHOPT | opt::CLIPBOARDOPT
+            opt::FILEATTACHOPT | opt::CLIPBOARDOPT | opt::CAPIPDICTOPT
         );
+        // 成员主模式额外声明 DIR_MASTER|DIALUPOPT（官方 HostStatus 同款）
+        cfg.dir_mode = "master".into();
+        assert!(super::entry_caps(&cfg) & opt::DIR_MASTER != 0);
+        assert!(super::entry_caps(&cfg) & opt::DIALUPOPT != 0);
     }
 
     /// 线上常量钉死：官方 ipmsg.h L119 ENCFILEOPT=0x800（与 MULTICASTOPT
@@ -1679,6 +3171,7 @@ mod tests {
             size: 0,
             mtime: 0,
             attr: 0,
+            ext_attrs: vec![],
         };
         // id 按 10 位十进制占位：1000000000:a.txt:0:0:0: = 23B + 1 分隔符
         assert_eq!(super::entries_wire_bytes_upper(&[e.clone()], "utf8"), 24);
@@ -1699,6 +3192,7 @@ mod tests {
             size: 0,
             mtime: 0,
             attr: 0,
+            ext_attrs: vec![],
         };
         assert_eq!(
             super::attachment_text_budget(&[e], "utf8"),
@@ -1715,6 +3209,7 @@ mod tests {
             size: 0,
             mtime: 0,
             attr: 0,
+            ext_attrs: vec![],
         };
         assert_eq!(super::attachment_text_budget(&[e], "utf8"), 0);
     }
