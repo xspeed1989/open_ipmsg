@@ -2640,13 +2640,7 @@ async fn handle_dict_datagram(ctx: &NetCtx, dict: &crate::ipdict::Dict, from: So
                 return;
             }
             let seg = {
-                let nets = dict.get_dict_list(DICT_NADDRS);
-                if nets.is_empty() {
-                    // 兼容单 dict 形态
-                    dict.get_dict_list(DICT_NADDRS)
-                } else {
-                    nets
-                }
+                poll_networks(dict)
                 .iter()
                 .filter_map(|d| {
                     let addr = d.get_str(DICT_ADDR)?;
@@ -2800,6 +2794,18 @@ async fn handle_dict_datagram(ctx: &NetCtx, dict: &crate::ipdict::Dict, from: So
                 .diag(&format!("<- {from} ANSLIST_DICT：并入 {} 台", hosts.len()));
         }
         _ => {}
+    }
+}
+
+/// DIR_POLL 的 NADRS 可按官方 list 发送，也兼容旧单 dict 形态。
+fn poll_networks(dict: &crate::ipdict::Dict) -> Vec<crate::ipdict::Dict> {
+    let nets = dict.get_dict_list(crate::ipdict::DICT_NADDRS);
+    if nets.is_empty() {
+        dict.get_dict(crate::ipdict::DICT_NADDRS)
+            .into_iter()
+            .collect()
+    } else {
+        nets
     }
 }
 
@@ -3156,6 +3162,22 @@ pub fn chunk_by_budget(text: &str, encoding: &str, budget: usize) -> Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_networks_accept_a_single_nadrs_dict() {
+        let mut network = crate::ipdict::Dict::new();
+        network
+            .put_str(crate::ipdict::DICT_ADDR, "192.168.10.0")
+            .put_int(crate::ipdict::DICT_MASK, 24);
+        let mut poll = crate::ipdict::Dict::new();
+        poll.put_dict(crate::ipdict::DICT_NADDRS, &network);
+
+        let networks = poll_networks(&poll);
+
+        assert_eq!(networks.len(), 1);
+        assert_eq!(networks[0].get_str(crate::ipdict::DICT_ADDR), Some("192.168.10.0"));
+        assert_eq!(networks[0].get_int(crate::ipdict::DICT_MASK), Some(24));
+    }
 
     #[test]
     fn peer_addr_uses_ip_and_latest_port() {
