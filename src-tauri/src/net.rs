@@ -842,7 +842,12 @@ fn parse_ipdict_datagram(
 }
 
 fn resolve_ipdict_files(d: &crate::ipdict::Dict) -> Result<Vec<proto::FileEntry>, String> {
-    d.get_dict_list(ipd::DICT_FILE)
+    let files = match d.try_get_dict_list(ipd::DICT_FILE)? {
+        None => return Ok(Vec::new()),
+        Some(files) if files.is_empty() => return Err("FILE 列表为空".into()),
+        Some(files) => files,
+    };
+    files
         .into_iter()
         .map(|file| {
             let id = u32::try_from(file.get_int(ipd::DICT_FID).ok_or("FILE 缺 FI")?)
@@ -3283,6 +3288,19 @@ mod tests {
             assert!(
                 super::resolve_ipdict_packet(&d).is_err(),
                 "missing {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_ipdict_packet_rejects_malformed_or_empty_file_list() {
+        for raw in [&b"not-a-list"[..], &b""[..]] {
+            let mut d = official_sendmsg_dict("body", crate::protocol::opt::FILEATTACHOPT);
+            d.put_bytes(crate::ipdict::DICT_FILE, raw);
+
+            assert!(
+                super::resolve_ipdict_packet(&d).is_err(),
+                "FILE raw={raw:?}"
             );
         }
     }

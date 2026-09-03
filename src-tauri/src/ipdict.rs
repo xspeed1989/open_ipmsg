@@ -166,9 +166,19 @@ impl Dict {
         parse_content(self.get(key)?)
     }
 
+    pub fn try_get_dict_list(&self, key: &str) -> Result<Option<Vec<Dict>>, String> {
+        let Some(raw) = self.get(key) else {
+            return Ok(None);
+        };
+        parse_dict_list(raw)
+            .map(Some)
+            .ok_or_else(|| format!("{key} 不是合法字典列表"))
+    }
+
     pub fn get_dict_list(&self, key: &str) -> Vec<Dict> {
-        self.get(key)
-            .and_then(parse_dict_list)
+        self.try_get_dict_list(key)
+            .ok()
+            .flatten()
             .unwrap_or_default()
     }
 
