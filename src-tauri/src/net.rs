@@ -823,6 +823,24 @@ async fn crypto_rehandshake(ctx: &NetCtx, from: SocketAddr, key: &str, reason: &
 
 /* ================= 入站处理 ================= */
 
+fn parse_ipdict_datagram(
+    data: &[u8],
+) -> Result<Option<(crate::ipdict::Dict, usize)>, String> {
+    if !data.starts_with(crate::ipdict::IPDICT_HEAD.as_bytes()) {
+        return Ok(None);
+    }
+    let (dict, used) = crate::ipdict::Dict::unpack(data)
+        .ok_or_else(|| "IP2 外壳或内容长度无效".to_string())?;
+    let suffix = &data[used..];
+    if suffix.is_empty() {
+        return Ok(Some((dict, 0)));
+    }
+    if suffix.len() == 64 && suffix.iter().all(|byte| *byte == 0) {
+        return Ok(Some((dict, 64)));
+    }
+    Err(format!("IP2 非法尾随数据：{}B", suffix.len()))
+}
+
 async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
     // 自身回声先过滤（EncIPDict 拦截与经典解析共用同一口径）
     if from.port() == ctx.port && is_self_ip(ctx, from.ip()) {
@@ -3135,6 +3153,39 @@ pub fn chunk_by_budget(text: &str, encoding: &str, budget: usize) -> Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipdict_datagram_accepts_exact_official_retry_padding() {
+        let mut d = crate::ipdict::Dict::new();
+        d.put_int(crate::ipdict::DICT_EF, crate::ipdict::ENCIPDICT_EF);
+        let wire = d.pack();
+
+        let (_, pad0) = super::parse_ipdict_datagram(&wire).unwrap().unwrap();
+        assert_eq!(pad0, 0);
+
+        let mut retry = wire;
+        retry.extend_from_slice(&[0; 64]);
+        let (_, pad64) = super::parse_ipdict_datagram(&retry).unwrap().unwrap();
+        assert_eq!(pad64, 64);
+    }
+
+    #[test]
+    fn ipdict_datagram_rejects_partial_or_wrong_suffix_without_classic_fallback() {
+        let wire = crate::ipdict::Dict::new().put_int("A", 1).pack();
+        for suffix in [&[0u8; 63][..], &[0u8; 65][..], &[1u8][..]] {
+            let mut bad = wire.clone();
+            bad.extend_from_slice(suffix);
+            assert!(super::parse_ipdict_datagram(&bad).is_err());
+        }
+        assert!(super::parse_ipdict_datagram(b"IP2:5:bad:Z").is_err());
+    }
+
+    #[test]
+    fn ipdict_datagram_leaves_classic_packets_untouched() {
+        let classic = b"1:42:user:host:32:hello";
+        assert!(super::parse_ipdict_datagram(classic).unwrap().is_none());
+        assert_eq!(crate::protocol::parse(classic).unwrap().extra, b"hello");
+    }
 
     #[test]
     fn poll_networks_accept_a_single_nadrs_dict() {
