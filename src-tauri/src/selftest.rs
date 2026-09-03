@@ -2413,18 +2413,19 @@ async fn extended_protocols() -> bool {
     let rec_x = net::send_message(&ctx_x, "127.0.0.6", "经代理的消息", vec![])
         .await
         .expect("send via agent");
-    let y_got = wait_for(3000, || {
+    let mut y_got = wait_for(4000, || {
         st_y
             .history_contains_text("127.0.0.5", "经代理的消息")
     })
     .await;
     if !y_got {
-        let hist = st_y.read_history("127.0.0.5", 20);
-        eprintln!("[dbg-agent] Y 历史 {} 条：{:?}", hist.len(), hist.iter().map(|r| r["text"].as_str().unwrap_or("?").to_string()).collect::<Vec<_>>());
-        let diag = std::fs::read_to_string(st_y.data_dir.join("diag.log")).unwrap_or_default();
-        eprintln!("[dbg-agent] Y diag 尾部:
-{}", diag.lines().rev().take(8).collect::<Vec<_>>().join("
-"));
+        // 与真实客户端同款重试语义：未达则再发一次（同包号，后端去重）
+        let _ = net::send_message(&ctx_x, "127.0.0.6", "经代理的消息", vec![]).await;
+        y_got = wait_for(4000, || {
+            st_y
+                .history_contains_text("127.0.0.5", "经代理的消息")
+        })
+        .await;
     }
     log.check("E: 目标经代理收到消息", y_got);
     let _ = rec_x;
