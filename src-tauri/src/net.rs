@@ -2424,18 +2424,11 @@ fn dict_sign(ctx: &NetCtx, d: &mut crate::ipdict::Dict) -> Result<(), String> {
 fn dict_verify(d: &crate::ipdict::Dict) -> Result<bool, String> {
     use crate::ipdict::*;
     use rsa::{BigUint, RsaPublicKey};
-    let Some(sig) = d.get(DICT_SIGN) else {
+    let Some(sig_bytes) = d.get_bytes(DICT_SIGN).map(ToOwned::to_owned) else {
         return Ok(false);
     };
-    let sig_bytes = match sig {
-        Val::Bytes(b) => b.clone(),
-        _ => return Err("SIGN 不是字节值".into()),
-    };
     let e = d.get_int(DICT_PUBE).ok_or("缺 PUB_E")?;
-    let n = match d.get(DICT_PUBN) {
-        Some(Val::Bytes(b)) => b.clone(),
-        _ => return Err("缺 PUB_N".into()),
-    };
+    let n = d.get_bytes(DICT_PUBN).ok_or("缺 PUB_N")?.to_vec();
     let pubk = RsaPublicKey::new(BigUint::from_bytes_be(&n), BigUint::from(e as u64))
         .map_err(|e| e.to_string())?;
     let mut stripped = d.clone();

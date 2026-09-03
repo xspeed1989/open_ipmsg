@@ -11,11 +11,8 @@
 //! dict:    "(item1_key):(item1_hexlen):(item1_value):(item2_key):…"
 //! ipdict:  嵌套 Full 格式
 //! ```
-//! 格式本身无类型信息：本实现按「结构探测 + 调用方类型」双轨解析——
-//! 值先尝试按 dict/list 结构解析，失败再按标量（int→str→bytes 启发）。
-//! 我方能控制的两端（成员主互操作、ANSLIST_DICT）字段类型是确定的，
-//! 官方互通时常用字段（VER/PKT/CMD/FLAGS/STAT/MASK/NCK/GRP/ADDR 等）类型
-//! 亦与官方约定一致。
+//! 格式本身无类型信息：所有字段先按接收顺序保存原始字节，调用方通过
+//! `get_int`、`get_str`、`get_bytes`、`get_dict` 或 `get_dict_list` 显式解码。
 
 use serde::Serialize;
 
@@ -68,313 +65,343 @@ pub const DICT_CLIPPOS: &str = "CP";
 /// 官方 EncIPDict 的 EF 组合：RSA2048|AES256|IPDICT_CTR = 0x500004
 pub const ENCIPDICT_EF: i64 = 0x0005_0004;
 
-/// IPDict 值类型（解析端使用的宽松表示）
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub enum Val {
-    Int(i64),
-    Str(String),
-    Bytes(Vec<u8>),
-    List(Vec<Val>),
-    Dict(Vec<(String, Val)>),
-}
-
-impl Val {
-    pub fn get_int(&self) -> Option<i64> {
-        match self {
-            Val::Int(v) => Some(*v),
-            _ => None,
-        }
-    }
-    pub fn get_str(&self) -> Option<&str> {
-        match self {
-            Val::Str(s) => Some(s),
-            _ => None,
-        }
-    }
-    pub fn get_dict(&self) -> Option<&[(String, Val)]> {
-        match self {
-            Val::Dict(d) => Some(d),
-            _ => None,
-        }
-    }
-}
-
-/// 有序字典（保留键的插入顺序，与官方一致）
+/// 有序字典。每个值都保留为收到或写入时的原始字节，类型由 getter 决定。
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Dict {
-    pub items: Vec<(String, Val)>,
+    pub items: Vec<(String, Vec<u8>)>,
 }
 
 impl Dict {
     pub fn new() -> Self {
-        Dict { items: Vec::new() }
+        Self::default()
     }
 
-    pub fn put_int(&mut self, key: &str, v: i64) -> &mut Self {
-        self.items.push((key.to_string(), Val::Int(v)));
+    fn set_raw(&mut self, key: &str, value: Vec<u8>) -> &mut Self {
+        if let Some((_, current)) = self.items.iter_mut().find(|(k, _)| k == key) {
+            *current = value;
+        } else {
+            self.items.push((key.to_string(), value));
+        }
         self
     }
 
-    pub fn put_str(&mut self, key: &str, v: &str) -> &mut Self {
-        self.items.push((key.to_string(), Val::Str(v.to_string())));
-        self
+    pub fn put_int(&mut self, key: &str, value: i64) -> &mut Self {
+        let raw = if value < 0 {
+            format!("-{:x}", value.unsigned_abs()).into_bytes()
+        } else {
+            format!("{value:x}").into_bytes()
+        };
+        self.set_raw(key, raw)
     }
 
-    pub fn put_bytes(&mut self, key: &str, v: &[u8]) -> &mut Self {
-        self.items.push((key.to_string(), Val::Bytes(v.to_vec())));
-        self
+    pub fn put_str(&mut self, key: &str, value: &str) -> &mut Self {
+        self.set_raw(key, value.as_bytes().to_vec())
     }
 
+    pub fn put_bytes(&mut self, key: &str, value: &[u8]) -> &mut Self {
+        self.set_raw(key, value.to_vec())
+    }
+
+    /// dict 值只包含内容段；完整 IP2 外壳属于单独的 ipdict 值类型。
     pub fn put_dict(&mut self, key: &str, sub: &Dict) -> &mut Self {
-        self.items.push((key.to_string(), Val::Dict(sub.items.clone())));
-        self
+        self.set_raw(key, sub.pack_content_prefix(sub.items.len()))
     }
 
     pub fn put_dict_list(&mut self, key: &str, list: &[Dict]) -> &mut Self {
-        self.items.push((
-            key.to_string(),
-            Val::List(list.iter().map(|d| Val::Dict(d.items.clone())).collect()),
-        ));
-        self
-    }
-
-    pub fn get(&self, key: &str) -> Option<&Val> {
-        self.items.iter().find(|(k, _)| k == key).map(|(_, v)| v)
-    }
-
-    /// 取 dict_list（Val::List 内含 Val::Dict）→ Vec<Dict>；单 dict 值也兼容
-    pub fn get_dict_list(&self, key: &str) -> Vec<Dict> {
-        match self.get(key) {
-            Some(Val::List(items)) => items
-                .iter()
-                .filter_map(|v| v.get_dict().map(|i| Dict { items: i.to_vec() }))
-                .collect(),
-            Some(Val::Dict(items)) => vec![Dict {
-                items: items.clone(),
-            }],
-            _ => Vec::new(),
+        let mut raw = Vec::new();
+        for (index, dict) in list.iter().enumerate() {
+            if index > 0 {
+                raw.push(b':');
+            }
+            let item = dict.pack_content_prefix(dict.items.len());
+            raw.extend_from_slice(format!("{:x}:", item.len()).as_bytes());
+            raw.extend_from_slice(&item);
         }
+        self.set_raw(key, raw)
+    }
+
+    pub fn get(&self, key: &str) -> Option<&[u8]> {
+        self.items
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, value)| value.as_slice())
+    }
+
+    pub fn get_bytes(&self, key: &str) -> Option<&[u8]> {
+        self.get(key)
     }
 
     pub fn get_int(&self, key: &str) -> Option<i64> {
-        self.get(key).and_then(|v| v.get_int())
+        let raw = self.get(key)?;
+        let (negative, digits) = match raw.first() {
+            Some(b'-') => (true, &raw[1..]),
+            _ => (false, raw),
+        };
+        if digits.is_empty() || digits.len() > 16 || !digits.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        let value = u64::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()?;
+        if negative {
+            let min_magnitude = i64::MAX as u64 + 1;
+            if value > min_magnitude {
+                return None;
+            }
+            if value == min_magnitude {
+                Some(i64::MIN)
+            } else {
+                Some(-(value as i64))
+            }
+        } else if value <= i64::MAX as u64 {
+            Some(value as i64)
+        } else {
+            None
+        }
     }
 
     pub fn get_str(&self, key: &str) -> Option<&str> {
-        self.get(key).and_then(|v| v.get_str())
+        std::str::from_utf8(self.get(key)?).ok()
+    }
+
+    pub fn get_dict(&self, key: &str) -> Option<Dict> {
+        parse_content(self.get(key)?)
+    }
+
+    pub fn get_dict_list(&self, key: &str) -> Vec<Dict> {
+        self.get(key)
+            .and_then(parse_dict_list)
+            .unwrap_or_default()
     }
 
     pub fn has(&self, key: &str) -> bool {
-        self.items.iter().any(|(k, _)| k == key)
+        self.get(key).is_some()
     }
 
-    /// 序列化完整格式 `IP2:(len):(content):Z`
-    pub fn pack(&self) -> Vec<u8> {
-        let content = self.pack_content_impl();
-        let mut out = IPDICT_HEAD.as_bytes().to_vec();
-        out.extend_from_slice(format!("{:x}:", content.len()).as_bytes());
+    /// Serialize the full `IP2:(len):(content):Z` packet with an ordered item prefix.
+    pub fn pack_prefix(&self, max_items: usize) -> Vec<u8> {
+        let content = self.pack_content_prefix(max_items.min(self.items.len()));
+        let mut out = format!("IP2:{:x}:", content.len()).into_bytes();
         out.extend_from_slice(&content);
         out.extend_from_slice(IPDICT_FOOT.as_bytes());
         out
     }
 
-    fn pack_content_impl(&self) -> Vec<u8> {
+    /// Serialize the full `IP2:(len):(content):Z` packet.
+    pub fn pack(&self) -> Vec<u8> {
+        self.pack_prefix(self.items.len())
+    }
+
+    fn pack_content_prefix(&self, max_items: usize) -> Vec<u8> {
         let mut out = Vec::new();
-        for (k, v) in &self.items {
-            out.extend_from_slice(k.as_bytes());
-            out.push(b':');
-            let val = pack_val(v);
-            out.extend_from_slice(format!("{:x}:", val.len()).as_bytes());
-            out.extend_from_slice(&val);
+        for (index, (key, value)) in self.items.iter().take(max_items).enumerate() {
+            if index > 0 {
+                out.push(b':');
+            }
+            out.extend_from_slice(key.as_bytes());
+            out.extend_from_slice(format!(":{:x}:", value.len()).as_bytes());
+            out.extend_from_slice(value);
         }
         out
     }
 
-    /// 解析完整格式。返回 (解析后的字典, 消耗的字节数)；0 表示失败。
+    /// Parse a full packet and return the consumed byte count.
     pub fn unpack(data: &[u8]) -> Option<(Dict, usize)> {
         if !data.starts_with(IPDICT_HEAD.as_bytes()) {
             return None;
         }
-        let mut i = IPDICT_HEAD.len();
-        // 内容长度（十六进制）
-        let len_start = i;
-        while i < data.len() && data[i] != b':' {
-            i += 1;
+        let mut index = IPDICT_HEAD.len();
+        let len_start = index;
+        while index < data.len() && data[index] != b':' {
+            index += 1;
         }
-        if i >= data.len() {
+        if index == len_start || index == data.len() {
             return None;
         }
-        let len_hex = std::str::from_utf8(&data[len_start..i]).ok()?;
-        let content_len = usize::from_str_radix(len_hex.trim(), 16).ok()?;
-        i += 1; // ':'
-        if i + content_len + IPDICT_FOOT.len() > data.len() {
+        let content_len = parse_hex_len(&data[len_start..index])?;
+        index += 1;
+        let content_end = index.checked_add(content_len)?;
+        let total = content_end.checked_add(IPDICT_FOOT.len())?;
+        if total > data.len() || &data[content_end..total] != IPDICT_FOOT.as_bytes() {
             return None;
         }
-        let content = &data[i..i + content_len];
-        if &data[i + content_len..i + content_len + IPDICT_FOOT.len()] != IPDICT_FOOT.as_bytes() {
-            return None;
-        }
-        let total = i + content_len + IPDICT_FOOT.len();
-        let dict = parse_content(content)?;
-        Some((dict, total))
+        Some((parse_content(&data[index..content_end])?, total))
     }
 }
 
-/// 序列化「内容段」（去掉 IP2:…:Z 外壳的 key:len:val 序列）。
-/// 签名辅助（DIR 成员主协议）与外壳打包共用。
+/// Serialize a content segment without the IP2 envelope.
 pub fn pack_content(d: &Dict) -> Vec<u8> {
-    d.pack_content_impl()
+    d.pack_content_prefix(d.items.len())
 }
 
-/// 解析「内容段」：`key:len:val…` 序列（可选尾部 `:Z`）。
-/// EncIPDict 密文消息的线格式为 `1:<包号>:` + 本内容 + `:Z`（无 IP2 外壳）。
+/// Parse an exact content segment without stripping an envelope or padding.
 pub fn unpack_content(data: &[u8]) -> Option<Dict> {
-    // 官方 UDP 发送缓冲在报文后残留 NUL 填充（线上实测 extra 尾部大量 0x00）：
-    // 先剥掉尾部 NUL，再剥可选 `:Z` 脚注，其余部分按内容段解析
-    let mut end = data.len();
-    while end > 0 && data[end - 1] == 0 {
-        end -= 1;
-    }
-    let body = data[..end].strip_suffix(b":Z").unwrap_or(&data[..end]);
-    parse_content(body)
+    parse_content(data)
 }
 
-/// 值 → 线格式字节（int 十六进制 ASII；str UTF-8；bytes 原样；
-/// List 为 len:val 序列；Dict 为嵌套完整格式）
-fn pack_val(v: &Val) -> Vec<u8> {
-    match v {
-        // 负数按官方约定带 '-' 前缀的十六进制（Rust {:x} 对负数输出补码，不能直接用）
-        Val::Int(n) if *n < 0 => format!("-{:x}", n.unsigned_abs()).into_bytes(),
-        Val::Int(n) => format!("{n:x}").into_bytes(),
-        Val::Str(s) => s.as_bytes().to_vec(),
-        Val::Bytes(b) => b.clone(),
-        Val::List(items) => {
-            let mut out = Vec::new();
-            for it in items {
-                let iv = pack_val(it);
-                out.extend_from_slice(format!("{:x}:", iv.len()).as_bytes());
-                out.extend_from_slice(&iv);
-            }
-            out
-        }
-        // dict 值 = 内容段格式（官方 ipdict.h：dict ≠ ipdict，后者才带 IP2 外壳）
-        Val::Dict(sub) => pack_content(&Dict { items: sub.clone() }),
+fn parse_hex_len(raw: &[u8]) -> Option<usize> {
+    if raw.is_empty() || !raw.iter().all(u8::is_ascii_hexdigit) {
+        return None;
     }
+    usize::from_str_radix(std::str::from_utf8(raw).ok()?, 16).ok()
 }
 
-/// 解析一段内容（key:len:val…）为字典
+/// Parse exact `key:len:value` entries with official inter-entry colons.
 fn parse_content(data: &[u8]) -> Option<Dict> {
-    let mut items = Vec::new();
-    let mut i = 0usize;
-    while i < data.len() {
-        // 官方 v5 序列化在每条 `key:len:value` 后追加分隔冒号
-        // （实抓 `EI:10:<16B>:EK:100:<256B>:…`）；无分隔的紧凑格式同样兼容
-        if data[i] == b':' {
-            i += 1;
-            if i >= data.len() {
-                break;
+    let mut dict = Dict::new();
+    let mut index = 0usize;
+    let mut first = true;
+
+    while index < data.len() {
+        if !first {
+            if data[index] != b':' {
+                return None;
+            }
+            index += 1;
+            if index == data.len() {
+                return None;
             }
         }
-        // key 到下一个 ':'
-        let key_start = i;
-        while i < data.len() && data[i] != b':' {
-            i += 1;
+        first = false;
+
+        let key_start = index;
+        while index < data.len() && data[index] != b':' {
+            index += 1;
         }
-        if i >= data.len() {
+        if index == key_start || index == data.len() {
             return None;
         }
-        let key = String::from_utf8_lossy(&data[key_start..i]).into_owned();
-        if key.is_empty() {
+        let key = std::str::from_utf8(&data[key_start..index]).ok()?;
+        index += 1;
+
+        let len_start = index;
+        while index < data.len() && data[index] != b':' {
+            index += 1;
+        }
+        if index == len_start || index == data.len() {
             return None;
         }
-        i += 1;
-        // len（十六进制）
-        let len_start = i;
-        while i < data.len() && data[i] != b':' {
-            i += 1;
-        }
-        if i >= data.len() {
+        let value_len = parse_hex_len(&data[len_start..index])?;
+        index += 1;
+        let value_end = index.checked_add(value_len)?;
+        if value_end > data.len() {
             return None;
         }
-        let len_hex = std::str::from_utf8(&data[len_start..i]).ok()?;
-        let vlen = usize::from_str_radix(len_hex.trim(), 16).ok()?;
-        i += 1;
-        if i + vlen > data.len() {
-            return None;
-        }
-        let val = parse_val(&data[i..i + vlen]);
-        i += vlen;
-        items.push((key, val));
+        dict.set_raw(key, data[index..value_end].to_vec());
+        index = value_end;
     }
-    Some(Dict { items })
+    Some(dict)
 }
 
-/// 解析一个值：优先尝试 dict 结构（嵌套 IP2 或 key:len:val 模式），
-/// 再尝试 int（纯 hex），否则按 UTF-8 字符串/字节
-fn parse_val(data: &[u8]) -> Val {
-    // 嵌套完整 IP2 格式
-    if data.starts_with(IPDICT_HEAD.as_bytes()) {
-        if let Some((d, used)) = Dict::unpack(data) {
-            if used == data.len() {
-                return Val::Dict(d.items);
+/// Parse exact `len:dict-content` list items with required inter-item colons.
+fn parse_dict_list(data: &[u8]) -> Option<Vec<Dict>> {
+    let mut list = Vec::new();
+    let mut index = 0usize;
+    let mut first = true;
+
+    while index < data.len() {
+        if !first {
+            if data[index] != b':' {
+                return None;
+            }
+            index += 1;
+            if index == data.len() {
+                return None;
             }
         }
-    }
-    // 逐项结构（key:len:val 可套）→ dict
-    if let Some(d) = parse_content(data) {
-        return Val::Dict(d.items);
-    }
-    // 列表结构（len:val 重复）
-    if let Some(l) = parse_list(data) {
-        return Val::List(l);
-    }
-    // 标量：整数 hex（可带 '-'）
-    let s = String::from_utf8_lossy(data);
-    let t = s.trim();
-    let neg = t.strip_prefix('-');
-    let body = neg.unwrap_or(t);
-    if !body.is_empty() && body.len() <= 16 && body.bytes().all(|b| b.is_ascii_hexdigit()) {
-        if let Ok(v) = i64::from_str_radix(body, 16) {
-            return Val::Int(if neg.is_some() { -v } else { v });
-        }
-    }
-    match std::str::from_utf8(data) {
-        Ok(s) => Val::Str(s.to_string()),
-        Err(_) => Val::Bytes(data.to_vec()),
-    }
-}
+        first = false;
 
-/// 尝试按列表结构（重复的 len:val）解析
-fn parse_list(data: &[u8]) -> Option<Vec<Val>> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < data.len() {
-        let len_start = i;
-        while i < data.len() && data[i] != b':' {
-            i += 1;
+        let len_start = index;
+        while index < data.len() && data[index] != b':' {
+            index += 1;
         }
-        if i >= data.len() {
+        if index == len_start || index == data.len() {
             return None;
         }
-        let len_hex = std::str::from_utf8(&data[len_start..i]).ok()?;
-        let vlen = usize::from_str_radix(len_hex.trim(), 16).ok()?;
-        i += 1;
-        if i + vlen > data.len() {
+        let item_len = parse_hex_len(&data[len_start..index])?;
+        index += 1;
+        let item_end = index.checked_add(item_len)?;
+        if item_end > data.len() {
             return None;
         }
-        out.push(parse_val(&data[i..i + vlen]));
-        i += vlen;
+        list.push(parse_content(&data[index..item_end])?);
+        index = item_end;
     }
-    Some(out)
+    Some(list)
 }
-
-
-
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpack_keeps_values_raw_until_the_requested_getter() {
+        let wire = b"IP2:20:VER:1:3:BODY:7:1111111:BIN:3:\x00:\xff:Z";
+        let (d, used) = Dict::unpack(wire).expect("official IPDict");
+
+        assert_eq!(used, wire.len());
+        assert_eq!(d.get_int("VER"), Some(3));
+        assert_eq!(d.get_str("BODY"), Some("1111111"));
+        assert_eq!(d.get_int("BODY"), Some(0x1111111));
+        assert_eq!(d.get_bytes("BIN"), Some(&b"\x00:\xff"[..]));
+        assert_eq!(d.pack(), wire);
+    }
+
+    #[test]
+    fn empty_text_is_a_valid_string_value() {
+        let wire = Dict::new().put_str(DICT_BODY, "").pack();
+        let (d, used) = Dict::unpack(&wire).expect("empty BODY");
+
+        assert_eq!(used, wire.len());
+        assert_eq!(d.get_str(DICT_BODY), Some(""));
+        assert_eq!(d.get_bytes(DICT_BODY), Some(&b""[..]));
+    }
+
+    #[test]
+    fn official_dict_list_uses_colons_between_items() {
+        let mut a = Dict::new();
+        a.put_str("UID", "a");
+        let mut b = Dict::new();
+        b.put_str("UID", "b");
+        let wire = Dict::new().put_dict_list("LIST", &[a, b]).pack();
+        let (d, _) = Dict::unpack(&wire).expect("dict list");
+
+        let list = d.get_dict_list("LIST");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].get_str("UID"), Some("a"));
+        assert_eq!(list[1].get_str("UID"), Some("b"));
+    }
+
+    #[test]
+    fn pack_prefix_signs_only_the_requested_ordered_items() {
+        let wire = Dict::new()
+            .put_int("VER", 3)
+            .put_str("UID", "alice")
+            .pack_prefix(1);
+
+        assert_eq!(wire, b"IP2:7:VER:1:3:Z");
+    }
+
+    #[test]
+    fn unpack_content_requires_exact_dict_content() {
+        assert!(unpack_content(b"VER:1:3").is_some());
+        assert!(unpack_content(b"VER:1:3:Z").is_none());
+    }
+
+    #[test]
+    fn get_int_rejects_noncanonical_raw_values() {
+        let d = Dict {
+            items: vec![
+                ("EMPTY".into(), b"".to_vec()),
+                ("SIGN_ONLY".into(), b"-".to_vec()),
+                ("TOO_LONG".into(), b"00000000000000003".to_vec()),
+                ("NON_HEX".into(), b"10g".to_vec()),
+            ],
+        };
+
+        for key in ["EMPTY", "SIGN_ONLY", "TOO_LONG", "NON_HEX"] {
+            assert_eq!(d.get_int(key), None, "{key} 不能作为官方整数");
+        }
+    }
 
     #[test]
     fn roundtrip_scalars() {
@@ -402,20 +429,13 @@ mod tests {
         d.put_dict_list("LIST", &[sub.clone(), sub.clone(), sub.clone()]);
         let packed = d.pack();
         let (parsed, _) = Dict::unpack(&packed).expect("unpack");
-        let net = parsed.get("NET").and_then(|v| v.get_dict()).expect("dict").to_vec();
-        let net = Dict { items: net };
+        let net = parsed.get_dict("NET").expect("dict");
         assert_eq!(net.get_str("ADDR"), Some("192.168.1.0"));
         assert_eq!(net.get_int("MASK"), Some(24));
-        let list = parsed.get("LIST").expect("list");
-        match list {
-            Val::List(items) => {
-                assert_eq!(items.len(), 3);
-                for it in items {
-                    let d = it.get_dict().expect("list item 必须是 dict");
-                    assert_eq!(d[0].0, "ADDR");
-                }
-            }
-            other => panic!("LIST 被解析成 {other:?}"),
+        let list = parsed.get_dict_list("LIST");
+        assert_eq!(list.len(), 3);
+        for item in list {
+            assert_eq!(item.get_str("ADDR"), Some("192.168.1.0"));
         }
     }
 
@@ -447,7 +467,3 @@ mod tests {
         assert!(Dict::unpack(&packed[..packed.len() - 1]).is_none());
     }
 }
-
-
-
-

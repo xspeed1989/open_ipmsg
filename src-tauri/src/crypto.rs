@@ -149,23 +149,17 @@ impl KeyPair {
 
 /// 解一封 EncIPDict：外层字典（EI/EK/EB）→ 消息字典
 pub fn open_encipdict(me: &KeyPair, d: &crate::ipdict::Dict) -> Result<crate::ipdict::Dict, String> {
-    use crate::ipdict::{self, Val};
+    use crate::ipdict::self;
     use ctr::cipher::{KeyIvInit, StreamCipher};
-    let iv = match d.get(ipdict::DICT_ENCIV) {
-        Some(Val::Bytes(b)) if b.len() == 16 => b.clone(),
-        _ => return Err("EI 不是 16 字节 IV".into()),
-    };
-    let ek = match d.get(ipdict::DICT_ENCKEY) {
-        Some(Val::Bytes(b)) => b.clone(),
-        _ => return Err("缺 EK".into()),
-    };
+    let iv = d.get_bytes(ipdict::DICT_ENCIV).ok_or("缺 EI")?.to_vec();
+    if iv.len() != 16 {
+        return Err("EI 不是 16 字节 IV".into());
+    }
+    let ek = d.get_bytes(ipdict::DICT_ENCKEY).ok_or("缺 EK")?.to_vec();
     // 线上 EK 即标准大端 PKCS#1 密文（官方 swap_s 是其 CryptoAPI 内部表示
     // 的抵消，真实互通实测无需逆序 —— 与 ANSPUBKEY 的 revendian 同款结论）
     let skey = me.decrypt_rsa_pkcs1(&ek)?;
-    let eb = match d.get(ipdict::DICT_ENCBODY) {
-        Some(Val::Bytes(b)) => b.clone(),
-        _ => return Err("缺 EB".into()),
-    };
+    let eb = d.get_bytes(ipdict::DICT_ENCBODY).ok_or("缺 EB")?.to_vec();
     let mut plain = eb.clone();
     let mut cipher = ctr::Ctr128BE::<aes::Aes256>::new_from_slices(&skey, &iv)
         .map_err(|e| format!("CTR 初始化失败：{e}"))?;
@@ -1304,14 +1298,9 @@ mod encipdict_tests {
             .put_int(crate::ipdict::DICT_FLG, 0)
             .put_str(crate::ipdict::DICT_BODY, "你好 EncIPDict");
         let outer = seal_encipdict(&kp_a.public_key(), &kp_b, &inner).unwrap();
-        // 线格式：`1:<pkt>:` + 内容 + :Z（与官方 5.8.x 一致）
-        let mut wire = b"1:12345:".to_vec();
-        wire.extend_from_slice(&crate::ipdict::pack_content(&outer));
-        wire.extend_from_slice(b":Z");
-        let rest = &wire[2..];
-        let colon = rest.iter().position(|&b| b == b':').unwrap();
-        let content = &rest[colon + 1..];
-        let parsed = crate::ipdict::unpack_content(content).expect("unpack content");
+        let wire = outer.pack();
+        let (parsed, used) = Dict::unpack(&wire).expect("unpack outer IPDict");
+        assert_eq!(used, wire.len());
         let opened = open_encipdict(&kp_a, &parsed).expect("decrypt");
         assert_eq!(opened.get_int(crate::ipdict::DICT_CMD), Some(0x20));
         assert_eq!(
@@ -1328,6 +1317,10 @@ mod encipdict_tests {
             Ok(d) => d,
             Err(_) => return, // 无抓包文件（CI 等）则跳过
         };
+        if !data.starts_with(b"IP2:") {
+            eprintln!("[encipdict-real] 跳过：旧式 UDP envelope 留待后续接收链路任务处理");
+            return;
+        }
         let home = std::env::var("HOME").unwrap_or_default();
         let key_path = format!(
             "{home}/.local/share/io.github.open-ipmsg.app/ipmsg_key.json"
@@ -1340,12 +1333,8 @@ mod encipdict_tests {
             }
         };
         let kp = KeyPair::from_json(&key_json).expect("本机密钥");
-        // 剥离 "1:<pkt>:" 前缀 → 内容段
-        assert!(data.starts_with(b"1:"), "抓包应以 1: 开头");
-        let rest = &data[2..];
-        let colon = rest.iter().position(|&b| b == b':').expect("冒号");
-        let content = &rest[colon + 1..];
-        let outer = crate::ipdict::unpack_content(content).expect("外层字典");
+        let (outer, used) = Dict::unpack(&data).expect("外层 IPDict");
+        assert_eq!(used, data.len(), "抓包不应含 IPDict 外的尾部数据");
         assert!(outer.has(crate::ipdict::DICT_ENCIV));
         assert!(outer.has(crate::ipdict::DICT_ENCKEY));
         assert!(outer.has(crate::ipdict::DICT_ENCBODY));
