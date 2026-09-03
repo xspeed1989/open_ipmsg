@@ -8,3 +8,4 @@ src-tauri/gen/schemas/
 Thumbs.db
 __pycache__/
 dist-packages/
+.worktrees/
