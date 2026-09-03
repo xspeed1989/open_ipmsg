@@ -403,7 +403,8 @@ header {
   padding-right: 10px;
 }
 .field input,
-.field select {
+.field select,
+.adv-input {
   flex: 1;
   height: 30px;
   border: 1px solid var(--c-border);
@@ -417,7 +418,8 @@ header {
 }
 /* WebKitGTK 会用原生控件画 select（底色不受 CSS 控制，深色下就成了浅底浅字），
    这里关掉原生外观并自绘箭头，保证两种主题下都受控 */
-.field select {
+.field select,
+select.adv-input {
   appearance: none;
   -webkit-appearance: none;
   padding-right: 26px;
@@ -428,12 +430,14 @@ header {
   background-repeat: no-repeat;
   cursor: pointer;
 }
-.field select option {
+.field select option,
+select.adv-input option {
   background: var(--c-card);
   color: var(--c-text);
 }
 .field input:focus,
-.field select:focus {
+.field select:focus,
+.adv-input:focus {
   border-color: var(--c-accent);
 }
 .dir-row {
@@ -543,6 +547,38 @@ header {
   width: 64px;
   flex: none;
   color: var(--c-sub);
+}
+/* 协议扩展项包含标题、控件和说明，不能沿用 .si-row 的横向双列表格。 */
+.adv-col {
+  flex-direction: column;
+  align-items: stretch;
+  line-height: normal;
+  padding: 8px 0;
+}
+.adv-col + .adv-col {
+  border-top: 1px solid var(--c-hairline);
+}
+.adv-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 30px;
+}
+.adv-col .lab {
+  width: auto;
+  min-width: 0;
+  padding-right: 0;
+  color: var(--c-text);
+  line-height: 1.4;
+}
+.adv-input {
+  width: 100%;
+  flex: none;
+  margin-top: 6px;
+}
+.adv-col .import-hint {
+  margin-top: 5px;
 }
 .import-hint {
   font-size: 11.5px;
