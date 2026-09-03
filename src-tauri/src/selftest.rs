@@ -2438,76 +2438,134 @@ async fn extended_protocols() -> bool {
 
     /* ---- E10. 官方 v5 密文消息（EncIPDict）端到端 ---- */
     {
-        // 模拟官方 5.8.x 对 CAPIPDICTOPT 对端的发送：`1:<包号>:` + 字典内容 + `:Z`
-        let mut inner = crate::ipdict::Dict::new();
+        let sender = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
         let enc_pkt = 665500;
+        let kp_sender = crate::crypto::KeyPair::generate().unwrap();
+        let mut inner = crate::ipdict::Dict::new();
         inner
             .put_int(crate::ipdict::DICT_VER, 3)
             .put_int(crate::ipdict::DICT_PKT, enc_pkt)
             .put_str(crate::ipdict::DICT_UID, "官方假对端")
             .put_str(crate::ipdict::DICT_HID, "win-host")
-            .put_int(crate::ipdict::DICT_CMD, 0x20)
-            // 与真实报文一致：FLG 恒带 SECRET|ENCRYPT（传输加密语义）
+            .put_int(crate::ipdict::DICT_CMD, cmd::SENDMSG as i64)
             .put_int(
                 crate::ipdict::DICT_FLG,
-                (opt::SENDCHECKOPT | opt::SECRETOPT | opt::READCHECKOPT | opt::UTF8OPT | opt::ENCRYPTOPT) as i64,
+                (opt::SENDCHECKOPT | opt::UTF8OPT | opt::ENCRYPTOPT) as i64,
             )
-            // 与真实场景一致：消息在官方延迟发送队列里，正文带延迟尾注
-            .put_str(
-                crate::ipdict::DICT_BODY,
-                "v5 密文消息 123\n----\n(IPMsg Delayed Send: 09/02 18:05 )",
-            );
-        let kp_sender = crate::crypto::KeyPair::generate().unwrap();
-        let outer = crate::crypto::seal_encipdict(
-            &ctx.st.own_keypair().public_key(),
-            &kp_sender,
-            &inner,
-        )
-        .unwrap();
-        let mut wire = b"1:12345:".to_vec();
-        wire.extend_from_slice(&crate::ipdict::pack_content(&outer));
-        wire.extend_from_slice(b":Z");
-        // 官方 UDP 缓冲残留：报文尾部补 NUL 填充（线上实测形态）
-        wire.extend_from_slice(&[0u8; 40]);
-        // 用独立临时 socket 发送（自身 socket 自发自收会被回声过滤拦截）
-        let _ = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
-            .await
-            .unwrap()
-            .send_to(&wire, target_app)
-            .await;
-        let got_v5 = wait_for(3000, || {
+            .put_str(crate::ipdict::DICT_BODY, "1111111");
+        let outer =
+            crate::crypto::seal_encipdict(&ctx.st.own_keypair().public_key(), &kp_sender, &inner)
+                .unwrap();
+        let wire = outer.pack();
+        sender.send_to(&wire, target_app).await.unwrap();
+
+        let mut ack_buf = [0u8; 1024];
+        let (ack_len, _) =
+            tokio::time::timeout(Duration::from_secs(2), sender.recv_from(&mut ack_buf))
+                .await
+                .expect("RECVMSG timeout")
+                .expect("RECVMSG recv");
+        let ack = proto::parse(&ack_buf[..ack_len]).expect("classic RECVMSG");
+        log.check(
+            "E: 完整官方 IP2 EncIPDict 解密并通过签名校验",
+            ack.command & 0xff == cmd::RECVMSG
+                && events.lock().unwrap().iter().any(|(event, value)| {
+                    event == "msg-in"
+                        && value["msg"]["pkt"].as_u64() == Some(enc_pkt as u64)
+                        && value["msg"]["enc"].as_bool() == Some(true)
+                        && value["msg"]["sig_ok"].as_bool() == Some(true)
+                }),
+        );
+        log.check(
+            "E: EncIPDict RECVMSG 使用 inner PKT",
+            proto::text_of(&ack).trim_end_matches('\0') == enc_pkt.to_string(),
+        );
+
+        let got_numeric_body = wait_for(3000, || {
             events.lock().unwrap().iter().any(|(e, v)| {
                 e == "msg-in"
-                    && v["msg"]["text"]
-                        .as_str()
-                        .map(|t| t.contains("v5 密文消息 123"))
-                        .unwrap_or(false)
-                    && v["msg"]["enc"].as_bool() == Some(true)
+                    && v["msg"]["pkt"].as_u64() == Some(enc_pkt as u64)
+                    && v["msg"]["text"].as_str() == Some("1111111")
+                    && v["msg"]["secret"].as_bool() == Some(false)
             })
         })
         .await;
-        log.check("E: 官方 v5 密文消息解密并上屏", got_v5);
+        log.check("E: 普通纯数字 BODY 逐字保留并上屏", got_numeric_body);
+
+        let mut retry_wire = wire.clone();
+        retry_wire.extend_from_slice(&[0u8; 64]);
+        sender.send_to(&retry_wire, target_app).await.unwrap();
+
+        let (retry_ack_len, _) =
+            tokio::time::timeout(Duration::from_secs(2), sender.recv_from(&mut ack_buf))
+                .await
+                .expect("duplicate RECVMSG timeout")
+                .expect("duplicate RECVMSG recv");
+        let retry_ack = proto::parse(&ack_buf[..retry_ack_len]).expect("duplicate classic RECVMSG");
         log.check(
-            "E: FLG 的 SECRET 位剥离（非封书，气泡即时可见）",
-            !events.lock().unwrap().iter().any(|(e, v)| {
-                e == "msg-in"
-                    && v["msg"]["text"].as_str().map(|t| t.contains("v5 密文消息 123")).unwrap_or(false)
-                    && v["msg"]["secret"].as_bool().unwrap_or(true)
+            "E: 精确 64-NUL 重投仍回 RECVMSG（inner PKT）",
+            retry_ack.command & 0xff == cmd::RECVMSG
+                && proto::text_of(&retry_ack).trim_end_matches('\0') == enc_pkt.to_string(),
+        );
+        let matching_events = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(event, value)| {
+                event == "msg-in" && value["msg"]["pkt"].as_u64() == Some(enc_pkt as u64)
+            })
+            .count();
+        log.check("E: 64-NUL 重投不重复 emit", matching_events == 1);
+        let matching_records = st
+            .read_history(&peer_key, 200)
+            .iter()
+            .filter(|record| {
+                record["dir"] == "in" && record["pkt"].as_u64() == Some(enc_pkt as u64)
+            })
+            .count();
+        log.check("E: 64-NUL 重投历史只落一条", matching_records == 1);
+
+        let secret_pkt = 665501;
+        let mut secret_inner = crate::ipdict::Dict::new();
+        secret_inner
+            .put_int(crate::ipdict::DICT_VER, 3)
+            .put_int(crate::ipdict::DICT_PKT, secret_pkt)
+            .put_str(crate::ipdict::DICT_UID, "官方假对端")
+            .put_str(crate::ipdict::DICT_HID, "win-host")
+            .put_int(crate::ipdict::DICT_CMD, cmd::SENDMSG as i64)
+            .put_int(
+                crate::ipdict::DICT_FLG,
+                (opt::SECRETOPT | opt::READCHECKOPT | opt::ENCRYPTOPT | opt::UTF8OPT) as i64,
+            )
+            .put_str(crate::ipdict::DICT_BODY, "官方封书正文");
+        let secret_outer = crate::crypto::seal_encipdict(
+            &ctx.st.own_keypair().public_key(),
+            &kp_sender,
+            &secret_inner,
+        )
+        .unwrap();
+        sender
+            .send_to(&secret_outer.pack(), target_app)
+            .await
+            .unwrap();
+        let secret_emitted = wait_for(3000, || {
+            events.lock().unwrap().iter().any(|(event, value)| {
+                event == "msg-in"
+                    && value["msg"]["pkt"].as_u64() == Some(secret_pkt as u64)
+                    && value["msg"]["secret"].as_bool() == Some(true)
+                    && value["msg"]["sig_ok"].as_bool() == Some(true)
+            })
+        })
+        .await;
+        log.check("E: EncIPDict 保留官方 SECRETOPT 封书语义", secret_emitted);
+        log.check(
+            "E: EncIPDict 封书历史保留 secret=true",
+            st.read_history(&peer_key, 200).iter().any(|record| {
+                record["dir"] == "in"
+                    && record["pkt"].as_u64() == Some(secret_pkt as u64)
+                    && record["secret"].as_bool() == Some(true)
             }),
         );
-        let delayed_ok = wait_for(1500, || {
-            st.history_contains_text(&peer_key, "IPMsg Delayed Send")
-        })
-        .await;
-        log.check("E: 延迟队列尾注随密文解密保留（前端按原发送时间显示）", delayed_ok);
-        // 送达确认（SENDCHECKOPT → RECVMSG，包号=消息字典 PKT）
-        let ack_v5 = wait_for(2000, || {
-            st.read_history(&peer_key, 200).iter().any(|r| {
-                r["pkt"].as_u64() == Some(enc_pkt as u64) && r["dir"] == "in"
-            })
-        })
-        .await;
-        log.check("E: v5 密文消息落库（按字典 PKT）", ack_v5);
     }
 
     /* ---- 收尾 ---- */
