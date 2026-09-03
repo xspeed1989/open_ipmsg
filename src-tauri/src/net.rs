@@ -838,7 +838,8 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             }
         }
     }
-    // 官方 v5 密文消息（EncIPDict）：`1:<包号>:` + 字典内容段（EF/EI/EK/EB…）+ `:Z`
+    // 兼容早期实现/旧抓包的经典 UDP envelope + EncIPDict 内容段；官方线格式
+    // 是上方分支接收的完整 `IP2:...:Z` 外层字典。
     if data.starts_with(b"1:") {
         let after_ver = &data[2..];
         if let Some(colon) = after_ver.iter().position(|&b| b == b':') {
@@ -2403,42 +2404,14 @@ fn dict_init(
 /// 覆盖除 SIGN 外的全部打包字节。官方内部字节序怪癖（swap_s）在真实互通
 /// 中已被推翻（见 crypto.rs 注释），这里按标准大端实现，解析端宽容。
 fn dict_sign(ctx: &NetCtx, d: &mut crate::ipdict::Dict) -> Result<(), String> {
-    use crate::ipdict::*;
-    if d.has(DICT_SIGN) {
-        d.items.retain(|(k, _)| k != DICT_SIGN);
-    }
-    let kp = ctx.st.own_keypair();
-    d.put_int(DICT_PUBE, kp.public_exponent() as i64);
-    d.put_bytes(DICT_PUBN, &kp.modulus_be());
-    d.put_int(DICT_EF, DICT_EF_SHA256);
-    let cfg = ctx.st.config();
-    d.put_int(DICT_EC, (entry_caps(&cfg) | crypto::CAPA_OUR_SEND) as i64);
-    let content = crate::ipdict::pack_content(d);
-    let sig = kp.sign_sha256(&content)?;
-    d.put_bytes(DICT_SIGN, &sig);
-    Ok(())
+    let capa = entry_caps(&ctx.st.config()) | crypto::CAPA_OUR_SEND;
+    crypto::sign_ipdict(d, &ctx.st.own_keypair(), capa)
 }
 
 /// 校验 IPDict 签名：从 PUB_E/PUB_N/SIGN 重建公钥核验（SHA-256）。
 /// 无 SIGN（我方的未签名报文）返回 Ok(false)；解析失败按校验失败处理。
 fn dict_verify(d: &crate::ipdict::Dict) -> Result<bool, String> {
-    use crate::ipdict::*;
-    use rsa::{BigUint, RsaPublicKey};
-    let Some(sig_bytes) = d.get_bytes(DICT_SIGN).map(ToOwned::to_owned) else {
-        return Ok(false);
-    };
-    let e = d.get_int(DICT_PUBE).ok_or("缺 PUB_E")?;
-    let n = d.get_bytes(DICT_PUBN).ok_or("缺 PUB_N")?.to_vec();
-    let pubk = RsaPublicKey::new(BigUint::from_bytes_be(&n), BigUint::from(e as u64))
-        .map_err(|e| e.to_string())?;
-    let mut stripped = d.clone();
-    stripped.items.retain(|(k, _)| k != DICT_SIGN);
-    let content = crate::ipdict::pack_content(&stripped);
-    if crypto::verify_sha256(&pubk, &content, &sig_bytes) {
-        Ok(true)
-    } else {
-        Err("DIR 报文签名校验失败".into())
-    }
+    crypto::verify_ipdict(d).map(|verified| verified.is_some())
 }
 
 /// 一台主机 → IPDict 主机字典（官方 MakeHostDict 同款字段：
@@ -2484,7 +2457,7 @@ fn peer_from_host_dict(d: &crate::ipdict::Dict) -> Option<PeerInfo> {
 
 /* ================= 官方 v5 密文消息（EncIPDict） ================= */
 
-/// 处理一封官方 v5 IPDict 密文消息（线格式 `1:<包号>:` + EF/EI/EK/EB… `:Z`）。
+/// 处理一封官方 v5 IPDict 密文消息（完整 `IP2:...:Z` 外层含 EF/EI/EK/EB）。
 ///
 /// 解密（官方 DecIPDict 同款语义）后得到消息字典（VER/PKT/UID/HID/CMD/FLG/
 /// BODY/FILE…），再合成等价的明文报文交给 handle_sendmsg 走既有全链路

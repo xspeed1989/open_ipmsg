@@ -138,7 +138,7 @@ impl KeyPair {
 /* ================= v5 IPDict 密文消息（官方 EncIPDict，5.8.x 对 CAPIPDICTOPT
  * 对端使用的新格式）=================
  *
- * 线格式：`1:<包号>:` + 字典内容段（EF/EI/EK/EB…）+ `:Z`（无 IP2 外壳）。
+ * 线格式：完整 `IP2:...:Z` 外层字典（EF/EI/EK/EB…）。
  * - EF = 组合位（RSA2048|AES256|IPDICT_CTR = 0x500004）
  * - EI = 16B AES IV（同时是 CTR 初始计数器）
  * - EK = RSA-2048(PKCS#1v1.5, 收方公钥, 32B 会话钥) 的**字节逆序**（官方 swap_s）
@@ -190,7 +190,9 @@ pub fn seal_encipdict(
         rand::thread_rng().fill_bytes(&mut v);
         v
     };
-    let plain = inner.pack();
+    let mut signed_inner = inner.clone();
+    sign_ipdict(&mut signed_inner, me, CAPA_OUR_SEND)?;
+    let plain = signed_inner.pack();
     let mut eb = plain.clone();
     let mut cipher = ctr::Ctr128BE::<aes::Aes256>::new_from_slices(&skey, &iv)
         .map_err(|e| format!("CTR 初始化失败：{e}"))?;
@@ -203,8 +205,60 @@ pub fn seal_encipdict(
         .put_bytes(ipdict::DICT_ENCIV, &iv)
         .put_bytes(ipdict::DICT_ENCKEY, &ek)
         .put_bytes(ipdict::DICT_ENCBODY, &eb);
-    let _ = me;
     Ok(out)
+}
+
+/// 按官方 SignIPDict 规则签名完整 IPDict：先移除旧 SIGN，追加公钥与算法字段，
+/// 对此时的完整 `IP2:...:Z` 报文签名，再把 SIGN 作为末尾字段追加。
+pub fn sign_ipdict(
+    dict: &mut crate::ipdict::Dict,
+    key: &KeyPair,
+    capa: u32,
+) -> Result<(), String> {
+    use crate::ipdict::*;
+    dict.items.retain(|(name, _)| name != DICT_SIGN);
+    dict.put_int(DICT_PUBE, key.public_exponent() as i64)
+        .put_bytes(DICT_PUBN, &key.modulus_be())
+        .put_int(DICT_EF, DICT_EF_SHA256)
+        .put_int(DICT_EC, capa as i64);
+    let signature = key.sign_sha256(&dict.pack())?;
+    dict.put_bytes(DICT_SIGN, &signature);
+    Ok(())
+}
+
+/// 校验官方完整 IPDict 签名。无 SIGN 返回 `Ok(None)`；签名存在时要求其为末尾
+/// 字段，并返回签名内嵌且已验证的公钥与能力位。
+pub fn verify_ipdict(
+    dict: &crate::ipdict::Dict,
+) -> Result<Option<(RsaPublicKey, u32)>, String> {
+    use crate::ipdict::*;
+
+    let Some(sign) = dict.get_bytes(DICT_SIGN) else {
+        return Ok(None);
+    };
+    if dict.items.last().map(|(key, _)| key.as_str()) != Some(DICT_SIGN) {
+        return Err("SIGN 不是末尾字段".into());
+    }
+    let ef = dict.get_int(DICT_EF).ok_or("缺 EF")? as u32;
+    if ef & DICT_EF_SHA256 as u32 == 0 {
+        return Err("SIGN 未声明 SHA-256".into());
+    }
+    let capa = dict.get_int(DICT_EC).ok_or("缺 EC")? as u32;
+    let exponent = dict.get_int(DICT_PUBE).ok_or("缺 PUBE")?;
+    if exponent <= 0 {
+        return Err("IPDict 公钥指数必须为正数".into());
+    }
+    let modulus = dict.get_bytes(DICT_PUBN).ok_or("缺 PUBN")?;
+    let public = RsaPublicKey::new(
+        BigUint::from_bytes_be(modulus),
+        BigUint::from(exponent as u64),
+    )
+    .map_err(|e| format!("IPDict 公钥无效：{e}"))?;
+    let signed = dict.pack_prefix(dict.items.len() - 1);
+    if !verify_sha256(&public, &signed, sign) {
+        return Err("IPDict SHA-256 签名校验失败".into());
+    }
+    Ok(Some((public, capa)))
 }
 
 pub fn verify_sha256(pubk: &RsaPublicKey, data: &[u8], sig: &[u8]) -> bool {
@@ -1283,6 +1337,39 @@ mod tests {
 mod encipdict_tests {
     use super::*;
     use crate::ipdict::Dict;
+    use rsa::traits::PublicKeyParts;
+
+    #[test]
+    fn ipdict_signature_covers_full_packet_except_final_sign() {
+        let key = KeyPair::generate().unwrap();
+        let mut d = crate::ipdict::Dict::new();
+        d.put_int(crate::ipdict::DICT_VER, 3)
+            .put_int(crate::ipdict::DICT_PKT, 42)
+            .put_str(crate::ipdict::DICT_UID, "sender")
+            .put_str(crate::ipdict::DICT_HID, "host")
+            .put_int(crate::ipdict::DICT_CMD, 0x20)
+            .put_int(crate::ipdict::DICT_FLG, 0)
+            .put_str(crate::ipdict::DICT_BODY, "1111111");
+
+        sign_ipdict(&mut d, &key, CAPA_OUR_SEND).unwrap();
+        let verified = verify_ipdict(&d).unwrap().expect("signed");
+        assert_eq!(verified.0.n(), key.public_key().n());
+        assert_eq!(verified.1, CAPA_OUR_SEND);
+
+        d.put_str(crate::ipdict::DICT_BODY, "1111112");
+        assert!(verify_ipdict(&d).is_err());
+    }
+
+    #[test]
+    fn ipdict_signature_must_be_the_last_field() {
+        let key = KeyPair::generate().unwrap();
+        let mut d = crate::ipdict::Dict::new();
+        d.put_int(crate::ipdict::DICT_VER, 3);
+        sign_ipdict(&mut d, &key, CAPA_OUR_SEND).unwrap();
+        d.put_str("AFTER", "not-signed");
+
+        assert!(verify_ipdict(&d).is_err());
+    }
 
     /// 旧测试抓包使用 UDP envelope；迁移后先还原精确内容，再用完整 IPDict 验证。
     fn legacy_outer_fixture_to_ipdict(data: &[u8]) -> Option<Vec<u8>> {
@@ -1334,6 +1421,9 @@ mod encipdict_tests {
             Some("你好 EncIPDict")
         );
         assert_eq!(opened.get_str(crate::ipdict::DICT_UID), Some("sender"));
+        let verified = verify_ipdict(&opened).unwrap().expect("signed inner");
+        assert_eq!(verified.0.n(), kp_b.public_key().n());
+        assert_eq!(verified.1, CAPA_OUR_SEND);
     }
 
     /// 真实抓包回放：仅在本机存在抓包文件与本机密钥时运行（互通验证试验台）

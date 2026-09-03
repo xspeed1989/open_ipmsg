@@ -63,7 +63,7 @@ pub const DICT_MTIME: &str = "MT";
 pub const DICT_FATTR: &str = "FA";
 pub const DICT_CLIPPOS: &str = "CP";
 /// 官方 EncIPDict 的 EF 组合：RSA2048|AES256|IPDICT_CTR = 0x500004
-pub const ENCIPDICT_EF: i64 = 0x0005_0004;
+pub const ENCIPDICT_EF: i64 = 0x0050_0004;
 
 /// 有序字典。每个值都保留为收到或写入时的原始字节，类型由 getter 决定。
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -332,6 +332,11 @@ fn parse_dict_list(data: &[u8]) -> Option<Vec<Dict>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encipdict_ef_matches_official_rsa2048_aes256_ctr_bits() {
+        assert_eq!(ENCIPDICT_EF, 0x0050_0004);
+    }
 
     #[test]
     fn unpack_keeps_values_raw_until_the_requested_getter() {
