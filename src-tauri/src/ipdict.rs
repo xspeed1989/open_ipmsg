@@ -237,11 +237,6 @@ impl Dict {
     }
 }
 
-/// Serialize a content segment without the IP2 envelope.
-pub fn pack_content(d: &Dict) -> Vec<u8> {
-    d.pack_content_prefix(d.items.len())
-}
-
 /// Parse an exact content segment without stripping an envelope or padding.
 pub fn unpack_content(data: &[u8]) -> Option<Dict> {
     parse_content(data)
