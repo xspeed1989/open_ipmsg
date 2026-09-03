@@ -2435,6 +2435,66 @@ async fn extended_protocols() -> bool {
     .await;
     log.check("E: 代理中继的送达确认回流（重发队列清空）", acked);
 
+    /* ---- E10. 官方 v5 密文消息（EncIPDict）端到端 ---- */
+    {
+        // 模拟官方 5.8.x 对 CAPIPDICTOPT 对端的发送：`1:<包号>:` + 字典内容 + `:Z`
+        let mut inner = crate::ipdict::Dict::new();
+        let enc_pkt = 665500;
+        inner
+            .put_int(crate::ipdict::DICT_VER, 3)
+            .put_int(crate::ipdict::DICT_PKT, enc_pkt)
+            .put_str(crate::ipdict::DICT_UID, "官方假对端")
+            .put_str(crate::ipdict::DICT_HID, "win-host")
+            .put_int(crate::ipdict::DICT_CMD, 0x20)
+            .put_int(crate::ipdict::DICT_FLG, (opt::SENDCHECKOPT | opt::UTF8OPT) as i64)
+            // 与真实场景一致：消息在官方延迟发送队列里，正文带延迟尾注
+            .put_str(
+                crate::ipdict::DICT_BODY,
+                "v5 密文消息 123\n----\n(IPMsg Delayed Send: 09/02 18:05 )",
+            );
+        let kp_sender = crate::crypto::KeyPair::generate().unwrap();
+        let outer = crate::crypto::seal_encipdict(
+            &ctx.st.own_keypair().public_key(),
+            &kp_sender,
+            &inner,
+        )
+        .unwrap();
+        let mut wire = b"1:12345:".to_vec();
+        wire.extend_from_slice(&crate::ipdict::pack_content(&outer));
+        wire.extend_from_slice(b":Z");
+        // 用独立临时 socket 发送（自身 socket 自发自收会被回声过滤拦截）
+        let _ = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .unwrap()
+            .send_to(&wire, target_app)
+            .await;
+        let got_v5 = wait_for(3000, || {
+            events.lock().unwrap().iter().any(|(e, v)| {
+                e == "msg-in"
+                    && v["msg"]["text"]
+                        .as_str()
+                        .map(|t| t.contains("v5 密文消息 123"))
+                        .unwrap_or(false)
+                    && v["msg"]["enc"].as_bool() == Some(true)
+            })
+        })
+        .await;
+        log.check("E: 官方 v5 密文消息解密并上屏", got_v5);
+        let delayed_ok = wait_for(1500, || {
+            st.history_contains_text(&peer_key, "IPMsg Delayed Send")
+        })
+        .await;
+        log.check("E: 延迟队列尾注随密文解密保留（前端按原发送时间显示）", delayed_ok);
+        // 送达确认（SENDCHECKOPT → RECVMSG，包号=消息字典 PKT）
+        let ack_v5 = wait_for(2000, || {
+            st.read_history(&peer_key, 200).iter().any(|r| {
+                r["pkt"].as_u64() == Some(enc_pkt as u64) && r["dir"] == "in"
+            })
+        })
+        .await;
+        log.check("E: v5 密文消息落库（按字典 PKT）", ack_v5);
+    }
+
     /* ---- 收尾 ---- */
     fake_task.abort();
     let all = log.all_ok();

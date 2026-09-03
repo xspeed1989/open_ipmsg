@@ -115,6 +115,13 @@ impl KeyPair {
             .join(":")
     }
 
+    /// RSA PKCS#1 v1.5 解密（EncIPDict 的 EK 段用；输入为线格式原始字节）
+    pub fn decrypt_rsa_pkcs1(&self, ct: &[u8]) -> Result<Vec<u8>, String> {
+        self.priv_key
+            .decrypt(Pkcs1v15Encrypt, ct)
+            .map_err(|e| format!("RSA 解密失败：{e}"))
+    }
+
     /// RSA-SHA256 签名（PKCS#1 v1.5；成员主协议 DIR 报文签名用）
     pub fn sign_sha256(&self, data: &[u8]) -> Result<Vec<u8>, String> {
         use rsa::pkcs1v15::SigningKey;
@@ -128,6 +135,85 @@ impl KeyPair {
 }
 
 /// RSA-SHA256 验签（PKCS#1 v1.5；见 KeyPair::sign_sha256）
+/* ================= v5 IPDict 密文消息（官方 EncIPDict，5.8.x 对 CAPIPDICTOPT
+ * 对端使用的新格式）=================
+ *
+ * 线格式：`1:<包号>:` + 字典内容段（EF/EI/EK/EB…）+ `:Z`（无 IP2 外壳）。
+ * - EF = 组合位（RSA2048|AES256|IPDICT_CTR = 0x500004）
+ * - EI = 16B AES IV（同时是 CTR 初始计数器）
+ * - EK = RSA-2048(PKCS#1v1.5, 收方公钥, 32B 会话钥) 的**字节逆序**（官方 swap_s）
+ * - EB = AES-256-CTR 密文，计数器从块末字节递增（ctr::Ctr128LE），
+ *       明文 = 完整 IPDict 打包（IP2:…:Z），即消息字典（VER/PKT/UID/HID/CMD/FLG/BODY…）
+ * 解密后用同款 CETR-LE 原语与 seal（测试/回信用）。
+ * ================================================================ */
+
+/// 解一封 EncIPDict：外层字典（EI/EK/EB）→ 消息字典
+pub fn open_encipdict(me: &KeyPair, d: &crate::ipdict::Dict) -> Result<crate::ipdict::Dict, String> {
+    use crate::ipdict::{self, Val};
+    use ctr::cipher::{KeyIvInit, StreamCipher};
+    let iv = match d.get(ipdict::DICT_ENCIV) {
+        Some(Val::Bytes(b)) if b.len() == 16 => b.clone(),
+        _ => return Err("EI 不是 16 字节 IV".into()),
+    };
+    let ek = match d.get(ipdict::DICT_ENCKEY) {
+        Some(Val::Bytes(b)) => b.clone(),
+        _ => return Err("缺 EK".into()),
+    };
+    // 线上 EK 即标准大端 PKCS#1 密文（官方 swap_s 是其 CryptoAPI 内部表示
+    // 的抵消，真实互通实测无需逆序 —— 与 ANSPUBKEY 的 revendian 同款结论）
+    let skey = me.decrypt_rsa_pkcs1(&ek)?;
+    let eb = match d.get(ipdict::DICT_ENCBODY) {
+        Some(Val::Bytes(b)) => b.clone(),
+        _ => return Err("缺 EB".into()),
+    };
+    let mut plain = eb.clone();
+    let mut cipher = ctr::Ctr128BE::<aes::Aes256>::new_from_slices(&skey, &iv)
+        .map_err(|e| format!("CTR 初始化失败：{e}"))?;
+    cipher.apply_keystream(&mut plain);
+    let (inner, used) = crate::ipdict::Dict::unpack(&plain)
+        .ok_or("密文解出的不是 IPDict 报文")?;
+    if used != plain.len() {
+        return Err("IPDict 报文尾部有剩余数据".into());
+    }
+    Ok(inner)
+}
+
+/// 封装一封 EncIPDict（测试与对端回信共用）：消息字典 → 外层密文字典
+pub fn seal_encipdict(
+    peer_pub: &RsaPublicKey,
+    me: &KeyPair,
+    inner: &crate::ipdict::Dict,
+) -> Result<crate::ipdict::Dict, String> {
+    use crate::ipdict::{self, Dict};
+    use ctr::cipher::{KeyIvInit, StreamCipher};
+    use rand::RngCore;
+    let skey: [u8; 32] = {
+        let mut k = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut k);
+        k
+    };
+    let iv: [u8; 16] = {
+        let mut v = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut v);
+        v
+    };
+    let plain = inner.pack();
+    let mut eb = plain.clone();
+    let mut cipher = ctr::Ctr128BE::<aes::Aes256>::new_from_slices(&skey, &iv)
+        .map_err(|e| format!("CTR 初始化失败：{e}"))?;
+    cipher.apply_keystream(&mut eb);
+    let ek = peer_pub
+        .encrypt(&mut rand::thread_rng(), Pkcs1v15Encrypt, &skey)
+        .map_err(|e| format!("RSA 加密失败：{e}"))?;
+    let mut out = Dict::new();
+    out.put_int(ipdict::DICT_EF, ipdict::ENCIPDICT_EF)
+        .put_bytes(ipdict::DICT_ENCIV, &iv)
+        .put_bytes(ipdict::DICT_ENCKEY, &ek)
+        .put_bytes(ipdict::DICT_ENCBODY, &eb);
+    let _ = me;
+    Ok(out)
+}
+
 pub fn verify_sha256(pubk: &RsaPublicKey, data: &[u8], sig: &[u8]) -> bool {
     use rsa::pkcs1v15::{Signature, VerifyingKey};
     use rsa::signature::Verifier;
@@ -1197,5 +1283,83 @@ mod tests {
             hex_lower(&ct_key),
             hex_lower(&ct)
         ))
+    }
+}
+
+#[cfg(test)]
+mod encipdict_tests {
+    use super::*;
+    use crate::ipdict::Dict;
+    #[test]
+    fn encipdict_roundtrip_synthetic() {
+        let kp_a = KeyPair::generate().unwrap();
+        let kp_b = KeyPair::generate().unwrap();
+        let mut inner = Dict::new();
+        inner
+            .put_int(crate::ipdict::DICT_VER, 3)
+            .put_int(crate::ipdict::DICT_PKT, 12345)
+            .put_str(crate::ipdict::DICT_UID, "sender")
+            .put_str(crate::ipdict::DICT_HID, "host-x")
+            .put_int(crate::ipdict::DICT_CMD, 0x20)
+            .put_int(crate::ipdict::DICT_FLG, 0)
+            .put_str(crate::ipdict::DICT_BODY, "你好 EncIPDict");
+        let outer = seal_encipdict(&kp_a.public_key(), &kp_b, &inner).unwrap();
+        // 线格式：`1:<pkt>:` + 内容 + :Z（与官方 5.8.x 一致）
+        let mut wire = b"1:12345:".to_vec();
+        wire.extend_from_slice(&crate::ipdict::pack_content(&outer));
+        wire.extend_from_slice(b":Z");
+        let rest = &wire[2..];
+        let colon = rest.iter().position(|&b| b == b':').unwrap();
+        let content = &rest[colon + 1..];
+        let parsed = crate::ipdict::unpack_content(content).expect("unpack content");
+        let opened = open_encipdict(&kp_a, &parsed).expect("decrypt");
+        assert_eq!(opened.get_int(crate::ipdict::DICT_CMD), Some(0x20));
+        assert_eq!(
+            opened.get_str(crate::ipdict::DICT_BODY),
+            Some("你好 EncIPDict")
+        );
+        assert_eq!(opened.get_str(crate::ipdict::DICT_UID), Some("sender"));
+    }
+
+    /// 真实抓包回放：仅在本机存在抓包文件与本机密钥时运行（互通验证试验台）
+    #[test]
+    fn encipdict_real_capture_decrypts() {
+        let data = match std::fs::read("/tmp/encipdict_capture.bin") {
+            Ok(d) => d,
+            Err(_) => return, // 无抓包文件（CI 等）则跳过
+        };
+        let home = std::env::var("HOME").unwrap_or_default();
+        let key_path = format!(
+            "{home}/.local/share/io.github.open-ipmsg.app/ipmsg_key.json"
+        );
+        let key_json = match std::fs::read_to_string(&key_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[encipdict-real] 跳过：无密钥文件（{e}）");
+                return;
+            }
+        };
+        let kp = KeyPair::from_json(&key_json).expect("本机密钥");
+        // 剥离 "1:<pkt>:" 前缀 → 内容段
+        assert!(data.starts_with(b"1:"), "抓包应以 1: 开头");
+        let rest = &data[2..];
+        let colon = rest.iter().position(|&b| b == b':').expect("冒号");
+        let content = &rest[colon + 1..];
+        let outer = crate::ipdict::unpack_content(content).expect("外层字典");
+        assert!(outer.has(crate::ipdict::DICT_ENCIV));
+        assert!(outer.has(crate::ipdict::DICT_ENCKEY));
+        assert!(outer.has(crate::ipdict::DICT_ENCBODY));
+        let inner = open_encipdict(&kp, &outer)
+            .unwrap_or_else(|e| panic!("真实抓包解密失败：{e}"));
+        eprintln!(
+            "[encipdict-real] UID={:?} HID={:?} CMD={:#x} BODY={:?} VER={:?}",
+            inner.get_str(crate::ipdict::DICT_UID),
+            inner.get_str(crate::ipdict::DICT_HID),
+            inner.get_int(crate::ipdict::DICT_CMD).unwrap_or(0) as u32,
+            inner.get_str(crate::ipdict::DICT_BODY),
+            inner.get_int(crate::ipdict::DICT_VER),
+        );
+        assert_eq!(inner.get_int(crate::ipdict::DICT_VER), Some(3));
+        assert!(inner.get_int(crate::ipdict::DICT_CMD).is_some());
     }
 }

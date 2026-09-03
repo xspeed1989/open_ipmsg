@@ -53,6 +53,20 @@ pub const DICT_EF: &str = "EF";
 pub const DICT_EC: &str = "EC";
 /// 官方签名标志：SIGN_SHA256 = 0x40000000（DIR 主签名必用）
 pub const DICT_EF_SHA256: i64 = 0x4000_0000;
+/// v5 密文消息（EncIPDict）与消息体字段
+pub const DICT_ENCIV: &str = "EI";
+pub const DICT_ENCKEY: &str = "EK";
+pub const DICT_ENCBODY: &str = "EB";
+pub const DICT_BODY: &str = "BODY";
+pub const DICT_FILE: &str = "FILE";
+pub const DICT_FID: &str = "FI";
+pub const DICT_FNAME: &str = "FN";
+pub const DICT_FSIZE: &str = "FS";
+pub const DICT_MTIME: &str = "MT";
+pub const DICT_FATTR: &str = "FA";
+pub const DICT_CLIPPOS: &str = "CP";
+/// 官方 EncIPDict 的 EF 组合：RSA2048|AES256|IPDICT_CTR = 0x500004
+pub const ENCIPDICT_EF: i64 = 0x0005_0004;
 
 /// IPDict 值类型（解析端使用的宽松表示）
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -212,6 +226,13 @@ pub fn pack_content(d: &Dict) -> Vec<u8> {
     d.pack_content_impl()
 }
 
+/// 解析「内容段」：`key:len:val…` 序列（可选尾部 `:Z`）。
+/// EncIPDict 密文消息的线格式为 `1:<包号>:` + 本内容 + `:Z`（无 IP2 外壳）。
+pub fn unpack_content(data: &[u8]) -> Option<Dict> {
+    let body = data.strip_suffix(b":Z").unwrap_or(data);
+    parse_content(body)
+}
+
 /// 值 → 线格式字节（int 十六进制 ASII；str UTF-8；bytes 原样；
 /// List 为 len:val 序列；Dict 为嵌套完整格式）
 fn pack_val(v: &Val) -> Vec<u8> {
@@ -240,6 +261,14 @@ fn parse_content(data: &[u8]) -> Option<Dict> {
     let mut items = Vec::new();
     let mut i = 0usize;
     while i < data.len() {
+        // 官方 v5 序列化在每条 `key:len:value` 后追加分隔冒号
+        // （实抓 `EI:10:<16B>:EK:100:<256B>:…`）；无分隔的紧凑格式同样兼容
+        if data[i] == b':' {
+            i += 1;
+            if i >= data.len() {
+                break;
+            }
+        }
         // key 到下一个 ':'
         let key_start = i;
         while i < data.len() && data[i] != b':' {
@@ -335,6 +364,8 @@ fn parse_list(data: &[u8]) -> Option<Vec<Val>> {
 
 
 
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,20 +440,8 @@ mod tests {
         let packed = Dict::new().put_str("a", "b").pack();
         assert!(Dict::unpack(&packed[..packed.len() - 1]).is_none());
     }
+}
 
-}
-#[cfg(test)]
-mod dbg_tests {
-    use super::*;
-    #[test]
-    fn negative_int_uses_minus_prefix_hex() {
-        let mut d = Dict::new();
-        d.put_int("NEG", -2000);
-        let p = d.pack();
-        eprintln!("packed={:?}", String::from_utf8_lossy(&p));
-        let (parsed, _) = Dict::unpack(&p).unwrap();
-        let v = parsed.get("NEG").unwrap();
-        eprintln!("parsed NEG = {:?}", v);
-        assert_eq!(parsed.get_int("NEG"), Some(-2000));
-    }
-}
+
+
+

@@ -824,6 +824,10 @@ async fn crypto_rehandshake(ctx: &NetCtx, from: SocketAddr, key: &str, reason: &
 /* ================= 入站处理 ================= */
 
 async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
+    // 自身回声先过滤（EncIPDict 拦截与经典解析共用同一口径）
+    if from.port() == ctx.port && is_self_ip(ctx, from.ip()) {
+        return;
+    }
     // 纯 IPDict 报文（v5 新格式 / DIR 成员主协议）：整包即 IP2:...:Z，
     // 与经典报文互斥嗅探（官方 ResolveMsg 同款分流）
     if data.starts_with(b"IP2:") {
@@ -834,15 +838,35 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             }
         }
     }
+    // 官方 v5 密文消息（EncIPDict）：`1:<包号>:` + 字典内容段（EF/EI/EK/EB…）+ `:Z`
+    if data.starts_with(b"1:") {
+        let after_ver = &data[2..];
+        if let Some(colon) = after_ver.iter().position(|&b| b == b':') {
+            let (pkt_part, rest) = after_ver.split_at(colon);
+            let rest = &rest[1..];
+            if !pkt_part.is_empty()
+                && pkt_part.iter().all(|b| b.is_ascii_digit())
+                && pkt_part.len() <= 10
+            {
+                if let Some(outer) = crate::ipdict::unpack_content(rest) {
+                    if outer.has(ipd::DICT_ENCIV)
+                        && outer.has(ipd::DICT_ENCKEY)
+                        && outer.has(ipd::DICT_ENCBODY)
+                    {
+                        let outer_pkt: u32 = String::from_utf8_lossy(pkt_part).parse().unwrap_or(0);
+                        if handle_encipdict(ctx, &outer, outer_pkt, from).await {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
     let Some(pkt) = proto::parse(data) else {
         return;
     };
     #[cfg(feature = "net_debug")]
     oim_log!("[udp] <- {from} cmd={:#010x} user={:?} extra_len={}", pkt.command, pkt.user, pkt.extra.len());
-    // 过滤自身广播/组播回声（定向广播与组播会被内核本地回投）
-    if from.port() == ctx.port && is_self_ip(ctx, from.ip()) {
-        return;
-    }
     // 基本命令取低 8 位（官方规范：所有选项标志位于 bit8 以上）
     let base = pkt.command & 0xFF;
     // 会话身份 = 对端 IP（同 IP 不同源端口是同一台主机，见 upsert_peer 注释）
@@ -2463,6 +2487,141 @@ fn peer_from_host_dict(d: &crate::ipdict::Dict) -> Option<PeerInfo> {
         absence_text: None,
         vs: None,
     })
+}
+
+/* ================= 官方 v5 密文消息（EncIPDict） ================= */
+
+/// 处理一封官方 v5 IPDict 密文消息（线格式 `1:<包号>:` + EF/EI/EK/EB… `:Z`）。
+///
+/// 解密（官方 DecIPDict 同款语义）后得到消息字典（VER/PKT/UID/HID/CMD/FLG/
+/// BODY/FILE…），再合成等价的明文报文交给 handle_sendmsg 走既有全链路
+/// （陌生来源注册、已读回执、封书/密码、自动收图、不在自动应答等）。
+/// 返回 true 表示该数据报已被消费（识别成功即消费，含解密失败——按官方
+/// 语义密文报文不落入经典解析路径）。
+async fn handle_encipdict(
+    ctx: &NetCtx,
+    outer: &crate::ipdict::Dict,
+    outer_pkt: u32,
+    from: SocketAddr,
+) -> bool {
+    let key = from.ip().to_string();
+    let cfg = ctx.st.config();
+    // 送达确认要在解密后才知道 SENDCHECKOPT；重复包过滤在前（重发也要回执，
+    // 但 mark_seen 命中说明本条已处理过——重发同包仍补回执，参考经典路径）
+    let seen = !ctx.st.mark_seen(from.ip(), outer_pkt);
+    if !cfg.encrypt {
+        ctx.st.diag(&format!(
+            "<- {from} EncIPDict 密文消息（pkt={outer_pkt}）被丢弃：本机加密已关闭"
+        ));
+        return true;
+    }
+    let inner = match crypto::open_encipdict(&ctx.st.own_keypair(), outer) {
+        Ok(d) => d,
+        Err(e) => {
+            ctx.st.diag(&format!(
+                "<- {from} EncIPDict 解密失败（pkt={outer_pkt}）：{e}"
+            ));
+            crypto_rehandshake(ctx, from, &key, "encipdict-decrypt-fail").await;
+            return true;
+        }
+    };
+    let Some(cmd_val) = inner.get_int(ipd::DICT_CMD) else {
+        ctx.st.diag(&format!("<- {from} EncIPDict 缺 CMD，丢弃"));
+        return true;
+    };
+    let base = cmd_val as u32 & 0xFF;
+    let flags = inner.get_int(ipd::DICT_FLG).unwrap_or(0) as u32;
+    // 官方 ResolveDictMsg：command |= flags（选项并入命令）
+    let command = cmd_val as u32 | flags;
+    let pkt_no = inner.get_int(ipd::DICT_PKT).unwrap_or(outer_pkt as i64) as u32;
+    let uid = inner.get_str(ipd::DICT_UID).unwrap_or("").to_string();
+    let hid = inner.get_str(ipd::DICT_HID).unwrap_or("").to_string();
+    let utf8 = command & opt::UTF8OPT != 0;
+
+    if seen {
+        // 重复包：仍补一次送达确认（对端重发说明它没收到回执）
+        ack_encipdict(ctx, from, command, pkt_no).await;
+        return true;
+    }
+    // 送达确认：SENDCHECKOPT 且非自动/广播（经典路径同款门控）
+    ack_encipdict(ctx, from, command, pkt_no).await;
+
+    // 合成等价明文报文（正文 BODY + 附件 FILE 列表）
+    let body = inner.get_str(ipd::DICT_BODY).unwrap_or("");
+    let mut extra = if utf8 {
+        body.as_bytes().to_vec()
+    } else {
+        proto::encode_out(body, "gbk")
+    };
+    let files: Vec<proto::FileEntry> = inner
+        .get_dict_list(ipd::DICT_FILE)
+        .iter()
+        .filter_map(|fd| {
+            let id = fd.get_int(ipd::DICT_FID)? as u32;
+            let name = fd.get_str(ipd::DICT_FNAME).unwrap_or("").to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let mut e = proto::FileEntry {
+                id,
+                raw_id: format!("{id:x}"),
+                name,
+                size: fd.get_int(ipd::DICT_FSIZE).unwrap_or(0) as u64,
+                mtime: fd.get_int(ipd::DICT_MTIME).unwrap_or(0) as u64,
+                attr: fd.get_int(ipd::DICT_FATTR).unwrap_or(1) as u32,
+                ext_attrs: Vec::new(),
+            };
+            if let Some(cp) = fd.get_int(ipd::DICT_CLIPPOS) {
+                e.ext_attrs.push((proto::extattr::CLIPBOARDPOS, cp.to_string()));
+            }
+            Some(e)
+        })
+        .collect();
+    if !files.is_empty() {
+        extra.push(0);
+        let enc = if utf8 { "utf8" } else { "gbk" };
+        let joined: Vec<String> = files.iter().map(|f| f.serialize(enc)).collect();
+        extra.extend_from_slice(joined.join("\u{7}").as_bytes());
+        extra.push(0x07);
+    }
+
+    let pkt = proto::Packet {
+        pkt_no,
+        user: uid,
+        host: hid,
+        command,
+        extra,
+    };
+    ctx.st.diag(&format!(
+        "<- {from} EncIPDict 解密成功 pkt={pkt_no} cmd={command:#010x} body={}B files={}",
+        body.len(),
+        files.len()
+    ));
+    // 复用明文 SENDMSG 全链路；enc_meta=Some(true)（官方整包加密）
+    handle_sendmsg(ctx, from, &pkt, &key, Some(true)).await;
+    // 其余命令（ENTRY 等）暂按明文合成路径处理
+    if base != cmd::SENDMSG {
+        ctx.st.diag(&format!(
+            "<- {from} EncIPDict 非 SENDMSG 命令（base={base:#x}）仅记录"
+        ));
+    }
+    true
+}
+
+/// EncIPDict 送达确认（RECVMSG，包号取消息字典 PKT —— 官方应答口径）
+async fn ack_encipdict(ctx: &NetCtx, from: SocketAddr, command: u32, pkt_no: u32) {
+    if command & opt::SENDCHECKOPT == 0
+        || command & (opt::BROADCASTOPT | opt::AUTORETOPT) != 0
+    {
+        return;
+    }
+    let cfg = ctx.st.config();
+    let mut r = proto::Packet::new(cmd::RECVMSG | opt::AUTORETOPT);
+    r.extra = pkt_no.to_string().into_bytes();
+    let bytes = r.encode(&my_user(&cfg), &my_host());
+    let _ = ctx.sock.send_to(&bytes, from).await;
+    ctx.st
+        .diag(&format!("-> {from} EncIPDict RECVMSG 送达确认 pkt={pkt_no}"));
 }
 
 /// 纯 IPDict 报文分发（官方 ResolveDictMsg 同款）：DIR_* 与 ANSLIST_DICT
