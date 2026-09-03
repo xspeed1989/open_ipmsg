@@ -841,45 +841,107 @@ fn parse_ipdict_datagram(
     Err(format!("IP2 非法尾随数据：{}B", suffix.len()))
 }
 
+fn resolve_ipdict_files(d: &crate::ipdict::Dict) -> Result<Vec<proto::FileEntry>, String> {
+    d.get_dict_list(ipd::DICT_FILE)
+        .into_iter()
+        .map(|file| {
+            let id = u32::try_from(file.get_int(ipd::DICT_FID).ok_or("FILE 缺 FI")?)
+                .map_err(|_| "FILE FI 超出 u32")?;
+            let name = file
+                .get_str(ipd::DICT_FNAME)
+                .ok_or("FILE 缺 FN")?
+                .to_string();
+            let size = file
+                .get_int(ipd::DICT_FSIZE)
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0);
+            let mtime = file
+                .get_int(ipd::DICT_MTIME)
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0);
+            let attr = file
+                .get_int(ipd::DICT_FATTR)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(1);
+            let mut ext_attrs = Vec::new();
+            if let Some(clippos) = file
+                .get_int(ipd::DICT_CLIPPOS)
+                .and_then(|value| u32::try_from(value).ok())
+            {
+                ext_attrs.push((proto::extattr::CLIPBOARDPOS, clippos.to_string()));
+            }
+            Ok(proto::FileEntry {
+                id,
+                raw_id: format!("{id:x}"),
+                name,
+                size,
+                mtime,
+                attr,
+                ext_attrs,
+            })
+        })
+        .collect()
+}
+
+fn resolve_ipdict_packet(d: &crate::ipdict::Dict) -> Result<proto::Packet, String> {
+    if d.get_int(ipd::DICT_VER) != Some(3) {
+        return Err("VER 不是 IPMSG_NEW_VERSION(3)".into());
+    }
+    let pkt_no = u32::try_from(d.get_int(ipd::DICT_PKT).ok_or("缺 PKT")?)
+        .map_err(|_| "PKT 超出 u32")?;
+    let user = d.get_str(ipd::DICT_UID).ok_or("缺 UID")?.to_string();
+    let host = d.get_str(ipd::DICT_HID).ok_or("缺 HID")?.to_string();
+    let mode = u32::try_from(d.get_int(ipd::DICT_CMD).ok_or("缺 CMD")?)
+        .map_err(|_| "CMD 超出 u32")?;
+    let flags = u32::try_from(d.get_int(ipd::DICT_FLG).ok_or("缺 FLG")?)
+        .map_err(|_| "FLG 超出 u32")?;
+    let body = d.get_str(ipd::DICT_BODY).unwrap_or("");
+    let mut extra = body.as_bytes().to_vec();
+
+    let files = resolve_ipdict_files(d)?;
+    if !files.is_empty() {
+        extra.push(0);
+        let encoded: Vec<String> = files.iter().map(|file| file.serialize("utf8")).collect();
+        extra.extend_from_slice(encoded.join("\u{7}").as_bytes());
+        extra.push(0x07);
+    }
+    Ok(proto::Packet {
+        pkt_no,
+        user,
+        host,
+        command: mode | flags,
+        extra,
+    })
+}
+
 async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
-    // 自身回声先过滤（EncIPDict 拦截与经典解析共用同一口径）
+    // 自身回声先过滤（IPDict 与经典解析共用同一口径）
     if from.port() == ctx.port && is_self_ip(ctx, from.ip()) {
         return;
     }
-    // 纯 IPDict 报文（v5 新格式 / DIR 成员主协议）：整包即 IP2:...:Z，
-    // 与经典报文互斥嗅探（官方 ResolveMsg 同款分流）
-    if data.starts_with(b"IP2:") {
-        if let Some((dict, used)) = crate::ipdict::Dict::unpack(data) {
-            if used == data.len() {
+    match parse_ipdict_datagram(data) {
+        Ok(Some((dict, padding))) => {
+            ctx.st.diag(&format!(
+                "<- {from} IP2 stage=datagram len={} padding={}B keys={} pkt=? command=?",
+                data.len(),
+                padding,
+                dict.items.len()
+            ));
+            if dict.has(ipd::DICT_ENCBODY) {
+                handle_encipdict(ctx, &dict, from).await;
+            } else {
                 handle_dict_datagram(ctx, &dict, from).await;
-                return;
             }
+            return;
         }
-    }
-    // 兼容早期实现/旧抓包的经典 UDP envelope + EncIPDict 内容段；官方线格式
-    // 是上方分支接收的完整 `IP2:...:Z` 外层字典。
-    if data.starts_with(b"1:") {
-        let after_ver = &data[2..];
-        if let Some(colon) = after_ver.iter().position(|&b| b == b':') {
-            let (pkt_part, rest) = after_ver.split_at(colon);
-            let rest = &rest[1..];
-            if !pkt_part.is_empty()
-                && pkt_part.iter().all(|b| b.is_ascii_digit())
-                && pkt_part.len() <= 10
-            {
-                if let Some(outer) = crate::ipdict::unpack_content(rest) {
-                    if outer.has(ipd::DICT_ENCIV)
-                        && outer.has(ipd::DICT_ENCKEY)
-                        && outer.has(ipd::DICT_ENCBODY)
-                    {
-                        let outer_pkt: u32 = String::from_utf8_lossy(pkt_part).parse().unwrap_or(0);
-                        if handle_encipdict(ctx, &outer, outer_pkt, from).await {
-                            return;
-                        }
-                    }
-                }
-            }
+        Err(error) => {
+            ctx.st.diag(&format!(
+                "<- {from} IP2 stage=datagram len={} keys=? pkt=? command=? 拒绝：{error}",
+                data.len()
+            ));
+            return;
         }
+        Ok(None) => {}
     }
     let Some(pkt) = proto::parse(data) else {
         return;
@@ -2476,124 +2538,83 @@ fn peer_from_host_dict(d: &crate::ipdict::Dict) -> Option<PeerInfo> {
 /* ================= 官方 v5 密文消息（EncIPDict） ================= */
 
 /// 处理一封官方 v5 IPDict 密文消息（完整 `IP2:...:Z` 外层含 EF/EI/EK/EB）。
-///
-/// 解密（官方 DecIPDict 同款语义）后得到消息字典（VER/PKT/UID/HID/CMD/FLG/
-/// BODY/FILE…），再合成等价的明文报文交给 handle_sendmsg 走既有全链路
-/// （陌生来源注册、已读回执、封书/密码、自动收图、不在自动应答等）。
-/// 返回 true 表示该数据报已被消费（识别成功即消费，含解密失败——按官方
-/// 语义密文报文不落入经典解析路径）。
-async fn handle_encipdict(
-    ctx: &NetCtx,
-    outer: &crate::ipdict::Dict,
-    outer_pkt: u32,
-    from: SocketAddr,
-) -> bool {
+async fn handle_encipdict(ctx: &NetCtx, outer: &crate::ipdict::Dict, from: SocketAddr) {
     let key = from.ip().to_string();
-    let cfg = ctx.st.config();
-    // 送达确认要在解密后才知道 SENDCHECKOPT；重复包过滤在前（重发也要回执，
-    // 但 mark_seen 命中说明本条已处理过——重发同包仍补回执，参考经典路径）
-    let seen = !ctx.st.mark_seen(from.ip(), outer_pkt);
-    if !cfg.encrypt {
+    if !ctx.st.config().encrypt {
         ctx.st.diag(&format!(
-            "<- {from} EncIPDict 密文消息（pkt={outer_pkt}）被丢弃：本机加密已关闭"
+            "<- {from} EncIPDict stage=config len={} keys={} pkt=? command=? 被拒绝：本机加密已关闭",
+            outer.pack().len(),
+            outer.items.len()
         ));
-        return true;
+        return;
     }
     let inner = match crypto::open_encipdict(&ctx.st.own_keypair(), outer) {
-        Ok(d) => d,
-        Err(e) => {
+        Ok(inner) => inner,
+        Err(error) => {
             ctx.st.diag(&format!(
-                "<- {from} EncIPDict 解密失败（pkt={outer_pkt}）：{e}"
+                "<- {from} EncIPDict stage=decrypt len={} keys={} pkt=? command=? 失败：{error}",
+                outer.pack().len(),
+                outer.items.len()
             ));
             crypto_rehandshake(ctx, from, &key, "encipdict-decrypt-fail").await;
-            return true;
+            return;
         }
     };
-    let Some(cmd_val) = inner.get_int(ipd::DICT_CMD) else {
-        ctx.st.diag(&format!("<- {from} EncIPDict 缺 CMD，丢弃"));
-        return true;
+    let inner_len = inner.pack().len();
+    let packet = match resolve_ipdict_packet(&inner) {
+        Ok(packet) => packet,
+        Err(error) => {
+            ctx.st.diag(&format!(
+                "<- {from} EncIPDict stage=resolve len={inner_len} keys={} pkt=? command=? 失败：{error}",
+                inner.items.len()
+            ));
+            return;
+        }
     };
-    let base = cmd_val as u32 & 0xFF;
-    let mut flags = inner.get_int(ipd::DICT_FLG).unwrap_or(0) as u32;
-    // 官方 ResolveDictMsg：command |= flags（选项并入命令）
-    // 实测官方 5.8.x v5 消息的 FLG 恒带 SECRETOPT(0x200)+ENCRYPTOPT：
-    // 语义是「传输已加密」而非用户勾选的「封书」交互——剥离后按普通消息
-    // 展示（enc 锁图标保留，气泡即时可见不用开封）
-    flags &= !(opt::SECRETOPT | opt::ENCRYPTOPT);
-    let command = cmd_val as u32 | flags;
-    let pkt_no = inner.get_int(ipd::DICT_PKT).unwrap_or(outer_pkt as i64) as u32;
-    let uid = inner.get_str(ipd::DICT_UID).unwrap_or("").to_string();
-    let hid = inner.get_str(ipd::DICT_HID).unwrap_or("").to_string();
-    let utf8 = command & opt::UTF8OPT != 0;
-
-    if seen {
-        // 重复包：仍补一次送达确认（对端重发说明它没收到回执）
-        ack_encipdict(ctx, from, command, pkt_no).await;
-        return true;
-    }
-    // 送达确认：SENDCHECKOPT 且非自动/广播（经典路径同款门控）
-    ack_encipdict(ctx, from, command, pkt_no).await;
-
-    // 合成等价明文报文（正文 BODY + 附件 FILE 列表）
-    let body = inner.get_str(ipd::DICT_BODY).unwrap_or("");
-    let mut extra = if utf8 {
-        body.as_bytes().to_vec()
-    } else {
-        proto::encode_out(body, "gbk")
+    let (public, capa) = match crypto::verify_ipdict(&inner) {
+        Ok(Some(verified)) => verified,
+        Ok(None) => {
+            ctx.st.diag(&format!(
+                "<- {from} EncIPDict stage=verify len={inner_len} keys={} pkt={} command={:#010x} 缺 SIGN",
+                inner.items.len(),
+                packet.pkt_no,
+                packet.command
+            ));
+            return;
+        }
+        Err(error) => {
+            ctx.st.diag(&format!(
+                "<- {from} EncIPDict stage=verify len={inner_len} keys={} pkt={} command={:#010x} 失败：{error}",
+                inner.items.len(),
+                packet.pkt_no,
+                packet.command
+            ));
+            return;
+        }
     };
-    let files: Vec<proto::FileEntry> = inner
-        .get_dict_list(ipd::DICT_FILE)
-        .iter()
-        .filter_map(|fd| {
-            let id = fd.get_int(ipd::DICT_FID)? as u32;
-            let name = fd.get_str(ipd::DICT_FNAME).unwrap_or("").to_string();
-            if name.is_empty() {
-                return None;
-            }
-            let mut e = proto::FileEntry {
-                id,
-                raw_id: format!("{id:x}"),
-                name,
-                size: fd.get_int(ipd::DICT_FSIZE).unwrap_or(0) as u64,
-                mtime: fd.get_int(ipd::DICT_MTIME).unwrap_or(0) as u64,
-                attr: fd.get_int(ipd::DICT_FATTR).unwrap_or(1) as u32,
-                ext_attrs: Vec::new(),
-            };
-            if let Some(cp) = fd.get_int(ipd::DICT_CLIPPOS) {
-                e.ext_attrs.push((proto::extattr::CLIPBOARDPOS, cp.to_string()));
-            }
-            Some(e)
-        })
-        .collect();
-    if !files.is_empty() {
-        extra.push(0);
-        let enc = if utf8 { "utf8" } else { "gbk" };
-        let joined: Vec<String> = files.iter().map(|f| f.serialize(enc)).collect();
-        extra.extend_from_slice(joined.join("\u{7}").as_bytes());
-        extra.push(0x07);
-    }
-
-    let pkt = proto::Packet {
-        pkt_no,
-        user: uid,
-        host: hid,
-        command,
-        extra,
-    };
+    ctx.st.remember_peer_key(&key, capa, &public);
     ctx.st.diag(&format!(
-        "<- {from} EncIPDict 解密成功 pkt={pkt_no} cmd={command:#010x} body={}B files={}",
-        body.len(),
-        files.len()
+        "<- {from} EncIPDict stage=verified len={inner_len} keys={} pkt={} command={:#010x}",
+        inner.items.len(),
+        packet.pkt_no,
+        packet.command
     ));
-    // 复用明文 SENDMSG 全链路；enc_meta=Some(true)（官方整包加密）
-    handle_sendmsg(ctx, from, &pkt, &key, Some(true)).await;
-    // 其余命令（ENTRY 等）暂按明文合成路径处理
-    if base != cmd::SENDMSG {
-        ctx.st.diag(&format!(
-            "<- {from} EncIPDict 非 SENDMSG 命令（base={base:#x}）仅记录"
-        ));
+
+    if !ctx.st.mark_seen(from.ip(), packet.pkt_no) {
+        ack_encipdict(ctx, from, packet.command, packet.pkt_no).await;
+        return;
     }
-    true
+    if packet.command & 0xff != cmd::SENDMSG {
+        ctx.st.diag(&format!(
+            "<- {from} EncIPDict stage=dispatch len={inner_len} keys={} pkt={} command={:#010x} 非 SENDMSG",
+            inner.items.len(),
+            packet.pkt_no,
+            packet.command
+        ));
+        return;
+    }
+    handle_sendmsg(ctx, from, &packet, &key, Some(true)).await;
+    ack_encipdict(ctx, from, packet.command, packet.pkt_no).await;
 }
 
 /// EncIPDict 送达确认（RECVMSG，包号取消息字典 PKT —— 官方应答口径）
@@ -2607,7 +2628,7 @@ async fn ack_encipdict(ctx: &NetCtx, from: SocketAddr, command: u32, pkt_no: u32
     let mut r = proto::Packet::new(cmd::RECVMSG | opt::AUTORETOPT);
     r.extra = pkt_no.to_string().into_bytes();
     let bytes = r.encode(&my_user(&cfg), &my_host());
-    let _ = ctx.sock.send_to(&bytes, from).await;
+    let _ = reply_send(ctx, &from.ip().to_string(), from, &bytes).await;
     ctx.st
         .diag(&format!("-> {from} EncIPDict RECVMSG 送达确认 pkt={pkt_no}"));
 }
@@ -3153,6 +3174,217 @@ pub fn chunk_by_budget(text: &str, encoding: &str, budget: usize) -> Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_data_dir(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "open-ipmsg-net-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    async fn encipdict_test_ctx(
+        label: &str,
+    ) -> (NetCtx, Arc<AppState>, Arc<std::net::UdpSocket>, PathBuf) {
+        let data_dir = test_data_dir(label);
+        let st = Arc::new(AppState::new(data_dir.clone()));
+        let sock = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let peer = Arc::new(std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let port = sock.local_addr().unwrap().port();
+        let ctx = NetCtx {
+            st: st.clone(),
+            sock,
+            v6_sock: tokio::sync::Mutex::new(None),
+            port,
+        };
+        (ctx, st, peer, data_dir)
+    }
+
+    fn seal_raw_ipdict(
+        peer_pub: &rsa::RsaPublicKey,
+        inner: &crate::ipdict::Dict,
+    ) -> crate::ipdict::Dict {
+        use ctr::cipher::{KeyIvInit, StreamCipher};
+        use rand::RngCore as _;
+
+        let mut key = [0u8; 32];
+        let mut iv = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut key);
+        rand::thread_rng().fill_bytes(&mut iv);
+        let mut body = inner.pack();
+        let mut cipher = ctr::Ctr128BE::<aes::Aes256>::new_from_slices(&key, &iv).unwrap();
+        cipher.apply_keystream(&mut body);
+        let encrypted_key = peer_pub
+            .encrypt(&mut rand::thread_rng(), rsa::Pkcs1v15Encrypt, &key)
+            .unwrap();
+        let mut outer = crate::ipdict::Dict::new();
+        outer
+            .put_int(crate::ipdict::DICT_EF, crate::ipdict::ENCIPDICT_EF)
+            .put_bytes(crate::ipdict::DICT_ENCIV, &iv)
+            .put_bytes(crate::ipdict::DICT_ENCKEY, &encrypted_key)
+            .put_bytes(crate::ipdict::DICT_ENCBODY, &body);
+        outer
+    }
+
+    fn official_sendmsg_dict(body: &str, flags: u32) -> crate::ipdict::Dict {
+        let mut d = crate::ipdict::Dict::new();
+        d.put_int(crate::ipdict::DICT_VER, 3)
+            .put_int(crate::ipdict::DICT_PKT, 665500)
+            .put_str(crate::ipdict::DICT_UID, "sender")
+            .put_str(crate::ipdict::DICT_HID, "win-host")
+            .put_int(crate::ipdict::DICT_CMD, crate::protocol::cmd::SENDMSG as i64)
+            .put_int(crate::ipdict::DICT_FLG, flags as i64)
+            .put_str(crate::ipdict::DICT_BODY, body);
+        d
+    }
+
+    #[test]
+    fn resolve_ipdict_packet_preserves_numeric_body_and_flags() {
+        let flags = crate::protocol::opt::SENDCHECKOPT
+            | crate::protocol::opt::SECRETOPT
+            | crate::protocol::opt::ENCRYPTOPT
+            | crate::protocol::opt::UTF8OPT;
+        let wire = official_sendmsg_dict("1111111", flags).pack();
+        let (parsed, _) = crate::ipdict::Dict::unpack(&wire).unwrap();
+        let packet = super::resolve_ipdict_packet(&parsed).unwrap();
+
+        assert_eq!(packet.pkt_no, 665500);
+        assert_eq!(packet.extra, b"1111111");
+        assert_eq!(packet.command, crate::protocol::cmd::SENDMSG | flags);
+    }
+
+    #[test]
+    fn resolve_ipdict_packet_rejects_missing_required_fields() {
+        for missing in ["VER", "PKT", "UID", "HID", "CMD", "FLG"] {
+            let mut d = official_sendmsg_dict("body", 0);
+            d.items.retain(|(key, _)| key != missing);
+            assert!(
+                super::resolve_ipdict_packet(&d).is_err(),
+                "missing {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_ipdict_packet_rejects_file_without_id_or_name() {
+        for missing in [crate::ipdict::DICT_FID, crate::ipdict::DICT_FNAME] {
+            let mut file = crate::ipdict::Dict::new();
+            file.put_int(crate::ipdict::DICT_FID, 7)
+                .put_str(crate::ipdict::DICT_FNAME, "report.txt");
+            file.items.retain(|(key, _)| key != missing);
+            let mut d = official_sendmsg_dict("body", crate::protocol::opt::FILEATTACHOPT);
+            d.put_dict_list(crate::ipdict::DICT_FILE, &[file]);
+
+            assert!(
+                super::resolve_ipdict_packet(&d).is_err(),
+                "missing {missing}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn encipdict_missing_signature_has_no_side_effects() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("unsigned").await;
+        let receiver = st.own_keypair();
+        let inner = official_sendmsg_dict("unsigned", crate::protocol::opt::SENDCHECKOPT);
+        let outer = seal_raw_ipdict(&receiver.public_key(), &inner);
+        let from = peer.local_addr().unwrap();
+
+        super::handle_encipdict(&ctx, &outer, from).await;
+
+        assert!(st.find_in_record(&from.ip().to_string(), 665500).is_none());
+        assert!(st.peer_pubkey(&from.ip().to_string()).is_none());
+        assert!(peer.recv_from(&mut [0u8; 2048]).is_err(), "不能回 ACK");
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn encipdict_invalid_signature_has_no_side_effects() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("bad-signature").await;
+        let receiver = st.own_keypair();
+        let sender = crate::crypto::KeyPair::generate().unwrap();
+        let mut inner = official_sendmsg_dict("signed", crate::protocol::opt::SENDCHECKOPT);
+        crate::crypto::sign_ipdict(&mut inner, &sender, crate::crypto::CAPA_OUR_SEND).unwrap();
+        inner.put_str(crate::ipdict::DICT_BODY, "tampered");
+        let outer = seal_raw_ipdict(&receiver.public_key(), &inner);
+        let from = peer.local_addr().unwrap();
+
+        super::handle_encipdict(&ctx, &outer, from).await;
+
+        assert!(st.find_in_record(&from.ip().to_string(), 665500).is_none());
+        assert!(st.peer_pubkey(&from.ip().to_string()).is_none());
+        assert!(peer.recv_from(&mut [0u8; 2048]).is_err(), "不能回 ACK");
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn encipdict_persists_before_ack_and_dedups_by_inner_packet() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("ack-order").await;
+        let receiver = st.own_keypair();
+        let sender = crate::crypto::KeyPair::generate().unwrap();
+        let flags = crate::protocol::opt::SENDCHECKOPT
+            | crate::protocol::opt::SECRETOPT
+            | crate::protocol::opt::ENCRYPTOPT
+            | crate::protocol::opt::UTF8OPT;
+        let inner = official_sendmsg_dict("signed-body", flags);
+        let outer = crate::crypto::seal_encipdict(&receiver.public_key(), &sender, &inner).unwrap();
+        let from = peer.local_addr().unwrap();
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observations_in_event = observations.clone();
+        let st_in_event = st.clone();
+        let peer_in_event = peer.clone();
+        st.set_event(Box::new(move |event, _| {
+            if event == "msg-in" {
+                let persisted = st_in_event
+                    .find_in_record(&from.ip().to_string(), 665500)
+                    .is_some();
+                let ack_absent = peer_in_event.recv_from(&mut [0u8; 2048]).is_err();
+                observations_in_event
+                    .lock()
+                    .unwrap()
+                    .push((persisted, ack_absent));
+            }
+        }));
+
+        super::handle_encipdict(&ctx, &outer, from).await;
+
+        assert_eq!(&*observations.lock().unwrap(), &[(true, true)]);
+        assert!(st.peer_pubkey(&from.ip().to_string()).is_some());
+        let mut ack = [0u8; 2048];
+        let (len, _) = peer.recv_from(&mut ack).expect("ACK timeout");
+        let ack = crate::protocol::parse(&ack[..len]).unwrap();
+        assert_eq!(ack.command & 0xff, crate::protocol::cmd::RECVMSG);
+        assert_eq!(ack.extra, b"665500");
+
+        super::handle_encipdict(&ctx, &outer, from).await;
+
+        assert_eq!(
+            observations.lock().unwrap().len(),
+            1,
+            "相同 inner PKT 只持久化和 emit 一次"
+        );
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn handle_datagram_dispatches_full_ip2_encbody() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("dispatch").await;
+        let receiver = st.own_keypair();
+        let sender = crate::crypto::KeyPair::generate().unwrap();
+        let inner = official_sendmsg_dict("official", 0);
+        let outer = crate::crypto::seal_encipdict(&receiver.public_key(), &sender, &inner).unwrap();
+        let from = peer.local_addr().unwrap();
+
+        super::handle_datagram(&ctx, &outer.pack(), from).await;
+
+        assert!(st.find_in_record(&from.ip().to_string(), 665500).is_some());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
 
     #[test]
     fn ipdict_datagram_accepts_exact_official_retry_padding() {

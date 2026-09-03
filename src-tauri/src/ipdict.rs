@@ -223,7 +223,7 @@ impl Dict {
         if total > data.len() || &data[content_end..total] != IPDICT_FOOT.as_bytes() {
             return None;
         }
-        Some((parse_content(&data[index..content_end])?, total))
+        Some((unpack_content(&data[index..content_end])?, total))
     }
 }
 
