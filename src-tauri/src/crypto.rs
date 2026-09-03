@@ -1321,6 +1321,74 @@ mod encipdict_tests {
         assert_eq!(opened.get_str(crate::ipdict::DICT_UID), Some("sender"));
     }
 
+    // 新增真实报文 vs 老报文的解析差异定位
+    #[test]
+    fn real_new_vs_old_parse() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let key_json = match std::fs::read_to_string(format!(
+            "{home}/.local/share/io.github.open-ipmsg.app/ipmsg_key.json"
+        )) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let kp = KeyPair::from_json(&key_json).unwrap();
+        for (tag, path) in [
+            ("旧(注入成功)", "/tmp/encipdict_capture.bin"),
+            ("新#1", "/tmp/encipdict_1788399981.bin"),
+            ("新#2", "/tmp/encipdict_1788400009.bin"),
+        ] {
+            let data = match std::fs::read(path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let rest = &data[2..];
+            let Some(colon) = rest.iter().position(|&b| b == b':') else {
+                eprintln!("[{tag}] 无冒号"); continue;
+            };
+            let pkt_part = &rest[..colon];
+            let content = &rest[colon + 1..];
+            eprintln!("[{tag}] pkt={:?} content_len={}", String::from_utf8_lossy(pkt_part), content.len());
+            let outer = crate::ipdict::unpack_content(content);
+            match &outer {
+                Some(d) => eprintln!("[{tag}] unpack OK, keys={:?}", d.items.iter().map(|(k,_)| k.clone()).collect::<Vec<_>>()),
+                None => {
+                    eprintln!("[{tag}] unpack FAIL");
+                    eprintln!("[{tag}] 内容头 40B: {:?}", &content[..content.len().min(40)]);
+                    // 手工 walk（带分隔跳过，定位卡点）
+                    let mut i = 0;
+                    while i < content.len() {
+                        if content[i] == b':' {
+                            i += 1;
+                            eprintln!("  (跳过分隔 @{i})");
+                            if i >= content.len() { eprintln!("  @{i} 尾部只有冒号"); break; }
+                        }
+                        let ks = i;
+                        while i < content.len() && content[i] != b':' { i += 1; }
+                        if i >= content.len() { eprintln!("  @{i} key 到结尾"); break; }
+                        let key = String::from_utf8_lossy(&content[ks..i]);
+                        if key.is_empty() { eprintln!("  @{i} 空 key"); break; }
+                        i += 1;
+                        let ls = i;
+                        while i < content.len() && content[i] != b':' { i += 1; }
+                        if i >= content.len() { eprintln!("  key={key} len 到结尾"); break; }
+                        let l = String::from_utf8_lossy(&content[ls..i]);
+                        i += 1;
+                        let vlen = match usize::from_str_radix(l.trim(), 16) { Ok(v) => v, Err(e) => { eprintln!("  key={key} len={l:?} 解析失败 {e}"); break; } };
+                        if i + vlen > content.len() { eprintln!("  key={key} len={vlen} 越界 剩余={}", content.len()-i); break; }
+                        eprintln!("  key={key} len={vlen}");
+                        i += vlen;
+                    }
+                }
+            }
+            if let Some(outer) = outer {
+                match open_encipdict(&kp, &outer) {
+                    Ok(inner) => eprintln!("[{tag}] 解密 OK CMD={:#x} FLG={:#x} BODY={:?}", inner.get_int(crate::ipdict::DICT_CMD).unwrap_or(0) as u32, inner.get_int(crate::ipdict::DICT_FLG).unwrap_or(0) as u32, inner.get_str(crate::ipdict::DICT_BODY)),
+                    Err(e) => eprintln!("[{tag}] 解密失败: {e}"),
+                }
+            }
+        }
+    }
+
     /// 真实抓包回放：仅在本机存在抓包文件与本机密钥时运行（互通验证试验台）
     #[test]
     fn encipdict_real_capture_decrypts() {

@@ -2446,7 +2446,11 @@ async fn extended_protocols() -> bool {
             .put_str(crate::ipdict::DICT_UID, "官方假对端")
             .put_str(crate::ipdict::DICT_HID, "win-host")
             .put_int(crate::ipdict::DICT_CMD, 0x20)
-            .put_int(crate::ipdict::DICT_FLG, (opt::SENDCHECKOPT | opt::UTF8OPT) as i64)
+            // 与真实报文一致：FLG 恒带 SECRET|ENCRYPT（传输加密语义）
+            .put_int(
+                crate::ipdict::DICT_FLG,
+                (opt::SENDCHECKOPT | opt::SECRETOPT | opt::READCHECKOPT | opt::UTF8OPT | opt::ENCRYPTOPT) as i64,
+            )
             // 与真实场景一致：消息在官方延迟发送队列里，正文带延迟尾注
             .put_str(
                 crate::ipdict::DICT_BODY,
@@ -2462,6 +2466,8 @@ async fn extended_protocols() -> bool {
         let mut wire = b"1:12345:".to_vec();
         wire.extend_from_slice(&crate::ipdict::pack_content(&outer));
         wire.extend_from_slice(b":Z");
+        // 官方 UDP 缓冲残留：报文尾部补 NUL 填充（线上实测形态）
+        wire.extend_from_slice(&[0u8; 40]);
         // 用独立临时 socket 发送（自身 socket 自发自收会被回声过滤拦截）
         let _ = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
             .await
@@ -2480,6 +2486,14 @@ async fn extended_protocols() -> bool {
         })
         .await;
         log.check("E: 官方 v5 密文消息解密并上屏", got_v5);
+        log.check(
+            "E: FLG 的 SECRET 位剥离（非封书，气泡即时可见）",
+            !events.lock().unwrap().iter().any(|(e, v)| {
+                e == "msg-in"
+                    && v["msg"]["text"].as_str().map(|t| t.contains("v5 密文消息 123")).unwrap_or(false)
+                    && v["msg"]["secret"].as_bool().unwrap_or(true)
+            }),
+        );
         let delayed_ok = wait_for(1500, || {
             st.history_contains_text(&peer_key, "IPMsg Delayed Send")
         })

@@ -229,7 +229,13 @@ pub fn pack_content(d: &Dict) -> Vec<u8> {
 /// 解析「内容段」：`key:len:val…` 序列（可选尾部 `:Z`）。
 /// EncIPDict 密文消息的线格式为 `1:<包号>:` + 本内容 + `:Z`（无 IP2 外壳）。
 pub fn unpack_content(data: &[u8]) -> Option<Dict> {
-    let body = data.strip_suffix(b":Z").unwrap_or(data);
+    // 官方 UDP 发送缓冲在报文后残留 NUL 填充（线上实测 extra 尾部大量 0x00）：
+    // 先剥掉尾部 NUL，再剥可选 `:Z` 脚注，其余部分按内容段解析
+    let mut end = data.len();
+    while end > 0 && data[end - 1] == 0 {
+        end -= 1;
+    }
+    let body = data[..end].strip_suffix(b":Z").unwrap_or(&data[..end]);
     parse_content(body)
 }
 

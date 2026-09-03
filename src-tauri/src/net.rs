@@ -2530,8 +2530,12 @@ async fn handle_encipdict(
         return true;
     };
     let base = cmd_val as u32 & 0xFF;
-    let flags = inner.get_int(ipd::DICT_FLG).unwrap_or(0) as u32;
+    let mut flags = inner.get_int(ipd::DICT_FLG).unwrap_or(0) as u32;
     // 官方 ResolveDictMsg：command |= flags（选项并入命令）
+    // 实测官方 5.8.x v5 消息的 FLG 恒带 SECRETOPT(0x200)+ENCRYPTOPT：
+    // 语义是「传输已加密」而非用户勾选的「封书」交互——剥离后按普通消息
+    // 展示（enc 锁图标保留，气泡即时可见不用开封）
+    flags &= !(opt::SECRETOPT | opt::ENCRYPTOPT);
     let command = cmd_val as u32 | flags;
     let pkt_no = inner.get_int(ipd::DICT_PKT).unwrap_or(outer_pkt as i64) as u32;
     let uid = inner.get_str(ipd::DICT_UID).unwrap_or("").to_string();
