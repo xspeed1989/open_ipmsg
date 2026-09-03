@@ -24,6 +24,7 @@ const form = reactive({
   allow_send_list: true,
   ipdict_enabled: true,
   dir_mode: 'off',
+  v6_mcast: true,
 })
 
 watch(
@@ -46,6 +47,7 @@ watch(
       form.allow_send_list = store.config.allow_send_list !== false
       form.ipdict_enabled = store.config.ipdict_enabled !== false
       form.dir_mode = store.config.dir_mode || 'off'
+      form.v6_mcast = store.config.v6_mcast !== false
     }
   },
   { immediate: true }
@@ -155,6 +157,7 @@ async function save() {
     allow_send_list: !!form.allow_send_list,
     ipdict_enabled: !!form.ipdict_enabled,
     dir_mode: form.dir_mode,
+    v6_mcast: !!form.v6_mcast,
   }
   try {
     await ipc.saveConfig(patch)
@@ -294,6 +297,16 @@ async function save() {
               </button>
               <span class="lab">{{ t('settings.ipdict') }}</span>
             </label>
+          </div>
+          <div class="si-row adv-col">
+            <label class="adv-line">
+              <button type="button" class="switch" :class="{ on: form.v6_mcast }" role="switch"
+                :aria-checked="form.v6_mcast ? 'true' : 'false'" @click="form.v6_mcast = !form.v6_mcast">
+                <i class="knob"></i>
+              </button>
+              <span class="lab">{{ t('settings.v6mcast') }}</span>
+            </label>
+            <div class="import-hint">{{ t('settings.v6mcastHint') }}</div>
           </div>
         </div>
 

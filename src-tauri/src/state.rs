@@ -59,6 +59,10 @@ pub struct Config {
     /// master（作为成员主，汇总并分发全网列表）
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub dir_mode: String,
+    /// IPv6 组播成员发现（ff15::979/ff02::1）：默认开启；关闭后纯 IPv4，
+    /// 供与官方 Windows 客户端混合组网时排查「v4/v6 双条目」互通问题
+    #[serde(default = "default_true")]
+    pub v6_mcast: bool,
 }
 
 fn default_absence_text() -> String {
@@ -102,6 +106,7 @@ impl Default for Config {
             allow_send_list: default_true(),
             ipdict_enabled: default_true(),
             dir_mode: String::new(),
+            v6_mcast: default_true(),
         }
     }
 }

@@ -232,10 +232,15 @@ async fn start_network_impl(
     });
     sock.set_broadcast(true)?;
 
-    // IPv6 组播通道：尽力创建（无 IPv6 环境静默降级）；
+    // IPv6 组播通道：尽力创建（无 IPv6 环境静默降级；v6_mcast 关闭时跳过）；
     // quiet/loopback 启动（自检）走回环节点，隔离真实局域网
-    let hermetic = !announce_start;
-    let v6_sock = match create_v6_multicast_sock(port, hermetic) {
+    let cfg_start = st.config();
+    let v6_sock = if !cfg_start.v6_mcast {
+        oim_log!("[udp6] IPv6 组播已按配置关闭（纯 IPv4）");
+        None
+    } else {
+        let hermetic = !announce_start;
+        match create_v6_multicast_sock(port, hermetic) {
         Ok(s) => {
             oim_log!("[udp6] IPv6 组播已启用（ff15::979 / ff02::1）");
             Some(s)
@@ -243,6 +248,7 @@ async fn start_network_impl(
         Err(e) => {
             oim_log!("[udp6] IPv6 组播不可用（降级纯 IPv4）: {e}");
             None
+        }
         }
     };
 
@@ -655,7 +661,9 @@ pub async fn announce(ctx: &NetCtx) {
         let _ = ctx.sock.send_to(&bytes, t).await;
     }
     // IPv6 组播通道（ff15::979 站点组播 + ff02::1 链路组播，逐接口带 scope）
+    let cfg_v6ok = ctx.st.config().v6_mcast;
     let v6 = ctx.v6_sock.lock().await;
+    if cfg_v6ok {
     if let Some(s) = v6.as_ref() {
         for (scope, _) in v6_ifaces() {
             let _ = s
@@ -665,6 +673,7 @@ pub async fn announce(ctx: &NetCtx) {
                 .send_to(&bytes, SocketAddr::V6(SocketAddrV6::new(IPV6_MCAST_LINK, ctx.port, 0, scope)))
                 .await;
         }
+    }
     }
 }
 

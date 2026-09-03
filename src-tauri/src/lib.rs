@@ -150,6 +150,9 @@ struct ConfigPatch {
     /// 成员主模式：off / user / master
     #[serde(default)]
     dir_mode: Option<String>,
+    /// IPv6 组播成员发现（默认开；关闭即纯 IPv4）
+    #[serde(default)]
+    v6_mcast: Option<bool>,
 }
 
 /// 配置 + 本机信息（前端设置页展示）
@@ -227,6 +230,7 @@ async fn save_config(
         allow_send_list: patch.allow_send_list.unwrap_or(prev.allow_send_list),
         ipdict_enabled: patch.ipdict_enabled.unwrap_or(prev.ipdict_enabled),
         dir_mode: patch.dir_mode.unwrap_or(prev.dir_mode),
+        v6_mcast: patch.v6_mcast.unwrap_or(prev.v6_mcast),
     };
     let absence_changed = cfg.absence_enabled != prev.absence_enabled;
     st.set_config(cfg.clone());

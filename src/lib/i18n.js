@@ -95,6 +95,8 @@ const zh = {
   'settings.dirHint': 'Directory service: the master aggregates members per segment; members POLL it periodically.',
   'settings.allowSendList': 'Allow peers to request my host list',
   'settings.ipdict': 'Advertise IPDict capability (v5 format)',
+  'settings.v6mcast': 'IPv6 multicast discovery (ff15::979 / ff02::1)',
+  'settings.v6mcastHint': 'Disable for pure IPv4. Turn off when diagnosing interop issues with official Windows clients (avoids dual v4/v6 entries in their roster).',
 
   'settings.absence': '不在模式',
   'settings.absenceText': '不在通知文（自动回复与离开信息）',
@@ -112,6 +114,8 @@ const zh = {
   'settings.dirHint': '成员主目录服务：主节点汇总各段成员，成员定期 POLL 获取全网列表。',
   'settings.allowSendList': '允许对方索取我的主机列表',
   'settings.ipdict': '声明 IPDict 能力（v5 新格式）',
+  'settings.v6mcast': 'IPv6 组播成员发现（ff15::979 / ff02::1）',
+  'settings.v6mcastHint': '关闭后纯 IPv4。与官方 Windows 客户端混合组网遇到互通异常时可关闭排查（防止对端名单里出现 v4/v6 双条目）。',
 
   'settings.fpLabel': '本机密钥指纹',
   'settings.fpTitle': '点击复制本机密钥指纹',
