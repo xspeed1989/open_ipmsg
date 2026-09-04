@@ -1621,16 +1621,15 @@ async fn handle_sendmsg(
     let text = proto::decode_for_command(&pkt.extra[..text_end], pkt.command);
 
     // 封书（SECRETOPT 位即可；SECRETEXOPT = SECRET|READCHECK 亦含此位）与密码锁
-    // （PASSWORDOPT，且本机启用密码功能）：无密码封书自动显示正文；密码锁仍需输入密码。
+    // （PASSWORDOPT）：无密码封书自动显示正文；线上密码锁始终需输入本机密码。
     // 两者的已读回执都只在现有会话可见的 mark-read 路径中发送。
     let secret = pkt.command & opt::SECRETOPT != 0;
-    let cfg_now = ctx.st.config();
-    let locked = pkt.command & opt::PASSWORDOPT != 0 && cfg_now.password_use;
+    let password_protected = pkt.command & opt::PASSWORDOPT != 0;
     let prev_unlocked = prev_rec
         .as_ref()
         .and_then(|r| r.get("unlocked").and_then(|v| v.as_bool()))
         .unwrap_or(false);
-    let auto_unlocked = secret && !locked;
+    let auto_unlocked = secret && !password_protected;
     let unlocked = prev_unlocked || auto_unlocked;
 
     let rec = json!({
@@ -1649,7 +1648,7 @@ async fn handle_sendmsg(
         "sig_ok": enc_meta.unwrap_or(true),
         // 无密码封书直接展示正文；密码锁在输入本机密码前保持锁定。
         "secret": secret,
-        "locked": locked && !unlocked,
+        "locked": password_protected && !unlocked,
         "unlocked": unlocked,
         "broadcast": is_broadcast,
     });
@@ -2401,11 +2400,12 @@ pub async fn unlock_message(
     }
     if is_locked {
         let cfg = ctx.st.config();
-        if cfg.password_use {
-            let pw = password.unwrap_or_default();
-            if !pw.eq(&cfg.password) || cfg.password.is_empty() {
-                return Err("密码错误".into());
-            }
+        if !cfg.password_use || cfg.password.is_empty() {
+            return Err("本机未启用密码验证，无法解锁密码消息".into());
+        }
+        let pw = password.unwrap_or_default();
+        if !pw.eq(&cfg.password) {
+            return Err("密码错误".into());
         }
     }
     ctx.st.update_history_pkt(key, pkt, |r| {
@@ -3402,6 +3402,40 @@ mod tests {
         super::handle_datagram(&ctx, &outer.pack(), from).await;
 
         assert!(st.find_in_record(&from.ip().to_string(), 665500).is_some());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn passwordopt_stays_locked_when_local_password_is_disabled() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("password-disabled").await;
+        let mut cfg = crate::state::Config::default();
+        cfg.password_use = false;
+        cfg.password.clear();
+        st.set_config(cfg);
+        let pkt_no = 665501;
+        let mut packet = crate::protocol::Packet::new(
+            crate::protocol::cmd::SENDMSG
+                | crate::protocol::opt::SECRETOPT
+                | crate::protocol::opt::PASSWORDOPT,
+        )
+        .with_pkt_no(pkt_no);
+        packet.extra = b"protected".to_vec();
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+
+        super::handle_sendmsg(&ctx, from, &packet, &key, None).await;
+
+        let record = st.find_history_pkt(&key, pkt_no).expect("password record");
+        assert_eq!(record["secret"].as_bool(), Some(true));
+        assert_eq!(record["locked"].as_bool(), Some(true));
+        assert_eq!(record["unlocked"].as_bool(), Some(false));
+        let err = super::unlock_message(&ctx, &key, pkt_no, Some("secret123".into()))
+            .await
+            .expect_err("disabled local password verification must not unlock PASSWORDOPT");
+        assert!(err.contains("未启用密码验证"));
+        let record = st.find_history_pkt(&key, pkt_no).expect("password record remains");
+        assert_eq!(record["locked"].as_bool(), Some(true));
+        assert_eq!(record["unlocked"].as_bool(), Some(false));
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

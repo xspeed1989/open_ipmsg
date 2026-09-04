@@ -2296,6 +2296,50 @@ async fn extended_protocols() -> bool {
             .unwrap_or(false),
     );
 
+    // 线上 PASSWORDOPT 的保护语义不取决于本机是否启用了密码功能。关闭本机密码
+    // 功能后，不能把密码封书降级成可见正文，更不能绕过验证直接解锁。
+    let mut cfg_password_disabled = st.config();
+    cfg_password_disabled.password_use = false;
+    cfg_password_disabled.password.clear();
+    st.set_config(cfg_password_disabled);
+    let disabled_pass_pkt = proto::next_packet_no();
+    let mut s3 = proto::Packet::new(
+        cmd::SENDMSG | opt::SECRETOPT | opt::PASSWORDOPT | opt::READCHECKOPT,
+    )
+    .with_pkt_no(disabled_pass_pkt);
+    s3.extra = "关闭本机密码时仍需保护的封书".as_bytes().to_vec();
+    let _ = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+        .await
+        .unwrap()
+        .send_to(&s3.encode("扩展假对端", "fake-ext"), target_app)
+        .await;
+    let disabled_pass_locked = wait_for(2000, || {
+        events.lock().unwrap().iter().any(|(e, v)| {
+            e == "msg-in" && v["msg"]["pkt"].as_u64() == Some(disabled_pass_pkt as u64)
+                && v["msg"]["secret"].as_bool() == Some(true)
+                && v["msg"]["locked"].as_bool() == Some(true)
+                && v["msg"]["unlocked"].as_bool() == Some(false)
+                && v["msg"]["read"].as_bool() == Some(false)
+        })
+    })
+    .await;
+    log.check(
+        "E: 本机关闭密码功能时 PASSWORDOPT 仍保持锁定",
+        disabled_pass_locked,
+    );
+    let disabled_unlock =
+        net::unlock_message(&ctx, &peer_key, disabled_pass_pkt, Some("secret123".into())).await;
+    log.check(
+        "E: 本机关闭密码功能时拒绝解锁 PASSWORDOPT",
+        matches!(disabled_unlock, Err(ref e) if e.contains("未启用密码验证")),
+    );
+    log.check(
+        "E: 被拒绝后 PASSWORDOPT 记录仍锁定",
+        st.find_history_pkt(&peer_key, disabled_pass_pkt)
+            .map(|r| r["locked"].as_bool() == Some(true) && r["unlocked"].as_bool() == Some(false))
+            .unwrap_or(false),
+    );
+
     /* ---- E6. 在线重发（SENDCHECKOPT 未确认 → 同包号重发） ---- */
     ext.lock().unwrap().drop_ack = true;
     let drop_pkt_no = {
