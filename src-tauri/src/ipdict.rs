@@ -132,30 +132,7 @@ impl Dict {
     }
 
     pub fn get_int(&self, key: &str) -> Option<i64> {
-        let raw = self.get(key)?;
-        let (negative, digits) = match raw.first() {
-            Some(b'-') => (true, &raw[1..]),
-            _ => (false, raw),
-        };
-        if digits.is_empty() || digits.len() > 16 || !digits.iter().all(u8::is_ascii_hexdigit) {
-            return None;
-        }
-        let value = u64::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()?;
-        if negative {
-            let min_magnitude = i64::MAX as u64 + 1;
-            if value > min_magnitude {
-                return None;
-            }
-            if value == min_magnitude {
-                Some(i64::MIN)
-            } else {
-                Some(-(value as i64))
-            }
-        } else if value <= i64::MAX as u64 {
-            Some(value as i64)
-        } else {
-            None
-        }
+        parse_int(self.get(key)?)
     }
 
     pub fn get_str(&self, key: &str) -> Option<&str> {
@@ -166,17 +143,79 @@ impl Dict {
         parse_content(self.get(key)?)
     }
 
-    pub fn try_get_dict_list(&self, key: &str) -> Result<Option<Vec<Dict>>, String> {
+    /// Read a nested full `IP2:...:Z` value and require exact consumption.
+    pub fn get_ipdict(&self, key: &str) -> Option<Dict> {
+        let raw = self.get(key)?;
+        let (dict, used) = Dict::unpack(raw)?;
+        (used == raw.len()).then_some(dict)
+    }
+
+    fn try_get_list<T>(
+        &self,
+        key: &str,
+        kind: &str,
+        mut parse: impl FnMut(&[u8]) -> Option<T>,
+    ) -> Result<Option<Vec<T>>, String> {
         let Some(raw) = self.get(key) else {
             return Ok(None);
         };
-        parse_dict_list(raw)
+        let values = parse_raw_list(raw).ok_or_else(|| format!("{key} 不是合法{kind}列表"))?;
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                parse(value).ok_or_else(|| format!("{key} 的第 {index} 项不是合法{kind}"))
+            })
+            .collect::<Result<Vec<_>, _>>()
             .map(Some)
-            .ok_or_else(|| format!("{key} 不是合法字典列表"))
+    }
+
+    pub fn try_get_int_list(&self, key: &str) -> Result<Option<Vec<i64>>, String> {
+        self.try_get_list(key, "整数", parse_int)
+    }
+
+    pub fn get_int_list(&self, key: &str) -> Vec<i64> {
+        self.try_get_int_list(key).ok().flatten().unwrap_or_default()
+    }
+
+    pub fn try_get_str_list(&self, key: &str) -> Result<Option<Vec<String>>, String> {
+        self.try_get_list(key, "字符串", |raw| {
+            std::str::from_utf8(raw).ok().map(str::to_string)
+        })
+    }
+
+    pub fn get_str_list(&self, key: &str) -> Vec<String> {
+        self.try_get_str_list(key).ok().flatten().unwrap_or_default()
+    }
+
+    pub fn try_get_bytes_list(&self, key: &str) -> Result<Option<Vec<Vec<u8>>>, String> {
+        self.try_get_list(key, "字节", |raw| Some(raw.to_vec()))
+    }
+
+    pub fn get_bytes_list(&self, key: &str) -> Vec<Vec<u8>> {
+        self.try_get_bytes_list(key).ok().flatten().unwrap_or_default()
+    }
+
+    pub fn try_get_dict_list(&self, key: &str) -> Result<Option<Vec<Dict>>, String> {
+        self.try_get_list(key, "字典", parse_content)
     }
 
     pub fn get_dict_list(&self, key: &str) -> Vec<Dict> {
         self.try_get_dict_list(key)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    pub fn try_get_ipdict_list(&self, key: &str) -> Result<Option<Vec<Dict>>, String> {
+        self.try_get_list(key, "IPDict", |raw| {
+            let (dict, used) = Dict::unpack(raw)?;
+            (used == raw.len()).then_some(dict)
+        })
+    }
+
+    pub fn get_ipdict_list(&self, key: &str) -> Vec<Dict> {
+        self.try_get_ipdict_list(key)
             .ok()
             .flatten()
             .unwrap_or_default()
@@ -249,6 +288,32 @@ fn parse_hex_len(raw: &[u8]) -> Option<usize> {
     usize::from_str_radix(std::str::from_utf8(raw).ok()?, 16).ok()
 }
 
+fn parse_int(raw: &[u8]) -> Option<i64> {
+    let (negative, digits) = match raw.first() {
+        Some(b'-') => (true, &raw[1..]),
+        _ => (false, raw),
+    };
+    if digits.is_empty() || digits.len() > 16 || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let value = u64::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()?;
+    if negative {
+        let min_magnitude = i64::MAX as u64 + 1;
+        if value > min_magnitude {
+            return None;
+        }
+        if value == min_magnitude {
+            Some(i64::MIN)
+        } else {
+            Some(-(value as i64))
+        }
+    } else if value <= i64::MAX as u64 {
+        Some(value as i64)
+    } else {
+        None
+    }
+}
+
 /// Parse exact `key:len:value` entries with official inter-entry colons.
 fn parse_content(data: &[u8]) -> Option<Dict> {
     let mut dict = Dict::new();
@@ -296,8 +361,8 @@ fn parse_content(data: &[u8]) -> Option<Dict> {
     Some(dict)
 }
 
-/// Parse exact `len:dict-content` list items with required inter-item colons.
-fn parse_dict_list(data: &[u8]) -> Option<Vec<Dict>> {
+/// Split exact `len:value` list items with required inter-item colons.
+fn parse_raw_list(data: &[u8]) -> Option<Vec<&[u8]>> {
     let mut list = Vec::new();
     let mut index = 0usize;
     let mut first = true;
@@ -327,7 +392,7 @@ fn parse_dict_list(data: &[u8]) -> Option<Vec<Dict>> {
         if item_end > data.len() {
             return None;
         }
-        list.push(parse_content(&data[index..item_end])?);
+        list.push(&data[index..item_end]);
         index = item_end;
     }
     Some(list)
@@ -337,6 +402,18 @@ fn parse_dict_list(data: &[u8]) -> Option<Vec<Dict>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pack_raw_list(items: &[&[u8]]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            if index > 0 {
+                raw.push(b':');
+            }
+            raw.extend_from_slice(format!("{:x}:", item.len()).as_bytes());
+            raw.extend_from_slice(item);
+        }
+        raw
+    }
 
     #[test]
     fn encipdict_ef_matches_official_rsa2048_aes256_ctr_bits() {
@@ -447,6 +524,57 @@ mod tests {
         for item in list {
             assert_eq!(item.get_str("ADDR"), Some("192.168.1.0"));
         }
+    }
+
+    #[test]
+    fn official_raw_typed_getters_roundtrip_lists_and_full_ipdict() {
+        let mut nested_a = Dict::new();
+        nested_a.put_str("N", "a");
+        let mut nested_b = Dict::new();
+        nested_b.put_str("N", "b");
+        let full_a = nested_a.pack();
+        let full_b = nested_b.pack();
+
+        let mut d = Dict::new();
+        d.put_bytes("NEST", &full_a)
+            .put_bytes(
+                "INTS",
+                &pack_raw_list(&[&b"1"[..], &b"-2"[..], &b"ff"[..]]),
+            )
+            .put_bytes(
+                "STRS",
+                &pack_raw_list(&[&b""[..], &b"hello"[..], "中文".as_bytes()]),
+            )
+            .put_bytes(
+                "BYTES",
+                &pack_raw_list(&[&b"\x00:\xff"[..], &b""[..]]),
+            )
+            .put_bytes("IPDS", &pack_raw_list(&[full_a.as_slice(), full_b.as_slice()]));
+
+        assert_eq!(d.get_ipdict("NEST"), Some(nested_a.clone()));
+        assert_eq!(d.get_int_list("INTS"), vec![1, -2, 255]);
+        assert_eq!(d.get_str_list("STRS"), vec!["", "hello", "中文"]);
+        assert_eq!(
+            d.get_bytes_list("BYTES"),
+            vec![b"\x00:\xff".to_vec(), Vec::new()]
+        );
+        assert_eq!(d.get_ipdict_list("IPDS"), vec![nested_a, nested_b]);
+    }
+
+    #[test]
+    fn official_raw_typed_getters_reject_malformed_nested_values() {
+        let mut d = Dict::new();
+        d.put_bytes("NEST", b"IP2:1:A:Zjunk")
+            .put_bytes("INTS", b"1:1:2:x")
+            .put_bytes("STRS", b"1:\xff")
+            .put_bytes("BYTES", b"3:ab")
+            .put_bytes("IPDS", b"8:IP2:0::Zx");
+
+        assert!(d.get_ipdict("NEST").is_none());
+        assert!(d.try_get_int_list("INTS").is_err());
+        assert!(d.try_get_str_list("STRS").is_err());
+        assert!(d.try_get_bytes_list("BYTES").is_err());
+        assert!(d.try_get_ipdict_list("IPDS").is_err());
     }
 
     #[test]

@@ -147,6 +147,14 @@ pub struct SessionInfo {
     pub unread_ts: u64,
 }
 
+/// 在历史互斥区内原子判定并落库一条入站记录后的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InRecordOutcome {
+    Inserted,
+    Duplicate,
+    ReplacedConflict,
+}
+
 /// 局域网内的对端用户
 #[derive(Serialize, Clone, Debug)]
 pub struct PeerInfo {
@@ -566,23 +574,27 @@ impl AppState {
     /// 返回 true 表示首次出现；false 表示重复包应丢弃
     pub fn mark_seen(&self, ip: IpAddr, pkt_no: u32) -> bool {
         let item = (ip, pkt_no);
-        {
-            let set = self.seen_set.lock().unwrap();
-            if set.contains(&item) {
-                return false;
-            }
-        }
         let mut set = self.seen_set.lock().unwrap();
+        if !set.insert(item) {
+            return false;
+        }
         let mut queue = self.seen_queue.lock().unwrap();
-        if set.insert(item) {
-            queue.push_back(item);
-            while queue.len() > SEEN_CAP {
-                if let Some(old) = queue.pop_front() {
-                    set.remove(&old);
-                }
+        queue.push_back(item);
+        while queue.len() > SEEN_CAP {
+            if let Some(old) = queue.pop_front() {
+                set.remove(&old);
             }
         }
         true
+    }
+
+    /// 持久化失败时撤销内存去重占位，让后续 UDP 重投能再次尝试落库。
+    pub fn forget_seen(&self, ip: IpAddr, pkt_no: u32) {
+        let item = (ip, pkt_no);
+        let mut set = self.seen_set.lock().unwrap();
+        set.remove(&item);
+        let mut queue = self.seen_queue.lock().unwrap();
+        queue.retain(|entry| *entry != item);
     }
 
     /* ---------- 端到端加密：本机密钥与对端公钥缓存 ---------- */
@@ -1238,20 +1250,59 @@ impl AppState {
         self.logs_dir.join(format!("{}.jsonl", safe))
     }
 
-    /// 追加一条消息记录
-    pub fn log_record(&self, key: &str, rec: &serde_json::Value) {
-        let _g = self.hist_lock.lock().unwrap();
-        let path = self.log_path(key);
+    fn append_record_locked(
+        &self,
+        path: &std::path::Path,
+        rec: &serde_json::Value,
+    ) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            std::fs::create_dir_all(dir)?;
         }
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            // 整行一次写入：writeln! 会把 JSON 拆成多次 write 系统调用，
-            // 追加模式下与其它写入者交错就会写出无法解析的坏行
-            let line = format!("{rec}\n");
-            let _ = f.write_all(line.as_bytes());
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        // 整行一次 write_all：writeln! 会把 JSON 拆成多次 write 系统调用，
+        // 追加模式下与其它写入者交错就会写出无法解析的坏行。
+        file.write_all(format!("{rec}\n").as_bytes())
+    }
+
+    fn rewrite_records_locked(
+        &self,
+        path: &std::path::Path,
+        lines: &[String],
+    ) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
         }
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?;
+        if !lines.is_empty() {
+            file.write_all(lines.join("\n").as_bytes())?;
+            file.write_all(b"\n")?;
+        }
+        Ok(())
+    }
+
+    /// 可失败的追加接口：目录创建、打开和 write_all 全部成功后才算落库。
+    pub fn log_record_fallible(
+        &self,
+        key: &str,
+        rec: &serde_json::Value,
+    ) -> std::io::Result<()> {
+        let _guard = self.hist_lock.lock().unwrap();
+        self.append_record_locked(&self.log_path(key), rec)
+    }
+
+    /// 兼容旧调用方的便利封装；这些路径沿用忽略历史错误的旧行为。新的入站
+    /// 接收代码必须调用上面的可失败接口。
+    pub fn log_record(&self, key: &str, rec: &serde_json::Value) {
+        let _ = self.log_record_fallible(key, rec);
     }
 
     /// 落库一条入站记录：同包号的旧记录存在则原地更新，否则追加。
@@ -1259,52 +1310,97 @@ impl AppState {
     /// 对端的"延迟发送/离线重发"会用同一包号反复投递同一条消息（飞秋等实现
     /// 每次我方上线都会重发），逐条追加会让历史无限膨胀，更要命的是每份新副本
     /// 都是未读状态，前端一标记已读就再回一次 READMSG，对端于是反复弹
-    /// "消息已被查看"。返回 true 表示是本会话第一次见到该包号。
-    pub fn upsert_in_record(&self, key: &str, rec: &serde_json::Value) -> bool {
+    /// "消息已被查看"。payload identity 让判断跨进程重启仍有效，并让同一
+    /// 临界区里的持久化结果成为并发投递的唯一权威。
+    pub fn upsert_in_record_fallible(
+        &self,
+        key: &str,
+        rec: &serde_json::Value,
+    ) -> std::io::Result<InRecordOutcome> {
+        let _guard = self.hist_lock.lock().unwrap();
+        let path = self.log_path(key);
         let pkt = rec.get("pkt").and_then(|v| v.as_u64());
         let Some(pkt) = pkt else {
-            self.log_record(key, rec);
-            return true;
+            self.append_record_locked(&path, rec)?;
+            return Ok(InRecordOutcome::Inserted);
         };
-        {
-            let _g = self.hist_lock.lock().unwrap();
-            let path = self.log_path(key);
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                let mut found = false;
-                let mut lines: Vec<String> = Vec::new();
-                for line in content.lines() {
-                    let old: serde_json::Value = match serde_json::from_str(line) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            lines.push(line.to_string());
-                            continue;
-                        }
-                    };
-                    let hit = old.get("dir").and_then(|v| v.as_str()) == Some("in")
-                        && old.get("pkt").and_then(|v| v.as_u64()) == Some(pkt);
-                    if hit && !found {
-                        found = true;
-                        let mut merged = rec.clone();
-                        // 保留首次收到的时间，重发不该把消息顶到列表末尾
-                        if let Some(ts) = old.get("ts") {
-                            merged["ts"] = ts.clone();
-                        }
-                        lines.push(merged.to_string());
-                    } else if hit {
-                        // 历史上已经堆积的重复副本：顺手清理掉
-                        continue;
-                    } else {
-                        lines.push(line.to_string());
-                    }
-                }
-                if found {
-                    let _ = std::fs::write(&path, lines.join("\n") + "\n");
-                    return false;
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.append_record_locked(&path, rec)?;
+                return Ok(InRecordOutcome::Inserted);
+            }
+            Err(error) => return Err(error),
+        };
+        let new_identity = rec.get("payload_id").and_then(|value| value.as_str());
+        let mut parsed_lines: Vec<(String, Option<serde_json::Value>)> = Vec::new();
+        let mut matching_indices = Vec::new();
+        for line in content.lines() {
+            let parsed = serde_json::from_str::<serde_json::Value>(line).ok();
+            if parsed.as_ref().is_some_and(|old| {
+                old.get("dir").and_then(|value| value.as_str()) == Some("in")
+                    && old.get("pkt").and_then(|value| value.as_u64()) == Some(pkt)
+            }) {
+                matching_indices.push(parsed_lines.len());
+            }
+            parsed_lines.push((line.to_string(), parsed));
+        }
+
+        if matching_indices.iter().any(|index| {
+            let old_identity = parsed_lines[*index]
+                .1
+                .as_ref()
+                .and_then(|old| old.get("payload_id"))
+                .and_then(|value| value.as_str());
+            new_identity.is_some() && old_identity == new_identity
+        }) {
+            return Ok(InRecordOutcome::Duplicate);
+        }
+
+        if let Some(first_index) = matching_indices.first().copied() {
+            let legacy_without_identity = new_identity.is_none()
+                && parsed_lines[first_index]
+                    .1
+                    .as_ref()
+                    .and_then(|old| old.get("payload_id"))
+                    .is_none();
+            let mut replacement = rec.clone();
+            if legacy_without_identity {
+                // 导入记录和旧版无 identity 记录沿用旧封装行为；已认证入站
+                // 报文总会提供 identity，不走此兼容分支。
+                if let Some(timestamp) = parsed_lines[first_index]
+                    .1
+                    .as_ref()
+                    .and_then(|old| old.get("ts"))
+                {
+                    replacement["ts"] = timestamp.clone();
                 }
             }
+            let matching: HashSet<usize> = matching_indices.into_iter().collect();
+            let mut lines = Vec::with_capacity(parsed_lines.len());
+            for (index, (original, parsed)) in parsed_lines.into_iter().enumerate() {
+                if index == first_index {
+                    lines.push(replacement.to_string());
+                } else if !matching.contains(&index) {
+                    lines.push(parsed.map_or(original, |value| value.to_string()));
+                }
+            }
+            self.rewrite_records_locked(&path, &lines)?;
+            return Ok(InRecordOutcome::ReplacedConflict);
         }
-        self.log_record(key, rec);
-        true
+
+        self.append_record_locked(&path, rec)?;
+        Ok(InRecordOutcome::Inserted)
+    }
+
+    /// 兼容封装：只有新追加包返回 true；需要真实 I/O 状态或冲突详情的调用方
+    /// 必须使用可失败接口。
+    pub fn upsert_in_record(&self, key: &str, rec: &serde_json::Value) -> bool {
+        matches!(
+            self.upsert_in_record_fallible(key, rec),
+            Ok(InRecordOutcome::Inserted)
+        )
     }
 
     /// 全文搜索聊天记录。
@@ -1933,6 +2029,31 @@ mod tests {
     }
 
     #[test]
+    fn seen_dedup_is_atomic_under_concurrent_insert() {
+        let st = Arc::new(temp_state("seen-race"));
+        let ip: IpAddr = "127.0.0.9".parse().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(32));
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                let st = st.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    st.mark_seen(ip, 77)
+                })
+            })
+            .collect();
+        let winners = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|winner| *winner)
+            .count();
+
+        assert_eq!(winners, 1, "同一个 (IP, PKT) 只能有一个首次插入者");
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
     fn history_append_read_update() {
         let st = temp_state("hist");
         let rec = serde_json::json!({
@@ -2096,6 +2217,101 @@ mod tests {
         assert!(hist[0]["text"].as_str().unwrap().contains("Delayed Send"));
         assert!(st.pending_receipts("k:1", &[500]).is_empty(), "重投不再回执");
         let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn exact_payload_identity_duplicate_does_not_rewrite_persisted_state() {
+        let st = temp_state("payload-id-duplicate");
+        let first = serde_json::json!({
+            "dir": "in", "kind": "file", "text": "same", "pkt": 501, "ts": 100,
+            "payload_id": "sha256:abc", "read": true, "unlocked": true,
+            "files": [{"id": 7, "state": "done", "path": "/kept/file.png"}]
+        });
+        assert!(st.upsert_in_record("k:payload", &first));
+        let before = std::fs::read(st.log_path("k:payload")).unwrap();
+
+        let retry = serde_json::json!({
+            "dir": "in", "kind": "file", "text": "same", "pkt": 501, "ts": 999,
+            "payload_id": "sha256:abc", "read": false, "unlocked": false,
+            "files": [{"id": 7, "state": "downloading"}]
+        });
+        assert!(!st.upsert_in_record("k:payload", &retry));
+
+        assert_eq!(std::fs::read(st.log_path("k:payload")).unwrap(), before);
+        assert_eq!(st.find_in_record("k:payload", 501).unwrap()["read"], true);
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn inbound_history_outcomes_survive_restart_and_distinguish_conflicts() {
+        let dir = std::env::temp_dir().join(format!(
+            "oim-state-outcome-restart-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = AppState::new(dir.clone());
+        let original = serde_json::json!({
+            "dir": "in", "kind": "text", "text": "one", "pkt": 700, "ts": 1,
+            "payload_id": "sha256:one", "read": true, "locked": false, "unlocked": true
+        });
+        assert_eq!(
+            first
+                .upsert_in_record_fallible("10.0.0.7", &original)
+                .unwrap(),
+            InRecordOutcome::Inserted
+        );
+        drop(first);
+
+        let restarted = AppState::new(dir.clone());
+        let duplicate = serde_json::json!({
+            "dir": "in", "kind": "text", "text": "one", "pkt": 700, "ts": 999,
+            "payload_id": "sha256:one", "read": false, "locked": true, "unlocked": false
+        });
+        assert_eq!(
+            restarted
+                .upsert_in_record_fallible("10.0.0.7", &duplicate)
+                .unwrap(),
+            InRecordOutcome::Duplicate
+        );
+        assert_eq!(restarted.find_in_record("10.0.0.7", 700).unwrap()["read"], true);
+
+        let conflict = serde_json::json!({
+            "dir": "in", "kind": "text", "text": "two", "pkt": 700, "ts": 2,
+            "payload_id": "sha256:two", "read": false, "locked": true, "unlocked": false
+        });
+        assert_eq!(
+            restarted
+                .upsert_in_record_fallible("10.0.0.7", &conflict)
+                .unwrap(),
+            InRecordOutcome::ReplacedConflict
+        );
+        let stored = restarted.find_in_record("10.0.0.7", 700).unwrap();
+        assert_eq!(stored["text"], "two");
+        assert_eq!(stored["ts"], 2);
+        assert_eq!(stored["read"], false);
+        assert_eq!(stored["locked"], true);
+        assert_eq!(stored["unlocked"], false);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fallible_history_apis_report_invalid_directory_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "oim-state-invalid-history-dir-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::write(&dir, b"not a directory").unwrap();
+        let st = AppState::new(dir.clone());
+        let record = serde_json::json!({
+            "dir": "in", "pkt": 1, "payload_id": "sha256:x"
+        });
+
+        assert!(st.log_record_fallible("10.0.0.1", &record).is_err());
+        assert!(st
+            .upsert_in_record_fallible("10.0.0.1", &record)
+            .is_err());
+        std::fs::remove_file(dir).unwrap();
     }
 
     /// 会话摘要未读统计：in 且 read=false 计数；out 记录、已读记录不计；
@@ -2551,5 +2767,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 }
-
-

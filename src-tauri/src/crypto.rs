@@ -226,39 +226,93 @@ pub fn sign_ipdict(
     Ok(())
 }
 
-/// 校验官方完整 IPDict 签名。无 SIGN 返回 `Ok(None)`；签名存在时要求其为末尾
-/// 字段，并返回签名内嵌且已验证的公钥与能力位。
-pub fn verify_ipdict(
+struct ParsedIpDictSignature<'a> {
+    embedded_key: RsaPublicKey,
+    capa: u32,
+    signature: &'a [u8],
+    signed: Vec<u8>,
+}
+
+/// 只提取并校验签名字段自身结构，不在这里决定信任哪把钥；EncIPDict 调用方
+/// 必须另行用已缓存的对端钥作信任判断。
+fn parse_ipdict_signature(
     dict: &crate::ipdict::Dict,
-) -> Result<Option<(RsaPublicKey, u32)>, String> {
+) -> Result<Option<ParsedIpDictSignature<'_>>, String> {
     use crate::ipdict::*;
+    use rsa::traits::PublicKeyParts;
 
     let Some(sign) = dict.get_bytes(DICT_SIGN) else {
         return Ok(None);
     };
+    if sign.len() != RSA_BITS / 8 {
+        return Err(format!("SIGN 必须为 {} 字节", RSA_BITS / 8));
+    }
     if dict.items.last().map(|(key, _)| key.as_str()) != Some(DICT_SIGN) {
         return Err("SIGN 不是末尾字段".into());
     }
-    let ef = dict.get_int(DICT_EF).ok_or("缺 EF")? as u32;
+    let ef = u32::try_from(dict.get_int(DICT_EF).ok_or("缺 EF")?)
+        .map_err(|_| "EF 超出 u32")?;
     if ef & DICT_EF_SHA256 as u32 == 0 {
         return Err("SIGN 未声明 SHA-256".into());
     }
-    let capa = dict.get_int(DICT_EC).ok_or("缺 EC")? as u32;
+    let capa = u32::try_from(dict.get_int(DICT_EC).ok_or("缺 EC")?)
+        .map_err(|_| "EC 超出 u32")?;
     let exponent = dict.get_int(DICT_PUBE).ok_or("缺 PUBE")?;
     if exponent <= 0 {
         return Err("IPDict 公钥指数必须为正数".into());
     }
     let modulus = dict.get_bytes(DICT_PUBN).ok_or("缺 PUBN")?;
+    if modulus.len() != RSA_BITS / 8 {
+        return Err(format!("PUBN 必须为 {} 字节", RSA_BITS / 8));
+    }
     let public = RsaPublicKey::new(
         BigUint::from_bytes_be(modulus),
         BigUint::from(exponent as u64),
     )
     .map_err(|e| format!("IPDict 公钥无效：{e}"))?;
+    if public.n().bits() != RSA_BITS {
+        return Err(format!("IPDict 公钥模数必须为 {RSA_BITS} 位"));
+    }
     let signed = dict.pack_prefix(dict.items.len() - 1);
-    if !verify_sha256(&public, &signed, sign) {
+    Ok(Some(ParsedIpDictSignature {
+        embedded_key: public,
+        capa,
+        signature: sign,
+        signed,
+    }))
+}
+
+/// 校验官方完整 IPDict 签名。无 SIGN 返回 `Ok(None)`；签名存在时要求其为末尾
+/// 字段，并返回签名内嵌且已验证的公钥与能力位。适用于没有既有信任锚的 TOFU
+/// 或目录报文；已知 EncIPDict 对端必须改用 `verify_ipdict_with_key`。
+pub fn verify_ipdict(
+    dict: &crate::ipdict::Dict,
+) -> Result<Option<(RsaPublicKey, u32)>, String> {
+    let Some(parsed) = parse_ipdict_signature(dict)? else {
+        return Ok(None);
+    };
+    if !verify_sha256(&parsed.embedded_key, &parsed.signed, parsed.signature) {
         return Err("IPDict SHA-256 签名校验失败".into());
     }
-    Ok(Some((public, capa)))
+    Ok(Some((parsed.embedded_key, parsed.capa)))
+}
+
+/// 用缓存的对端公钥校验签名。报文内嵌钥必须与信任锚一致，自签的替换钥即使
+/// 能自洽验签也会被拒绝。
+pub fn verify_ipdict_with_key(
+    dict: &crate::ipdict::Dict,
+    trusted: &RsaPublicKey,
+) -> Result<Option<u32>, String> {
+    let Some(parsed) = parse_ipdict_signature(dict)? else {
+        return Ok(None);
+    };
+    if &parsed.embedded_key != trusted {
+        return Err("IPDict 内嵌公钥与缓存公钥不匹配".into());
+    }
+    if !verify_sha256(trusted, &parsed.signed, parsed.signature) {
+        return Err("IPDict SHA-256 签名校验失败".into());
+    }
+    Ok(Some(parsed.capa))
 }
 
 pub fn verify_sha256(pubk: &RsaPublicKey, data: &[u8], sig: &[u8]) -> bool {
@@ -1369,6 +1423,54 @@ mod encipdict_tests {
         d.put_str("AFTER", "not-signed");
 
         assert!(verify_ipdict(&d).is_err());
+    }
+
+    #[test]
+    fn ipdict_signature_requires_exact_rsa2048_wire_lengths() {
+        let key = KeyPair::generate().unwrap();
+        let mut d = crate::ipdict::Dict::new();
+        d.put_int(crate::ipdict::DICT_VER, 3);
+        sign_ipdict(&mut d, &key, CAPA_OUR_SEND).unwrap();
+
+        let mut short_modulus = d.clone();
+        let modulus = short_modulus
+            .get_bytes(crate::ipdict::DICT_PUBN)
+            .unwrap()[1..]
+            .to_vec();
+        short_modulus.put_bytes(crate::ipdict::DICT_PUBN, &modulus);
+        let err = verify_ipdict(&short_modulus).unwrap_err();
+        assert!(
+            err.contains("PUBN") && err.contains("256"),
+            "unexpected error: {err}"
+        );
+
+        let mut short_signature = d;
+        let signature = short_signature
+            .get_bytes(crate::ipdict::DICT_SIGN)
+            .unwrap()[1..]
+            .to_vec();
+        short_signature.put_bytes(crate::ipdict::DICT_SIGN, &signature);
+        let err = verify_ipdict(&short_signature).unwrap_err();
+        assert!(
+            err.contains("SIGN") && err.contains("256"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ipdict_signature_rejects_a_padded_non_2048_bit_modulus() {
+        let private = RsaPrivateKey::new(&mut rand::thread_rng(), RSA_BITS - 8).unwrap();
+        let key = KeyPair { priv_key: private };
+        let mut d = crate::ipdict::Dict::new();
+        d.put_int(crate::ipdict::DICT_VER, 3);
+        sign_ipdict(&mut d, &key, CAPA_OUR_SEND).unwrap();
+        let mut signature = d.get_bytes(crate::ipdict::DICT_SIGN).unwrap().to_vec();
+        assert_eq!(signature.len(), 255);
+        signature.insert(0, 0);
+        d.put_bytes(crate::ipdict::DICT_SIGN, &signature);
+
+        let err = verify_ipdict(&d).unwrap_err();
+        assert!(err.contains("2048"), "unexpected error: {err}");
     }
 
     /// 旧测试抓包使用 UDP envelope；迁移后先还原精确内容，再用完整 IPDict 验证。
