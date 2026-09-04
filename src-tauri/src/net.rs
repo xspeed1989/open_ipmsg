@@ -3862,6 +3862,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn encipdict_parent_sync_failure_keeps_trust_consistent_without_business_side_effects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("tofu-parent-sync-failure").await;
+        let sender = crate::crypto::KeyPair::generate().unwrap();
+        let sender_public = sender.public_key();
+        let inner = official_sendmsg_dict("must-not-dispatch", crate::protocol::opt::SENDCHECKOPT);
+        let outer = crate::crypto::seal_encipdict(
+            &st.own_keypair().public_key(),
+            &sender,
+            &inner,
+        )
+        .unwrap();
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_in_event = emitted.clone();
+        st.set_event(Box::new(move |event, _| {
+            if event == "msg-in" {
+                emitted_in_event.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        st.set_peer_key_parent_sync_failure_for_test(true);
+
+        super::handle_encipdict(&ctx, &outer, from).await;
+
+        assert_eq!(st.peer_pubkey(&key), Some(sender_public.clone()));
+        assert!(st.peer_key_durability_indeterminate_for_test());
+        let reloaded = AppState::new(data_dir.clone());
+        reloaded.load_peer_keys();
+        assert_eq!(reloaded.peer_pubkey(&key), Some(sender_public));
+        assert!(st.find_in_record(&key, 665500).is_none());
+        assert_eq!(emitted.load(Ordering::SeqCst), 0);
+        assert!(recv_test_packets(&peer)
+            .iter()
+            .all(|packet| packet.command & 0xff != crate::protocol::cmd::RECVMSG));
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
     #[tokio::test]
     async fn encipdict_known_current_key_verifies_without_rotating_cache() {
         let (ctx, st, peer, data_dir) = encipdict_test_ctx("known-current").await;

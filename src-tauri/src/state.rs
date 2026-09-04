@@ -248,6 +248,26 @@ struct PeerKeyPersistenceTestHooks {
     fail_parent_sync: bool,
 }
 
+enum PeerKeyPersistenceFailure {
+    PreCommit(std::io::Error),
+    PostCommit(std::io::Error),
+}
+
+impl PeerKeyPersistenceFailure {
+    fn into_io_error(self) -> std::io::Error {
+        match self {
+            Self::PreCommit(error) => std::io::Error::new(
+                error.kind(),
+                format!("peer-key persistence failed before replace: {error}"),
+            ),
+            Self::PostCommit(error) => std::io::Error::new(
+                error.kind(),
+                format!("peer-key persistence durability indeterminate after replace: {error}"),
+            ),
+        }
+    }
+}
+
 /// A verified embedded peer key's trust result at the instant it is committed.
 /// Cryptographic verification happens before this decision; this type only
 /// describes the atomic comparison against the live peer-key cache.
@@ -366,6 +386,9 @@ pub struct AppState {
     on_event: Mutex<Option<EventFn>>,
     /// 对端 IP → 密钥缓存（最新公钥 + 上一把备选）；持久化到 peer_keys.json（仅最新）
     peer_crypto: Mutex<HashMap<String, PeerCryptoEntry>>,
+    /// canonical 已 replace，但 parent directory sync 失败；内存已发布同一
+    /// proposed snapshot，后续 trust mutation 必须先修复持久性。
+    peer_key_durability_indeterminate: AtomicBool,
     #[cfg(test)]
     peer_key_persistence_test_hooks: Mutex<PeerKeyPersistenceTestHooks>,
     /// 已确认走明文协议的对端 IP（仅内存态：重启后重新协商）
@@ -447,6 +470,7 @@ impl AppState {
             pending_out: Mutex::new(HashMap::new()),
             on_event: Mutex::new(None),
             peer_crypto: Mutex::new(HashMap::new()),
+            peer_key_durability_indeterminate: AtomicBool::new(false),
             #[cfg(test)]
             peer_key_persistence_test_hooks: Mutex::new(PeerKeyPersistenceTestHooks::default()),
             peer_plain: Mutex::new(HashSet::new()),
@@ -755,8 +779,9 @@ impl AppState {
     /// Compare a cryptographically verified embedded key against the live
     /// cache and apply the allowed cache update as one atomic operation.
     /// RSA verification must be completed by the caller before entering here.
-    /// Persistence is completed before the proposed cache is published; an
-    /// I/O failure therefore leaves the in-memory trust state unchanged.
+    /// A pre-replace I/O failure leaves memory unchanged. If replace succeeded
+    /// but directory sync failed, proposed is published to match canonical and
+    /// the store is marked durability-indeterminate until a later repair.
     pub fn commit_verified_peer_key(
         &self,
         ip: &str,
@@ -764,6 +789,7 @@ impl AppState {
         embedded: &RsaPublicKey,
     ) -> std::io::Result<VerifiedPeerKeyDecision> {
         let mut peers = self.peer_crypto.lock().unwrap();
+        self.repair_peer_key_durability_if_needed(&peers)?;
         let decision = match peers.get(ip) {
             None => VerifiedPeerKeyDecision::TofuStored,
             Some(entry) if &entry.pub_key == embedded && entry.capa == capa => {
@@ -805,8 +831,7 @@ impl AppState {
                 unreachable!()
             }
         }
-        self.persist_peer_keys_snapshot(&proposed)?;
-        *peers = proposed;
+        self.persist_and_publish_peer_keys(&mut peers, proposed)?;
         Ok(decision)
     }
 
@@ -818,6 +843,7 @@ impl AppState {
         pubk: &RsaPublicKey,
     ) -> std::io::Result<()> {
         let mut peers = self.peer_crypto.lock().unwrap();
+        self.repair_peer_key_durability_if_needed(&peers)?;
         let mut proposed = peers.clone();
         let mut key_change = None;
         match proposed.get_mut(ip) {
@@ -860,8 +886,7 @@ impl AppState {
                 },
             );
         }
-        self.persist_peer_keys_snapshot(&proposed)?;
-        *peers = proposed;
+        self.persist_and_publish_peer_keys(&mut peers, proposed)?;
         drop(peers);
         if let Some((old_fp, new_fp)) = key_change {
             self.diag(&format!(
@@ -879,20 +904,65 @@ impl AppState {
     /// 未缓存的对端是安全空操作；只影响目标 IP，其它缓存原样保留。
     pub fn forget_peer_key(&self, ip: &str) -> std::io::Result<()> {
         let mut peers = self.peer_crypto.lock().unwrap();
+        self.repair_peer_key_durability_if_needed(&peers)?;
         if !peers.contains_key(ip) {
             return Ok(());
         }
         let mut proposed = peers.clone();
         proposed.remove(ip);
-        self.persist_peer_keys_snapshot(&proposed)?;
-        *peers = proposed;
-        Ok(())
+        self.persist_and_publish_peer_keys(&mut peers, proposed)
+    }
+
+    fn repair_peer_key_durability_if_needed(
+        &self,
+        current: &HashMap<String, PeerCryptoEntry>,
+    ) -> std::io::Result<()> {
+        if !self
+            .peer_key_durability_indeterminate
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        match self.persist_peer_keys_snapshot(current) {
+            Ok(()) => {
+                self.peer_key_durability_indeterminate
+                    .store(false, Ordering::Release);
+                Ok(())
+            }
+            Err(failure) => Err(failure.into_io_error()),
+        }
+    }
+
+    fn persist_and_publish_peer_keys(
+        &self,
+        current: &mut HashMap<String, PeerCryptoEntry>,
+        proposed: HashMap<String, PeerCryptoEntry>,
+    ) -> std::io::Result<()> {
+        match self.persist_peer_keys_snapshot(&proposed) {
+            Ok(()) => {
+                *current = proposed;
+                self.peer_key_durability_indeterminate
+                    .store(false, Ordering::Release);
+                Ok(())
+            }
+            Err(failure @ PeerKeyPersistenceFailure::PreCommit(_)) => {
+                Err(failure.into_io_error())
+            }
+            Err(failure @ PeerKeyPersistenceFailure::PostCommit(_)) => {
+                // rename/move 已经把 canonical 换成 proposed；即使 parent fsync
+                // 失败，内存也必须发布同一快照，避免进程内外 trust 分裂。
+                *current = proposed;
+                self.peer_key_durability_indeterminate
+                    .store(true, Ordering::Release);
+                Err(failure.into_io_error())
+            }
+        }
     }
 
     fn persist_peer_keys_snapshot(
         &self,
         data: &HashMap<String, PeerCryptoEntry>,
-    ) -> std::io::Result<()> {
+    ) -> Result<(), PeerKeyPersistenceFailure> {
         use rsa::traits::PublicKeyParts;
         #[cfg(test)]
         let (write_count, before_replace, fail_replace, fail_parent_sync) = {
@@ -922,15 +992,20 @@ impl AppState {
             })
             .collect();
         let bytes = serde_json::to_vec(&PeerKeyFile { rev: PEER_KEY_FILE_REV, keys })
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            .map_err(|error| {
+                PeerKeyPersistenceFailure::PreCommit(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error,
+                ))
+            })?;
         let target = self.peer_keys_path();
         let parent = target.parent().ok_or_else(|| {
-            std::io::Error::new(
+            PeerKeyPersistenceFailure::PreCommit(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "peer_keys.json has no parent directory",
-            )
+            ))
         })?;
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(PeerKeyPersistenceFailure::PreCommit)?;
 
         let temp = loop {
             let sequence = PEER_KEY_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -949,41 +1024,57 @@ impl AppState {
                     if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
                         drop(file);
                         let _ = std::fs::remove_file(&candidate);
-                        return Err(error);
+                        return Err(PeerKeyPersistenceFailure::PreCommit(error));
                     }
                     drop(file);
                     break candidate;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
+                Err(error) => return Err(PeerKeyPersistenceFailure::PreCommit(error)),
             }
         };
         #[cfg(test)]
         if let Some(before_replace) = before_replace {
             before_replace();
         }
-        let persisted = (|| {
-            #[cfg(test)]
-            if fail_replace {
-                return Err(std::io::Error::new(
+        #[cfg(test)]
+        if fail_replace {
+            let _ = std::fs::remove_file(&temp);
+            return Err(PeerKeyPersistenceFailure::PreCommit(
+                std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "injected peer-key replacement failure",
-                ));
-            }
-            replace_peer_key_file(&temp, &target)?;
-            #[cfg(test)]
-            if fail_parent_sync {
-                return Err(std::io::Error::new(
+                ),
+            ));
+        }
+        if let Err(error) = replace_peer_key_file(&temp, &target) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(PeerKeyPersistenceFailure::PreCommit(error));
+        }
+        #[cfg(test)]
+        if fail_parent_sync {
+            return Err(PeerKeyPersistenceFailure::PostCommit(
+                std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "injected peer-key parent sync failure",
-                ));
-            }
-            sync_peer_key_parent(parent)
-        })();
-        if persisted.is_err() {
-            let _ = std::fs::remove_file(&temp);
+                ),
+            ));
         }
-        persisted
+        sync_peer_key_parent(parent).map_err(PeerKeyPersistenceFailure::PostCommit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_peer_key_parent_sync_failure_for_test(&self, fail: bool) {
+        self.peer_key_persistence_test_hooks
+            .lock()
+            .unwrap()
+            .fail_parent_sync = fail;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peer_key_durability_indeterminate_for_test(&self) -> bool {
+        self.peer_key_durability_indeterminate
+            .load(Ordering::Acquire)
     }
 
     /// 启动时从磁盘恢复对端密钥缓存；单条损坏跳过该条，整体损坏视为无缓存。
@@ -1010,7 +1101,7 @@ impl AppState {
                 out.insert(ip, (ent.capa, pubk));
             }
         }
-        *self.peer_crypto.lock().unwrap() = out
+        let loaded = out
             .into_iter()
             .map(|(ip, (capa, k))| {
                 (
@@ -1023,6 +1114,9 @@ impl AppState {
                 )
             })
             .collect();
+        *self.peer_crypto.lock().unwrap() = loaded;
+        self.peer_key_durability_indeterminate
+            .store(false, Ordering::Release);
     }
 
     /// 标记该对端只走明文协议（仅内存态：重启后按报文重新协商）
@@ -2999,7 +3093,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn parent_directory_sync_failure_is_returned_not_treated_as_success() {
+    fn parent_directory_sync_failure_publishes_committed_state_and_marks_poisoned() {
         let st = temp_state("parent-sync-failure");
         let key = KeyPair::generate().unwrap().public_key();
         st.remember_peer_key("10.0.0.81", 0x11, &key).unwrap();
@@ -3011,12 +3105,70 @@ mod tests {
         assert!(st
             .commit_verified_peer_key("10.0.0.81", 0x22, &key)
             .is_err());
-        assert_eq!(st.peer_pubkey("10.0.0.81"), Some(key));
+        assert_eq!(st.peer_pubkey("10.0.0.81"), Some(key.clone()));
         assert_eq!(
             st.peer_capa("10.0.0.81"),
-            0x11,
-            "post-rename directory sync failure must not publish proposed memory state"
+            0x22,
+            "rename committed proposed state, so memory must match canonical despite Err"
         );
+        assert!(st.peer_key_durability_indeterminate_for_test());
+        let reloaded = AppState::new(st.data_dir.clone());
+        reloaded.load_peer_keys();
+        assert_eq!(reloaded.peer_pubkey("10.0.0.81"), Some(key));
+        assert_eq!(reloaded.peer_capa("10.0.0.81"), 0x22);
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poisoned_store_blocks_changes_until_repair_then_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let st = temp_state("poisoned-store-recovery");
+        let key = KeyPair::generate().unwrap().public_key();
+        st.remember_peer_key("10.0.0.84", 0x11, &key).unwrap();
+        let writes = Arc::new(AtomicUsize::new(0));
+        {
+            let mut hooks = st.peer_key_persistence_test_hooks.lock().unwrap();
+            hooks.write_count = Some(writes.clone());
+            hooks.fail_parent_sync = true;
+        }
+
+        assert!(st
+            .commit_verified_peer_key("10.0.0.84", 0x22, &key)
+            .is_err());
+        assert_eq!(st.peer_capa("10.0.0.84"), 0x22);
+        assert!(st.peer_key_durability_indeterminate_for_test());
+
+        assert!(st
+            .commit_verified_peer_key("10.0.0.84", 0x33, &key)
+            .is_err());
+        assert_eq!(
+            st.peer_capa("10.0.0.84"),
+            0x22,
+            "failed poison repair must block the requested new capability"
+        );
+        assert!(st.peer_key_durability_indeterminate_for_test());
+
+        st.peer_key_persistence_test_hooks
+            .lock()
+            .unwrap()
+            .fail_parent_sync = false;
+        assert_eq!(
+            st.commit_verified_peer_key("10.0.0.84", 0x33, &key)
+                .unwrap(),
+            VerifiedPeerKeyDecision::Current
+        );
+        assert_eq!(st.peer_capa("10.0.0.84"), 0x33);
+        assert!(!st.peer_key_durability_indeterminate_for_test());
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            4,
+            "initial indeterminate write, failed repair, successful repair, then new change"
+        );
+        let reloaded = AppState::new(st.data_dir.clone());
+        reloaded.load_peer_keys();
+        assert_eq!(reloaded.peer_capa("10.0.0.84"), 0x33);
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
