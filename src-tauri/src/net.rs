@@ -1590,10 +1590,36 @@ fn sha256_identity(prefix: &[u8], parts: &[&[u8]]) -> String {
     format!("sha256:{hex}")
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    (!needle.is_empty() && needle.len() <= haystack.len())
-        .then(|| haystack.windows(needle.len()).position(|window| window == needle))
-        .flatten()
+/// Remove only the complete footer emitted by `flush_pending_for`. A marker in
+/// normal message content is not transport metadata and must stay in the hash.
+fn strip_official_delayed_suffix(body: &[u8]) -> &[u8] {
+    const PREFIX: &[u8] = b"\n----\n(IPMsg Delayed Send: ";
+
+    let Some(without_close) = body.strip_suffix(b" )") else {
+        return body;
+    };
+    let Some(start) = without_close
+        .windows(PREFIX.len())
+        .rposition(|window| window == PREFIX)
+    else {
+        return body;
+    };
+    let timestamp = &without_close[start + PREFIX.len()..];
+    if timestamp.is_empty()
+        || timestamp
+            .iter()
+            .any(|byte| matches!(*byte, b'\r' | b'\n' | b')'))
+    {
+        return body;
+    }
+    &body[..start]
+}
+
+fn push_classic_identity_field(encoded: &mut Vec<u8>, domain: &[u8], value: &[u8]) {
+    encoded.extend_from_slice(&(domain.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(domain);
+    encoded.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(value);
 }
 
 /// 经典报文的稳定 identity。延迟发送尾注属于传输元数据，计算时剔除；正文与
@@ -1604,41 +1630,60 @@ fn classic_payload_identity(pkt: &proto::Packet) -> String {
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(pkt.extra.len());
-    let mut text = &pkt.extra[..text_end];
-    for marker in [
-        &b"\n----\n(IPMsg Delayed Send:"[..],
-        &b"\r\n----\r\n(IPMsg Delayed Send:"[..],
-    ] {
-        if let Some(index) = find_subslice(text, marker) {
-            text = &text[..index];
-            break;
-        }
-    }
+    let text = strip_official_delayed_suffix(&pkt.extra[..text_end]);
 
-    let command = pkt.command.to_be_bytes();
-    let mut owned_parts = vec![
-        pkt.user.as_bytes().to_vec(),
-        pkt.host.as_bytes().to_vec(),
-        text.to_vec(),
-    ];
+    // SENDCHECK/RETRY/ENCRYPT describe delivery mechanics, not the delivered
+    // payload. Every other known or future bit remains identity-bearing so a
+    // semantic flag cannot accidentally inherit state from another message.
+    let semantic_command = pkt.command & !(opt::SENDCHECKOPT | opt::RETRYOPT | opt::ENCRYPTOPT);
+    let mut encoded = Vec::new();
+    push_classic_identity_field(
+        &mut encoded,
+        b"semantic-command",
+        &semantic_command.to_be_bytes(),
+    );
+    push_classic_identity_field(&mut encoded, b"user", pkt.user.as_bytes());
+    push_classic_identity_field(&mut encoded, b"host", pkt.host.as_bytes());
+    push_classic_identity_field(&mut encoded, b"body", text);
+
     let files = if pkt.command & opt::FILEATTACHOPT != 0 {
         proto::parse_file_entries(&pkt.extra)
     } else {
         Vec::new()
     };
-    for file in files {
-        owned_parts.push(file.name.into_bytes());
-        owned_parts.push(file.size.to_be_bytes().to_vec());
-        owned_parts.push(file.mtime.to_be_bytes().to_vec());
-        owned_parts.push(file.attr.to_be_bytes().to_vec());
-        for (key, value) in file.ext_attrs {
-            owned_parts.push(key.to_be_bytes().to_vec());
-            owned_parts.push(value.into_bytes());
+    push_classic_identity_field(
+        &mut encoded,
+        b"file-count",
+        &(files.len() as u64).to_be_bytes(),
+    );
+    for (file_index, file) in files.iter().enumerate() {
+        push_classic_identity_field(
+            &mut encoded,
+            b"file-index",
+            &(file_index as u64).to_be_bytes(),
+        );
+        push_classic_identity_field(&mut encoded, b"file-id", &file.id.to_be_bytes());
+        push_classic_identity_field(&mut encoded, b"file-raw-id", file.raw_id.as_bytes());
+        push_classic_identity_field(&mut encoded, b"file-name", file.name.as_bytes());
+        push_classic_identity_field(&mut encoded, b"file-size", &file.size.to_be_bytes());
+        push_classic_identity_field(&mut encoded, b"file-mtime", &file.mtime.to_be_bytes());
+        push_classic_identity_field(&mut encoded, b"file-attr", &file.attr.to_be_bytes());
+        push_classic_identity_field(
+            &mut encoded,
+            b"ext-count",
+            &(file.ext_attrs.len() as u64).to_be_bytes(),
+        );
+        for (ext_index, (key, value)) in file.ext_attrs.iter().enumerate() {
+            push_classic_identity_field(
+                &mut encoded,
+                b"ext-index",
+                &(ext_index as u64).to_be_bytes(),
+            );
+            push_classic_identity_field(&mut encoded, b"ext-key", &key.to_be_bytes());
+            push_classic_identity_field(&mut encoded, b"ext-value", value.as_bytes());
         }
     }
-    let mut parts: Vec<&[u8]> = vec![&command];
-    parts.extend(owned_parts.iter().map(Vec::as_slice));
-    sha256_identity(b"classic-v1", &parts)
+    sha256_identity(b"classic-v2", &[&encoded])
 }
 
 fn verified_ipdict_payload_identity(inner: &crate::ipdict::Dict) -> String {
@@ -4334,6 +4379,153 @@ mod tests {
         super::handle_datagram(&ctx, &outer.pack(), from).await;
 
         assert!(st.find_in_record(&from.ip().to_string(), 665500).is_some());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    fn classic_identity_packet(extra: &[u8], command: u32) -> crate::protocol::Packet {
+        crate::protocol::Packet {
+            pkt_no: 665503,
+            user: "sender".into(),
+            host: "classic-host".into(),
+            command,
+            extra: extra.to_vec(),
+        }
+    }
+
+    #[test]
+    fn classic_identity_does_not_strip_delayed_marker_from_body_middle() {
+        let command = crate::protocol::cmd::SENDMSG | crate::protocol::opt::UTF8OPT;
+        let plain = classic_identity_packet(b"message", command);
+        let marker_in_body = classic_identity_packet(
+            b"message\n----\n(IPMsg Delayed Send: 09/04 10:15 )\nstill body",
+            command,
+        );
+
+        assert_ne!(
+            super::classic_payload_identity(&plain),
+            super::classic_payload_identity(&marker_in_body),
+            "a delayed marker inside BODY is message content, not a removable footer"
+        );
+    }
+
+    #[test]
+    fn classic_identity_only_strips_complete_official_delayed_suffix() {
+        let command = crate::protocol::cmd::SENDMSG | crate::protocol::opt::UTF8OPT;
+        let plain = classic_identity_packet(b"message", command);
+        let valid = classic_identity_packet(
+            b"message\n----\n(IPMsg Delayed Send: 09/04 10:15 )",
+            command,
+        );
+        assert_eq!(
+            super::classic_payload_identity(&plain),
+            super::classic_payload_identity(&valid),
+            "a genuine official delayed retry must retain its original identity"
+        );
+
+        for malformed in [
+            &b"message\n----\n(IPMsg Delayed Send: 09/04 10:15 "[..],
+            &b"message\n----\n(IPMsg Delayed Send:  )"[..],
+            &b"message\n----\n(IPMsg Delayed Send: 09/04 10:15 )tail"[..],
+        ] {
+            let packet = classic_identity_packet(malformed, command);
+            assert_ne!(
+                super::classic_payload_identity(&plain),
+                super::classic_payload_identity(&packet),
+                "malformed footer must remain part of BODY: {:?}",
+                String::from_utf8_lossy(malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn classic_identity_includes_raw_and_canonical_file_id() {
+        let command = crate::protocol::cmd::SENDMSG
+            | crate::protocol::opt::UTF8OPT
+            | crate::protocol::opt::FILEATTACHOPT;
+        let decimal_id =
+            classic_identity_packet(b"file\x0010:same.txt:20:1234:1:8=0:\x07", command);
+        let hexadecimal_id =
+            classic_identity_packet(b"file\x000a:same.txt:20:1234:1:8=0:\x07", command);
+        let different_canonical_id =
+            classic_identity_packet(b"file\x0011:same.txt:20:1234:1:8=0:\x07", command);
+        let decimal_file = crate::protocol::parse_file_entries(&decimal_id.extra);
+        let hexadecimal_file = crate::protocol::parse_file_entries(&hexadecimal_id.extra);
+        let different_canonical_file =
+            crate::protocol::parse_file_entries(&different_canonical_id.extra);
+        assert_eq!(decimal_file[0].id, hexadecimal_file[0].id);
+        assert_ne!(decimal_file[0].raw_id, hexadecimal_file[0].raw_id);
+        assert_ne!(decimal_file[0].id, different_canonical_file[0].id);
+
+        assert_ne!(
+            super::classic_payload_identity(&decimal_id),
+            super::classic_payload_identity(&hexadecimal_id),
+            "different wire file IDs must not collide even when all other metadata matches"
+        );
+        assert_ne!(
+            super::classic_payload_identity(&decimal_id),
+            super::classic_payload_identity(&different_canonical_id),
+            "different canonical file IDs must not collide even when all other metadata matches"
+        );
+    }
+
+    #[tokio::test]
+    async fn classic_passwordopt_identity_conflict_resets_read_unlock_and_file_state() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("classic-password-conflict").await;
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        let pkt_no = 665504;
+        let extra = b"protected file\x0010:report.txt:20:1234:1:\x07";
+        let base_command = crate::protocol::cmd::SENDMSG
+            | crate::protocol::opt::SECRETOPT
+            | crate::protocol::opt::FILEATTACHOPT
+            | crate::protocol::opt::UTF8OPT;
+        let mut first = classic_identity_packet(extra, base_command);
+        first.pkt_no = pkt_no;
+        let first_identity = super::classic_payload_identity(&first);
+        super::handle_sendmsg(
+            &ctx,
+            from,
+            &first,
+            &key,
+            None,
+            &first_identity,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        st.mark_in_read(&key, &[pkt_no]);
+        st.update_history_file(&key, pkt_no, 10, |file| {
+            file["state"] = "done".into();
+            file["path"] = "/tmp/old-report.txt".into();
+            file["error"] = "old runtime error".into();
+        });
+        assert_eq!(st.find_in_record(&key, pkt_no).unwrap()["unlocked"], true);
+
+        let mut replacement = first.clone();
+        replacement.command |= crate::protocol::opt::PASSWORDOPT;
+        let replacement_identity = super::classic_payload_identity(&replacement);
+        assert_ne!(first_identity, replacement_identity);
+        super::handle_sendmsg(
+            &ctx,
+            from,
+            &replacement,
+            &key,
+            None,
+            &replacement_identity,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let record = st.find_in_record(&key, pkt_no).unwrap();
+        assert_eq!(record["read"], false);
+        assert_eq!(record["locked"], true);
+        assert_eq!(record["unlocked"], false);
+        assert_eq!(record["files"][0]["state"], "pending");
+        assert!(record["files"][0].get("path").is_none());
+        assert!(record["files"][0].get("error").is_none());
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
