@@ -512,7 +512,11 @@ impl AppState {
         // 首次运行：昵称留空（前端弹出设置向导），下载目录 = 数据目录/接收文件
         let mut cfg = Config::default();
         if cfg.download_dir.is_empty() {
-            cfg.download_dir = self.data_dir.join("接收文件").to_string_lossy().into_owned();
+            cfg.download_dir = self
+                .data_dir
+                .join("接收文件")
+                .to_string_lossy()
+                .into_owned();
         }
         *self.config.lock().unwrap() = cfg;
         let _ = self.persist_config();
@@ -535,7 +539,11 @@ impl AppState {
         static DIAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = DIAG_LOCK.lock().unwrap();
         let path = self.data_dir.join("diag.log");
-        let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let mut f = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             Ok(f) => f,
             Err(_) => return,
         };
@@ -733,10 +741,7 @@ impl AppState {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &path,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
                 }
                 kp
             })
@@ -750,12 +755,21 @@ impl AppState {
 
     /// 对端最近一次公告的公钥（未缓存返回 None；发送加密用最新一把）
     pub fn peer_pubkey(&self, ip: &str) -> Option<RsaPublicKey> {
-        self.peer_crypto.lock().unwrap().get(ip).map(|e| e.pub_key.clone())
+        self.peer_crypto
+            .lock()
+            .unwrap()
+            .get(ip)
+            .map(|e| e.pub_key.clone())
     }
 
     /// 对端最近一次公告的能力位（未缓存返回 0）
     pub fn peer_capa(&self, ip: &str) -> u32 {
-        self.peer_crypto.lock().unwrap().get(ip).map(|e| e.capa).unwrap_or(0)
+        self.peer_crypto
+            .lock()
+            .unwrap()
+            .get(ip)
+            .map(|e| e.capa)
+            .unwrap_or(0)
     }
 
     /// 验签候选公钥（最新在前、上一把备选在后）：多客户端交替/多实例场景下
@@ -945,9 +959,7 @@ impl AppState {
                     .store(false, Ordering::Release);
                 Ok(())
             }
-            Err(failure @ PeerKeyPersistenceFailure::PreCommit(_)) => {
-                Err(failure.into_io_error())
-            }
+            Err(failure @ PeerKeyPersistenceFailure::PreCommit(_)) => Err(failure.into_io_error()),
             Err(failure @ PeerKeyPersistenceFailure::PostCommit(_)) => {
                 // rename/move 已经把 canonical 换成 proposed；即使 parent fsync
                 // 失败，内存也必须发布同一快照，避免进程内外 trust 分裂。
@@ -991,13 +1003,16 @@ impl AppState {
                 )
             })
             .collect();
-        let bytes = serde_json::to_vec(&PeerKeyFile { rev: PEER_KEY_FILE_REV, keys })
-            .map_err(|error| {
-                PeerKeyPersistenceFailure::PreCommit(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    error,
-                ))
-            })?;
+        let bytes = serde_json::to_vec(&PeerKeyFile {
+            rev: PEER_KEY_FILE_REV,
+            keys,
+        })
+        .map_err(|error| {
+            PeerKeyPersistenceFailure::PreCommit(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error,
+            ))
+        })?;
         let target = self.peer_keys_path();
         let parent = target.parent().ok_or_else(|| {
             PeerKeyPersistenceFailure::PreCommit(std::io::Error::new(
@@ -1040,12 +1055,10 @@ impl AppState {
         #[cfg(test)]
         if fail_replace {
             let _ = std::fs::remove_file(&temp);
-            return Err(PeerKeyPersistenceFailure::PreCommit(
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "injected peer-key replacement failure",
-                ),
-            ));
+            return Err(PeerKeyPersistenceFailure::PreCommit(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected peer-key replacement failure",
+            )));
         }
         if let Err(error) = replace_peer_key_file(&temp, &target) {
             let _ = std::fs::remove_file(&temp);
@@ -1053,12 +1066,10 @@ impl AppState {
         }
         #[cfg(test)]
         if fail_parent_sync {
-            return Err(PeerKeyPersistenceFailure::PostCommit(
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "injected peer-key parent sync failure",
-                ),
-            ));
+            return Err(PeerKeyPersistenceFailure::PostCommit(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected peer-key parent sync failure",
+            )));
         }
         sync_peer_key_parent(parent).map_err(PeerKeyPersistenceFailure::PostCommit)
     }
@@ -1138,7 +1149,12 @@ impl AppState {
 
     /// 该 IP 的历史 GETPUBKEY 探测次数（无记录为 0）
     pub fn probe_count(&self, ip: &str) -> u32 {
-        self.probe_counts.lock().unwrap().get(ip).copied().unwrap_or(0)
+        self.probe_counts
+            .lock()
+            .unwrap()
+            .get(ip)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// send_message 无缓存分支的探测决策（spec §5）：
@@ -1455,12 +1471,7 @@ impl AppState {
     }
 
     pub fn dir_members_snapshot(&self) -> Vec<DirMember> {
-        self.dir_members
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect()
+        self.dir_members.lock().unwrap().values().cloned().collect()
     }
 
     pub fn remove_dir_member(&self, key: &str) {
@@ -1507,9 +1518,7 @@ impl AppState {
             let Some((ip_part, port_part)) = stem.rsplit_once('_') else {
                 continue;
             };
-            if ip_part.parse::<std::net::Ipv4Addr>().is_err()
-                || port_part.parse::<u16>().is_err()
-            {
+            if ip_part.parse::<std::net::Ipv4Addr>().is_err() || port_part.parse::<u16>().is_err() {
                 continue;
             }
             let target = self.logs_dir.join(format!("{ip_part}.jsonl"));
@@ -1555,7 +1564,13 @@ impl AppState {
     pub(crate) fn log_path(&self, key: &str) -> PathBuf {
         let safe: String = key
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.logs_dir.join(format!("{}.jsonl", safe))
     }
@@ -1600,11 +1615,7 @@ impl AppState {
     }
 
     /// 可失败的追加接口：目录创建、打开和 write_all 全部成功后才算落库。
-    pub fn log_record_fallible(
-        &self,
-        key: &str,
-        rec: &serde_json::Value,
-    ) -> std::io::Result<()> {
+    pub fn log_record_fallible(&self, key: &str, rec: &serde_json::Value) -> std::io::Result<()> {
         let _guard = self.hist_lock.lock().unwrap();
         self.append_record_locked(&self.log_path(key), rec)
     }
@@ -1673,13 +1684,9 @@ impl AppState {
 
         if let Some(first_index) = matching_indices.first().copied() {
             let legacy_without_identity = identity_field.is_none()
-                && parsed_lines[first_index]
-                    .1
-                    .as_ref()
-                    .is_some_and(|old| {
-                        old.get("payload_id").is_none()
-                            && old.get("classic_payload_id").is_none()
-                    });
+                && parsed_lines[first_index].1.as_ref().is_some_and(|old| {
+                    old.get("payload_id").is_none() && old.get("classic_payload_id").is_none()
+                });
             let mut replacement = rec.clone();
             if legacy_without_identity {
                 // 导入记录和旧版无 identity 记录沿用旧封装行为；已认证入站
@@ -1838,8 +1845,7 @@ impl AppState {
                 .unwrap_or("")
                 .to_string();
             if let Some((ip_part, port_part)) = stem.rsplit_once('_') {
-                if ip_part.parse::<std::net::Ipv4Addr>().is_ok()
-                    && port_part.parse::<u16>().is_ok()
+                if ip_part.parse::<std::net::Ipv4Addr>().is_ok() && port_part.parse::<u16>().is_ok()
                 {
                     continue;
                 }
@@ -1939,8 +1945,13 @@ impl AppState {
     }
 
     fn persist_hidden(&self) {
-        let mut keys: Vec<String> =
-            self.hidden_contacts.lock().unwrap().iter().cloned().collect();
+        let mut keys: Vec<String> = self
+            .hidden_contacts
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
         keys.sort();
         if let Some(dir) = self.hidden_path().parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -2061,7 +2072,10 @@ impl AppState {
             let Some(pkt) = rec.get("pkt").and_then(|v| v.as_u64()).map(|p| p as u32) else {
                 continue;
             };
-            let need = rec.get("need_read").and_then(|v| v.as_bool()).unwrap_or(false);
+            let need = rec
+                .get("need_read")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let read = rec.get("read").and_then(|v| v.as_bool()).unwrap_or(false);
             let secret = rec.get("secret").and_then(|v| v.as_bool()).unwrap_or(false);
             let locked = rec.get("locked").and_then(|v| v.as_bool()).unwrap_or(false)
@@ -2144,9 +2158,9 @@ impl AppState {
                         .get("files")
                         .and_then(|f| f.as_array())
                         .map(|files| {
-                            files
-                                .iter()
-                                .any(|f| f.get("id").and_then(|v| v.as_u64()) == Some(file_id as u64))
+                            files.iter().any(|f| {
+                                f.get("id").and_then(|v| v.as_u64()) == Some(file_id as u64)
+                            })
                         })
                         .unwrap_or(false)
             },
@@ -2262,11 +2276,8 @@ mod tests {
     use super::*;
 
     fn temp_state(tag: &str) -> AppState {
-        let dir = std::env::temp_dir().join(format!(
-            "oim-state-test-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("oim-state-test-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         AppState::new(dir)
     }
@@ -2306,7 +2317,10 @@ mod tests {
         let st = temp_state("config");
         std::fs::create_dir_all(&st.data_dir).unwrap();
         st.load_config();
-        assert!(st.config().nickname.is_empty(), "首次运行昵称留空，由设置向导填写");
+        assert!(
+            st.config().nickname.is_empty(),
+            "首次运行昵称留空，由设置向导填写"
+        );
         assert!(!st.config().download_dir.is_empty(), "下载目录有默认值");
         let mut cfg = st.config();
         cfg.nickname = "测试昵称".into();
@@ -2376,7 +2390,10 @@ mod tests {
             "files": [{"id": 3, "name": "a.zip", "size": 5, "state": "pending"}]
         });
         st.log_record("192.168.1.9:2425", &rec);
-        st.log_record("192.168.1.9:2425", &serde_json::json!({"dir":"out","text":"x","pkt":101,"ts":2}));
+        st.log_record(
+            "192.168.1.9:2425",
+            &serde_json::json!({"dir":"out","text":"x","pkt":101,"ts":2}),
+        );
         let hist = st.read_history("192.168.1.9:2425", 10);
         assert_eq!(hist.len(), 2);
         assert_eq!(hist[0]["pkt"], 100);
@@ -2402,19 +2419,28 @@ mod tests {
         let st = temp_state("search");
         let a = "10.0.0.1:2425";
         let b = "10.0.0.2:2425";
-        st.log_record(a, &serde_json::json!({
-            "dir":"in","kind":"text","text":"明天下午开会","pkt":1,"ts":100,
-            "peer":{"key":a,"nickname":"老王"}
-        }));
-        st.log_record(a, &serde_json::json!({
-            "dir":"out","kind":"file","text":"","pkt":2,"ts":200,
-            "files":[{"id":1,"name":"会议纪要.docx","size":10}],
-            "peer":{"key":a,"nickname":"老王"}
-        }));
-        st.log_record(b, &serde_json::json!({
-            "dir":"in","kind":"text","text":"Hello World","pkt":3,"ts":300,
-            "peer":{"key":b,"nickname":"Tom"}
-        }));
+        st.log_record(
+            a,
+            &serde_json::json!({
+                "dir":"in","kind":"text","text":"明天下午开会","pkt":1,"ts":100,
+                "peer":{"key":a,"nickname":"老王"}
+            }),
+        );
+        st.log_record(
+            a,
+            &serde_json::json!({
+                "dir":"out","kind":"file","text":"","pkt":2,"ts":200,
+                "files":[{"id":1,"name":"会议纪要.docx","size":10}],
+                "peer":{"key":a,"nickname":"老王"}
+            }),
+        );
+        st.log_record(
+            b,
+            &serde_json::json!({
+                "dir":"in","kind":"text","text":"Hello World","pkt":3,"ts":300,
+                "peer":{"key":b,"nickname":"Tom"}
+            }),
+        );
 
         // 全局搜索：命中正文
         let r = st.search_history("开会", None, 50);
@@ -2452,13 +2478,22 @@ mod tests {
     #[test]
     fn clear_history_removes_records() {
         let st = temp_state("clear");
-        st.log_record("k:9", &serde_json::json!({"dir":"in","pkt":1,"ts":1,"text":"a"}));
-        st.log_record("k:9", &serde_json::json!({"dir":"out","pkt":2,"ts":2,"text":"b"}));
+        st.log_record(
+            "k:9",
+            &serde_json::json!({"dir":"in","pkt":1,"ts":1,"text":"a"}),
+        );
+        st.log_record(
+            "k:9",
+            &serde_json::json!({"dir":"out","pkt":2,"ts":2,"text":"b"}),
+        );
         assert_eq!(st.read_history("k:9", 10).len(), 2);
         assert_eq!(st.clear_history("k:9"), 2);
         assert!(st.read_history("k:9", 10).is_empty());
         // 清空后仍可继续记录新消息
-        st.log_record("k:9", &serde_json::json!({"dir":"in","pkt":3,"ts":3,"text":"c"}));
+        st.log_record(
+            "k:9",
+            &serde_json::json!({"dir":"in","pkt":3,"ts":3,"text":"c"}),
+        );
         assert_eq!(st.read_history("k:9", 10).len(), 1);
         // 没有历史的会话：清空是幂等的空操作
         assert_eq!(st.clear_history("k:none"), 0);
@@ -2468,8 +2503,14 @@ mod tests {
     #[test]
     fn delete_contact_hides_and_removes_history() {
         let st = temp_state("del-contact");
-        st.log_record("10.0.0.9", &serde_json::json!({"dir":"in","pkt":1,"ts":1,"text":"a"}));
-        st.log_record("10.0.0.9", &serde_json::json!({"dir":"out","pkt":2,"ts":2,"text":"b"}));
+        st.log_record(
+            "10.0.0.9",
+            &serde_json::json!({"dir":"in","pkt":1,"ts":1,"text":"a"}),
+        );
+        st.log_record(
+            "10.0.0.9",
+            &serde_json::json!({"dir":"out","pkt":2,"ts":2,"text":"b"}),
+        );
         assert_eq!(st.list_sessions().len(), 1);
         assert!(!st.is_hidden("10.0.0.9"));
 
@@ -2479,7 +2520,10 @@ mod tests {
         assert!(st.read_history("10.0.0.9", 10).is_empty(), "记录文件已删除");
 
         // 对方重新发消息：历史重建，但列表仍隐藏（等待 unhide 恢复）
-        st.log_record("10.0.0.9", &serde_json::json!({"dir":"in","pkt":3,"ts":3,"text":"c"}));
+        st.log_record(
+            "10.0.0.9",
+            &serde_json::json!({"dir":"in","pkt":3,"ts":3,"text":"c"}),
+        );
         assert!(st.list_sessions().is_empty(), "恢复前仍隐藏");
 
         // 收到对方消息（unhide_contact）后会话重新出现
@@ -2495,7 +2539,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oim-hidden-persist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let st = AppState::new(dir.clone());
-        st.log_record("192.168.1.5", &serde_json::json!({"dir":"in","pkt":1,"ts":1,"text":"a"}));
+        st.log_record(
+            "192.168.1.5",
+            &serde_json::json!({"dir":"in","pkt":1,"ts":1,"text":"a"}),
+        );
         st.delete_contact("192.168.1.5");
         assert!(st.is_hidden("192.168.1.5"));
         drop(st);
@@ -2518,7 +2565,10 @@ mod tests {
         assert!(st.upsert_in_record("k:1", &rec), "首次落库");
         assert_eq!(st.pending_receipts("k:1", &[500]), vec![500]);
         st.mark_in_read("k:1", &[500]);
-        assert!(st.pending_receipts("k:1", &[500]).is_empty(), "已读后不再回执");
+        assert!(
+            st.pending_receipts("k:1", &[500]).is_empty(),
+            "已读后不再回执"
+        );
 
         // 对端重投：正文带尾注、状态继承已读
         let resend = serde_json::json!({
@@ -2530,7 +2580,10 @@ mod tests {
         assert_eq!(hist.len(), 1, "重投不追加新记录");
         assert_eq!(hist[0]["ts"], 100, "保留首次收到时间");
         assert!(hist[0]["text"].as_str().unwrap().contains("Delayed Send"));
-        assert!(st.pending_receipts("k:1", &[500]).is_empty(), "重投不再回执");
+        assert!(
+            st.pending_receipts("k:1", &[500]).is_empty(),
+            "重投不再回执"
+        );
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -2559,10 +2612,8 @@ mod tests {
 
     #[test]
     fn inbound_history_outcomes_survive_restart_and_distinguish_conflicts() {
-        let dir = std::env::temp_dir().join(format!(
-            "oim-state-outcome-restart-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("oim-state-outcome-restart-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let first = AppState::new(dir.clone());
         let original = serde_json::json!({
@@ -2588,7 +2639,10 @@ mod tests {
                 .unwrap(),
             InRecordOutcome::Duplicate
         );
-        assert_eq!(restarted.find_in_record("10.0.0.7", 700).unwrap()["read"], true);
+        assert_eq!(
+            restarted.find_in_record("10.0.0.7", 700).unwrap()["read"],
+            true
+        );
 
         let conflict = serde_json::json!({
             "dir": "in", "kind": "text", "text": "two", "pkt": 700, "ts": 2,
@@ -2623,9 +2677,7 @@ mod tests {
         });
 
         assert!(st.log_record_fallible("10.0.0.1", &record).is_err());
-        assert!(st
-            .upsert_in_record_fallible("10.0.0.1", &record)
-            .is_err());
+        assert!(st.upsert_in_record_fallible("10.0.0.1", &record).is_err());
         std::fs::remove_file(dir).unwrap();
     }
 
@@ -2643,15 +2695,21 @@ mod tests {
         st.log_record("10.0.0.9", &rec(1, 100, false));
         st.log_record("10.0.0.9", &rec(2, 200, false));
         st.log_record("10.0.0.9", &rec(3, 300, true)); // 已读：不计
-        st.log_record("10.0.0.9", &serde_json::json!({
-            "dir": "out", "kind": "text", "pkt": 9, "ts": 400, "read": false,
-            "peer": {"key": "10.0.0.9", "nickname": "阿九", "host": "h9"}
-        }));
+        st.log_record(
+            "10.0.0.9",
+            &serde_json::json!({
+                "dir": "out", "kind": "text", "pkt": 9, "ts": 400, "read": false,
+                "peer": {"key": "10.0.0.9", "nickname": "阿九", "host": "h9"}
+            }),
+        );
         // 旧版记录没有 read 字段：视为未读
-        st.log_record("10.0.0.9", &serde_json::json!({
-            "dir": "in", "kind": "text", "pkt": 4, "ts": 250,
-            "peer": {"key": "10.0.0.9", "nickname": "阿九", "host": "h9"}
-        }));
+        st.log_record(
+            "10.0.0.9",
+            &serde_json::json!({
+                "dir": "in", "kind": "text", "pkt": 4, "ts": 250,
+                "peer": {"key": "10.0.0.9", "nickname": "阿九", "host": "h9"}
+            }),
+        );
         let sess = st
             .list_sessions()
             .into_iter()
@@ -2680,11 +2738,16 @@ mod tests {
         let path = st.logs_dir.join("k_1.jsonl");
         // 旧版本遗留：同包号 3 份副本 + 一行交错坏行 + 一条正常出站记录
         let body = concat!(
-            r#"{"dir":"in","pkt":7,"ts":1,"text":"a","read":true,"need_read":true}"#, "\n",
-            r#"{"dir":"in","pkt":7,"ts":2,"text":"a+","read":false,"need_read":true}"#, "\n",
-            r#"{"dir":"in","pkt":"#, "\n",
-            r#"{"dir":"in","pkt":7,"ts":3,"text":"a++","read":false,"need_read":true}"#, "\n",
-            r#"{"dir":"out","pkt":8,"ts":4,"text":"b"}"#, "\n",
+            r#"{"dir":"in","pkt":7,"ts":1,"text":"a","read":true,"need_read":true}"#,
+            "\n",
+            r#"{"dir":"in","pkt":7,"ts":2,"text":"a+","read":false,"need_read":true}"#,
+            "\n",
+            r#"{"dir":"in","pkt":"#,
+            "\n",
+            r#"{"dir":"in","pkt":7,"ts":3,"text":"a++","read":false,"need_read":true}"#,
+            "\n",
+            r#"{"dir":"out","pkt":8,"ts":4,"text":"b"}"#,
+            "\n",
         );
         std::fs::write(&path, body).unwrap();
         let (merged, dropped) = st.compact_histories();
@@ -2712,7 +2775,11 @@ mod tests {
         let list = st.pending_for("10.0.0.9");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].pkt, 777);
-        assert_eq!(list[0].paths, vec!["/tmp/a.zip", "/tmp/docs"], "附件路径随队列持久化");
+        assert_eq!(
+            list[0].paths,
+            vec!["/tmp/a.zip", "/tmp/docs"],
+            "附件路径随队列持久化"
+        );
         assert!(st.pending_for("10.0.0.8").is_empty());
 
         // 重启（新实例读同一数据目录）后队列仍在
@@ -2775,13 +2842,19 @@ mod tests {
         // 两个会话：一个在线时会话（peer 快照完整），一个只靠文件名兜底
         let a = "10.0.0.5";
         let b = "192.168.1.8";
-        st.log_record(a, &serde_json::json!({
-            "dir": "in", "pkt": 1, "ts": 100, "text": "hi",
-            "peer": {"key": a, "nickname": "小王", "host": "pc-wang", "group": "财务"}
-        }));
-        st.log_record(b, &serde_json::json!({
-            "dir": "out", "pkt": 2, "ts": 300, "text": "yo"
-        }));
+        st.log_record(
+            a,
+            &serde_json::json!({
+                "dir": "in", "pkt": 1, "ts": 100, "text": "hi",
+                "peer": {"key": a, "nickname": "小王", "host": "pc-wang", "group": "财务"}
+            }),
+        );
+        st.log_record(
+            b,
+            &serde_json::json!({
+                "dir": "out", "pkt": 2, "ts": 300, "text": "yo"
+            }),
+        );
         let list = st.list_sessions();
         assert_eq!(list.len(), 2, "两个有历史的会话都列出");
         let by_key: std::collections::HashMap<_, _> =
@@ -2789,7 +2862,10 @@ mod tests {
         assert_eq!(by_key[a].nickname, "小王");
         assert_eq!(by_key[a].group, "财务");
         assert_eq!(by_key[a].last_ts, 100);
-        assert_eq!(by_key[b].last_ts, 300, "无 peer 快照时按文件名校出 key，时间取最大");
+        assert_eq!(
+            by_key[b].last_ts, 300,
+            "无 peer 快照时按文件名校出 key，时间取最大"
+        );
         assert_eq!(by_key[b].key, b);
         // 按最近时间倒序
         assert_eq!(list[0].key, b);
@@ -2892,7 +2968,10 @@ mod tests {
             "记录内快照的会话键同步归一化，搜索跳转才找得到会话"
         );
         assert_eq!(hist[0]["peer"]["nickname"], "老王", "其余字段原样保留");
-        assert!(st.logs_dir.join("notes.jsonl").exists(), "非会话命名不受影响");
+        assert!(
+            st.logs_dir.join("notes.jsonl").exists(),
+            "非会话命名不受影响"
+        );
         assert!(st.logs_dir.join("10.0.0.9.jsonl").exists());
         assert!(
             st.logs_dir.join("10.0.0.9_2425.jsonl").exists(),
@@ -2923,7 +3002,11 @@ mod tests {
             st2.peer_pubkey("10.0.0.9").unwrap().n().to_bytes_be(),
             kp.public_key().n().to_bytes_be()
         );
-        assert_eq!(st2.peer_capa("10.0.0.9"), 0x40100004, "能力位随密钥一起恢复");
+        assert_eq!(
+            st2.peer_capa("10.0.0.9"),
+            0x40100004,
+            "能力位随密钥一起恢复"
+        );
 
         // 明文标记是内存态，不跨实例
         st.mark_peer_plain("10.0.0.8");
@@ -3083,16 +3166,17 @@ mod tests {
         assert!(st
             .commit_verified_peer_key("10.0.0.80", 0x22, &key)
             .is_err());
-        assert_eq!(std::fs::read(st.peer_keys_path()).unwrap(), canonical_before);
+        assert_eq!(
+            std::fs::read(st.peer_keys_path()).unwrap(),
+            canonical_before
+        );
         assert_eq!(st.peer_pubkey("10.0.0.80"), Some(key));
         assert_eq!(st.peer_capa("10.0.0.80"), 0x11);
-        assert!(std::fs::read_dir(&st.data_dir)
+        assert!(std::fs::read_dir(&st.data_dir).unwrap().all(|entry| !entry
             .unwrap()
-            .all(|entry| !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".peer_keys.json.")));
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".peer_keys.json.")));
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -3196,11 +3280,11 @@ mod tests {
             .lock()
             .unwrap()
             .before_replace = Some(Arc::new(move || {
-                if calls_in_hook.fetch_add(1, Ordering::SeqCst) == 0 {
-                    reached_in_hook.wait();
-                    release_in_hook.wait();
-                }
-            }));
+            if calls_in_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                reached_in_hook.wait();
+                release_in_hook.wait();
+            }
+        }));
 
         let (done_tx, done_rx) = mpsc::channel();
         let first_state = st.clone();
@@ -3224,7 +3308,10 @@ mod tests {
 
         for _ in 0..2 {
             assert_eq!(
-                done_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(),
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap(),
                 VerifiedPeerKeyDecision::TofuStored
             );
         }
@@ -3357,7 +3444,10 @@ mod tests {
         // 撤回必须持久化：重启（新实例读盘）后旧公钥不得复活
         let st2 = AppState::new(st.data_dir.clone());
         st2.load_peer_keys();
-        assert!(st2.peer_pubkey("10.0.0.9").is_none(), "撤回写盘，重启不复活");
+        assert!(
+            st2.peer_pubkey("10.0.0.9").is_none(),
+            "撤回写盘，重启不复活"
+        );
 
         // 未缓存的对端撤回是安全空操作；其它对端的缓存不受影响
         st.forget_peer_key("10.0.0.99").unwrap();

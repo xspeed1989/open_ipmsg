@@ -217,9 +217,14 @@ impl Packet {
 
     /// 编码为线上字节流（头部 ASCII，附加数据原样）
     pub fn encode(&self, user: &str, host: &str) -> Vec<u8> {
-        let mut buf =
-            format!("1:{}:{}:{}:{}:", self.pkt_no, clean_field(user), clean_field(host), self.command)
-                .into_bytes();
+        let mut buf = format!(
+            "1:{}:{}:{}:{}:",
+            self.pkt_no,
+            clean_field(user),
+            clean_field(host),
+            self.command
+        )
+        .into_bytes();
         buf.extend_from_slice(&self.extra);
         buf
     }
@@ -242,7 +247,9 @@ pub fn parse(raw: &[u8]) -> Option<Packet> {
     }
     let field = |k: usize| -> String {
         let start = if k == 0 { 0 } else { idx[k - 1] + 1 };
-        String::from_utf8_lossy(&raw[start..idx[k]]).trim().to_string()
+        String::from_utf8_lossy(&raw[start..idx[k]])
+            .trim()
+            .to_string()
     };
     let _ver = field(0);
     let pkt_no: u32 = field(1).parse().ok()?;
@@ -283,7 +290,11 @@ pub fn encode_out(s: &str, encoding: &str) -> Vec<u8> {
 
 /// 取报文中的消息体（第一个 NUL 之前的部分）并解码
 pub fn text_of(pkt: &Packet) -> String {
-    let end = pkt.extra.iter().position(|&b| b == 0).unwrap_or(pkt.extra.len());
+    let end = pkt
+        .extra
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(pkt.extra.len());
     decode_bytes(&pkt.extra[..end])
 }
 
@@ -435,8 +446,9 @@ pub fn parse_file_entries(extra: &[u8]) -> Vec<FileEntry> {
             // 与我方序列化保持一致：十六进制优先，纯字母串自动回退
             let size = num_hex_first(&String::from_utf8_lossy(&fields[2]))?;
             let mtime = num_hex_first(&String::from_utf8_lossy(&fields[3])).unwrap_or(0);
-            let attr =
-                num_hex_first(&String::from_utf8_lossy(&fields[4])).map(|v| v as u32).unwrap_or(fileattr::REGULAR);
+            let attr = num_hex_first(&String::from_utf8_lossy(&fields[4]))
+                .map(|v| v as u32)
+                .unwrap_or(fileattr::REGULAR);
             // 扩展属性段：`key=value`（值可含逗号；末尾空段忽略）
             let mut ext_attrs: Vec<(u32, String)> = Vec::new();
             for f in &fields[5..] {
@@ -635,8 +647,16 @@ pub fn build_anslist(
             h.status,
             h.ip,
             host_port_wire(h.port),
-            if h.nick.is_empty() { HOSTLIST_DUMMY.into() } else { h.nick.clone() },
-            if h.group.is_empty() { HOSTLIST_DUMMY.into() } else { h.group.clone() },
+            if h.nick.is_empty() {
+                HOSTLIST_DUMMY.into()
+            } else {
+                h.nick.clone()
+            },
+            if h.group.is_empty() {
+                HOSTLIST_DUMMY.into()
+            } else {
+                h.group.clone()
+            },
         );
         let bytes = encode_out(&wire, encoding);
         if out.len() + bytes.len() > budget {
@@ -648,7 +668,11 @@ pub fn build_anslist(
     // 回填续传索引与本包条数（条数可能被预算截断）
     let head = format!(
         "{}\u{7}{}\u{7}",
-        if start + n == hosts.len() { 0 } else { start + n },
+        if start + n == hosts.len() {
+            0
+        } else {
+            start + n
+        },
         n
     );
     let head = encode_out(&head, encoding);
@@ -662,7 +686,10 @@ pub fn build_anslist(
 pub fn parse_anslist(extra: &[u8], command: u32) -> (u32, Vec<HostListEntry>) {
     let fields: Vec<&[u8]> = extra.split(|&b| b == HOSTLIST_SEP).collect();
     let atoi = |f: &[u8]| -> u32 {
-        String::from_utf8_lossy(f).trim().parse::<u32>().unwrap_or(0)
+        String::from_utf8_lossy(f)
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(0)
     };
     if fields.len() < 2 {
         return (0, Vec::new());
@@ -691,8 +718,16 @@ pub fn parse_anslist(extra: &[u8], command: u32) -> (u32, Vec<HostListEntry>) {
             status,
             ip,
             port,
-            nick: if nick == HOSTLIST_DUMMY { String::new() } else { nick },
-            group: if group == HOSTLIST_DUMMY { String::new() } else { group },
+            nick: if nick == HOSTLIST_DUMMY {
+                String::new()
+            } else {
+                nick
+            },
+            group: if group == HOSTLIST_DUMMY {
+                String::new()
+            } else {
+                group
+            },
         });
     }
     (cont, out)
@@ -756,7 +791,13 @@ pub fn fmt_delayed(ts: u64) -> String {
         }
         let (_, mo, d) = civil_from_days((ts / 86_400) as i64);
         let secs = ts % 86_400;
-        format!("{:02}/{:02} {:02}:{:02}", mo, d, secs / 3600, (secs % 3600) / 60)
+        format!(
+            "{:02}/{:02} {:02}:{:02}",
+            mo,
+            d,
+            secs / 3600,
+            (secs % 3600) / 60
+        )
     }
 }
 
@@ -866,7 +907,10 @@ mod tests {
             ext_attrs: vec![],
         };
         let wire = e.serialize("utf8");
-        assert!(wire.contains("A::B 报告::c.txt"), "必须按 :: 转义线上格式: {wire}");
+        assert!(
+            wire.contains("A::B 报告::c.txt"),
+            "必须按 :: 转义线上格式: {wire}"
+        );
         let mut extra = b"\0".to_vec();
         extra.extend_from_slice(wire.as_bytes());
         extra.push(0x07);
@@ -882,7 +926,10 @@ mod tests {
         let raw = b"x\x00a:b:100:200:1:".to_vec();
         let fs = parse_file_entries(&raw);
         assert_eq!(fs.len(), 1);
-        assert_eq!(fs[0].name, "b", "旧方言无转义，': 前截断为名字（宽容不报错）");
+        assert_eq!(
+            fs[0].name, "b",
+            "旧方言无转义，': 前截断为名字（宽容不报错）"
+        );
     }
 
     #[test]
@@ -935,7 +982,11 @@ mod tests {
         assert_eq!(fs[0].name, "ipmsgclip_s_14_0.png");
         assert_eq!(fs[0].size, 0x55);
         assert_eq!(fs[0].attr & 0xFF, 0x20, "IPMSG_FILE_CLIPBOARD");
-        assert_eq!(fs[0].ext(extattr::CLIPBOARDPOS), Some("0"), "CLIPBOARDPOS 扩展段要落到 ext_attrs");
+        assert_eq!(
+            fs[0].ext(extattr::CLIPBOARDPOS),
+            Some("0"),
+            "CLIPBOARDPOS 扩展段要落到 ext_attrs"
+        );
         assert!(
             fs[0].name.to_lowercase().ends_with(".png"),
             "粘贴图片必须保留 .png 扩展名（内联预览前提）"
@@ -1017,7 +1068,10 @@ mod tests {
         assert_eq!(parsed[1].group, "");
         assert_eq!(parsed[1].port, 2425);
         // 端口线值 = htons(port) 十进制（官方小端怪癖：2425 → 30985）
-        assert!(wire.windows(5).any(|w| w == b"30985"), "端口必须按网络序线值");
+        assert!(
+            wire.windows(5).any(|w| w == b"30985"),
+            "端口必须按网络序线值"
+        );
         // 预算截断 → 续传索引指向下一台（首条目+头部约 62B）
         let (wire2, n2) = build_anslist(&hosts, 0, 40, "utf8");
         assert_eq!(n2, 0);
@@ -1032,7 +1086,8 @@ mod tests {
     #[test]
     fn anslist_parses_official_wire_shape() {
         // 官方 MakeHostListStr 形态（小端 htons 端口 30985、\b 空占位、尾部空段）
-        let raw = b"1\x077\x07alice\x07pc-a\x07400003\x07192.168.1.10\x0730985\x07\x08\x07grp\x07\x07";
+        let raw =
+            b"1\x077\x07alice\x07pc-a\x07400003\x07192.168.1.10\x0730985\x07\x08\x07grp\x07\x07";
         let (cont, list) = parse_anslist(raw, cmd::ANSLIST);
         assert_eq!(cont, 1);
         assert_eq!(list.len(), 1);

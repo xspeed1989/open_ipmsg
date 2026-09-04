@@ -290,11 +290,7 @@ async fn set_absence(
 
 /// 撤回我方发出的某条文本消息（DELMSG 封书破弃语义）
 #[tauri::command]
-async fn recall_message(
-    ctx: State<'_, SharedCtx>,
-    key: String,
-    pkt: u32,
-) -> Result<(), String> {
+async fn recall_message(ctx: State<'_, SharedCtx>, key: String, pkt: u32) -> Result<(), String> {
     net::recall_message(&ctx, &key, pkt).await
 }
 
@@ -455,18 +451,17 @@ async fn download_file(
     // 后台执行；进度与结果通过 file-progress 事件推送
     let ctx = ctx.inner().clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) =
-            net::download_file_task(
-                &ctx,
-                &key,
-                pkt_no,
-                file_id,
-                &name,
-                rid.as_deref().unwrap_or(""),
-                size.unwrap_or(0),
-                is_dir.unwrap_or(false),
-            )
-            .await
+        if let Err(e) = net::download_file_task(
+            &ctx,
+            &key,
+            pkt_no,
+            file_id,
+            &name,
+            rid.as_deref().unwrap_or(""),
+            size.unwrap_or(0),
+            is_dir.unwrap_or(false),
+        )
+        .await
         {
             oim_log!("[download] {key} #{file_id} {name}: {e}");
         }
@@ -497,7 +492,10 @@ async fn send_clipboard_image(
             &key,
             &text,
             vec![path.to_string_lossy().into_owned()],
-            net::MsgSendOpts { clip_pos: Some(0), ..Default::default() },
+            net::MsgSendOpts {
+                clip_pos: Some(0),
+                ..Default::default()
+            },
         )
         .await?
     ))
@@ -547,7 +545,10 @@ async fn copy_file_as(source: String, dest: String) -> Result<(), String> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp") {
+    if !matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp"
+    ) {
         return Err("不支持的图片类型".into());
     }
     if !src.is_file() {
@@ -589,9 +590,7 @@ impl DoubleClickGate {
     /// 下一组双击的第一次单击）。
     pub(crate) fn feed(&mut self, now: std::time::Instant) -> bool {
         let double = match self.last {
-            Some(prev) => {
-                now.saturating_duration_since(prev).as_millis() <= DOUBLE_CLICK_WINDOW_MS
-            }
+            Some(prev) => now.saturating_duration_since(prev).as_millis() <= DOUBLE_CLICK_WINDOW_MS,
             None => false,
         };
         self.last = if double { None } else { Some(now) };
@@ -615,7 +614,10 @@ mod gate_tests {
         let mut g = DoubleClickGate::new();
         let t = Instant::now();
         assert!(!g.feed(t), "第一次单击不构成双击");
-        assert!(!g.feed(t + Duration::from_millis(400)), "间隔超窗的单击不算双击");
+        assert!(
+            !g.feed(t + Duration::from_millis(400)),
+            "间隔超窗的单击不算双击"
+        );
         // 400ms 后的那次单击已成为新的「第一次」，再来一次相隔 400ms 的仍是单击
         let t2 = t + Duration::from_millis(800);
         assert!(!g.feed(t2));
@@ -626,10 +628,16 @@ mod gate_tests {
         let mut g = DoubleClickGate::new();
         let t = Instant::now();
         assert!(!g.feed(t));
-        assert!(g.feed(t + Duration::from_millis(200)), "350ms 内第二次单击 = 双击");
+        assert!(
+            g.feed(t + Duration::from_millis(200)),
+            "350ms 内第二次单击 = 双击"
+        );
         // 判定成功后状态清空：1s 后的单击是下一组的第一下
         assert!(!g.feed(t + Duration::from_millis(1000)));
-        assert!(g.feed(t + Duration::from_millis(1200)), "第二组双击仍能识别");
+        assert!(
+            g.feed(t + Duration::from_millis(1200)),
+            "第二组双击仍能识别"
+        );
     }
 
     #[test]
@@ -641,7 +649,10 @@ mod gate_tests {
 
         let mut g2 = DoubleClickGate::new();
         assert!(!g2.feed(t));
-        assert!(!g2.feed(t + Duration::from_millis(351)), "超过窗口 1ms 不算");
+        assert!(
+            !g2.feed(t + Duration::from_millis(351)),
+            "超过窗口 1ms 不算"
+        );
     }
 }
 
@@ -664,7 +675,7 @@ SNI 注册失败（桌面没有 SNI 宿主，如部分 X11 轻量桌面）时回
 mod linux_tray {
     use super::{activate_from_tray, tray_idle_image, TRAY_SIZE};
     use ksni::{
-        menu::{StandardItem, MenuItem},
+        menu::{MenuItem, StandardItem},
         Icon, ToolTip, Tray, TrayMethods,
     };
     use std::sync::OnceLock;
@@ -868,7 +879,11 @@ fn set_tray_frame(app: &tauri::AppHandle, blank: bool) {
         linux_tray::set_blank(blank);
         return;
     }
-    let img = if blank { tray_blank_image() } else { tray_idle_image() };
+    let img = if blank {
+        tray_blank_image()
+    } else {
+        tray_idle_image()
+    };
     set_tray_icon(app, img);
 }
 
@@ -1121,7 +1136,10 @@ async fn open_image_viewer(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp") {
+    if !matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp"
+    ) {
         return Err("不支持的图片类型".into());
     }
     if !p.is_file() {
@@ -1204,7 +1222,10 @@ mod tests {
             Some("/tmp/x")
         );
         // 结尾的换行（uri-list 分隔符残留）要去掉
-        assert_eq!(file_uri_to_path("file:///tmp/x\r\n").as_deref(), Some("/tmp/x"));
+        assert_eq!(
+            file_uri_to_path("file:///tmp/x\r\n").as_deref(),
+            Some("/tmp/x")
+        );
         assert_eq!(file_uri_to_path("http://example.com/a"), None);
         assert_eq!(file_uri_to_path("file://"), None);
     }
@@ -1247,7 +1268,11 @@ mod tests {
 
 /// 标记入站消息已读，并对要求回执的消息向对端发送 READMSG
 #[tauri::command]
-async fn mark_read(ctx: State<'_, SharedCtx>, key: String, pkts: Vec<u32>) -> Result<usize, String> {
+async fn mark_read(
+    ctx: State<'_, SharedCtx>,
+    key: String,
+    pkts: Vec<u32>,
+) -> Result<usize, String> {
     let ctx = ctx.inner().clone();
     net::mark_read_and_receipt(&ctx, &key, &pkts).await
 }
@@ -1275,10 +1300,7 @@ fn list_sessions(st: State<'_, SharedState>) -> Result<Vec<state::SessionInfo>, 
 /// 从官方 IP Messenger 的日志库（v4.5+ 的 ipmsg.db，SQLite）导入聊天记录。
 /// 可一次传多个文件；返回汇总与逐文件明细，前端弹结果并刷新会话列表。
 #[tauri::command]
-async fn import_ipmsg_log(
-    st: State<'_, SharedState>,
-    paths: Vec<String>,
-) -> Result<Value, String> {
+async fn import_ipmsg_log(st: State<'_, SharedState>, paths: Vec<String>) -> Result<Value, String> {
     let st = st.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut total = 0usize;
@@ -1419,7 +1441,10 @@ pub fn run() {
                     .map(|d| d.name().to_string())
                     .unwrap_or_else(|| "<none>".into())
             );
-            println!("剪贴板文本: {:?}", cb.wait_for_text().map(|t| t.to_string()));
+            println!(
+                "剪贴板文本: {:?}",
+                cb.wait_for_text().map(|t| t.to_string())
+            );
             match cb.wait_for_targets() {
                 Some(t) => println!(
                     "剪贴板可用目标: {:?}",
@@ -1450,8 +1475,8 @@ pub fn run() {
             .build()
             .expect("runtime");
         rt.block_on(async move {
-            let dir = std::env::temp_dir()
-                .join(format!("open-ipmsg-dumppeers-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("open-ipmsg-dumppeers-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let st = Arc::new(AppState::new(dir));

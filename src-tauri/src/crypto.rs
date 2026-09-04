@@ -5,8 +5,8 @@
 // 暂时压制 dead_code 提示；后续任务接入后可移除。
 #![allow(dead_code)]
 
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use aes::cipher::generic_array::GenericArray;
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use ctr::cipher::{StreamCipher, StreamCipherSeek};
 use rand::RngCore;
 use rsa::pkcs1v15::{Signature, SigningKey, VerifyingKey};
@@ -44,8 +44,8 @@ pub struct KeyPair {
 impl KeyPair {
     pub fn generate() -> Result<Self, String> {
         let mut rng = rand::thread_rng();
-        let priv_key = RsaPrivateKey::new(&mut rng, RSA_BITS)
-            .map_err(|e| format!("RSA 密钥生成失败：{e}"))?;
+        let priv_key =
+            RsaPrivateKey::new(&mut rng, RSA_BITS).map_err(|e| format!("RSA 密钥生成失败：{e}"))?;
         Ok(KeyPair { priv_key })
     }
 
@@ -67,8 +67,8 @@ impl KeyPair {
         let der = base64::engine::general_purpose::STANDARD
             .decode(v["der_b64"].as_str().unwrap_or_default())
             .map_err(|e| format!("密钥文件损坏：{e}"))?;
-        let priv_key = RsaPrivateKey::from_pkcs8_der(&der)
-            .map_err(|e| format!("密钥文件损坏：{e}"))?;
+        let priv_key =
+            RsaPrivateKey::from_pkcs8_der(&der).map_err(|e| format!("密钥文件损坏：{e}"))?;
         // 尺寸绑定校验：模数必须恰好 RSA_BITS 位。错误尺寸（敌意或损坏）的
         // 密钥文件会让 modulus_be 的定长补齐逻辑下溢/越界 panic，入口直接拒绝。
         use rsa::traits::PublicKeyParts;
@@ -127,9 +127,7 @@ impl KeyPair {
         use rsa::pkcs1v15::SigningKey;
         use sha2::Sha256;
         let sk = SigningKey::<Sha256>::new(self.priv_key.clone());
-        let sig = sk
-            .sign_with_rng(&mut rand::thread_rng(), data)
-            .to_vec();
+        let sig = sk.sign_with_rng(&mut rand::thread_rng(), data).to_vec();
         Ok(sig)
     }
 }
@@ -148,8 +146,11 @@ impl KeyPair {
  * ================================================================ */
 
 /// 解一封 EncIPDict：外层字典（EI/EK/EB）→ 消息字典
-pub fn open_encipdict(me: &KeyPair, d: &crate::ipdict::Dict) -> Result<crate::ipdict::Dict, String> {
-    use crate::ipdict::self;
+pub fn open_encipdict(
+    me: &KeyPair,
+    d: &crate::ipdict::Dict,
+) -> Result<crate::ipdict::Dict, String> {
+    use crate::ipdict;
     use ctr::cipher::{KeyIvInit, StreamCipher};
     let iv = d.get_bytes(ipdict::DICT_ENCIV).ok_or("缺 EI")?.to_vec();
     if iv.len() != 16 {
@@ -163,8 +164,7 @@ pub fn open_encipdict(me: &KeyPair, d: &crate::ipdict::Dict) -> Result<crate::ip
     let mut cipher = ctr::Ctr128BE::<aes::Aes256>::new_from_slices(&skey, &iv)
         .map_err(|e| format!("CTR 初始化失败：{e}"))?;
     cipher.apply_keystream(&mut plain);
-    let (inner, used) = crate::ipdict::Dict::unpack(&plain)
-        .ok_or("密文解出的不是 IPDict 报文")?;
+    let (inner, used) = crate::ipdict::Dict::unpack(&plain).ok_or("密文解出的不是 IPDict 报文")?;
     if used != plain.len() {
         return Err("IPDict 报文尾部有剩余数据".into());
     }
@@ -210,11 +210,7 @@ pub fn seal_encipdict(
 
 /// 按官方 SignIPDict 规则签名完整 IPDict：先移除旧 SIGN，追加公钥与算法字段，
 /// 对此时的完整 `IP2:...:Z` 报文签名，再把 SIGN 作为末尾字段追加。
-pub fn sign_ipdict(
-    dict: &mut crate::ipdict::Dict,
-    key: &KeyPair,
-    capa: u32,
-) -> Result<(), String> {
+pub fn sign_ipdict(dict: &mut crate::ipdict::Dict, key: &KeyPair, capa: u32) -> Result<(), String> {
     use crate::ipdict::*;
     dict.items.retain(|(name, _)| name != DICT_SIGN);
     dict.put_int(DICT_PUBE, key.public_exponent() as i64)
@@ -250,13 +246,11 @@ fn parse_ipdict_signature(
     if dict.items.last().map(|(key, _)| key.as_str()) != Some(DICT_SIGN) {
         return Err("SIGN 不是末尾字段".into());
     }
-    let ef = u32::try_from(dict.get_int(DICT_EF).ok_or("缺 EF")?)
-        .map_err(|_| "EF 超出 u32")?;
+    let ef = u32::try_from(dict.get_int(DICT_EF).ok_or("缺 EF")?).map_err(|_| "EF 超出 u32")?;
     if ef & DICT_EF_SHA256 as u32 == 0 {
         return Err("SIGN 未声明 SHA-256".into());
     }
-    let capa = u32::try_from(dict.get_int(DICT_EC).ok_or("缺 EC")?)
-        .map_err(|_| "EC 超出 u32")?;
+    let capa = u32::try_from(dict.get_int(DICT_EC).ok_or("缺 EC")?).map_err(|_| "EC 超出 u32")?;
     let exponent = dict.get_int(DICT_PUBE).ok_or("缺 PUBE")?;
     if exponent <= 0 {
         return Err("IPDict 公钥指数必须为正数".into());
@@ -285,9 +279,7 @@ fn parse_ipdict_signature(
 /// 校验官方完整 IPDict 签名。无 SIGN 返回 `Ok(None)`；签名存在时要求其为末尾
 /// 字段，并返回签名内嵌且已验证的公钥与能力位。适用于没有既有信任锚的 TOFU
 /// 或目录报文；已知 EncIPDict 对端必须改用 `verify_ipdict_with_key`。
-pub fn verify_ipdict(
-    dict: &crate::ipdict::Dict,
-) -> Result<Option<(RsaPublicKey, u32)>, String> {
+pub fn verify_ipdict(dict: &crate::ipdict::Dict) -> Result<Option<(RsaPublicKey, u32)>, String> {
     let Some(parsed) = parse_ipdict_signature(dict)? else {
         return Ok(None);
     };
@@ -362,10 +354,7 @@ pub fn build_anspubkey(capa: u32, key: &KeyPair) -> String {
     // 模数直接输出标准大端 hex：官方发送端 bin2hexstr_revendian 先抵消其
     // CryptoAPI 小端 blob，线上即大端（2026-08 现场以真实样本实测定论）。
     let e_val = BigUint::from_bytes_be(&key.exponent_be());
-    format!(
-        "{capa:X}:{e_val:x}-{}",
-        hex_lower(&key.modulus_be())
-    )
+    format!("{capa:X}:{e_val:x}-{}", hex_lower(&key.modulus_be()))
 }
 
 /// 宽容解析 ANSPUBKEY 扩展部："{capa}:{e}-{n}"，hex 大小写通吃；
@@ -456,8 +445,12 @@ fn seal_with_hash(
         .encrypt_padded_vec_mut::<Pkcs7>(&mut buf);
 
     let sig = match hash {
-        SealHash::Sha256 => SigningKey::<Sha256>::new(me.priv_key.clone()).sign_with_rng(&mut rng, plain),
-        SealHash::Sha1 => SigningKey::<Sha1>::new(me.priv_key.clone()).sign_with_rng(&mut rng, plain),
+        SealHash::Sha256 => {
+            SigningKey::<Sha256>::new(me.priv_key.clone()).sign_with_rng(&mut rng, plain)
+        }
+        SealHash::Sha1 => {
+            SigningKey::<Sha1>::new(me.priv_key.clone()).sign_with_rng(&mut rng, plain)
+        }
     };
 
     Ok(format!(
@@ -529,7 +522,9 @@ pub fn open_message(
     }
 
     let plain_full: Vec<u8> = if aes_mode {
-        let k32: [u8; 32] = skey.try_into().map_err(|_| "AES 会话钥长度异常".to_string())?;
+        let k32: [u8; 32] = skey
+            .try_into()
+            .map_err(|_| "AES 会话钥长度异常".to_string())?;
         Aes256CbcDec::new_from_slices(&k32, &iv_aes)
             .map_err(|_| "AES 初始化失败".to_string())?
             .decrypt_padded_vec_mut::<Pkcs7>(&ct)
@@ -549,32 +544,33 @@ pub fn open_message(
             true // 无候选公钥：无法验签，保持可信（调用方记 diag）
         } else {
             match hex_decode_loose(sig_hex).and_then(|b| Signature::try_from(&b[..]).ok()) {
-            Some(sig) => {
-                if capa & (CAPA_SIGN_SHA256 | CAPA_SIGN_SHA1) != 0 {
-                    let mut ok = false;
-                    for pp in peer_pubs {
-                        ok = if capa & CAPA_SIGN_SHA256 != 0 {
-                            VerifyingKey::<Sha256>::new(pp.clone())
-                                .verify(&plain_full, &sig)
-                                .is_ok()
-                        } else if capa & CAPA_SIGN_SHA1 != 0 {
-                            VerifyingKey::<Sha1>::new(pp.clone())
-                                .verify(&plain_full, &sig)
-                                .is_ok()
-                        } else {
-                            false
-                        };
-                        if ok {
-                            break;
+                Some(sig) => {
+                    if capa & (CAPA_SIGN_SHA256 | CAPA_SIGN_SHA1) != 0 {
+                        let mut ok = false;
+                        for pp in peer_pubs {
+                            ok = if capa & CAPA_SIGN_SHA256 != 0 {
+                                VerifyingKey::<Sha256>::new(pp.clone())
+                                    .verify(&plain_full, &sig)
+                                    .is_ok()
+                            } else if capa & CAPA_SIGN_SHA1 != 0 {
+                                VerifyingKey::<Sha1>::new(pp.clone())
+                                    .verify(&plain_full, &sig)
+                                    .is_ok()
+                            } else {
+                                false
+                            };
+                            if ok {
+                                break;
+                            }
                         }
+                        ok
+                    } else {
+                        false // 有签名段却没声明哈希算法：无法验证，按不可信处理
                     }
-                    ok
-                } else {
-                    false // 有签名段却没声明哈希算法：无法验证，按不可信处理
                 }
+                None => false, // 签名段不是合法 hex
             }
-            None => false, // 签名段不是合法 hex
-        }};
+        };
     }
 
     let mut plain = plain_full;
@@ -601,7 +597,13 @@ pub fn seal_file_request(
     _pkt_no: u32,
     inner: &str,
 ) -> Result<String, String> {
-    seal_with_hash(pub_key, me, inner.as_bytes(), CAPA_FILE_REQUEST, SealHash::Sha1)
+    seal_with_hash(
+        pub_key,
+        me,
+        inner.as_bytes(),
+        CAPA_FILE_REQUEST,
+        SealHash::Sha1,
+    )
 }
 
 /// 解封装文件取回请求。签名核验此处跳过（服务端通常未缓存请求方公钥，
@@ -693,7 +695,12 @@ impl<S> EncStream<S> {
         if start_pos > 0 {
             c.seek(start_pos);
         }
-        Self { inner, c, outbuf: Vec::new(), outpos: 0 }
+        Self {
+            inner,
+            c,
+            outbuf: Vec::new(),
+            outpos: 0,
+        }
     }
 }
 
@@ -829,7 +836,9 @@ mod tests {
         // 的定长补齐逻辑越界。加载入口就挡掉，绝不能让坏钥匙混进来。
         let mut rng = rand::thread_rng();
         let priv_1024 = RsaPrivateKey::new(&mut rng, 1024).unwrap();
-        let kp = KeyPair { priv_key: priv_1024 };
+        let kp = KeyPair {
+            priv_key: priv_1024,
+        };
         assert!(
             KeyPair::from_json(&kp.to_json()).is_err(),
             "非 {RSA_BITS} 位密钥的 from_json 必须 Err"
@@ -988,7 +997,9 @@ mod tests {
         // 故按 brief 在测试内直接构造 1024 位私钥（仅限测试），再包成 KeyPair。
         let mut rng = rand::thread_rng();
         let priv_1024 = RsaPrivateKey::new(&mut rng, 1024).unwrap();
-        let kp = KeyPair { priv_key: priv_1024 };
+        let kp = KeyPair {
+            priv_key: priv_1024,
+        };
         let plain = b"legacy\0";
         let sealed = seal_message_compat_rsa1024_blowfish(&kp.public_key(), plain).unwrap();
         assert!(sealed.starts_with(&format!("{:X}:", CAPA_RSA1024 | CAPA_BLOWFISH128)));
@@ -1184,9 +1195,12 @@ mod tests {
         assert_eq!(got, inner);
         // NOENC 变体
         let inner2 = "1f:2a:4000000";
-        let (got2, enc2) =
-            open_file_request(&b, &seal_file_request(&b.public_key(), &a, 998, inner2).unwrap(), 0)
-                .unwrap();
+        let (got2, enc2) = open_file_request(
+            &b,
+            &seal_file_request(&b.public_key(), &a, 998, inner2).unwrap(),
+            0,
+        )
+        .unwrap();
         assert!(!enc2);
         assert_eq!(got2, inner2);
     }
@@ -1227,7 +1241,9 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let key = [11u8; 32];
         let pkt = 555;
-        let data: Vec<u8> = (0..70_000usize).map(|i| ((i * 13 + 9) % 253) as u8).collect();
+        let data: Vec<u8> = (0..70_000usize)
+            .map(|i| ((i * 13 + 9) % 253) as u8)
+            .collect();
         let (c, mut raw_peer) = tokio::io::duplex(128 * 1024);
         let mut w = EncStream::new(c, &key, pkt, 0);
         w.write_all(&data).await.unwrap();
@@ -1247,7 +1263,9 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let key = [22u8; 32];
         let pkt = 556;
-        let data: Vec<u8> = (0..70_000usize).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+        let data: Vec<u8> = (0..70_000usize)
+            .map(|i| ((i * 7 + 3) % 251) as u8)
+            .collect();
         let mut ct = data.clone();
         CtrCipher::new(&key, pkt).apply(&mut ct);
 
@@ -1282,7 +1300,11 @@ mod tests {
         w.shutdown().await.unwrap();
         let mut wire = Vec::new();
         raw_peer.read_to_end(&mut wire).await.unwrap();
-        assert_eq!(wire, &whole[start as usize..], "续传片段的密文须与整流片段一致");
+        assert_eq!(
+            wire,
+            &whole[start as usize..],
+            "续传片段的密文须与整流片段一致"
+        );
 
         // 读方向：同一密文喂给从 start 起步的 EncStream，必须还原明文尾部
         let (c2, mut raw_feed) = tokio::io::duplex(64 * 1024);
@@ -1291,7 +1313,11 @@ mod tests {
         raw_feed.shutdown().await.unwrap();
         let mut got = Vec::new();
         r.read_to_end(&mut got).await.unwrap();
-        assert_eq!(got, &payload[start as usize..], "读端 seek 后必须还原明文尾部");
+        assert_eq!(
+            got,
+            &payload[start as usize..],
+            "读端 seek 后必须还原明文尾部"
+        );
     }
 
     /// 测试专用写端：每次 poll_write 只接受 1 字节，且「接受一次、Pending 一次」交替，
@@ -1340,7 +1366,10 @@ mod tests {
         let pkt = 909;
         let data: Vec<u8> = (0..300usize).map(|i| ((i * 31 + 17) % 254) as u8).collect();
 
-        let sink = TrickleWriter { accepted: Vec::new(), calls: 0 };
+        let sink = TrickleWriter {
+            accepted: Vec::new(),
+            calls: 0,
+        };
         let mut w = EncStream::new(sink, &key, pkt, 0);
         w.write_all(&data).await.unwrap();
         w.flush().await.unwrap();
@@ -1362,8 +1391,8 @@ mod tests {
         plain: &[u8],
     ) -> Result<String, String> {
         type BlowfishCbcEnc = cbc::Encryptor<blowfish::Blowfish>;
-        use aes::cipher::{KeyIvInit, block_padding::Pkcs7};
         use aes::cipher::BlockEncryptMut;
+        use aes::cipher::{block_padding::Pkcs7, KeyIvInit};
         use rsa::Pkcs1v15Encrypt;
 
         let mut rng = rand::thread_rng();
@@ -1433,10 +1462,7 @@ mod encipdict_tests {
         sign_ipdict(&mut d, &key, CAPA_OUR_SEND).unwrap();
 
         let mut short_modulus = d.clone();
-        let modulus = short_modulus
-            .get_bytes(crate::ipdict::DICT_PUBN)
-            .unwrap()[1..]
-            .to_vec();
+        let modulus = short_modulus.get_bytes(crate::ipdict::DICT_PUBN).unwrap()[1..].to_vec();
         short_modulus.put_bytes(crate::ipdict::DICT_PUBN, &modulus);
         let err = verify_ipdict(&short_modulus).unwrap_err();
         assert!(
@@ -1445,10 +1471,7 @@ mod encipdict_tests {
         );
 
         let mut short_signature = d;
-        let signature = short_signature
-            .get_bytes(crate::ipdict::DICT_SIGN)
-            .unwrap()[1..]
-            .to_vec();
+        let signature = short_signature.get_bytes(crate::ipdict::DICT_SIGN).unwrap()[1..].to_vec();
         short_signature.put_bytes(crate::ipdict::DICT_SIGN, &signature);
         let err = verify_ipdict(&short_signature).unwrap_err();
         assert!(
@@ -1536,9 +1559,7 @@ mod encipdict_tests {
             Err(_) => return, // 无抓包文件（CI 等）则跳过
         };
         let home = std::env::var("HOME").unwrap_or_default();
-        let key_path = format!(
-            "{home}/.local/share/io.github.open-ipmsg.app/ipmsg_key.json"
-        );
+        let key_path = format!("{home}/.local/share/io.github.open-ipmsg.app/ipmsg_key.json");
         let key_json = match std::fs::read_to_string(&key_path) {
             Ok(s) => s,
             Err(e) => {
@@ -1557,8 +1578,7 @@ mod encipdict_tests {
         assert!(outer.has(crate::ipdict::DICT_ENCIV));
         assert!(outer.has(crate::ipdict::DICT_ENCKEY));
         assert!(outer.has(crate::ipdict::DICT_ENCBODY));
-        let inner = open_encipdict(&kp, &outer)
-            .unwrap_or_else(|e| panic!("真实抓包解密失败：{e}"));
+        let inner = open_encipdict(&kp, &outer).unwrap_or_else(|e| panic!("真实抓包解密失败：{e}"));
         eprintln!(
             "[encipdict-real] UID={:?} HID={:?} CMD={:#x} BODY={:?} VER={:?}",
             inner.get_str(crate::ipdict::DICT_UID),

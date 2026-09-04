@@ -99,8 +99,7 @@ async fn async_run() -> bool {
     let port_app = free_udp_port().await;
     let port_peer = free_udp_port().await;
 
-    let data_dir =
-        std::env::temp_dir().join(format!("open-ipmsg-selftest-{}", std::process::id()));
+    let data_dir = std::env::temp_dir().join(format!("open-ipmsg-selftest-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
 
     // 应用侧状态与事件采集
@@ -116,7 +115,9 @@ async fn async_run() -> bool {
     let events: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let ev = events.clone();
-        st.set_event(Box::new(move |e, v| ev.lock().unwrap().push((e.to_string(), v))));
+        st.set_event(Box::new(move |e, v| {
+            ev.lock().unwrap().push((e.to_string(), v))
+        }));
     }
 
     let ctx = net::start_network_quiet(st.clone(), port_app)
@@ -174,7 +175,12 @@ async fn async_run() -> bool {
         .expect("send text");
     log.check("发送文本返回 out 记录", rec["dir"] == "out");
     let got_text = wait_for(3000, || {
-        shared.lock().unwrap().texts.iter().any(|t| t == "你好，假对端！")
+        shared
+            .lock()
+            .unwrap()
+            .texts
+            .iter()
+            .any(|t| t == "你好，假对端！")
     })
     .await;
     log.check("假对端收到文本", got_text);
@@ -182,9 +188,7 @@ async fn async_run() -> bool {
     /* ---- 2b. 入站文本（陌生来源主动发来） ---- */
     let in_evt = wait_for(3000, || {
         events.lock().unwrap().iter().any(|(e, v)| {
-            e == "msg-in"
-                && v["msg"]["text"] == "你好，我是假对端"
-                && v["key"] == peer_key.as_str()
+            e == "msg-in" && v["msg"]["text"] == "你好，我是假对端" && v["key"] == peer_key.as_str()
         })
     })
     .await;
@@ -197,7 +201,9 @@ async fn async_run() -> bool {
     );
 
     /* ---- 3. 发送附件（对端经 TCP 取回比对） ---- */
-    let content: Vec<u8> = (0..250_000u32).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+    let content: Vec<u8> = (0..250_000u32)
+        .map(|i| ((i * 31 + 7) % 251) as u8)
+        .collect();
     let send_path = data_dir.join("upload.bin");
     std::fs::write(&send_path, &content).unwrap();
     let rec = net::send_message(
@@ -224,7 +230,11 @@ async fn async_run() -> bool {
     std::fs::create_dir_all(send_dir.join("sub")).unwrap();
     std::fs::create_dir_all(send_dir.join("空子目录")).unwrap(); // 空目录也要能传过去
     std::fs::write(send_dir.join("root.txt"), "根目录文件".as_bytes()).unwrap();
-    std::fs::write(send_dir.join("sub/inner.bin"), (0..9000u32).map(|i| (i % 253) as u8).collect::<Vec<u8>>()).unwrap();
+    std::fs::write(
+        send_dir.join("sub/inner.bin"),
+        (0..9000u32).map(|i| (i % 253) as u8).collect::<Vec<u8>>(),
+    )
+    .unwrap();
     let rec = net::send_message(
         &ctx,
         &peer_key,
@@ -244,13 +254,20 @@ async fn async_run() -> bool {
         p.fetched_dirs
             .last()
             .map(|t| {
-                let files: Vec<_> = t.iter().filter(|(n, _)| !n.ends_with('/')).cloned().collect();
+                let files: Vec<_> = t
+                    .iter()
+                    .filter(|(n, _)| !n.ends_with('/'))
+                    .cloned()
+                    .collect();
                 files == want_tree
             })
             .unwrap_or(false)
     })
     .await;
-    log.check("假对端经 GETDIRFILES 取回整棵目录树且逐字节一致", dir_fetch_ok);
+    log.check(
+        "假对端经 GETDIRFILES 取回整棵目录树且逐字节一致",
+        dir_fetch_ok,
+    );
     log.check(
         "发送目录：空子目录也在流里（对端能原样重建）",
         shared
@@ -358,7 +375,9 @@ async fn async_run() -> bool {
         };
         match dl {
             Ok(path) => {
-                let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(u64::MAX);
+                let len = std::fs::metadata(&path)
+                    .map(|m| m.len())
+                    .unwrap_or(u64::MAX);
                 log.check("空文件下载成功且落盘为 0 字节", len == 0);
                 let hist = st.read_history(&peer_key, 30);
                 let state_ok = hist
@@ -377,17 +396,8 @@ async fn async_run() -> bool {
     }
 
     /* ---- 4b. 接收目录（对端以 GETDIRFILES 流回传） ---- */
-    match net::download_file_task(
-        &ctx,
-        &peer_key,
-        offer_pkt_no,
-        11,
-        "假对端目录",
-        "",
-        0,
-        true,
-    )
-    .await
+    match net::download_file_task(&ctx, &peer_key, offer_pkt_no, 11, "假对端目录", "", 0, true)
+        .await
     {
         Ok(path) => {
             let got = read_tree(&path);
@@ -398,10 +408,7 @@ async fn async_run() -> bool {
             let mut want = want;
             want.sort();
             log.check("接收目录：目录树重建完整且逐字节一致", got == want);
-            log.check(
-                "接收目录：空子目录也被建出来",
-                path.join("空目录").is_dir(),
-            );
+            log.check("接收目录：空子目录也被建出来", path.join("空目录").is_dir());
             log.check(
                 "接收目录：符号链接等非常规条目不落盘（内容被正确跳过）",
                 !path.join("链接").exists(),
@@ -485,7 +492,11 @@ async fn async_run() -> bool {
     }
 
     /* ---- 4d. 发送剪贴板图片（落盘缓存 → 按附件公告 → 对端取回比对） ---- */
-    let png_bytes: Vec<u8> = b"\x89PNG\r\n\x1a\n".iter().copied().chain(0..200u8).collect();
+    let png_bytes: Vec<u8> = b"\x89PNG\r\n\x1a\n"
+        .iter()
+        .copied()
+        .chain(0..200u8)
+        .collect();
     let b64 = {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(&png_bytes)
@@ -558,14 +569,8 @@ async fn async_run() -> bool {
     let sent = net::mark_read_and_receipt(&ctx, &peer_key, &[777123])
         .await
         .expect("mark_read");
-    log.check(
-        "标记入站消息已读并回执（need_read 才发）",
-        sent == 1,
-    );
-    let receipt_seen = wait_for(2500, || {
-        shared.lock().unwrap().receipts.contains(&777123)
-    })
-    .await;
+    log.check("标记入站消息已读并回执（need_read 才发）", sent == 1);
+    let receipt_seen = wait_for(2500, || shared.lock().unwrap().receipts.contains(&777123)).await;
     log.check("假对端收到 READMSG 回执", receipt_seen);
     let in_marked = wait_for(1500, || {
         st.read_history(&peer_key, 20)
@@ -613,7 +618,13 @@ async fn async_run() -> bool {
     /* ---- 5b. 重启后对端重投延迟消息：不重复落库、不重复回执 ---- */
     // 真实场景：关掉程序再打开，对端把没确认的历史消息按原包号重投一遍。
     // 这里用「同一数据目录 + 新端口的第二套网络栈」模拟一次重启。
-    let receipts_before = shared.lock().unwrap().receipts.iter().filter(|p| **p == 777123).count();
+    let receipts_before = shared
+        .lock()
+        .unwrap()
+        .receipts
+        .iter()
+        .filter(|p| **p == 777123)
+        .count();
     let port_app2 = free_udp_port().await;
     let st2 = Arc::new(AppState::new(data_dir.clone()));
     let mut cfg2 = Config::default();
@@ -671,7 +682,13 @@ async fn async_run() -> bool {
         .expect("mark_read again");
     log.check("重复标记已读不再发回执", again == 0);
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let receipts_after = shared.lock().unwrap().receipts.iter().filter(|p| **p == 777123).count();
+    let receipts_after = shared
+        .lock()
+        .unwrap()
+        .receipts
+        .iter()
+        .filter(|p| **p == 777123)
+        .count();
     log.check(
         &format!("对端不会反复收到「消息已被查看」（{receipts_before} → {receipts_after} 次）"),
         receipts_after == receipts_before,
@@ -718,9 +735,15 @@ async fn async_run() -> bool {
             .max()
             .unwrap_or(0);
         sess_ok = s.unread == expect && s.unread_ts == expect_ts;
-        sess_snap = format!("摘要 unread={}（期望 {expect}）unread_ts={}（期望 {expect_ts}）", s.unread, s.unread_ts);
+        sess_snap = format!(
+            "摘要 unread={}（期望 {expect}）unread_ts={}（期望 {expect_ts}）",
+            s.unread, s.unread_ts
+        );
     }
-    log.check(&format!("会话摘要未读数与会话内未读记录一致（{sess_snap}）"), sess_ok);
+    log.check(
+        &format!("会话摘要未读数与会话内未读记录一致（{sess_snap}）"),
+        sess_ok,
+    );
 
     /* ---- 5c. 清空会话聊天记录 ---- */
     let before = st2.read_history(&peer_key, 500).len();
@@ -753,14 +776,21 @@ fn finish(log: Log, tasks: Vec<tokio::task::JoinHandle<()>>, data_dir: &Path) ->
     }
     let ok = log.all_ok();
     let _ = std::fs::remove_dir_all(data_dir);
-    println!("== 自检{} ==", if ok { "全部通过 ✔" } else { "存在失败项 ✘" });
+    println!(
+        "== 自检{} ==",
+        if ok {
+            "全部通过 ✔"
+        } else {
+            "存在失败项 ✘"
+        }
+    );
     ok
 }
 
 /* ==================== 场景：双实例端到端加密全链路 ==================== */
 
 /// peer_keys.json 里是否已缓存该 IP 的公钥（读盘断言，重启口径；
-    /// 文件为 {rev, keys:{ip:{...}}} 版本化结构）
+/// 文件为 {rev, keys:{ip:{...}}} 版本化结构）
 fn peer_keys_cached(dir: &Path, ip: &str) -> bool {
     std::fs::read_to_string(dir.join("peer_keys.json"))
         .ok()
@@ -801,7 +831,9 @@ async fn crypto_roundtrip() -> bool {
     cfg_a.encoding = "utf8".into();
     cfg_a.download_dir = dir_a.join("dl").to_string_lossy().into_owned();
     st_a.set_config(cfg_a);
-    let ctx_a = net::start_network_quiet(st_a.clone(), port_a).await.expect("start A");
+    let ctx_a = net::start_network_quiet(st_a.clone(), port_a)
+        .await
+        .expect("start A");
 
     let st_b = Arc::new(AppState::new(dir_b.clone()));
     let mut cfg_b = Config::default();
@@ -810,10 +842,9 @@ async fn crypto_roundtrip() -> bool {
     cfg_b.encoding = "utf8".into();
     cfg_b.download_dir = dir_b.join("dl").to_string_lossy().into_owned();
     st_b.set_config(cfg_b);
-    let ctx_b =
-        net::start_network_loopback(st_b.clone(), key_b.parse().unwrap(), port_b)
-            .await
-            .expect("start B");
+    let ctx_b = net::start_network_loopback(st_b.clone(), key_b.parse().unwrap(), port_b)
+        .await
+        .expect("start B");
 
     /* ---- 1. A 单播发现 B；双方各走一遍 GETPUBKEY 预握手 ---- */
     tokio::time::sleep(Duration::from_millis(60)).await;
@@ -824,9 +855,15 @@ async fn crypto_roundtrip() -> bool {
     log.check("发现实例 B（BR_ENTRY→ANSENTRY 注册）", discovered);
     // B 缓存了 A 的公钥 = B 侧预握手已完成（peer_keys.json 非空且含回环键）
     let b_cached_a = wait_for(5000, || peer_keys_cached(&dir_b, key)).await;
-    log.check("A 广播声明 ENCRYPTOPT → B 完成预握手并持久化 A 的公钥", b_cached_a);
+    log.check(
+        "A 广播声明 ENCRYPTOPT → B 完成预握手并持久化 A 的公钥",
+        b_cached_a,
+    );
     let a_cached_b = wait_for(5000, || peer_keys_cached(&dir_a, key_b)).await;
-    log.check("B 应答声明 ENCRYPTOPT → A 完成预握手并持久化 B 的公钥", a_cached_b);
+    log.check(
+        "B 应答声明 ENCRYPTOPT → A 完成预握手并持久化 B 的公钥",
+        a_cached_b,
+    );
     if !b_cached_a || !a_cached_b {
         return finish_crypto(log, &base);
     }
@@ -852,16 +889,17 @@ async fn crypto_roundtrip() -> bool {
     log.check("B 解密落库：文本一致且 enc=true、sig_ok=true", got_in_b);
 
     /* ---- 2b. 长文本自动分段：整段超出密封明文预算（3400B）时自动拆条
-           发送，每条独立包号且全部加密；B 收到后能按序拼接还原原文 ---- */
+    发送，每条独立包号且全部加密；B 收到后能按序拼接还原原文 ---- */
     let text_long = format!("长文本分段测试：{}结尾", "密".repeat(1800)); // ≈5400B+
     match net::send_message_multi(&ctx_a, key_b, &text_long, vec![]).await {
         Ok(recs) => {
             // 在线直发记录无 queued 字段；用 as_bool 判“非离线入队”
             let all_enc = !recs.is_empty()
-                && recs
-                    .iter()
-                    .all(|r| r["dir"] == "out" && r["enc"] == true
-                        && r.get("queued").and_then(|v| v.as_bool()).unwrap_or(false) == false);
+                && recs.iter().all(|r| {
+                    r["dir"] == "out"
+                        && r["enc"] == true
+                        && r.get("queued").and_then(|v| v.as_bool()).unwrap_or(false) == false
+                });
             log.check(
                 "A 长文本自动分段：返回 ≥2 条 out 记录且全部密文发出",
                 recs.len() >= 2 && all_enc,
@@ -906,7 +944,9 @@ async fn crypto_roundtrip() -> bool {
         }
     };
     let ok_attach = recs_attach.len() >= 2
-        && recs_attach[0]["files"].as_array().is_some_and(|f| !f.is_empty())
+        && recs_attach[0]["files"]
+            .as_array()
+            .is_some_and(|f| !f.is_empty())
         && recs_attach.iter().all(|r| {
             r["dir"] == "out"
                 && r["enc"] == true
@@ -963,7 +1003,9 @@ async fn crypto_roundtrip() -> bool {
     log.check("A 解密落库：文本一致且 enc=true、sig_ok=true", got_in_a);
 
     /* ---- 3b. A 公告文件，B 以加密取回请求下载（正文过 AES-CTR） ---- */
-    let content_ab: Vec<u8> = (0..150_000u32).map(|i| ((i * 17 + 5) % 253) as u8).collect();
+    let content_ab: Vec<u8> = (0..150_000u32)
+        .map(|i| ((i * 17 + 5) % 253) as u8)
+        .collect();
     let path_ab = dir_a.join("enc_upload.bin");
     std::fs::write(&path_ab, &content_ab).unwrap();
     let rec_file_ab = match net::send_message(
@@ -997,8 +1039,7 @@ async fn crypto_roundtrip() -> bool {
         .and_then(|r| r["files"][0]["id"].as_u64())
         .unwrap_or(0) as u32;
     let registered_at_b = wait_for(4000, || {
-        st_b
-            .read_history(key, 50)
+        st_b.read_history(key, 50)
             .iter()
             .any(|r| r["dir"] == "in" && r["pkt"].as_u64() == Some(ab_pkt as u64))
     })
@@ -1080,7 +1121,9 @@ async fn crypto_roundtrip() -> bool {
     }
 
     /* ---- 3c. 反向：B 公告文件，A 加密下载；加密请求标记必须落在 B 的日志里 ---- */
-    let content_ba: Vec<u8> = (0..90_000u32).map(|i| ((i * 23 + 11) % 251) as u8).collect();
+    let content_ba: Vec<u8> = (0..90_000u32)
+        .map(|i| ((i * 23 + 11) % 251) as u8)
+        .collect();
     let path_ba = dir_b.join("enc_reply.bin");
     std::fs::write(&path_ba, &content_ba).unwrap();
     let rec_file_ba = match net::send_message(
@@ -1106,8 +1149,7 @@ async fn crypto_roundtrip() -> bool {
         let ba_pkt = rec["pkt"].as_u64().unwrap_or(0) as u32;
         let ba_id = rec["files"][0]["id"].as_u64().unwrap_or(0) as u32;
         let registered_at_a = wait_for(4000, || {
-            st_a
-                .read_history(key_b, 50)
+            st_a.read_history(key_b, 50)
                 .iter()
                 .any(|r| r["dir"] == "in" && r["pkt"].as_u64() == Some(ba_pkt as u64))
         })
@@ -1185,9 +1227,9 @@ async fn crypto_roundtrip() -> bool {
     }
     let plain_at_c = wait_for(4000, || {
         // C 的会话键 = A 的 IP（127.0.0.1），与 C 自己绑在哪个地址无关
-        st_c.read_history(key, 50).iter().any(|r| {
-            r["dir"] == "in" && r["text"] == text_plain && r["enc"] == false
-        })
+        st_c.read_history(key, 50)
+            .iter()
+            .any(|r| r["dir"] == "in" && r["text"] == text_plain && r["enc"] == false)
     })
     .await;
     log.check("明文实例 C 收到该消息且记录 enc=false", plain_at_c);
@@ -1200,7 +1242,11 @@ fn finish_crypto(log: Log, base: &Path) -> bool {
     let _ = std::fs::remove_dir_all(base);
     println!(
         "== 加密场景{} ==",
-        if ok { "全部通过 ✔" } else { "存在失败项 ✘" }
+        if ok {
+            "全部通过 ✔"
+        } else {
+            "存在失败项 ✘"
+        }
     );
     ok
 }
@@ -1210,7 +1256,11 @@ fn finish_offline_file(log: Log, base: &Path) -> bool {
     let _ = std::fs::remove_dir_all(base);
     println!(
         "== 离线文件投递场景{} ==",
-        if ok { "全部通过 ✔" } else { "存在失败项 ✘" }
+        if ok {
+            "全部通过 ✔"
+        } else {
+            "存在失败项 ✘"
+        }
     );
     ok
 }
@@ -1218,8 +1268,7 @@ fn finish_offline_file(log: Log, base: &Path) -> bool {
 /// 离线文件投递：对方不在线时附件消息入队，对方上线后带延迟尾注重投，
 /// 文件槽在重投时登记，对端可正常取回；RECVMSG 确认后队列清空。
 async fn offline_file_delivery() -> bool {
-    let base =
-        std::env::temp_dir().join(format!("open-ipmsg-offline-file-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("open-ipmsg-offline-file-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let dir_a = base.join("a");
     let dir_b = base.join("b");
@@ -1281,7 +1330,9 @@ async fn offline_file_delivery() -> bool {
     /* ---- 2. 附件路径不可读：报错而不是入队 ---- */
     let bogus = dir_a.join("ghost.bin").to_string_lossy().into_owned();
     match net::send_message(&ctx_a, key_b, "不存在的文件", vec![bogus]).await {
-        Err(e) if e.contains("无法读取文件") => log.check("离线附件：路径不可读直接报错", true),
+        Err(e) if e.contains("无法读取文件") => {
+            log.check("离线附件：路径不可读直接报错", true)
+        }
         other => log.check(
             &format!("离线附件：路径不可读直接报错（实际 {other:?}）"),
             false,
@@ -1334,8 +1385,17 @@ async fn offline_file_delivery() -> bool {
             .as_str()
             .unwrap_or("offline_upload.bin")
             .to_string();
-        match net::download_file_task(&ctx_b, key_a, pkt, id, &name, "", content.len() as u64, false)
-            .await
+        match net::download_file_task(
+            &ctx_b,
+            key_a,
+            pkt,
+            id,
+            &name,
+            "",
+            content.len() as u64,
+            false,
+        )
+        .await
         {
             Ok(p) => fetched_ok = std::fs::read(&p).unwrap_or_default() == content,
             Err(e) => {
@@ -1397,7 +1457,7 @@ fn spawn_fake_peer(
                 mtime: 123,
                 attr: fileattr::REGULAR,
                 ext_attrs: vec![],
-        };
+            };
             let mut extra = "请收文件".as_bytes().to_vec();
             extra.push(0);
             extra.extend_from_slice(entry.serialize("utf8").as_bytes());
@@ -1456,7 +1516,7 @@ fn spawn_fake_peer(
                 mtime: 123,
                 attr: fileattr::REGULAR,
                 ext_attrs: vec![],
-        };
+            };
             let mut extra = "看这张图".as_bytes().to_vec();
             extra.push(0);
             extra.extend_from_slice(entry.serialize("utf8").as_bytes());
@@ -1472,9 +1532,9 @@ fn spawn_fake_peer(
     }));
 
     /* -- 官方「粘贴图片」：FILEATTACHOPT + attr=0x20(IPMSG_FILE_CLIPBOARD) + ipmsgclip_s_*.png
-            官方 5.8.6 senddlg.cpp：粘贴图片按普通附件公告（clipCnt 项），文件名
-            ipmsgclip_s_<id>_<pos>.png、attr=IPMSG_FILE_CLIPBOARD(0x20)、公告尾附
-            IPMSG_FILE_CLIPBOARDPOS=pos 扩展段。前提是对方 Entry 声明 CLIPBOARDOPT。 -- */
+    官方 5.8.6 senddlg.cpp：粘贴图片按普通附件公告（clipCnt 项），文件名
+    ipmsgclip_s_<id>_<pos>.png、attr=IPMSG_FILE_CLIPBOARD(0x20)、公告尾附
+    IPMSG_FILE_CLIPBOARDPOS=pos 扩展段。前提是对方 Entry 声明 CLIPBOARDOPT。 -- */
     tasks.push(tokio::spawn({
         let ps = ps.clone();
         let clip_bytes = {
@@ -1494,7 +1554,7 @@ fn spawn_fake_peer(
                 // 官方 IPMSG_FILE_CLIPBOARD=0x20；公告格式 id:name:size:mtime:attr:8=pos:
                 attr: 0x20,
                 ext_attrs: vec![],
-        };
+            };
             let mut extra = "粘贴的图片".as_bytes().to_vec();
             extra.push(0);
             extra.extend_from_slice(entry.serialize("utf8").as_bytes());
@@ -1524,7 +1584,7 @@ fn spawn_fake_peer(
                 mtime: 123,
                 attr: fileattr::REGULAR,
                 ext_attrs: vec![],
-        };
+            };
             let mut extra = "请收空文件".as_bytes().to_vec();
             extra.push(0);
             extra.extend_from_slice(entry.serialize("utf8").as_bytes());
@@ -1567,7 +1627,9 @@ fn spawn_fake_peer(
                     Ok(x) => x,
                     Err(_) => continue,
                 };
-                let Some(pkt) = proto::parse(&buf[..n]) else { continue };
+                let Some(pkt) = proto::parse(&buf[..n]) else {
+                    continue;
+                };
                 match pkt.command & 0xFF {
                     cmd::BR_ENTRY => {
                         let mut a = proto::Packet::new(cmd::ANSENTRY);
@@ -1693,12 +1755,16 @@ fn spawn_fake_peer(
             Err(_) => return,
         };
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { continue };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
             let content = serve_content.clone();
             tokio::spawn(async move {
                 let mut buf = [0u8; 512];
                 let n = stream.read(&mut buf).await.unwrap_or(0);
-                let Some(req) = proto::parse(&buf[..n]) else { return };
+                let Some(req) = proto::parse(&buf[..n]) else {
+                    return;
+                };
                 let extra = String::from_utf8_lossy(&req.extra);
                 let mut fields = extra.split(':');
                 // 按官方 IP Messenger 约定解析：包编号是十六进制。
@@ -1708,7 +1774,10 @@ fn spawn_fake_peer(
                     .next()
                     .and_then(|f| u32::from_str_radix(f.trim(), 16).ok())
                     .filter(|p| {
-                        *p == offer_pkt_no || *p == img_pkt_no || *p == empty_pkt_no || *p == clip_pkt_no
+                        *p == offer_pkt_no
+                            || *p == img_pkt_no
+                            || *p == empty_pkt_no
+                            || *p == clip_pkt_no
                     });
                 if pkt_val.is_none() {
                     let _ = stream.shutdown().await;
@@ -1740,7 +1809,6 @@ fn spawn_fake_peer(
     tasks
 }
 
-
 /* ---------------- 目录流工具（自检内独立实现，与被测代码不共享逻辑） ---------------- */
 
 fn dir_head(name: &str, size: u64, attr: u32) -> Vec<u8> {
@@ -1753,7 +1821,10 @@ fn dir_head(name: &str, size: u64, attr: u32) -> Vec<u8> {
 fn fake_dir_files() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("hello.txt", "目录里的文本内容".as_bytes().to_vec()),
-        ("sub/data.bin", (0..5000u32).map(|i| (i % 256) as u8).collect()),
+        (
+            "sub/data.bin",
+            (0..5000u32).map(|i| (i % 256) as u8).collect(),
+        ),
     ]
 }
 
@@ -1789,11 +1860,13 @@ async fn fetch_dir(
     pkt_no: u32,
     file_id: u32,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let mut stream =
-        tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(("127.0.0.1", port_app)))
-            .await
-            .map_err(|_| "连接超时".to_string())?
-            .map_err(|e| format!("connect: {e}"))?;
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(("127.0.0.1", port_app)),
+    )
+    .await
+    .map_err(|_| "连接超时".to_string())?
+    .map_err(|e| format!("connect: {e}"))?;
     let req = format!(
         "1:{}:fake:fake-host:{}:{}:{}:0\n",
         proto::next_packet_no(),
@@ -1801,7 +1874,10 @@ async fn fetch_dir(
         pkt_no,
         file_id
     );
-    stream.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
     let mut raw = Vec::new();
     tokio::time::timeout(Duration::from_secs(8), stream.read_to_end(&mut raw))
         .await
@@ -1812,12 +1888,13 @@ async fn fetch_dir(
     let mut stack: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < raw.len() {
-        let colon = raw[i..].iter().position(|&b| b == b':').ok_or("头部缺少冒号")? + i;
-        let head_len = usize::from_str_radix(
-            String::from_utf8_lossy(&raw[i..colon]).trim(),
-            16,
-        )
-        .map_err(|e| format!("头部长度: {e}"))?;
+        let colon = raw[i..]
+            .iter()
+            .position(|&b| b == b':')
+            .ok_or("头部缺少冒号")?
+            + i;
+        let head_len = usize::from_str_radix(String::from_utf8_lossy(&raw[i..colon]).trim(), 16)
+            .map_err(|e| format!("头部长度: {e}"))?;
         if i + head_len > raw.len() {
             return Err("头部越界".into());
         }
@@ -1870,10 +1947,16 @@ async fn fetch_dir(
 /// 递归读取本地目录为 (相对路径, 内容) 列表，用于比对
 fn read_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
     fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
             match e.metadata() {
                 Ok(m) if m.is_dir() => walk(&e.path(), &rel, out),
                 Ok(m) if m.is_file() => {
@@ -1891,11 +1974,13 @@ fn read_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
 
 /// 假对端作为 TCP 客户端，从应用侧 GETFILEDATA 取文件
 async fn fetch_file(port_app: u16, pkt_no: u32, file_id: u32) -> Result<Vec<u8>, String> {
-    let mut stream =
-        tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(("127.0.0.1", port_app)))
-            .await
-            .map_err(|_| "连接超时".to_string())?
-            .map_err(|e| format!("connect: {e}"))?;
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(("127.0.0.1", port_app)),
+    )
+    .await
+    .map_err(|_| "连接超时".to_string())?
+    .map_err(|e| format!("connect: {e}"))?;
     let req = format!(
         "1:{}:fake:fake-host:{}:{}:{}:0\n",
         proto::next_packet_no(),
@@ -1903,9 +1988,15 @@ async fn fetch_file(port_app: u16, pkt_no: u32, file_id: u32) -> Result<Vec<u8>,
         pkt_no,
         file_id
     );
-    stream.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    stream.read_to_end(&mut out).await.map_err(|e| e.to_string())?;
+    stream
+        .read_to_end(&mut out)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(out)
 }
 
@@ -1937,7 +2028,9 @@ async fn extended_protocols() -> bool {
     let events: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let ev = events.clone();
-        st.set_event(Box::new(move |e, v| ev.lock().unwrap().push((e.to_string(), v))));
+        st.set_event(Box::new(move |e, v| {
+            ev.lock().unwrap().push((e.to_string(), v))
+        }));
     }
 
     /* ---- 假对端（回显能力） ---- */
@@ -1958,8 +2051,7 @@ async fn extended_protocols() -> bool {
         anslists_sent: u32,
     }
     let ext = Arc::new(Mutex::new(ExtShared::default()));
-    let std_sock =
-        std::net::UdpSocket::bind(("127.0.0.1", port_fake)).expect("ext fake bind");
+    let std_sock = std::net::UdpSocket::bind(("127.0.0.1", port_fake)).expect("ext fake bind");
     std_sock.set_nonblocking(true).unwrap();
     let ps = Arc::new(UdpSocket::from_std(std_sock).expect("ext fake convert"));
     let target_app: SocketAddr = format!("127.0.0.1:{port_app}").parse().unwrap();
@@ -1973,18 +2065,26 @@ async fn extended_protocols() -> bool {
                     Ok(x) => x,
                     Err(_) => continue,
                 };
-                let Some(pkt) = proto::parse(&buf[..n]) else { continue };
+                let Some(pkt) = proto::parse(&buf[..n]) else {
+                    continue;
+                };
                 let base = pkt.command & 0xFF;
                 match base {
                     cmd::BR_ENTRY => {
                         // 记录不在模式位（ABSENCEOPT）
-                        ext.lock().unwrap().absence_flags.push(pkt.command & opt::ABSENCEOPT != 0);
+                        ext.lock()
+                            .unwrap()
+                            .absence_flags
+                            .push(pkt.command & opt::ABSENCEOPT != 0);
                         let mut a = proto::Packet::new(cmd::ANSENTRY);
                         a.extra = proto::build_entry_extra("扩展假对端", "扩展组", "utf8");
                         let _ = ps.send_to(&a.encode("扩展假对端", "fake-ext"), from).await;
                     }
                     cmd::BR_ABSENCE => {
-                        ext.lock().unwrap().absence_flags.push(pkt.command & opt::ABSENCEOPT != 0);
+                        ext.lock()
+                            .unwrap()
+                            .absence_flags
+                            .push(pkt.command & opt::ABSENCEOPT != 0);
                     }
                     cmd::SENDMSG => {
                         let (need_ack, dup_n) = {
@@ -1992,7 +2092,10 @@ async fn extended_protocols() -> bool {
                             sh.texts.push(proto::text_of(&pkt));
                             // 重发次数统计：同一包号第二次出现意味着在线重发生效
                             *sh.dup_count.entry(pkt.pkt_no).or_insert(0) += 1;
-                            (pkt.command & opt::SENDCHECKOPT != 0 && !sh.drop_ack, sh.dup_count.get(&pkt.pkt_no).copied().unwrap_or(0))
+                            (
+                                pkt.command & opt::SENDCHECKOPT != 0 && !sh.drop_ack,
+                                sh.dup_count.get(&pkt.pkt_no).copied().unwrap_or(0),
+                            )
                         }; // 守卫在此释放
                         if need_ack {
                             let mut r = proto::Packet::new(cmd::RECVMSG | opt::AUTORETOPT);
@@ -2011,15 +2114,24 @@ async fn extended_protocols() -> bool {
                         }
                         if pkt.command & opt::AUTORETOPT != 0 {
                             // 我们收到的自动应答（不在模式自动回复）
-                            ext.lock().unwrap().absence_replies.push(proto::text_of(&pkt));
+                            ext.lock()
+                                .unwrap()
+                                .absence_replies
+                                .push(proto::text_of(&pkt));
                         }
                     }
                     cmd::DELMSG => {
-                        let no = String::from_utf8_lossy(&pkt.extra).trim().parse().unwrap_or(0);
+                        let no = String::from_utf8_lossy(&pkt.extra)
+                            .trim()
+                            .parse()
+                            .unwrap_or(0);
                         ext.lock().unwrap().delmsg.push(no);
                     }
                     cmd::READMSG => {
-                        let no = String::from_utf8_lossy(&pkt.extra).trim().parse().unwrap_or(0);
+                        let no = String::from_utf8_lossy(&pkt.extra)
+                            .trim()
+                            .parse()
+                            .unwrap_or(0);
                         ext.lock().unwrap().receipts.push(no);
                     }
                     cmd::GETABSENCEINFO => {
@@ -2028,12 +2140,7 @@ async fn extended_protocols() -> bool {
                     cmd::BR_ISGETLIST => {
                         ext.lock().unwrap().ok_getlist = true;
                         let r = proto::Packet::new(cmd::OKGETLIST);
-                        let _ = ps
-                            .send_to(
-                                &r.encode("扩展假对端", "fake-ext"),
-                                from,
-                            )
-                            .await;
+                        let _ = ps.send_to(&r.encode("扩展假对端", "fake-ext"), from).await;
                     }
                     cmd::GETLIST => {
                         // 回一份含「第三方主机」的 ANSLIST（分页续传为 0）
@@ -2058,11 +2165,10 @@ async fn extended_protocols() -> bool {
                             },
                         ];
                         let (wire, _) = proto::build_anslist(&hosts, 0, 4000, "utf8");
-                        let mut r = proto::Packet::new(cmd::ANSLIST | opt::UTF8OPT | opt::AUTORETOPT);
+                        let mut r =
+                            proto::Packet::new(cmd::ANSLIST | opt::UTF8OPT | opt::AUTORETOPT);
                         r.extra = wire;
-                        let _ = ps
-                            .send_to(&r.encode("扩展假对端", "fake-ext"), from)
-                            .await;
+                        let _ = ps.send_to(&r.encode("扩展假对端", "fake-ext"), from).await;
                         ext.lock().unwrap().anslists_sent += 1;
                     }
                     _ => {}
@@ -2120,9 +2226,11 @@ async fn extended_protocols() -> bool {
         .send_to(&p.encode("扩展假对端", "fake-ext"), target_app)
         .await;
     let seen = wait_for(2000, || {
-        events.lock().unwrap().iter().any(|(e, v)| {
-            e == "msg-in" && v["msg"]["pkt"].as_u64() == Some(in_pkt as u64)
-        })
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(e, v)| e == "msg-in" && v["msg"]["pkt"].as_u64() == Some(in_pkt as u64))
     })
     .await;
     log.check("E: 入站消息就绪", seen);
@@ -2199,7 +2307,10 @@ async fn extended_protocols() -> bool {
         &peer_key,
         "封书消息",
         vec![],
-        MsgSendOpts { secret: true, ..Default::default() },
+        MsgSendOpts {
+            secret: true,
+            ..Default::default()
+        },
     )
     .await
     .expect("send secret");
@@ -2218,7 +2329,8 @@ async fn extended_protocols() -> bool {
         .await;
     let secret_in = wait_for(2000, || {
         events.lock().unwrap().iter().any(|(e, v)| {
-            e == "msg-in" && v["msg"]["pkt"].as_u64() == Some(secret_pkt as u64)
+            e == "msg-in"
+                && v["msg"]["pkt"].as_u64() == Some(secret_pkt as u64)
                 && v["msg"]["secret"].as_bool() == Some(true)
                 && v["msg"]["locked"].as_bool() == Some(false)
                 && v["msg"]["unlocked"].as_bool() == Some(true)
@@ -2286,7 +2398,8 @@ async fn extended_protocols() -> bool {
         .await;
     let locked_in = wait_for(2000, || {
         events.lock().unwrap().iter().any(|(e, v)| {
-            e == "msg-in" && v["msg"]["pkt"].as_u64() == Some(pass_pkt as u64)
+            e == "msg-in"
+                && v["msg"]["pkt"].as_u64() == Some(pass_pkt as u64)
                 && v["msg"]["locked"].as_bool() == Some(true)
                 && v["msg"]["unlocked"].as_bool() == Some(false)
                 && v["msg"]["read"].as_bool() == Some(false)
@@ -2318,10 +2431,9 @@ async fn extended_protocols() -> bool {
     cfg_password_disabled.password.clear();
     st.set_config(cfg_password_disabled);
     let disabled_pass_pkt = proto::next_packet_no();
-    let mut s3 = proto::Packet::new(
-        cmd::SENDMSG | opt::SECRETOPT | opt::PASSWORDOPT | opt::READCHECKOPT,
-    )
-    .with_pkt_no(disabled_pass_pkt);
+    let mut s3 =
+        proto::Packet::new(cmd::SENDMSG | opt::SECRETOPT | opt::PASSWORDOPT | opt::READCHECKOPT)
+            .with_pkt_no(disabled_pass_pkt);
     s3.extra = "关闭本机密码时仍需保护的封书".as_bytes().to_vec();
     let _ = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
         .await
@@ -2330,7 +2442,8 @@ async fn extended_protocols() -> bool {
         .await;
     let disabled_pass_locked = wait_for(2000, || {
         events.lock().unwrap().iter().any(|(e, v)| {
-            e == "msg-in" && v["msg"]["pkt"].as_u64() == Some(disabled_pass_pkt as u64)
+            e == "msg-in"
+                && v["msg"]["pkt"].as_u64() == Some(disabled_pass_pkt as u64)
                 && v["msg"]["secret"].as_bool() == Some(true)
                 && v["msg"]["locked"].as_bool() == Some(true)
                 && v["msg"]["unlocked"].as_bool() == Some(false)
@@ -2365,7 +2478,13 @@ async fn extended_protocols() -> bool {
     };
     // 重发间隔 4s：7.5s 内应看到同包号 ≥2 次
     let resent = wait_for(7500, || {
-        ext.lock().unwrap().dup_count.get(&drop_pkt_no).copied().unwrap_or(0) >= 2
+        ext.lock()
+            .unwrap()
+            .dup_count
+            .get(&drop_pkt_no)
+            .copied()
+            .unwrap_or(0)
+            >= 2
     })
     .await;
     log.check("E: 未确认消息按同包号自动重发", resent);
@@ -2379,18 +2498,9 @@ async fn extended_protocols() -> bool {
     let probe = proto::Packet::new(cmd::BR_ISGETLIST);
     let _ = ctx
         .sock
-        .send_to(
-            &probe.encode(&cfg_now.nickname, "ext-self"),
-            peer_addr,
-        )
+        .send_to(&probe.encode(&cfg_now.nickname, "ext-self"), peer_addr)
         .await;
-    let third = wait_for(3000, || {
-        st.peers
-            .lock()
-            .unwrap()
-            .contains_key("127.0.0.9")
-    })
-    .await;
+    let third = wait_for(3000, || st.peers.lock().unwrap().contains_key("127.0.0.9")).await;
     log.check("E: ANSLIST 第三方主机并入用户表", third);
 
     /* ---- E8. 成员主目录服务（DIR_MASTER 三实例：主/成员/普通） ---- */
@@ -2422,8 +2532,7 @@ async fn extended_protocols() -> bool {
         .expect("user net");
     net::dir_tick(&ctx_u).await; // 成员 POLL
     let member_reg = wait_for(3000, || {
-        st_m
-            .dir_members_snapshot()
+        st_m.dir_members_snapshot()
             .iter()
             .any(|m| m.key == "127.0.0.8")
     })
@@ -2488,10 +2597,7 @@ async fn extended_protocols() -> bool {
             .send_to(&hand.encode(&cfg_y.nickname, "y-host"), ag_addr)
             .await;
         // 直连注册完成后，代理应把 127.0.0.6 → Y 的真实地址入库
-        let registered = wait_for(2000, || {
-            ctx_ag.st.relay_peer("127.0.0.6").is_some()
-        })
-        .await;
+        let registered = wait_for(2000, || ctx_ag.st.relay_peer("127.0.0.6").is_some()).await;
         log.check("E: 代理登记 Y 的真实地址", registered);
     }
     // X 的会话表里手工登记 Y（回环下没有广播发现）
@@ -2518,26 +2624,21 @@ async fn extended_protocols() -> bool {
         .await
         .expect("send via agent");
     let mut y_got = wait_for(4000, || {
-        st_y
-            .history_contains_text("127.0.0.5", "经代理的消息")
+        st_y.history_contains_text("127.0.0.5", "经代理的消息")
     })
     .await;
     if !y_got {
         // 与真实客户端同款重试语义：未达则再发一次（同包号，后端去重）
         let _ = net::send_message(&ctx_x, "127.0.0.6", "经代理的消息", vec![]).await;
         y_got = wait_for(4000, || {
-            st_y
-                .history_contains_text("127.0.0.5", "经代理的消息")
+            st_y.history_contains_text("127.0.0.5", "经代理的消息")
         })
         .await;
     }
     log.check("E: 目标经代理收到消息", y_got);
     let _ = rec_x;
     // X 的重发队列应被 Y 的 RECVMSG（经代理回流）确认清空
-    let acked = wait_for(6000, || {
-        ctx_x.st.retry_for("127.0.0.6").is_empty()
-    })
-    .await;
+    let acked = wait_for(6000, || ctx_x.st.retry_for("127.0.0.6").is_empty()).await;
     log.check("E: 代理中继的送达确认回流（重发队列清空）", acked);
 
     /* ---- E10. 官方 v5 密文消息（EncIPDict）端到端 ---- */
@@ -2679,7 +2780,11 @@ async fn extended_protocols() -> bool {
     let all = log.all_ok();
     println!(
         "== 扩展协议场景{} ==",
-        if all { "全部通过 ✔" } else { "存在失败项 ✘" }
+        if all {
+            "全部通过 ✔"
+        } else {
+            "存在失败项 ✘"
+        }
     );
     all
 }

@@ -175,7 +175,10 @@ impl Dict {
     }
 
     pub fn get_int_list(&self, key: &str) -> Vec<i64> {
-        self.try_get_int_list(key).ok().flatten().unwrap_or_default()
+        self.try_get_int_list(key)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
     }
 
     pub fn try_get_str_list(&self, key: &str) -> Result<Option<Vec<String>>, String> {
@@ -185,7 +188,10 @@ impl Dict {
     }
 
     pub fn get_str_list(&self, key: &str) -> Vec<String> {
-        self.try_get_str_list(key).ok().flatten().unwrap_or_default()
+        self.try_get_str_list(key)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
     }
 
     pub fn try_get_bytes_list(&self, key: &str) -> Result<Option<Vec<Vec<u8>>>, String> {
@@ -193,7 +199,10 @@ impl Dict {
     }
 
     pub fn get_bytes_list(&self, key: &str) -> Vec<Vec<u8>> {
-        self.try_get_bytes_list(key).ok().flatten().unwrap_or_default()
+        self.try_get_bytes_list(key)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
     }
 
     pub fn try_get_dict_list(&self, key: &str) -> Result<Option<Vec<Dict>>, String> {
@@ -398,7 +407,6 @@ fn parse_raw_list(data: &[u8]) -> Option<Vec<&[u8]>> {
     Some(list)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,8 +501,11 @@ mod tests {
     #[test]
     fn roundtrip_scalars() {
         let mut d = Dict::new();
-        d.put_int("VER", 3).put_int("PKT", 123456).put_str("NCK", "小明")
-            .put_str("GRP", "研发部").put_int("NEG", -2000);
+        d.put_int("VER", 3)
+            .put_int("PKT", 123456)
+            .put_str("NCK", "小明")
+            .put_str("GRP", "研发部")
+            .put_int("NEG", -2000);
         let packed = d.pack();
         assert!(packed.starts_with(b"IP2:"));
         assert!(packed.ends_with(b":Z"));
@@ -537,19 +548,16 @@ mod tests {
 
         let mut d = Dict::new();
         d.put_bytes("NEST", &full_a)
-            .put_bytes(
-                "INTS",
-                &pack_raw_list(&[&b"1"[..], &b"-2"[..], &b"ff"[..]]),
-            )
+            .put_bytes("INTS", &pack_raw_list(&[&b"1"[..], &b"-2"[..], &b"ff"[..]]))
             .put_bytes(
                 "STRS",
                 &pack_raw_list(&[&b""[..], &b"hello"[..], "中文".as_bytes()]),
             )
+            .put_bytes("BYTES", &pack_raw_list(&[&b"\x00:\xff"[..], &b""[..]]))
             .put_bytes(
-                "BYTES",
-                &pack_raw_list(&[&b"\x00:\xff"[..], &b""[..]]),
-            )
-            .put_bytes("IPDS", &pack_raw_list(&[full_a.as_slice(), full_b.as_slice()]));
+                "IPDS",
+                &pack_raw_list(&[full_a.as_slice(), full_b.as_slice()]),
+            );
 
         assert_eq!(d.get_ipdict("NEST"), Some(nested_a.clone()));
         assert_eq!(d.get_int_list("INTS"), vec![1, -2, 255]);

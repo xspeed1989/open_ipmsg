@@ -91,9 +91,7 @@ fn fnames_by_msg(conn: &Connection, table: &str) -> HashMap<i64, Vec<String>> {
     let Ok(mut stmt) = conn.prepare(&sql) else {
         return out;
     };
-    let Ok(rows) = stmt.query_map([], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-    }) else {
+    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) else {
         return out;
     };
     for row in rows.flatten() {
@@ -237,8 +235,13 @@ pub fn import_ipmsg_db(st: &AppState, path: &Path) -> Result<ImportReport, Strin
         let recv = flags & 1 != 0; // DB_FLAG_FROM
 
         // 目标会话列表：收到→发件人；发出→每个收件人各一份
-        let mut targets: Vec<(String, String, String, String, String)> =
-            vec![(uid.clone(), nick.clone(), host.clone(), addr.clone(), gname.clone())];
+        let mut targets: Vec<(String, String, String, String, String)> = vec![(
+            uid.clone(),
+            nick.clone(),
+            host.clone(),
+            addr.clone(),
+            gname.clone(),
+        )];
         if !recv {
             targets.extend(extra_rcpt.get(&msg_id).cloned().unwrap_or_default());
         }
@@ -250,7 +253,11 @@ pub fn import_ipmsg_db(st: &AppState, path: &Path) -> Result<ImportReport, Strin
             let seen = seen_ids.entry(key.clone()).or_insert_with(|| {
                 st.read_history(&key, usize::MAX)
                     .iter()
-                    .filter_map(|r| r.get("imp").and_then(|i| i.get("id")).and_then(|v| v.as_u64()))
+                    .filter_map(|r| {
+                        r.get("imp")
+                            .and_then(|i| i.get("id"))
+                            .and_then(|v| v.as_u64())
+                    })
                     .collect()
             });
             if !seen.insert(msg_id as u64) {
@@ -296,7 +303,10 @@ pub fn import_ipmsg_db(st: &AppState, path: &Path) -> Result<ImportReport, Strin
         }
     }
 
-    rep.sessions_new = touched.iter().filter(|k| !known_before.contains(*k)).count();
+    rep.sessions_new = touched
+        .iter()
+        .filter(|k| !known_before.contains(*k))
+        .count();
     // 旧版本导入按 IP 拆出的「纯导入」会话文件：按 (昵称, 主机) 归并进目标
     // 会话并删除，清理掉中栏里同一联系人的多个同名会话
     rep.merged_sessions = consolidate_imported_sessions(st, &ident_map);
@@ -331,15 +341,12 @@ fn consolidate_imported_sessions(
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let all_imported = content
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .all(|l| {
-                serde_json::from_str::<serde_json::Value>(l)
-                    .ok()
-                    .and_then(|r| r.get("imp").cloned())
-                    .is_some()
-            });
+        let all_imported = content.lines().filter(|l| !l.trim().is_empty()).all(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .and_then(|r| r.get("imp").cloned())
+                .is_some()
+        });
         if !all_imported {
             continue;
         }
@@ -393,27 +400,25 @@ fn consolidate_imported_sessions(
         if !imp_only {
             continue;
         }
-        let seen = seen_targets
-            .entry(target.clone())
-            .or_insert_with(|| {
-                let tpath = st.log_path(&target);
-                std::fs::read_to_string(&tpath)
-                    .ok()
-                    .map(|c| {
-                        c.lines()
-                            .filter_map(|l| {
-                                serde_json::from_str::<serde_json::Value>(l)
-                                    .ok()
-                                    .and_then(|r| {
-                                        r.get("imp")
-                                            .and_then(|i| i.get("id"))
-                                            .and_then(|v| v.as_u64())
-                                    })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            });
+        let seen = seen_targets.entry(target.clone()).or_insert_with(|| {
+            let tpath = st.log_path(&target);
+            std::fs::read_to_string(&tpath)
+                .ok()
+                .map(|c| {
+                    c.lines()
+                        .filter_map(|l| {
+                            serde_json::from_str::<serde_json::Value>(l)
+                                .ok()
+                                .and_then(|r| {
+                                    r.get("imp")
+                                        .and_then(|i| i.get("id"))
+                                        .and_then(|v| v.as_u64())
+                                })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
         // 逐条去重并改写 peer.key 快照，攒成一次追加
         let mut append = String::new();
         for mut rec in recs {
@@ -466,11 +471,8 @@ mod tests {
     use rusqlite::params;
 
     fn temp_state(tag: &str) -> AppState {
-        let dir = std::env::temp_dir().join(format!(
-            "oim-import-test-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("oim-import-test-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         AppState::new(dir)
@@ -504,7 +506,8 @@ mod tests {
         conn.execute(
             "insert into host_tbl values(2,'bob-<88f54dca963f106a>','Bob','PC-BOB','10.0.0.5','')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "insert into host_tbl values(3,'ipmsg-memo-<0000000000000000>',' [ Memo ] ','localhost','','')",
             [],
@@ -512,7 +515,8 @@ mod tests {
         conn.execute(
             "insert into host_tbl values(4,'carol','Carol','CAROL-PC','','')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         let t: i64 = 1_700_000_000;
         let mid = |sec: i64, n: i64| (sec << 26) | n;
@@ -588,15 +592,9 @@ mod tests {
         assert_eq!(first["peer"]["nickname"], "Alice");
         assert_eq!(first["peer"]["host"], "PC-ALICE");
         assert_eq!(first["peer"]["group"], "研发");
-        assert_eq!(
-            first["peer"]["user"], "alice",
-            "uid 的 -<摘要> 尾巴应剥掉"
-        );
+        assert_eq!(first["peer"]["user"], "alice", "uid 的 -<摘要> 尾巴应剥掉");
         assert_eq!(first["imp"]["db"], "sample");
-        assert_eq!(
-            first["imp"]["id"],
-            ((1_700_000_000i64 << 26) | 1) as u64
-        );
+        assert_eq!(first["imp"]["id"], ((1_700_000_000i64 << 26) | 1) as u64);
 
         // 自己发出的那条
         let out = hist.iter().find(|r| r["text"] == "收到").unwrap();
@@ -685,10 +683,7 @@ mod tests {
             .expect("附件消息应为 file 类型");
         let files = rec["files"].as_array().unwrap();
         assert_eq!(files.len(), 2, "普通附件与剪贴板截图都记录");
-        let names: Vec<&str> = files
-            .iter()
-            .map(|f| f["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = files.iter().map(|f| f["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"报告.zip"));
         assert!(names.contains(&"ipmsgclip_r_1782986553_0.png"));
         for f in files {
@@ -760,16 +755,22 @@ mod tests {
     fn imports_merge_into_existing_session_and_consolidate_old_files() {
         let st = temp_state("mergeexisting");
         // 现有会话：本应用的实时记录（无 imp），IP 192.168.1.50
-        st.log_record("192.168.1.50", &serde_json::json!({
-            "dir": "in", "kind": "text", "text": "现在用的地址", "pkt": 1, "ts": 1_700_000_001,
-            "peer": {"key": "192.168.1.50", "nickname": "Alice", "host": "PC-ALICE"},
-        }));
+        st.log_record(
+            "192.168.1.50",
+            &serde_json::json!({
+                "dir": "in", "kind": "text", "text": "现在用的地址", "pkt": 1, "ts": 1_700_000_001,
+                "peer": {"key": "192.168.1.50", "nickname": "Alice", "host": "PC-ALICE"},
+            }),
+        );
         // 旧版本导入产生的「纯导入」残留：Alice 换过 IP 的另一个文件，只含 imp 记录
-        st.log_record("192.168.1.77", &serde_json::json!({
-            "dir": "in", "kind": "text", "text": "旧地址的历史", "ts": 1_700_000_002,
-            "imp": {"db": "sample", "id": 9001},
-            "peer": {"key": "192.168.1.77", "nickname": "Alice", "host": "PC-ALICE"},
-        }));
+        st.log_record(
+            "192.168.1.77",
+            &serde_json::json!({
+                "dir": "in", "kind": "text", "text": "旧地址的历史", "ts": 1_700_000_002,
+                "imp": {"db": "sample", "id": 9001},
+                "peer": {"key": "192.168.1.77", "nickname": "Alice", "host": "PC-ALICE"},
+            }),
+        );
 
         let db = st.data_dir.join("sample.db");
         make_db(&db);
@@ -847,13 +848,19 @@ mod tests {
         }
         let st = temp_state("realsample");
         let rep = import_ipmsg_db(&st, path).expect("真实样本应能导入");
-        eprintln!("imported={} skipped={} sessions_new={}", rep.imported, rep.skipped, rep.sessions_new);
+        eprintln!(
+            "imported={} skipped={} sessions_new={}",
+            rep.imported, rep.skipped, rep.sessions_new
+        );
         assert!(rep.imported > 0, "真实样本应有消息可导");
 
         // 全库记录健全性：时间合理、方向合法、无备忘录泄漏
         for sess in st.list_sessions() {
             for rec in st.read_history(&sess.key, usize::MAX) {
-                assert!(rec["ts"].as_u64().unwrap_or(0) > 100_000_000, "ts 应为合理 unix 秒");
+                assert!(
+                    rec["ts"].as_u64().unwrap_or(0) > 100_000_000,
+                    "ts 应为合理 unix 秒"
+                );
                 let dir = rec["dir"].as_str().unwrap();
                 assert!(dir == "in" || dir == "out");
                 assert!(
