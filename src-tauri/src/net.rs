@@ -1852,10 +1852,7 @@ async fn handle_sendmsg(
 
     // 从这里往后持久化已确认成功；UI、自动下载、联系人恢复和自动应答等副作用
     // 一律放在这个边界之后。
-    if !is_broadcast && ctx.st.is_hidden(key) {
-        ctx.st.unhide_contact(key);
-        ctx.st.emit("users-updated", json!({}));
-    }
+    let was_unhidden = !is_broadcast && ctx.st.unhide_contact(key);
 
     if !is_broadcast {
         let no_add_list = pkt.command & opt::NOADDLISTOPT != 0;
@@ -1915,14 +1912,11 @@ async fn handle_sendmsg(
                 absence_text: None,
                 vs: metadata.client_version,
             });
-            if added {
-                ctx.st.emit("users-updated", json!({}));
-            }
-            false
+            added
         } else {
             false
         };
-        if metadata_changed {
+        if was_unhidden || metadata_changed {
             ctx.st.emit("users-updated", json!({}));
         }
     }
@@ -5012,6 +5006,8 @@ mod tests {
         });
         st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &sender.public_key())
             .unwrap();
+        st.delete_contact(&key);
+        assert!(st.is_hidden(&key));
         let users_updated = Arc::new(AtomicUsize::new(0));
         let users_updated_in_event = users_updated.clone();
         st.set_event(Box::new(move |event, _| {
@@ -5045,7 +5041,9 @@ mod tests {
             assert!(refreshed.absence);
             assert_eq!(refreshed.port, 2425, "one-shot IP2 source port is not a delivery port");
         }
+        assert!(!st.is_hidden(&key));
         assert_eq!(users_updated.load(Ordering::SeqCst), 1);
+        users_updated.store(0, Ordering::SeqCst);
 
         let mut identical = official_sendmsg_dict("metadata unchanged", 0);
         identical
@@ -5063,7 +5061,7 @@ mod tests {
 
         super::handle_encipdict(&ctx, &identical, from).await;
 
-        assert_eq!(users_updated.load(Ordering::SeqCst), 1);
+        assert_eq!(users_updated.load(Ordering::SeqCst), 0);
         assert_eq!(st.peers.lock().unwrap().get(&key).unwrap().port, 2425);
         let _ = std::fs::remove_dir_all(data_dir);
     }
