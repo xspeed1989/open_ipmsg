@@ -8,7 +8,7 @@ use crate::ipdict::{self as ipd};
 use crate::protocol::{self as proto, cmd, fileattr, opt};
 use crate::state::{
     now_secs, AppState, Config, DirMember, InRecordOutcome, OfferedFile, PeerInfo, PendingOut,
-    RetryOut,
+    RetryOut, VerifiedPeerKeyDecision,
 };
 use serde_json::{json, Value};
 use std::io;
@@ -2761,6 +2761,32 @@ fn peer_from_host_dict(d: &crate::ipdict::Dict) -> Option<PeerInfo> {
 
 /* ================= 官方 v5 密文消息（EncIPDict） ================= */
 
+/// Final trust gate for a key whose signature has already been verified.
+/// Cache comparison/mutation is atomic in AppState; a stale snapshot mismatch
+/// must re-handshake and stop before receive-side business effects.
+async fn commit_verified_encipdict_key(
+    ctx: &NetCtx,
+    from: SocketAddr,
+    key: &str,
+    capa: u32,
+    public: &rsa::RsaPublicKey,
+    inner_len: usize,
+    key_count: usize,
+) -> bool {
+    match ctx.st.commit_verified_peer_key(key, capa, public) {
+        VerifiedPeerKeyDecision::TofuStored
+        | VerifiedPeerKeyDecision::Current
+        | VerifiedPeerKeyDecision::Previous => true,
+        VerifiedPeerKeyDecision::Mismatch => {
+            ctx.st.diag(&format!(
+                "<- {from} EncIPDict stage=trust len={inner_len} keys={key_count} pkt=? command=? 失败：已验签公钥不再是当前或备选密钥"
+            ));
+            crypto_rehandshake(ctx, from, key, "encipdict-key-mismatch").await;
+            false
+        }
+    }
+}
+
 /// 处理一封官方 v5 IPDict 密文消息（完整 `IP2:...:Z` 外层含 EF/EI/EK/EB）。
 async fn handle_encipdict(ctx: &NetCtx, outer: &crate::ipdict::Dict, from: SocketAddr) {
     let key = from.ip().to_string();
@@ -2785,15 +2811,10 @@ async fn handle_encipdict(ctx: &NetCtx, outer: &crate::ipdict::Dict, from: Socke
         }
     };
     let inner_len = inner.pack().len();
-    enum Trust {
-        Tofu(rsa::RsaPublicKey, u32),
-        Current(rsa::RsaPublicKey, u32),
-        Previous,
-    }
     let candidates = ctx.st.peer_pubkeys(&key);
-    let trust = if candidates.is_empty() {
+    let (verified_public, verified_capa) = if candidates.is_empty() {
         match crypto::verify_ipdict(&inner) {
-            Ok(Some((public, capa))) => Trust::Tofu(public, capa),
+            Ok(Some((public, capa))) => (public, capa),
             Ok(None) => {
                 ctx.st.diag(&format!(
                     "<- {from} EncIPDict stage=verify len={inner_len} keys={} pkt=? command=? 缺 SIGN",
@@ -2812,14 +2833,10 @@ async fn handle_encipdict(ctx: &NetCtx, outer: &crate::ipdict::Dict, from: Socke
     } else {
         let mut matched = None;
         let mut failure = None;
-        for (index, candidate) in candidates.iter().enumerate() {
+        for candidate in &candidates {
             match crypto::verify_ipdict_with_key(&inner, candidate) {
                 Ok(Some(capa)) => {
-                    matched = Some(if index == 0 {
-                        Trust::Current(candidate.clone(), capa)
-                    } else {
-                        Trust::Previous
-                    });
+                    matched = Some((candidate.clone(), capa));
                     break;
                 }
                 Ok(None) => {
@@ -2858,11 +2875,18 @@ async fn handle_encipdict(ctx: &NetCtx, outer: &crate::ipdict::Dict, from: Socke
             return;
         }
     };
-    match &trust {
-        Trust::Tofu(public, capa) | Trust::Current(public, capa) => {
-            ctx.st.remember_peer_key(&key, *capa, public);
-        }
-        Trust::Previous => {}
+    if !commit_verified_encipdict_key(
+        ctx,
+        from,
+        &key,
+        verified_capa,
+        &verified_public,
+        inner_len,
+        inner.items.len(),
+    )
+    .await
+    {
+        return;
     }
     let packet = &resolved.packet;
     ctx.st.diag(&format!(
@@ -3803,6 +3827,51 @@ mod tests {
         super::handle_encipdict(&ctx, &trusted_outer, from).await;
         assert_eq!(st.find_in_record(&key, 665500).unwrap()["text"], "trusted");
         assert_eq!(emitted.load(Ordering::SeqCst), 1, "mismatch must not mark PKT seen");
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn encipdict_atomic_trust_mismatch_rehandshakes_without_business_side_effects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("atomic-trust-mismatch").await;
+        let trusted = crate::crypto::KeyPair::generate().unwrap().public_key();
+        let stale_verified = crate::crypto::KeyPair::generate().unwrap().public_key();
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &trusted);
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_in_event = emitted.clone();
+        st.set_event(Box::new(move |event, _| {
+            if event == "msg-in" {
+                emitted_in_event.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        assert!(
+            !super::commit_verified_encipdict_key(
+                &ctx,
+                from,
+                &key,
+                crate::crypto::CAPA_OUR_SEND,
+                &stale_verified,
+                123,
+                9,
+            )
+            .await,
+            "a verified snapshot key that is no longer cached must stop receive dispatch"
+        );
+
+        assert_eq!(st.peer_pubkey(&key), Some(trusted));
+        assert!(st.find_in_record(&key, 665500).is_none());
+        assert_eq!(emitted.load(Ordering::SeqCst), 0);
+        let responses = recv_test_packets(&peer);
+        assert!(responses
+            .iter()
+            .any(|packet| packet.command & 0xff == crate::protocol::cmd::GETPUBKEY));
+        assert!(responses
+            .iter()
+            .all(|packet| packet.command & 0xff != crate::protocol::cmd::RECVMSG));
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

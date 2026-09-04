@@ -238,6 +238,17 @@ struct PeerCryptoEntry {
     prev_key: Option<RsaPublicKey>,
 }
 
+/// A verified embedded peer key's trust result at the instant it is committed.
+/// Cryptographic verification happens before this decision; this type only
+/// describes the atomic comparison against the live peer-key cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerifiedPeerKeyDecision {
+    TofuStored,
+    Current,
+    Previous,
+    Mismatch,
+}
+
 /// peer_keys.json 单条记录：{ip: {capa, n_b64, e_b64}}
 #[derive(Serialize, Deserialize)]
 struct PeerKeyEntry {
@@ -674,6 +685,59 @@ impl AppState {
             }
             None => Vec::new(),
         }
+    }
+
+    /// Compare a cryptographically verified embedded key against the live
+    /// cache and apply the allowed cache update as one atomic operation.
+    /// RSA verification must be completed by the caller before entering here.
+    pub fn commit_verified_peer_key(
+        &self,
+        ip: &str,
+        capa: u32,
+        embedded: &RsaPublicKey,
+    ) -> VerifiedPeerKeyDecision {
+        let decision = {
+            let mut peers = self.peer_crypto.lock().unwrap();
+            match peers.get_mut(ip) {
+                None => {
+                    peers.insert(
+                        ip.to_string(),
+                        PeerCryptoEntry {
+                            capa,
+                            pub_key: embedded.clone(),
+                            prev_key: None,
+                        },
+                    );
+                    if peers.len() > PEER_KEY_CAP {
+                        peers.clear();
+                        peers.insert(
+                            ip.to_string(),
+                            PeerCryptoEntry {
+                                capa,
+                                pub_key: embedded.clone(),
+                                prev_key: None,
+                            },
+                        );
+                    }
+                    VerifiedPeerKeyDecision::TofuStored
+                }
+                Some(entry) if &entry.pub_key == embedded => {
+                    entry.capa = capa;
+                    VerifiedPeerKeyDecision::Current
+                }
+                Some(entry) if entry.prev_key.as_ref() == Some(embedded) => {
+                    VerifiedPeerKeyDecision::Previous
+                }
+                Some(_) => VerifiedPeerKeyDecision::Mismatch,
+            }
+        };
+        if matches!(
+            decision,
+            VerifiedPeerKeyDecision::TofuStored | VerifiedPeerKeyDecision::Current
+        ) {
+            self.persist_peer_keys();
+        }
+        decision
     }
 
     /// 缓存对端公钥并持久化到 peer_keys.json（重启不丢）
@@ -2614,6 +2678,87 @@ mod tests {
         assert!(st.peer_marked_plain("10.0.0.8"));
         assert!(!st.peer_marked_plain("10.0.0.9"));
         assert!(!st2.peer_marked_plain("10.0.0.8"), "明文标记不持久化");
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn concurrent_verified_tofu_commits_choose_one_key_without_overwrite() {
+        use std::sync::Barrier;
+
+        let st = Arc::new(temp_state("concurrent-verified-tofu"));
+        let first = KeyPair::generate().unwrap().public_key();
+        let second = KeyPair::generate().unwrap().public_key();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let spawn_commit = |public: RsaPublicKey, capa| {
+            let st = st.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let decision = st.commit_verified_peer_key("10.0.0.77", capa, &public);
+                (decision, public)
+            })
+        };
+        let a = spawn_commit(first, 0x11);
+        let b = spawn_commit(second, 0x22);
+        barrier.wait();
+
+        let results = [a.join().unwrap(), b.join().unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(decision, _)| *decision == VerifiedPeerKeyDecision::TofuStored)
+                .count(),
+            1,
+            "empty-cache TOFU race must have exactly one winner"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(decision, _)| *decision == VerifiedPeerKeyDecision::Mismatch)
+                .count(),
+            1,
+            "the losing verified key must be rejected rather than overwrite the winner"
+        );
+        let winner = results
+            .iter()
+            .find(|(decision, _)| *decision == VerifiedPeerKeyDecision::TofuStored)
+            .unwrap();
+        assert_eq!(st.peer_pubkey("10.0.0.77"), Some(winner.1.clone()));
+        assert_eq!(
+            st.peer_capa("10.0.0.77"),
+            if winner.1 == results[0].1 { 0x11 } else { 0x22 },
+            "stored capability must belong to the winning key"
+        );
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn verified_stale_current_commit_accepts_previous_without_rollback() {
+        let st = temp_state("verified-stale-current");
+        let formerly_current = KeyPair::generate().unwrap().public_key();
+        let rotated_current = KeyPair::generate().unwrap().public_key();
+        st.remember_peer_key("10.0.0.78", 0x11, &formerly_current);
+
+        let verified_snapshot = st.peer_pubkeys("10.0.0.78");
+        assert_eq!(verified_snapshot, vec![formerly_current.clone()]);
+        st.remember_peer_key("10.0.0.78", 0x22, &rotated_current);
+
+        assert_eq!(
+            st.commit_verified_peer_key("10.0.0.78", 0x33, &verified_snapshot[0]),
+            VerifiedPeerKeyDecision::Previous
+        );
+        assert_eq!(st.peer_pubkey("10.0.0.78"), Some(rotated_current.clone()));
+        assert_eq!(
+            st.peer_pubkeys("10.0.0.78"),
+            vec![rotated_current, formerly_current],
+            "accepting a stale verified snapshot must not rotate it back to current"
+        );
+        assert_eq!(
+            st.peer_capa("10.0.0.78"),
+            0x22,
+            "Previous must not update the current key's capability"
+        );
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
