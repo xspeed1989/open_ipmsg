@@ -612,6 +612,13 @@ async fn async_run() -> bool {
     // 真实场景：关掉程序再打开，对端把没确认的历史消息按原包号重投一遍。
     // 这里用「同一数据目录 + 新端口的第二套网络栈」模拟一次重启。
     let receipts_before = shared.lock().unwrap().receipts.iter().filter(|p| **p == 777123).count();
+    let delivery_acks_before = shared
+        .lock()
+        .unwrap()
+        .recv_acks
+        .iter()
+        .filter(|p| **p == 777123)
+        .count();
     let port_app2 = free_udp_port().await;
     let st2 = Arc::new(AppState::new(data_dir.clone()));
     let mut cfg2 = Config::default();
@@ -625,14 +632,22 @@ async fn async_run() -> bool {
         .expect("restart network");
     net::announce_unicast(&ctx2, &[peer_addr]).await;
 
+    // 重投是同 payload identity 的 duplicate，正确行为是不改写历史。
+    // 因此不能再用“历史正文出现 delayed footer”判断应用已收到；
+    // 让本次重投带 SENDCHECKOPT，以对端收到新的 RECVMSG 作为网络栈
+    // 确已处理该报文的可观测信号。
     let resent = wait_for(4000, || {
-        st2.read_history(&peer_key, 100).iter().any(|r| {
-            r["pkt"].as_u64() == Some(777123)
-                && r["text"].as_str().map(|t| t.contains("Delayed Send")).unwrap_or(false)
-        })
+        shared
+            .lock()
+            .unwrap()
+            .recv_acks
+            .iter()
+            .filter(|p| **p == 777123)
+            .count()
+            > delivery_acks_before
     })
     .await;
-    log.check("重启后收到对端重投的延迟消息", resent);
+    log.check("重启后处理对端重投的延迟消息（再次回 RECVMSG）", resent);
 
     let hist = st2.read_history(&peer_key, 200);
     let copies = hist
@@ -642,6 +657,13 @@ async fn async_run() -> bool {
     log.check(
         &format!("重投不产生重复历史记录（实际 {copies} 条）"),
         copies == 1,
+    );
+    log.check(
+        "重投不改写首投正文（延迟尾注仅属于传输元数据）",
+        hist.iter()
+            .find(|r| r["pkt"].as_u64() == Some(777123))
+            .and_then(|r| r["text"].as_str())
+            == Some("带回执的消息"),
     );
     log.check(
         "重投副本继承已读状态（不再被当成新未读）",
@@ -1588,7 +1610,7 @@ fn spawn_fake_peer(
                                 pkt_no: 777123,
                                 user: "假对端".into(),
                                 host: "fake-host".into(),
-                                command: cmd::SENDMSG | opt::READCHECKOPT,
+                                command: cmd::SENDMSG | opt::READCHECKOPT | opt::SENDCHECKOPT,
                                 // 重发副本正文带尾注，与首投并不逐字相同
                                 extra: "带回执的消息\n----\n(IPMsg Delayed Send: 19:18 )"
                                     .as_bytes()
