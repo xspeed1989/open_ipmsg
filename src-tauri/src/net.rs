@@ -1859,27 +1859,44 @@ async fn handle_sendmsg(
 
     if !is_broadcast {
         let no_add_list = pkt.command & opt::NOADDLISTOPT != 0;
-        if let Some(mut existing) = existing_peer {
-            existing.last_seen = now_secs();
-            if peer_metadata.is_some() {
-                existing.host = pkt.host.clone();
-                existing.user = pkt.user.clone();
-                if let Some(nickname) = metadata_nickname {
-                    existing.nickname = proto::strip_control(nickname);
+        let metadata_changed = if existing_peer.is_some() {
+            let nickname = metadata_nickname.map(proto::strip_control);
+            let group = metadata_group.map(proto::strip_control);
+            let version = peer_metadata
+                .and_then(|metadata| metadata.client_version.as_deref())
+                .map(proto::strip_control);
+            let absence = peer_metadata
+                .and_then(|metadata| metadata.status)
+                .map(|status| status & opt::ABSENCEOPT != 0);
+            let mut peers = ctx.st.peers.lock().unwrap();
+            match peers.get_mut(key) {
+                Some(existing) => {
+                    existing.last_seen = now_secs();
+                    let mut changed = false;
+                    if peer_metadata.is_some() {
+                        existing.host = pkt.host.clone();
+                        existing.user = pkt.user.clone();
+                        if let Some(nickname) = nickname {
+                            changed |= existing.nickname != nickname;
+                            existing.nickname = nickname;
+                        }
+                        if let Some(group) = group {
+                            changed |= existing.group != group;
+                            existing.group = group;
+                        }
+                        if let Some(version) = version {
+                            changed |= existing.vs.as_deref() != Some(version.as_str());
+                            existing.vs = Some(version);
+                        }
+                        if let Some(absence) = absence {
+                            changed |= existing.absence != absence;
+                            existing.absence = absence;
+                        }
+                    }
+                    changed
                 }
-                if let Some(group) = metadata_group {
-                    existing.group = proto::strip_control(group);
-                }
-                if let Some(version) =
-                    peer_metadata.and_then(|metadata| metadata.client_version.as_deref())
-                {
-                    existing.vs = Some(proto::strip_control(version));
-                }
-                if let Some(status) = peer_metadata.and_then(|metadata| metadata.status) {
-                    existing.absence = status & opt::ABSENCEOPT != 0;
-                }
+                None => false,
             }
-            ctx.st.peers.lock().unwrap().insert(key.to_string(), existing);
         } else if !no_add_list {
             let metadata = peer_metadata.cloned().unwrap_or_default();
             let added = ctx.st.upsert_peer(PeerInfo {
@@ -1901,6 +1918,12 @@ async fn handle_sendmsg(
             if added {
                 ctx.st.emit("users-updated", json!({}));
             }
+            false
+        } else {
+            false
+        };
+        if metadata_changed {
+            ctx.st.emit("users-updated", json!({}));
         }
     }
 
@@ -4619,6 +4642,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classic_decrypt_failure_does_not_poison_same_packet_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("classic-decrypt-retry").await;
+        let sender = crate::crypto::KeyPair::generate().unwrap();
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        let pkt_no = 665507;
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_in_event = emitted.clone();
+        st.set_event(Box::new(move |event, _| {
+            if event == "msg-in" {
+                emitted_in_event.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        let mut invalid = crate::protocol::Packet::new(
+            crate::protocol::cmd::SENDMSG
+                | crate::protocol::opt::ENCRYPTOPT
+                | crate::protocol::opt::SENDCHECKOPT,
+        )
+        .with_pkt_no(pkt_no);
+        invalid.extra = b"not-a-classic-encrypted-message".to_vec();
+        super::handle_datagram(&ctx, &invalid.encode("sender", "classic-host"), from).await;
+        assert!(st.find_in_record(&key, pkt_no).is_none());
+        let _ = recv_test_packets(&peer);
+
+        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &sender.public_key())
+            .unwrap();
+        let mut valid = crate::protocol::Packet::new(
+            crate::protocol::cmd::SENDMSG
+                | crate::protocol::opt::ENCRYPTOPT
+                | crate::protocol::opt::SENDCHECKOPT,
+        )
+        .with_pkt_no(pkt_no);
+        valid.extra = crate::crypto::seal_message(
+            &st.own_keypair().public_key(),
+            &sender,
+            &super::plain_payload(b"valid retry"),
+        )
+        .unwrap()
+        .into_bytes();
+
+        super::handle_datagram(&ctx, &valid.encode("sender", "classic-host"), from).await;
+
+        assert_eq!(st.find_in_record(&key, pkt_no).unwrap()["text"], "valid retry");
+        assert_eq!(emitted.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            recv_test_packets(&peer)
+                .iter()
+                .filter(|packet| packet.command & 0xff == crate::protocol::cmd::RECVMSG)
+                .count(),
+            1,
+            "the successful retry must receive its SENDCHECK ACK"
+        );
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn classic_passwordopt_identity_conflict_resets_read_unlock_and_file_state() {
         let (ctx, st, peer, data_dir) = encipdict_test_ctx("classic-password-conflict").await;
         let from = peer.local_addr().unwrap();
@@ -4904,6 +4986,85 @@ mod tests {
         let record = st.find_in_record(&key, 665500).unwrap();
         assert_eq!(record["peer"]["nickname"], "Display Name");
         assert_eq!(record["peer"]["group"], "Research");
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn trusted_encipdict_metadata_change_notifies_once_without_replacing_peer_port() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("metadata-users-updated").await;
+        let sender = crate::crypto::KeyPair::generate().unwrap();
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        st.upsert_peer(PeerInfo {
+            key: key.clone(),
+            ip: key.clone(),
+            port: 2425,
+            nickname: "Old Nick".into(),
+            group: "Old Group".into(),
+            host: "win-host".into(),
+            user: "sender".into(),
+            last_seen: 0,
+            absence: false,
+            absence_text: None,
+            vs: Some("05070000".into()),
+        });
+        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &sender.public_key())
+            .unwrap();
+        let users_updated = Arc::new(AtomicUsize::new(0));
+        let users_updated_in_event = users_updated.clone();
+        st.set_event(Box::new(move |event, _| {
+            if event == "users-updated" {
+                users_updated_in_event.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        let mut changed = official_sendmsg_dict("metadata changed", 0);
+        changed
+            .put_int(crate::ipdict::DICT_PKT, 665508)
+            .put_str(crate::ipdict::DICT_NCK, "Refreshed Nick")
+            .put_str(crate::ipdict::DICT_GRP, "Refreshed Group")
+            .put_str(crate::ipdict::DICT_CVER, "05080006")
+            .put_int(crate::ipdict::DICT_STAT, crate::protocol::opt::ABSENCEOPT as i64);
+        let changed = crate::crypto::seal_encipdict(
+            &st.own_keypair().public_key(),
+            &sender,
+            &changed,
+        )
+        .unwrap();
+
+        super::handle_encipdict(&ctx, &changed, from).await;
+
+        {
+            let peers = st.peers.lock().unwrap();
+            let refreshed = peers.get(&key).unwrap();
+            assert_eq!(refreshed.nickname, "Refreshed Nick");
+            assert_eq!(refreshed.group, "Refreshed Group");
+            assert_eq!(refreshed.vs.as_deref(), Some("05080006"));
+            assert!(refreshed.absence);
+            assert_eq!(refreshed.port, 2425, "one-shot IP2 source port is not a delivery port");
+        }
+        assert_eq!(users_updated.load(Ordering::SeqCst), 1);
+
+        let mut identical = official_sendmsg_dict("metadata unchanged", 0);
+        identical
+            .put_int(crate::ipdict::DICT_PKT, 665509)
+            .put_str(crate::ipdict::DICT_NCK, "Refreshed Nick")
+            .put_str(crate::ipdict::DICT_GRP, "Refreshed Group")
+            .put_str(crate::ipdict::DICT_CVER, "05080006")
+            .put_int(crate::ipdict::DICT_STAT, crate::protocol::opt::ABSENCEOPT as i64);
+        let identical = crate::crypto::seal_encipdict(
+            &st.own_keypair().public_key(),
+            &sender,
+            &identical,
+        )
+        .unwrap();
+
+        super::handle_encipdict(&ctx, &identical, from).await;
+
+        assert_eq!(users_updated.load(Ordering::SeqCst), 1);
+        assert_eq!(st.peers.lock().unwrap().get(&key).unwrap().port, 2425);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
