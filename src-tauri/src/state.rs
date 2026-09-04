@@ -309,7 +309,7 @@ fn replace_peer_key_file(temp: &std::path::Path, target: &std::path::Path) -> st
 fn replace_peer_key_file(temp: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
-    #[link(name = "Kernel32")]
+    #[link(name = "kernel32")]
     extern "system" {
         fn MoveFileExW(
             existing_file_name: *const u16,

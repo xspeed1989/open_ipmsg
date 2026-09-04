@@ -36,6 +36,7 @@ const IPV6_MCAST_LINK: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 
 /// 枚举本机 IPv6 接口（scope_id ≥ 1 才可用）：返回 (scope_id, 全局地址集合)。
 /// 用于组播加入与按接口发送（链路组播需要接口作用域）。
+#[cfg(unix)]
 fn v6_ifaces() -> Vec<(u32, Ipv6Addr)> {
     let mut out = Vec::new();
     unsafe {
@@ -64,6 +65,66 @@ fn v6_ifaces() -> Vec<(u32, Ipv6Addr)> {
         libc::freeifaddrs(ifap);
     }
     out
+}
+
+/// Windows 没有 `getifaddrs`；通过 IP Helper API 读取 IPv6 地址及接口索引。
+#[cfg(windows)]
+fn v6_ifaces() -> Vec<(u32, Ipv6Addr)> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET6, SOCKADDR_IN6};
+
+    // GetAdaptersAddresses 文档建议先给 15 KiB，若不足则按返回尺寸重试。
+    let mut buffer_size = 15_000_u32;
+    loop {
+        // 用 usize 作为存储单元，保证转换后的结构体指针满足对齐要求。
+        let words = (buffer_size as usize).div_ceil(size_of::<usize>());
+        let mut buffer = vec![0_usize; words];
+        let first = buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+        let result = unsafe {
+            GetAdaptersAddresses(
+                AF_INET6 as u32,
+                0,
+                std::ptr::null(),
+                first,
+                &mut buffer_size,
+            )
+        };
+        if result == ERROR_BUFFER_OVERFLOW {
+            continue;
+        }
+        if result != ERROR_SUCCESS {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        let mut adapter = first;
+        unsafe {
+            while !adapter.is_null() {
+                let scope = (*adapter).Ipv6IfIndex;
+                let mut unicast = (*adapter).FirstUnicastAddress;
+                while scope != 0 && !unicast.is_null() {
+                    let sockaddr = (*unicast).Address.lpSockaddr;
+                    if !sockaddr.is_null() && (*sockaddr).sa_family == AF_INET6 {
+                        let sin6 = &*sockaddr.cast::<SOCKADDR_IN6>();
+                        let addr = Ipv6Addr::from(sin6.sin6_addr.u.Byte);
+                        if !addr.is_unspecified()
+                            && !addr.is_loopback()
+                            && !out.iter().any(|(s, a)| *s == scope && a == &addr)
+                        {
+                            out.push((scope, addr));
+                        }
+                    }
+                    unicast = (*unicast).Next;
+                }
+                adapter = (*adapter).Next;
+            }
+        }
+        return out;
+    }
 }
 
 /// 创建 IPv6 组播套接字：绑定 [::]:端口，逐接口加入 ff15::979 与 ff02::1。
