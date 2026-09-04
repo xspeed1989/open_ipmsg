@@ -1057,10 +1057,9 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
     // 会话身份 = 对端 IP（同 IP 不同源端口是同一台主机，见 upsert_peer 注释）
     let key = from.ip().to_string();
 
-    if !ctx.st.mark_seen(from.ip(), pkt.pkt_no) {
-        if base == cmd::SENDMSG && ctx.st.find_in_record(&key, pkt.pkt_no).is_some() {
-            let _ = ack_classic_sendmsg(ctx, from, &key, &pkt).await;
-        }
+    // SENDMSG 不能只按 (IP, PKT) 做内存去重：同一包号可能承载新的 payload。
+    // 它必须先完成解密与 identity 计算，再由持久化历史原子判定 duplicate/conflict。
+    if base != cmd::SENDMSG && !ctx.st.mark_seen(from.ip(), pkt.pkt_no) {
         return; // 重复包
     }
 
@@ -1287,7 +1286,6 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                     let _ = ack_classic_sendmsg(ctx, from, &key, &pkt).await;
                 }
                 Err(error) => {
-                    ctx.st.forget_seen(from.ip(), pkt.pkt_no);
                     ctx.st.diag(&format!(
                         "<- {from} SENDMSG stage=persist pkt={} command={:#010x} 失败：{error}",
                         pkt.pkt_no, pkt.command
@@ -1848,7 +1846,7 @@ async fn handle_sendmsg(
         .st
         .upsert_in_record_fallible(session_key, &record)
         .map_err(|error| format!("聊天记录持久化失败：{error}"))?;
-    if verified_payload && outcome == InRecordOutcome::Duplicate {
+    if outcome == InRecordOutcome::Duplicate {
         return Ok(outcome);
     }
 
@@ -1920,10 +1918,9 @@ async fn handle_sendmsg(
         }
     }
 
-    let resend = !verified_payload && outcome != InRecordOutcome::Inserted;
     ctx.st.emit(
         "msg-in",
-        json!({"key": session_key, "msg": record, "resend": resend}),
+        json!({"key": session_key, "msg": record, "resend": false}),
     );
 
     if !is_broadcast {
@@ -4466,6 +4463,159 @@ mod tests {
             super::classic_payload_identity(&different_canonical_id),
             "different canonical file IDs must not collide even when all other metadata matches"
         );
+
+        let whitespace_raw_id =
+            classic_identity_packet(b"file\x00 10 :same.txt:20:1234:1:8=0:\x07", command);
+        assert_eq!(
+            crate::protocol::parse_file_entries(&whitespace_raw_id.extra)[0].id,
+            decimal_file[0].id
+        );
+        assert_ne!(
+            super::classic_payload_identity(&decimal_id),
+            super::classic_payload_identity(&whitespace_raw_id),
+            "distinct raw file-ID spelling must remain identity-bearing"
+        );
+    }
+
+    #[test]
+    fn classic_identity_covers_attachment_order_metadata_and_semantic_flags() {
+        let command = crate::protocol::cmd::SENDMSG
+            | crate::protocol::opt::UTF8OPT
+            | crate::protocol::opt::FILEATTACHOPT;
+        let base_extra = b"file\x0010:a.txt:20:1234:1:8=0:9=x:\x0711:b.txt:30:1235:1:8=1:\x07";
+        let base = classic_identity_packet(base_extra, command);
+        let base_identity = super::classic_payload_identity(&base);
+        let variants: &[(&str, &[u8], u32)] = &[
+            (
+                "file order",
+                b"file\x0011:b.txt:30:1235:1:8=1:\x0710:a.txt:20:1234:1:8=0:9=x:\x07",
+                command,
+            ),
+            (
+                "extension order",
+                b"file\x0010:a.txt:20:1234:1:9=x:8=0:\x0711:b.txt:30:1235:1:8=1:\x07",
+                command,
+            ),
+            (
+                "name",
+                b"file\x0010:c.txt:20:1234:1:8=0:9=x:\x0711:b.txt:30:1235:1:8=1:\x07",
+                command,
+            ),
+            (
+                "size",
+                b"file\x0010:a.txt:21:1234:1:8=0:9=x:\x0711:b.txt:30:1235:1:8=1:\x07",
+                command,
+            ),
+            (
+                "mtime",
+                b"file\x0010:a.txt:20:1236:1:8=0:9=x:\x0711:b.txt:30:1235:1:8=1:\x07",
+                command,
+            ),
+            (
+                "attr",
+                b"file\x0010:a.txt:20:1234:2:8=0:9=x:\x0711:b.txt:30:1235:1:8=1:\x07",
+                command,
+            ),
+            (
+                "READCHECKOPT",
+                base_extra,
+                command | crate::protocol::opt::READCHECKOPT,
+            ),
+        ];
+
+        for (label, extra, variant_command) in variants {
+            let variant = classic_identity_packet(extra, *variant_command);
+            assert_ne!(
+                base_identity,
+                super::classic_payload_identity(&variant),
+                "{label} must change classic payload identity"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn classic_datagram_same_packet_different_payload_is_persisted_and_emitted() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("classic-entry-conflict").await;
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emitted_in_event = emitted.clone();
+        st.set_event(Box::new(move |event, value| {
+            if event == "msg-in" {
+                emitted_in_event.lock().unwrap().push(value);
+            }
+        }));
+        let pkt_no = 665505;
+        let mut first = crate::protocol::Packet::new(
+            crate::protocol::cmd::SENDMSG | crate::protocol::opt::SENDCHECKOPT,
+        )
+        .with_pkt_no(pkt_no);
+        first.extra = b"first payload".to_vec();
+        let mut replacement = crate::protocol::Packet::new(
+            crate::protocol::cmd::SENDMSG
+                | crate::protocol::opt::SENDCHECKOPT
+                | crate::protocol::opt::SECRETOPT
+                | crate::protocol::opt::PASSWORDOPT,
+        )
+        .with_pkt_no(pkt_no);
+        replacement.extra = b"replacement password payload".to_vec();
+
+        super::handle_datagram(&ctx, &first.encode("sender", "classic-host"), from).await;
+        st.mark_in_read(&key, &[pkt_no]);
+        super::handle_datagram(
+            &ctx,
+            &replacement.encode("sender", "classic-host"),
+            from,
+        )
+        .await;
+
+        let record = st.find_in_record(&key, pkt_no).unwrap();
+        assert_eq!(record["text"], "replacement password payload");
+        assert_eq!(record["read"], false);
+        assert_eq!(record["locked"], true);
+        assert_eq!(record["unlocked"], false);
+        let emitted = emitted.lock().unwrap();
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[1]["msg"]["text"], "replacement password payload");
+        assert_eq!(emitted[1]["resend"], false);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn classic_datagram_exact_retry_emits_once_and_acks_every_delivery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("classic-entry-duplicate").await;
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_in_event = emitted.clone();
+        st.set_event(Box::new(move |event, _| {
+            if event == "msg-in" {
+                emitted_in_event.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let mut packet = crate::protocol::Packet::new(
+            crate::protocol::cmd::SENDMSG | crate::protocol::opt::SENDCHECKOPT,
+        )
+        .with_pkt_no(665506);
+        packet.extra = b"same payload".to_vec();
+        let wire = packet.encode("sender", "classic-host");
+
+        super::handle_datagram(&ctx, &wire, from).await;
+        super::handle_datagram(&ctx, &wire, from).await;
+
+        assert_eq!(st.read_history(&key, 50).len(), 1);
+        assert_eq!(emitted.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            recv_test_packets(&peer)
+                .iter()
+                .filter(|packet| packet.command & 0xff == crate::protocol::cmd::RECVMSG)
+                .count(),
+            2,
+            "an exact persistent duplicate still needs a fresh ACK"
+        );
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]
@@ -5209,6 +5359,47 @@ mod tests {
     fn file_request_inner_omits_offset_when_zero() {
         let inner = file_request_inner("1f", "2a", 0, &"ab".repeat(32));
         assert_eq!(inner, format!("1f:2a:900000:{}", "ab".repeat(32)));
+    }
+
+    #[tokio::test]
+    async fn plaintext_getfile_request_echoes_raw_file_id_exactly() {
+        let (ctx, _st, _peer, data_dir) = encipdict_test_ctx("raw-file-id-request").await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 2048];
+            let len = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap();
+            request.truncate(len);
+            request
+        });
+
+        let pkt_no = 665507;
+        let (stream, encrypted) = super::open_transfer(
+            &ctx,
+            target,
+            pkt_no,
+            10,
+            " 10 ",
+            crate::protocol::cmd::GETFILEDATA,
+            super::DIALECTS[0],
+            0,
+        )
+        .await
+        .unwrap();
+        let request = server.await.unwrap();
+        drop(stream);
+
+        assert!(!encrypted);
+        assert!(
+            request.ends_with(format!(":{pkt_no}: 10 :0\n").as_bytes()),
+            "GETFILEDATA must echo the advertised raw ID bytes: {:?}",
+            String::from_utf8_lossy(&request)
+        );
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }
 
@@ -6255,10 +6446,10 @@ pub(crate) async fn open_transfer(
     } else {
         pkt_no.to_string()
     };
-    let id_field = if d.hex_id || rid.trim().is_empty() {
+    let id_field = if d.hex_id || rid.is_empty() {
         format!("{file_id:x}")
     } else {
-        rid.trim().to_string()
+        rid.to_string()
     };
     // CTR nonce 由 TCP 请求行的包号派生：收发双方都拿它当密钥流种子（spec §7）
     let req_pkt_no = proto::next_packet_no();

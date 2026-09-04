@@ -424,7 +424,7 @@ pub fn parse_file_entries(extra: &[u8]) -> Vec<FileEntry> {
             if fields.len() < 5 {
                 return None;
             }
-            let raw_id = String::from_utf8_lossy(&fields[0]).trim().to_string();
+            let raw_id = String::from_utf8_lossy(&fields[0]).into_owned();
             // 本环境对端（飞秋）ID 为十进制书写；含字母时自动按十六进制兜底
             let id = num_dec_first(&raw_id)?;
             let name = decode_bytes(&fields[1]);
@@ -906,10 +906,20 @@ mod tests {
         let fs = parse_file_entries(raw);
         assert_eq!(fs.len(), 1);
         // raw_id 必须原样保留，回传 GETFILEDATA 时按原字符串回显
-        assert_eq!(fs[0].raw_id, "89000344");
+        assert_eq!(fs[0].raw_id, " 89000344");
         assert_eq!(fs[0].name, "Microsoft Edge.lnk");
         assert_eq!(fs[0].size, 0x8d4); // 2260 字节
         assert_eq!(fs[0].mtime, 0x6a894407);
+    }
+
+    #[test]
+    fn file_entry_preserves_raw_id_whitespace_while_parsing_numeric_id() {
+        let raw = b"body\x00 10 :report.txt:20:1234:1:\x07";
+        let files = parse_file_entries(raw);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, 10);
+        assert_eq!(files[0].raw_id, " 10 ");
     }
 
     #[test]

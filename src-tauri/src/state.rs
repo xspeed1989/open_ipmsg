@@ -1643,7 +1643,12 @@ impl AppState {
             }
             Err(error) => return Err(error),
         };
-        let new_identity = rec.get("payload_id").and_then(|value| value.as_str());
+        let identity_field = ["payload_id", "classic_payload_id"]
+            .into_iter()
+            .find(|field| rec.get(*field).and_then(|value| value.as_str()).is_some());
+        let new_identity = identity_field
+            .and_then(|field| rec.get(field))
+            .and_then(|value| value.as_str());
         let mut parsed_lines: Vec<(String, Option<serde_json::Value>)> = Vec::new();
         let mut matching_indices = Vec::new();
         for line in content.lines() {
@@ -1658,10 +1663,8 @@ impl AppState {
         }
 
         if matching_indices.iter().any(|index| {
-            let old_identity = parsed_lines[*index]
-                .1
-                .as_ref()
-                .and_then(|old| old.get("payload_id"))
+            let old_identity = identity_field
+                .and_then(|field| parsed_lines[*index].1.as_ref()?.get(field))
                 .and_then(|value| value.as_str());
             new_identity.is_some() && old_identity == new_identity
         }) {
@@ -1669,12 +1672,14 @@ impl AppState {
         }
 
         if let Some(first_index) = matching_indices.first().copied() {
-            let legacy_without_identity = new_identity.is_none()
+            let legacy_without_identity = identity_field.is_none()
                 && parsed_lines[first_index]
                     .1
                     .as_ref()
-                    .and_then(|old| old.get("payload_id"))
-                    .is_none();
+                    .is_some_and(|old| {
+                        old.get("payload_id").is_none()
+                            && old.get("classic_payload_id").is_none()
+                    });
             let mut replacement = rec.clone();
             if legacy_without_identity {
                 // 导入记录和旧版无 identity 记录沿用旧封装行为；已认证入站
