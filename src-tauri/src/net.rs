@@ -771,8 +771,14 @@ fn maybe_withdraw_peer_key(
     cfg: &Config,
 ) {
     if cfg.encrypt && pkt.command & opt::ENCRYPTOPT == 0 && ctx.st.peer_pubkey(key).is_some() {
-        ctx.st.forget_peer_key(key);
-        ctx.st.diag(&format!("<- {from} 上线通告未声明 ENCRYPTOPT，撤回该对端公钥缓存"));
+        match ctx.st.forget_peer_key(key) {
+            Ok(()) => ctx.st.diag(&format!(
+                "<- {from} 上线通告未声明 ENCRYPTOPT，撤回该对端公钥缓存"
+            )),
+            Err(error) => ctx.st.diag(&format!(
+                "<- {from} 上线通告未声明 ENCRYPTOPT，撤回该对端公钥缓存失败：{error}"
+            )),
+        }
     }
 }
 
@@ -1533,8 +1539,14 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             // 或非标长度模数等互通格式差异（2026-08 现场排查用）
             match crypto::parse_anspubkey(&String::from_utf8_lossy(&pkt.extra)) {
                 Some((capa, pubk)) => {
-                    ctx.st.remember_peer_key(&key, capa, &pubk);
-                    ctx.st.diag(&format!("<- {from} ANSPUBKEY 已缓存 capa={capa:X}"));
+                    match ctx.st.remember_peer_key(&key, capa, &pubk) {
+                        Ok(()) => ctx
+                            .st
+                            .diag(&format!("<- {from} ANSPUBKEY 已缓存 capa={capa:X}")),
+                        Err(error) => ctx.st.diag(&format!(
+                            "<- {from} ANSPUBKEY 缓存失败 capa={capa:X}：{error}"
+                        )),
+                    }
                 }
                 None => {
                     let s = String::from_utf8_lossy(&pkt.extra);
@@ -2761,6 +2773,51 @@ fn peer_from_host_dict(d: &crate::ipdict::Dict) -> Option<PeerInfo> {
 
 /* ================= 官方 v5 密文消息（EncIPDict） ================= */
 
+#[cfg(test)]
+#[derive(Default)]
+struct EncipdictAfterVerifyHook {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+fn encipdict_after_verify_hooks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<EncipdictAfterVerifyHook>>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<EncipdictAfterVerifyHook>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_encipdict_after_verify_hook(
+    data_dir: &std::path::Path,
+    hook: Option<Arc<EncipdictAfterVerifyHook>>,
+) {
+    let mut hooks = encipdict_after_verify_hooks().lock().unwrap();
+    match hook {
+        Some(hook) => {
+            hooks.insert(data_dir.to_path_buf(), hook);
+        }
+        None => {
+            hooks.remove(data_dir);
+        }
+    }
+}
+
+#[cfg(test)]
+async fn wait_for_encipdict_after_verify_hook(data_dir: &std::path::Path) {
+    let hook = encipdict_after_verify_hooks()
+        .lock()
+        .unwrap()
+        .get(data_dir)
+        .cloned();
+    if let Some(hook) = hook {
+        hook.reached.notify_one();
+        hook.resume.notified().await;
+    }
+}
+
 /// Final trust gate for a key whose signature has already been verified.
 /// Cache comparison/mutation is atomic in AppState; a stale snapshot mismatch
 /// must re-handshake and stop before receive-side business effects.
@@ -2774,14 +2831,22 @@ async fn commit_verified_encipdict_key(
     key_count: usize,
 ) -> bool {
     match ctx.st.commit_verified_peer_key(key, capa, public) {
-        VerifiedPeerKeyDecision::TofuStored
-        | VerifiedPeerKeyDecision::Current
-        | VerifiedPeerKeyDecision::Previous => true,
-        VerifiedPeerKeyDecision::Mismatch => {
+        Ok(
+            VerifiedPeerKeyDecision::TofuStored
+            | VerifiedPeerKeyDecision::Current
+            | VerifiedPeerKeyDecision::Previous,
+        ) => true,
+        Ok(VerifiedPeerKeyDecision::Mismatch) => {
             ctx.st.diag(&format!(
                 "<- {from} EncIPDict stage=trust len={inner_len} keys={key_count} pkt=? command=? 失败：已验签公钥不再是当前或备选密钥"
             ));
             crypto_rehandshake(ctx, from, key, "encipdict-key-mismatch").await;
+            false
+        }
+        Err(error) => {
+            ctx.st.diag(&format!(
+                "<- {from} EncIPDict stage=trust len={inner_len} keys={key_count} pkt=? command=? 失败：公钥缓存持久化失败：{error}"
+            ));
             false
         }
     }
@@ -2865,6 +2930,8 @@ async fn handle_encipdict(ctx: &NetCtx, outer: &crate::ipdict::Dict, from: Socke
             }
         }
     };
+    #[cfg(test)]
+    wait_for_encipdict_after_verify_hook(&ctx.st.data_dir).await;
     let resolved = match resolve_ipdict_message(&inner) {
         Ok(resolved) => resolved,
         Err(error) => {
@@ -3759,12 +3826,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn encipdict_tofu_persistence_failure_has_no_memory_or_business_side_effects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("tofu-persist-failure").await;
+        let sender = crate::crypto::KeyPair::generate().unwrap();
+        let inner = official_sendmsg_dict("must-not-dispatch", crate::protocol::opt::SENDCHECKOPT);
+        let outer = crate::crypto::seal_encipdict(
+            &st.own_keypair().public_key(),
+            &sender,
+            &inner,
+        )
+        .unwrap();
+        std::fs::create_dir_all(&st.logs_dir).unwrap();
+        std::fs::write(st.logs_dir.join("writable-probe"), b"ok").unwrap();
+        std::fs::create_dir(data_dir.join("peer_keys.json")).unwrap();
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_in_event = emitted.clone();
+        st.set_event(Box::new(move |event, _| {
+            if event == "msg-in" {
+                emitted_in_event.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        super::handle_encipdict(&ctx, &outer, from).await;
+
+        assert!(st.peer_pubkey(&key).is_none(), "failed TOFU must not publish memory state");
+        assert!(st.find_in_record(&key, 665500).is_none());
+        assert_eq!(emitted.load(Ordering::SeqCst), 0);
+        assert!(recv_test_packets(&peer)
+            .iter()
+            .all(|packet| packet.command & 0xff != crate::protocol::cmd::RECVMSG));
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn encipdict_known_current_key_verifies_without_rotating_cache() {
         let (ctx, st, peer, data_dir) = encipdict_test_ctx("known-current").await;
         let sender = crate::crypto::KeyPair::generate().unwrap();
         let from = peer.local_addr().unwrap();
         let key = from.ip().to_string();
-        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &sender.public_key());
+        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &sender.public_key())
+            .unwrap();
         let inner = official_sendmsg_dict("known-current", 0);
         let outer = crate::crypto::seal_encipdict(
             &st.own_keypair().public_key(),
@@ -3789,7 +3894,8 @@ mod tests {
         let attacker = crate::crypto::KeyPair::generate().unwrap();
         let from = peer.local_addr().unwrap();
         let key = from.ip().to_string();
-        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &trusted.public_key());
+        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &trusted.public_key())
+            .unwrap();
         let emitted = Arc::new(AtomicUsize::new(0));
         let emitted_in_event = emitted.clone();
         st.set_event(Box::new(move |event, _| {
@@ -3839,7 +3945,8 @@ mod tests {
         let stale_verified = crate::crypto::KeyPair::generate().unwrap().public_key();
         let from = peer.local_addr().unwrap();
         let key = from.ip().to_string();
-        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &trusted);
+        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &trusted)
+            .unwrap();
         let emitted = Arc::new(AtomicUsize::new(0));
         let emitted_in_event = emitted.clone();
         st.set_event(Box::new(move |event, _| {
@@ -3882,8 +3989,10 @@ mod tests {
         let current = crate::crypto::KeyPair::generate().unwrap();
         let from = peer.local_addr().unwrap();
         let key = from.ip().to_string();
-        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &previous.public_key());
-        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &current.public_key());
+        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &previous.public_key())
+            .unwrap();
+        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &current.public_key())
+            .unwrap();
         assert_eq!(st.peer_pubkeys(&key), vec![current.public_key(), previous.public_key()]);
         let inner = official_sendmsg_dict("previous-key", 0);
         let outer = crate::crypto::seal_encipdict(
@@ -3898,6 +4007,47 @@ mod tests {
         assert_eq!(st.find_in_record(&key, 665500).unwrap()["text"], "previous-key");
         assert_eq!(st.peer_pubkey(&key), Some(current.public_key()));
         assert_eq!(st.peer_pubkeys(&key), vec![current.public_key(), previous.public_key()]);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn encipdict_real_handle_stale_verified_current_becomes_previous_without_rollback() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("real-stale-current").await;
+        let formerly_current = crate::crypto::KeyPair::generate().unwrap();
+        let rotated_current = crate::crypto::KeyPair::generate().unwrap();
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        st.remember_peer_key(&key, 0x11, &formerly_current.public_key())
+            .unwrap();
+        let inner = official_sendmsg_dict("stale-current", 0);
+        let outer = crate::crypto::seal_encipdict(
+            &st.own_keypair().public_key(),
+            &formerly_current,
+            &inner,
+        )
+        .unwrap();
+        let hook = Arc::new(super::EncipdictAfterVerifyHook::default());
+        super::set_encipdict_after_verify_hook(&data_dir, Some(hook.clone()));
+
+        let rotate_after_verify = async {
+            hook.reached.notified().await;
+            let rotated = st.remember_peer_key(&key, 0x22, &rotated_current.public_key());
+            hook.resume.notify_one();
+            rotated.unwrap();
+        };
+        tokio::join!(
+            super::handle_encipdict(&ctx, &outer, from),
+            rotate_after_verify
+        );
+        super::set_encipdict_after_verify_hook(&data_dir, None);
+
+        assert_eq!(st.find_in_record(&key, 665500).unwrap()["text"], "stale-current");
+        assert_eq!(st.peer_pubkey(&key), Some(rotated_current.public_key()));
+        assert_eq!(
+            st.peer_pubkeys(&key),
+            vec![rotated_current.public_key(), formerly_current.public_key()]
+        );
+        assert_eq!(st.peer_capa(&key), 0x22);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
