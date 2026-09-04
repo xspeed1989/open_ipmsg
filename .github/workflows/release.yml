@@ -80,7 +80,8 @@ jobs:
       - name: 测试
         run: |
           pnpm test
-          cd src-tauri && cargo test --release --locked
+          # 用子 shell 进 src-tauri 跑 cargo 测试，避免 cd 影响后续命令的工作目录
+          (cd src-tauri && cargo test --release --locked)
           ./src-tauri/target/release/open-ipmsg --selftest
 
       # 脚本会自行降权到普通用户（makepkg 拒绝以 root 运行）
@@ -92,9 +93,60 @@ jobs:
           name: arch-package
           path: dist-packages/*.pkg.tar.*
 
+  # ---------- Windows：MSI / NSIS（tauri-bundler 的 MSI 目标只支持 Windows 宿主，必须用 windows runner） ----------
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with: { version: 10 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: src-tauri }
+
+      - run: pnpm install --frozen-lockfile
+
+      # selftest 与测试都要跑在 release 二进制上（与 arch job 顺序一致）：
+      # 先 cargo build --release 产出二进制，再 pnpm 测试 / cargo 测试 / selftest。
+      # 统一 shell: bash（Windows runner 自带 Git Bash），避免 cmd 的 %ErrorLevel% 语义差异
+      - name: 构建 release 二进制
+        shell: bash
+        run: |
+          pnpm build
+          cargo build --release --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: 测试
+        shell: bash
+        run: |
+          pnpm test
+          cargo test --manifest-path src-tauri/Cargo.toml --locked
+          ./src-tauri/target/release/open-ipmsg.exe --selftest
+
+      - name: 打包 MSI / NSIS
+        shell: bash
+        run: pnpm exec tauri build --bundles msi,nsis
+
+      - name: 收集产物
+        shell: bash
+        run: |
+          mkdir -p out
+          cp src-tauri/target/release/bundle/msi/*.msi out/ 2>/dev/null || true
+          cp src-tauri/target/release/bundle/nsis/*.exe out/ 2>/dev/null || true
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          path: out/*
+
   # ---------- 打标签时汇总为一个 Release ----------
   release:
-    needs: [linux, arch]
+    needs: [linux, arch, windows]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:

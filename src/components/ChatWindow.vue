@@ -11,6 +11,7 @@ import {
 import { parseFileUris, highlightParts } from '../lib/text'
 import { computePopupPosition } from '../lib/popup'
 import { composeReplyBody, quotePreview } from '../lib/reply'
+import { recalledEditState } from '../lib/recall'
 import { forwardPayload, mergeForward } from '../lib/forward'
 import { copyTextOf } from '../lib/copymsg'
 import { pendingImgFromB64 } from '../lib/clipimg'
@@ -189,6 +190,19 @@ function startRecall() {
   if (!m || !store.activeKey) return
   closeCtx()
   recallMsg(store.activeKey, m.pkt).catch((e) => alert(e))
+}
+
+function reeditRecalled(m) {
+  const state = recalledEditState(m)
+  if (!state) return
+  draft.value = state.draft
+  replyTarget.value = state.replyTarget
+  nextTick(() => {
+    const el = ta.value
+    if (!el) return
+    el.focus()
+    el.selectionStart = el.selectionEnd = state.draft.length
+  })
 }
 
 function startBatch() {
@@ -987,6 +1001,13 @@ watch(
       <div v-for="v in viewList" :key="v.id">
         <div v-if="v.kind === 'day'" class="day-sep"><span>{{ v.label }}</span></div>
 
+        <div v-else-if="v.m.recalled" class="recall-notice" :data-pkt="v.m.pkt">
+          <span>{{ t(v.m.dir === 'out' ? 'chat.recalledSelf' : 'chat.recalledPeer') }}</span>
+          <button v-if="v.m.dir === 'out'" class="recall-edit" @click.stop="reeditRecalled(v.m)">
+            {{ t('chat.reedit') }}
+          </button>
+        </div>
+
         <div
           v-else
           class="msg-row"
@@ -1000,8 +1021,7 @@ watch(
             <i v-if="selMode" class="sel-check" :class="{ on: selected.has(v.m) }" @click.stop="toggleSel(v.m)"></i>
             <div class="bubble" :class="{ file: v.m.kind === 'file' }"
               @contextmenu.prevent="selMode ? null : openCtx(v.m, $event)">
-              <div v-if="v.m.recalled" class="b-text recalled">{{ t('chat.recalledTip') }}</div>
-              <div v-else-if="(v.m.locked || (v.m.secret && !v.m.unlocked))" class="b-text locked">
+              <div v-if="(v.m.locked || (v.m.secret && !v.m.unlocked))" class="b-text locked">
                 <span class="lock-ico">🔒</span>
                 <template v-if="v.m.locked && !v.m.unlocked">{{ t('chat.pwdLocked') }}</template>
                 <template v-else>{{ t('chat.secretSealed') }}</template>
@@ -1493,6 +1513,25 @@ watch(
 }
 .msg-row.merge {
   margin-top: -2px;
+}
+.recall-notice {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  margin: 10px 0 14px;
+  color: var(--c-sub);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.recall-edit {
+  padding: 0;
+  color: var(--c-link);
+  font-size: inherit;
+  line-height: inherit;
+}
+.recall-edit:hover {
+  text-decoration: underline;
 }
 .msg-row.self {
   flex-direction: row-reverse;
