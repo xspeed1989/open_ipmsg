@@ -1013,3 +1013,76 @@ Verify:
 - [ ] **Step 7: Report verified and unverified results separately**
 
 The final report must list exact automated command results and the observed Windows cases. If Windows testing is unavailable or any case still fails, say “未验证” or “失败” for that case; do not infer success from selftest alone.
+
+---
+
+### Task 7: Auto-Display Unpassworded Sealed Messages
+
+**Files:**
+- Modify: `src-tauri/src/net.rs:1623-1653`
+- Modify: `src-tauri/src/selftest.rs:2180-2252,2528-2568`
+- Test: existing Rust unit/integration tests and full `--selftest`
+
+**Interfaces:**
+- Consumes: existing `secret`, `locked`, `unlocked`, `need_read`, `mark_read_and_receipt`, and EncIPDict receive semantics.
+- Produces: unpassworded `SECRETOPT` records with `secret=true`, `locked=false`, `unlocked=true`; password-protected records remain locked; no READMSG is sent until the chat becomes visible and calls the existing mark-read path.
+
+- [ ] **Step 1: Write failing receive-state tests**
+
+Add or update tests to assert:
+
+```rust
+assert_eq!(record["secret"].as_bool(), Some(true));
+assert_eq!(record["locked"].as_bool(), Some(false));
+assert_eq!(record["unlocked"].as_bool(), Some(true));
+assert_eq!(record["read"].as_bool(), Some(false));
+```
+
+Before calling `mark_read_and_receipt`, assert the fake peer has received no READMSG. Then call the existing mark-read path and assert exactly one READMSG for that packet. Keep the password-message test asserting `locked=true` and `unlocked=false` until the correct password is supplied.
+
+- [ ] **Step 2: Run focused tests and verify RED**
+
+Run the narrow test(s) that exercise classic inbound `SECRETOPT` and EncIPDict inbound `SECRETOPT`.
+
+Expected: FAIL because the current record initializes `unlocked` only from `prev_unlocked`, so a new unpassworded sealed message remains hidden.
+
+- [ ] **Step 3: Implement automatic local unseal without eager read receipt**
+
+Compute initial state once in `handle_sendmsg`:
+
+```rust
+let auto_unlocked = secret && !locked;
+let unlocked = prev_unlocked || auto_unlocked;
+```
+
+Write the record as:
+
+```rust
+"secret": secret,
+"locked": locked && !unlocked,
+"unlocked": unlocked,
+```
+
+Do not clear `SECRETOPT`, do not set `read=true`, and do not call `mark_read_and_receipt` from the network receive handler. The existing frontend visibility/open-chat path remains the only trigger for READMSG.
+
+- [ ] **Step 4: Update E4 and E10 assertions**
+
+E4 must assert auto-unlocked state, no receipt before explicit `mark_read_and_receipt`, one receipt after it, and no duplicate receipt. E10's signed/sealed EncIPDict message must assert both `secret=true` and `unlocked=true`. Password E5 must remain locked until successful password verification.
+
+- [ ] **Step 5: Run complete verification**
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo run --manifest-path src-tauri/Cargo.toml -- --selftest
+pnpm test
+git diff --check
+```
+
+Expected: all commands exit 0 with no new warnings or FAIL lines.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src-tauri/src/net.rs src-tauri/src/selftest.rs
+git commit -m "fix(chat): auto-display unpassworded sealed messages"
+```
