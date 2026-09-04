@@ -1621,8 +1621,8 @@ async fn handle_sendmsg(
     let text = proto::decode_for_command(&pkt.extra[..text_end], pkt.command);
 
     // 封书（SECRETOPT 位即可；SECRETEXOPT = SECRET|READCHECK 亦含此位）与密码锁
-    // （PASSWORDOPT，且本机启用密码功能）：
-    // 内容对用户隐藏，需「开封/输密码」后才展示；已读回执同样推迟到解锁之后
+    // （PASSWORDOPT，且本机启用密码功能）：无密码封书自动显示正文；密码锁仍需输入密码。
+    // 两者的已读回执都只在现有会话可见的 mark-read 路径中发送。
     let secret = pkt.command & opt::SECRETOPT != 0;
     let cfg_now = ctx.st.config();
     let locked = pkt.command & opt::PASSWORDOPT != 0 && cfg_now.password_use;
@@ -1630,6 +1630,8 @@ async fn handle_sendmsg(
         .as_ref()
         .and_then(|r| r.get("unlocked").and_then(|v| v.as_bool()))
         .unwrap_or(false);
+    let auto_unlocked = secret && !locked;
+    let unlocked = prev_unlocked || auto_unlocked;
 
     let rec = json!({
         "dir": "in",
@@ -1645,11 +1647,10 @@ async fn handle_sendmsg(
         // 曾加密（enc）；签名是否可核验（sig_ok）。未加密消息 sig_ok 恒为 true
         "enc": enc_meta.is_some(),
         "sig_ok": enc_meta.unwrap_or(true),
-        // 封书：气泡展示锁定态，开封后置 unlocked 并补发已读回执
+        // 无密码封书直接展示正文；密码锁在输入本机密码前保持锁定。
         "secret": secret,
-        // 密码锁：输入本机密码后置 unlocked
-        "locked": locked && !prev_unlocked,
-        "unlocked": prev_unlocked,
+        "locked": locked && !unlocked,
+        "unlocked": unlocked,
         "broadcast": is_broadcast,
     });
     // 同包号原地更新，历史不再被重发副本撑爆

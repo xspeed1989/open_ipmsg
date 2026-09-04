@@ -2191,7 +2191,8 @@ async fn extended_protocols() -> bool {
     let secret_sent = wait_for(2000, || ext.lock().unwrap().secret_flags.contains(&true)).await;
     log.check("E: 封书发出带 SECRETOPT", secret_sent);
 
-    // 对端发来封书（SECRETEXOPT = SECRET|READCHECK）→ 未开封不回执，开封后回
+    // 对端发来无密码封书（SECRETEXOPT = SECRET|READCHECK）：正文自动展示但仍未读，
+    // 只有会话可见并走现有 mark-read 路径后才回 READMSG。
     let secret_pkt = proto::next_packet_no();
     let mut s = proto::Packet::new(cmd::SENDMSG | opt::SECRETEXOPT).with_pkt_no(secret_pkt);
     s.extra = "请开封查看的封书".as_bytes().to_vec();
@@ -2204,27 +2205,57 @@ async fn extended_protocols() -> bool {
         events.lock().unwrap().iter().any(|(e, v)| {
             e == "msg-in" && v["msg"]["pkt"].as_u64() == Some(secret_pkt as u64)
                 && v["msg"]["secret"].as_bool() == Some(true)
+                && v["msg"]["locked"].as_bool() == Some(false)
+                && v["msg"]["unlocked"].as_bool() == Some(true)
+                && v["msg"]["read"].as_bool() == Some(false)
         })
     })
     .await;
-    log.check("E: 封书入站标记 secret", secret_in);
-    let sent0 = net::mark_read_and_receipt(&ctx, &peer_key, &[secret_pkt])
+    log.check("E: 无密码封书入站自动展示但仍未读", secret_in);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    log.check(
+        "E: 无密码封书在显式标记前不发 READMSG",
+        !ext.lock().unwrap().receipts.contains(&secret_pkt),
+    );
+    let sent1 = net::mark_read_and_receipt(&ctx, &peer_key, &[secret_pkt])
         .await
         .expect("mark secret");
-    log.check("E: 封书未开封不发已读回执", sent0 == 0);
-    net::unlock_message(&ctx, &peer_key, secret_pkt, None)
-        .await
-        .expect("unlock secret");
-    // 开封动作本身补发 READMSG（unlock 内部 mark_read_and_receipt）
+    log.check("E: 显式标记无密码封书后发送 READMSG", sent1 == 1);
     let receipt_seen = wait_for(2000, || {
-        ext.lock().unwrap().receipts.contains(&secret_pkt)
+        ext.lock()
+            .unwrap()
+            .receipts
+            .iter()
+            .filter(|&&pkt| pkt == secret_pkt)
+            .count()
+            == 1
     })
     .await;
-    log.check("E: 开封后补发 READMSG 回执", receipt_seen);
+    log.check("E: 显式标记后恰好收到一条 READMSG", receipt_seen);
+    let sent_again = net::mark_read_and_receipt(&ctx, &peer_key, &[secret_pkt])
+        .await
+        .expect("mark secret again");
+    log.check("E: 重复标记无密码封书不重复发送回执", sent_again == 0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
     log.check(
-        "E: 开封后记录 unlocked",
+        "E: 重复标记后仍只有一条 READMSG",
+        ext.lock()
+            .unwrap()
+            .receipts
+            .iter()
+            .filter(|&&pkt| pkt == secret_pkt)
+            .count()
+            == 1,
+    );
+    log.check(
+        "E: 无密码封书记录保持 unlocked",
         st.find_history_pkt(&peer_key, secret_pkt)
-            .map(|r| r["unlocked"].as_bool().unwrap_or(false))
+            .map(|r| {
+                r["secret"].as_bool() == Some(true)
+                    && r["locked"].as_bool() == Some(false)
+                    && r["unlocked"].as_bool() == Some(true)
+                    && r["read"].as_bool() == Some(true)
+            })
             .unwrap_or(false),
     );
 
@@ -2242,14 +2273,28 @@ async fn extended_protocols() -> bool {
         events.lock().unwrap().iter().any(|(e, v)| {
             e == "msg-in" && v["msg"]["pkt"].as_u64() == Some(pass_pkt as u64)
                 && v["msg"]["locked"].as_bool() == Some(true)
+                && v["msg"]["unlocked"].as_bool() == Some(false)
+                && v["msg"]["read"].as_bool() == Some(false)
         })
     })
     .await;
-    log.check("E: 密码消息入站标记 locked", locked_in);
+    log.check("E: 密码消息入站保持 locked 且未解锁", locked_in);
     let bad = net::unlock_message(&ctx, &peer_key, pass_pkt, Some("wrong".into())).await;
     log.check("E: 错误密码拒绝开封", bad.is_err());
+    log.check(
+        "E: 错误密码后消息仍锁定",
+        st.find_history_pkt(&peer_key, pass_pkt)
+            .map(|r| r["locked"].as_bool() == Some(true) && r["unlocked"].as_bool() == Some(false))
+            .unwrap_or(false),
+    );
     let good = net::unlock_message(&ctx, &peer_key, pass_pkt, Some("secret123".into())).await;
     log.check("E: 正确密码开封成功", good.is_ok());
+    log.check(
+        "E: 正确密码后消息解锁",
+        st.find_history_pkt(&peer_key, pass_pkt)
+            .map(|r| r["locked"].as_bool() == Some(false) && r["unlocked"].as_bool() == Some(true))
+            .unwrap_or(false),
+    );
 
     /* ---- E6. 在线重发（SENDCHECKOPT 未确认 → 同包号重发） ---- */
     ext.lock().unwrap().drop_ack = true;
@@ -2553,17 +2598,19 @@ async fn extended_protocols() -> bool {
                 event == "msg-in"
                     && value["msg"]["pkt"].as_u64() == Some(secret_pkt as u64)
                     && value["msg"]["secret"].as_bool() == Some(true)
+                    && value["msg"]["unlocked"].as_bool() == Some(true)
                     && value["msg"]["sig_ok"].as_bool() == Some(true)
             })
         })
         .await;
         log.check("E: EncIPDict 保留官方 SECRETOPT 封书语义", secret_emitted);
         log.check(
-            "E: EncIPDict 封书历史保留 secret=true",
+            "E: EncIPDict 封书历史保留 secret=true 且自动解锁",
             st.read_history(&peer_key, 200).iter().any(|record| {
                 record["dir"] == "in"
                     && record["pkt"].as_u64() == Some(secret_pkt as u64)
                     && record["secret"].as_bool() == Some(true)
+                    && record["unlocked"].as_bool() == Some(true)
             }),
         );
     }
