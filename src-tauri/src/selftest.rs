@@ -48,6 +48,8 @@ impl Log {
 struct PeerShared {
     /// 收到的送达确认（RECVMSG）包编号 —— 十进制与十六进制两种写法都收
     recv_acks: Vec<u32>,
+    /// RECVMSG 的（包编号，来源端口），用于区分重启前后的两套网络栈。
+    recv_ack_sources: Vec<(u32, u16)>,
     /// 777456 还在待发队列里（没收到送达确认），对方一上线就重投
     queued_ack: bool,
     /// 777789 同理，但这个"对端"只认十六进制书写的包编号（方言差异）
@@ -612,13 +614,6 @@ async fn async_run() -> bool {
     // 真实场景：关掉程序再打开，对端把没确认的历史消息按原包号重投一遍。
     // 这里用「同一数据目录 + 新端口的第二套网络栈」模拟一次重启。
     let receipts_before = shared.lock().unwrap().receipts.iter().filter(|p| **p == 777123).count();
-    let delivery_acks_before = shared
-        .lock()
-        .unwrap()
-        .recv_acks
-        .iter()
-        .filter(|p| **p == 777123)
-        .count();
     let port_app2 = free_udp_port().await;
     let st2 = Arc::new(AppState::new(data_dir.clone()));
     let mut cfg2 = Config::default();
@@ -640,11 +635,8 @@ async fn async_run() -> bool {
         shared
             .lock()
             .unwrap()
-            .recv_acks
-            .iter()
-            .filter(|p| **p == 777123)
-            .count()
-            > delivery_acks_before
+            .recv_ack_sources
+            .contains(&(777123, port_app2))
     })
     .await;
     log.check("重启后处理对端重投的延迟消息（再次回 RECVMSG）", resent);
@@ -1665,6 +1657,7 @@ fn spawn_fake_peer(
                         if let Some(no) = no {
                             let mut sh = shared.lock().unwrap();
                             sh.recv_acks.push(no);
+                            sh.recv_ack_sources.push((no, from.port()));
                             // 送达已确认：从待发队列里移除，不再重投
                             if no == 777456 {
                                 sh.queued_ack = false;
