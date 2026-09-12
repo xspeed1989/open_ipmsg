@@ -419,7 +419,9 @@ git commit -m "feat(shot): 图像换算/马赛克/箭头/撤销栈/工具栏定�
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `normalizeCombo(input) -> string|null` (canonical `"Ctrl+Alt+A"`, modifier order `Ctrl,Alt,Shift,CmdOrCtrl`), `isValidCombo(combo) -> boolean` (requires ≥1 modifier), `comboFromEvent(e) -> string|null`.
+- Produces: `normalizeCombo(input) -> string|null` (canonical, modifier order `CmdOrCtrl,Ctrl,Alt,Shift`), `isValidCombo(combo) -> boolean` (requires ≥1 modifier), `comboFromEvent(e) -> string|null`.
+
+The modifier order is **CmdOrCtrl first**: it is the platform-primary modifier (⌘ on macOS, Ctrl elsewhere) and matches how both consumers render it. The Rust side parses by name in any order, so only the string form is affected.
 
 Two things are deliberately **not** implemented here:
 - The XDG shortcuts trigger format (`CTRL+ALT+a`) — the Wayland portal binding happens in Rust at startup, before any webview exists (Task 11 implements and tests `to_portal_trigger` there); a second JS copy would be dead code.
@@ -486,7 +488,8 @@ Create `src/lib/hotkey.js`:
  * 两侧都不需要 JS 再转换，所以这里只负责「录入即规范形」。
  */
 
-const MOD_ORDER = ['Ctrl', 'Alt', 'Shift', 'CmdOrCtrl']
+/** 输出顺序：平台主修饰键在前（CmdOrCtrl → Ctrl → Alt → Shift） */
+const MOD_ORDER = ['CmdOrCtrl', 'Ctrl', 'Alt', 'Shift']
 
 const MOD_ALIASES = {
   ctrl: 'Ctrl', control: 'Ctrl',
