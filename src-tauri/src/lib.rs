@@ -18,6 +18,7 @@ mod ipdict;
 mod ipmsg_import;
 mod net;
 mod protocol;
+mod screenshot;
 mod selftest;
 mod state;
 
@@ -1060,7 +1061,7 @@ async fn clipboard_file_paths(app: tauri::AppHandle) -> Result<Vec<String>, Stri
 /// `file:///home/a%20b.txt` → `/home/a b.txt`；非 file 协议返回 None。
 /// 只服务 Linux 下读 GTK 剪贴板的 text/uri-list（Windows/macOS 走插件）。
 #[cfg(target_os = "linux")]
-fn file_uri_to_path(uri: &str) -> Option<String> {
+pub(crate) fn file_uri_to_path(uri: &str) -> Option<String> {
     let rest = uri
         .strip_prefix("file://localhost")
         .or_else(|| uri.strip_prefix("file://"))?;
