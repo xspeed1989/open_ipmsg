@@ -397,7 +397,7 @@ portal:      toPortalTrigger("Alt+A") → "ALT+a"   // 修饰键大写，主键�
 ### 12.2 Node 单测
 
 - `scripts/shot.test.mjs`：§7.4 全部导出（几何边界、夹取、手柄命中、换算、马赛克、箭头、撤销栈、工具栏翻转）
-- `scripts/hotkey.test.mjs`：解析/格式化/校验/portal 转换/录制转换
+- `scripts/hotkey.test.mjs`：规范形解析/校验/录制转换。portal 触发器串的转换不在 JS 侧（绑定发生在启动期的 Rust 里），由 `shortcut.rs` 的单测覆盖。
 - 契约：`scripts/sfc-bindings.test.mjs` **需把 `ScreenshotOverlay.vue` 加进显式文件列表**（该测试是白名单式，不自动遍历目录）
 - i18n：双语文案齐备
 

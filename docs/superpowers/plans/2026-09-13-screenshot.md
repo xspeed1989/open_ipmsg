@@ -539,9 +539,12 @@ export function normalizeCombo(input) {
     if (key) return null // 出现第二个非修饰键
     const named = KEY_ALIASES[p.toLowerCase()]
     if (named) key = named
-    else if (/^f\d{1,2}$/i.test(p)) key = p.toUpperCase()
-    else if (p.length === 1) key = p.toUpperCase()
-    else key = p[0].toUpperCase() + p.slice(1)
+    else if (/^f([1-9]|1\d|2[0-4])$/i.test(p)) key = p.toUpperCase()
+    else if (/^[a-z0-9]$/i.test(p)) key = p.toUpperCase()
+    // 未知键名不猜（"Foobar" / "F0" / "F99" / "Å" 一律判非法）：
+    // isValidCombo 的职责就是「标出配置里存着的不可用快捷键」，
+    // 放行未知键名会让设置页给一个 Rust 根本注册不了的串打绿灯。
+    else return null
   }
   if (!key) return null
   return [...MOD_ORDER.filter((m) => mods.has(m)), key].join('+')
@@ -553,32 +556,83 @@ export function isValidCombo(combo) {
   return !!n && n.split('+').length >= 2
 }
 
-/** 设置页录制：从键盘事件得到规范形；纯修饰键或无修饰键返回 null */
+/**
+ * 从键盘事件取出规范主键名；取不到返回 null。
+ *
+ * 优先用 e.code（物理键位）：macOS 下按住 Option 再按字母，e.key 是合成字符
+ * （Option+A → 'å'），只有 e.code（'KeyA'）才能还原出 Rust 侧可解析的组合键。
+ * 没有 code 时退回 e.key，并拒绝一切非 ASCII 单字符（合成字符、'+' 等）。
+ */
+function keyFromEvent(e) {
+  const code = typeof e?.code === 'string' ? e.code : ''
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3)
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5)
+  if (/^F([1-9]|1\d|2[0-4])$/.test(code)) return code
+  if (code === 'Space') return 'Space'
+
+  const raw = typeof e?.key === 'string' ? e.key : ''
+  if (raw === ' ') return 'Space' // 空格键的 e.key 就是 ' '
+  const named = KEY_ALIASES[raw.toLowerCase()]
+  if (named) return named
+  if (/^[a-z0-9]$/i.test(raw)) return raw.toUpperCase()
+  return null
+}
+
+/** 设置页录制：从键盘事件得到规范形；纯修饰键、无修饰键或取不到主键都返回 null */
 export function comboFromEvent(e) {
-  const key = e?.key
+  const raw = e?.key
+  if (!raw) return null
+  if (['Control', 'Alt', 'Shift', 'Meta', 'CapsLock', 'Dead', 'Unidentified'].includes(raw)) return null
+  const key = keyFromEvent(e)
   if (!key) return null
-  if (['Control', 'Alt', 'Shift', 'Meta', 'CapsLock', 'Dead', 'Unidentified'].includes(key)) return null
   const mods = []
   if (e.ctrlKey) mods.push('Ctrl')
   if (e.altKey) mods.push('Alt')
   if (e.shiftKey) mods.push('Shift')
   if (e.metaKey) mods.push('CmdOrCtrl')
   if (!mods.length) return null
-  const combo = [...mods, key].join('+')
-  return isValidCombo(combo) ? normalizeCombo(combo) : null
+  return normalizeCombo([...mods, key].join('+'))
 }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `node --test scripts/hotkey.test.mjs`
-Expected: PASS — 3 tests green.
+Expected: PASS — 6 tests green.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/lib/hotkey.js scripts/hotkey.test.mjs
 git commit -m "feat(shot): 快捷键串纯函数（规范形校验/录制）"
+```
+
+**Review round 1 amendments (plan-mandated defects the first review found in the block above — apply these too):**
+
+Add to `scripts/hotkey.test.mjs`:
+
+```js
+test('空格键能录成 Space，无法表达的键被拒绝', () => {
+  assert.equal(comboFromEvent({ key: ' ', code: 'Space', ctrlKey: true }), 'Ctrl+Space')
+  assert.equal(normalizeCombo('ctrl+space'), 'Ctrl+Space')
+  // '+' 在 '+' 分隔的规范形里无法表达，直接拒绝而不是产出坏串
+  assert.equal(comboFromEvent({ key: '+', ctrlKey: true }), null)
+})
+
+test('macOS 的 Option 合成字符不会产出不可解析的组合键', () => {
+  // 按住 Option 再按 A：e.key 是 'å'，e.code 仍是 'KeyA'
+  assert.equal(comboFromEvent({ key: 'å', code: 'KeyA', altKey: true }), 'Alt+A')
+  // 拿不到 code 时拒绝合成字符，不猜
+  assert.equal(comboFromEvent({ key: 'å', altKey: true }), null)
+})
+
+test('未知键名与越界 F 键不算合法热键', () => {
+  assert.equal(isValidCombo('Ctrl+Foobar'), false)
+  assert.equal(isValidCombo('Ctrl+F0'), false)
+  assert.equal(isValidCombo('Ctrl+F99'), false)
+  assert.equal(isValidCombo('Ctrl+F24'), true)
+  assert.equal(normalizeCombo('Alt+Å'), null)
+})
 ```
 
 ---
