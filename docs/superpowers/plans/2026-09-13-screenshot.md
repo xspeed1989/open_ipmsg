@@ -419,9 +419,11 @@ git commit -m "feat(shot): 图像换算/马赛克/箭头/撤销栈/工具栏定�
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `normalizeCombo(input) -> string|null` (canonical `"Ctrl+Alt+A"`, modifier order `Ctrl,Alt,Shift,CmdOrCtrl`), `isValidCombo(combo) -> boolean` (requires ≥1 modifier), `toAccelerator(combo) -> string|null` (Tauri plugin format), `comboFromEvent(e) -> string|null`.
+- Produces: `normalizeCombo(input) -> string|null` (canonical `"Ctrl+Alt+A"`, modifier order `Ctrl,Alt,Shift,CmdOrCtrl`), `isValidCombo(combo) -> boolean` (requires ≥1 modifier), `comboFromEvent(e) -> string|null`.
 
-The XDG shortcuts trigger format (`CTRL+ALT+a`) is **not** implemented here: the Wayland portal binding happens in Rust at startup, before any webview exists, so the format only ever matters on that side — Task 11 implements and tests `to_portal_trigger` there. Keeping a second JS copy would be dead code.
+Two things are deliberately **not** implemented here:
+- The XDG shortcuts trigger format (`CTRL+ALT+a`) — the Wayland portal binding happens in Rust at startup, before any webview exists (Task 11 implements and tests `to_portal_trigger` there); a second JS copy would be dead code.
+- A JS accelerator-string converter for the Tauri plugin — the plugin parses the canonical string itself in Rust (`Shortcut::from_str`, Task 11), and the settings page stores exactly what `comboFromEvent` produced. A JS converter would have no caller.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -432,7 +434,7 @@ Create `scripts/hotkey.test.mjs`:
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  normalizeCombo, isValidCombo, toAccelerator, comboFromEvent,
+  normalizeCombo, isValidCombo, comboFromEvent,
 } from '../src/lib/hotkey.js'
 
 test('归一化：大小写/别名/修饰键顺序', () => {
@@ -452,11 +454,9 @@ test('必须是「修饰键 + 主键」，纯修饰键或单键不算有效全�
   assert.equal(isValidCombo('A'), false)
   assert.equal(isValidCombo('Shift'), false)
   assert.equal(isValidCombo('Ctrl+Shift'), false)
-})
-
-test('Tauri 插件加速器串就是规范形', () => {
-  assert.equal(toAccelerator('alt+a'), 'Alt+A')
-  assert.equal(toAccelerator('a'), null)
+  // 设置页用它标出「配置里存着一个不可用的快捷键」（手改配置 / 跨平台拷配置）
+  assert.equal(isValidCombo(''), false)
+  assert.equal(isValidCombo(undefined), false)
 })
 
 test('从键盘事件录制组合键', () => {
@@ -478,12 +478,12 @@ Create `src/lib/hotkey.js`:
 
 ```js
 /**
- * 快捷键串纯函数：内部规范形 ↔ 平台格式。
+ * 快捷键串纯函数：规范化 + 设置页录制。
  *
  * 规范形：修饰键（Ctrl/Alt/Shift/CmdOrCtrl）+ 主键，用 '+' 连接，如 "Ctrl+Alt+A"。
- * Tauri global-shortcut 插件（Windows/macOS/X11 全局热键）直接用规范形；
- * Wayland 的 portal 触发器格式在 Rust 侧（shortcut.rs），因为绑定发生在启动期，
- * 那时还没有 webview —— 这里不再重复实现一份。
+ * 这个字符串直接存进配置，启动时交给 Tauri 的 global-shortcut 插件
+ * （Windows/macOS/X11）或由 Rust 转成 portal 触发器（Wayland，见 shortcut.rs）；
+ * 两侧都不需要 JS 再转换，所以这里只负责「录入即规范形」。
  */
 
 const MOD_ORDER = ['Ctrl', 'Alt', 'Shift', 'CmdOrCtrl']
@@ -544,15 +544,10 @@ export function normalizeCombo(input) {
   return [...MOD_ORDER.filter((m) => mods.has(m)), key].join('+')
 }
 
-/** 有效全局热键 = 至少一个修饰键 + 主键 */
+/** 有效全局热键 = 至少一个修饰键 + 主键（设置页用它标出配置里存着的非法值） */
 export function isValidCombo(combo) {
   const n = normalizeCombo(combo)
   return !!n && n.split('+').length >= 2
-}
-
-/** Tauri global-shortcut 插件用的加速器串 */
-export function toAccelerator(combo) {
-  return isValidCombo(combo) ? normalizeCombo(combo) : null
 }
 
 /** 设置页录制：从键盘事件得到规范形；纯修饰键或无修饰键返回 null */
@@ -574,13 +569,13 @@ export function comboFromEvent(e) {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `node --test scripts/hotkey.test.mjs`
-Expected: PASS — 4 tests green.
+Expected: PASS — 3 tests green.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/lib/hotkey.js scripts/hotkey.test.mjs
-git commit -m "feat(shot): 快捷键串纯函数（规范形/加速器/portal 触发器/录制）"
+git commit -m "feat(shot): 快捷键串纯函数（规范形校验/录制）"
 ```
 
 ---
@@ -2620,7 +2615,7 @@ In `src/components/SettingsModal.vue`, add a screenshot section (follow the exis
 script additions:
 
 ```js
-import { comboFromEvent, isWaylandUA } from '../lib/hotkey'
+import { comboFromEvent, isValidCombo, isWaylandUA } from '../lib/hotkey'
 
 const recording = ref(false)
 
@@ -2635,11 +2630,13 @@ function onHotkeyKeydown(e) {
   if (combo) form.shot_hotkey = combo
 }
 
-const hotkeyHint = computed(() =>
-  isWaylandUA(navigator.userAgent)
+/** 配置里可能存着一个不可用的值（手改配置 / 跨平台拷贝）—— 明确告诉用户它不会生效 */
+const hotkeyHint = computed(() => {
+  if (form.shot_hotkey && !isValidCombo(form.shot_hotkey)) return t('settings.shotHotkeyInvalid')
+  return isWaylandUA(navigator.userAgent)
     ? t('settings.shotHotkeyWayland')
-    : t('settings.shotHotkeyHint'),
-)
+    : t('settings.shotHotkeyHint')
+})
 ```
 
 `isWaylandUA` lives in `src/lib/hotkey.js` so it stays testable:
@@ -2678,6 +2675,7 @@ In `src/lib/i18n.js`, both languages:
   'settings.shotHotkey': '截图快捷键',
   'settings.shotHotkeyPh': '点击后按下组合键',
   'settings.shotHotkeyHint': '默认 Alt+A；点进输入框后直接按组合键即可修改，Esc 清空表示不注册',
+  'settings.shotHotkeyInvalid': '当前保存的快捷键不可用（缺少修饰键），请重新录制或清空',
   'settings.shotHotkeyWayland': '当前是 Wayland 会话：首次保存会弹出系统绑定确认；若桌面环境不支持，可用命令行 open-ipmsg --screenshot 自行绑定快捷键',
   'settings.shotCopy': '确认后复制到剪贴板',
   // en
@@ -2685,6 +2683,7 @@ In `src/lib/i18n.js`, both languages:
   'settings.shotHotkey': 'Screenshot shortcut',
   'settings.shotHotkeyPh': 'Click, then press keys',
   'settings.shotHotkeyHint': 'Default Alt+A. Click the field and press a combination; Esc clears it (no global shortcut)',
+  'settings.shotHotkeyInvalid': 'The saved shortcut is unusable (no modifier key) — record a new one or clear it',
   'settings.shotHotkeyWayland': 'Wayland session: the first save asks the desktop to bind the shortcut. If your desktop does not support it, bind "open-ipmsg --screenshot" yourself',
   'settings.shotCopy': 'Copy to clipboard on confirm',
 ```
