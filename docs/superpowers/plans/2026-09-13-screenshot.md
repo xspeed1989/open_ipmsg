@@ -1068,7 +1068,17 @@ mod platform {
 }
 ```
 
-- [ ] **Step 5: Add the diagnostic CLI**
+- [ ] **Step 5: Update the `file_uri_to_path` doc comment**
+
+Task 4 changed only its visibility. Its doc comment still says it serves *only* the GTK clipboard `text/uri-list`; it now also serves the portal `Screenshot` `uri`. Update that comment in `src-tauri/src/lib.rs` (comment text only — do not touch its body):
+
+```
+/// file:///home/a%20b.txt → /home/a b.txt；非 file 协议返回 None。
+/// 服务两处：Linux 下读 GTK 剪贴板的 text/uri-list，以及 xdg-desktop-portal
+/// 截图返回的 uri（两者都可能带百分号编码）。
+```
+
+- [ ] **Step 6: Add the diagnostic CLI**
 
 In `src-tauri/src/lib.rs`, next to the `--clipboard-test` block, add:
 
@@ -1091,7 +1101,7 @@ In `src-tauri/src/lib.rs`, next to the `--clipboard-test` block, add:
     }
 ```
 
-- [ ] **Step 6: Run tests and the real diagnostic**
+- [ ] **Step 7: Run tests and the real diagnostic**
 
 Run: `cd src-tauri && cargo test screenshot::`
 Expected: PASS — 7 tests green.
