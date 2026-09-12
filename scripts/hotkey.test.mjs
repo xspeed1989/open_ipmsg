@@ -33,3 +33,25 @@ test('从键盘事件录制组合键', () => {
   assert.equal(comboFromEvent({ key: 'Meta', ctrlKey: false, altKey: false, shiftKey: false, metaKey: true }), null)
   assert.equal(comboFromEvent({ key: 'a', ctrlKey: false, altKey: false, shiftKey: false, metaKey: false }), null)
 })
+
+test('空格键能录成 Space，无法表达的键被拒绝', () => {
+  assert.equal(comboFromEvent({ key: ' ', code: 'Space', ctrlKey: true }), 'Ctrl+Space')
+  assert.equal(normalizeCombo('ctrl+space'), 'Ctrl+Space')
+  // '+' 在 '+' 分隔的规范形里无法表达，直接拒绝而不是产出坏串
+  assert.equal(comboFromEvent({ key: '+', ctrlKey: true }), null)
+})
+
+test('macOS 的 Option 合成字符不会产出不可解析的组合键', () => {
+  // 按住 Option 再按 A：e.key 是 'å'，e.code 仍是 'KeyA'
+  assert.equal(comboFromEvent({ key: 'å', code: 'KeyA', altKey: true }), 'Alt+A')
+  // 拿不到 code 时拒绝合成字符，不猜
+  assert.equal(comboFromEvent({ key: 'å', altKey: true }), null)
+})
+
+test('未知键名与越界 F 键不算合法热键', () => {
+  assert.equal(isValidCombo('Ctrl+Foobar'), false)
+  assert.equal(isValidCombo('Ctrl+F0'), false)
+  assert.equal(isValidCombo('Ctrl+F99'), false)
+  assert.equal(isValidCombo('Ctrl+F24'), true)
+  assert.equal(normalizeCombo('Alt+Å'), null)
+})
