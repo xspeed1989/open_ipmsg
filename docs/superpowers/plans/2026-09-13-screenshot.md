@@ -1109,7 +1109,7 @@ Expected: PASS — 7 tests green.
 Run: `cargo build 2>&1 | tail -5 && ./target/debug/open-ipmsg --shot-test`
 Expected: `抓屏成功: 5120x1440 → /tmp/oim-shot-test.png` (dimensions match this machine's dual-2K workspace; on a single-monitor machine one screen's size). Then verify the file is a real screenshot: open it and confirm it shows the desktop, and confirm no new file was left in the pictures directory.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src-tauri/Cargo.toml src-tauri/src/screenshot.rs src-tauri/src/lib.rs
