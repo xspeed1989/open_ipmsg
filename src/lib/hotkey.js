@@ -1,7 +1,7 @@
 /**
  * 快捷键串纯函数：规范化 + 设置页录制。
  *
- * 规范形：修饰键（CmdOrCtrl/Ctrl/Alt/Shift）+ 主键，用 '+' 连接，如 "CmdOrCtrl+Shift+A"。
+ * 规范形：修饰键（CmdOrCtrl/Ctrl/Alt/Shift，输出时按此顺序）+ 主键，用 '+' 连接，如 "Ctrl+Alt+A"。
  * 这个字符串直接存进配置，启动时交给 Tauri 的 global-shortcut 插件
  * （Windows/macOS/X11）或由 Rust 转成 portal 触发器（Wayland，见 shortcut.rs）；
  * 两侧都不需要 JS 再转换，所以这里只负责「录入即规范形」。
@@ -39,6 +39,13 @@ const KEY_ALIASES = {
   down: 'ArrowDown',
   left: 'ArrowLeft',
   right: 'ArrowRight',
+  // 规范名自身也要能解析：否则 normalizeCombo('Alt+ArrowUp') 返回 null，
+  // 而 normalizeCombo('Alt+Up') 返回 'Alt+ArrowUp' —— 规范化不幂等，
+  // 设置页会把一个 Rust 其实能注册的串标成「不可用」。
+  arrowup: 'ArrowUp',
+  arrowdown: 'ArrowDown',
+  arrowleft: 'ArrowLeft',
+  arrowright: 'ArrowRight',
   printscreen: 'PrintScreen',
 }
 

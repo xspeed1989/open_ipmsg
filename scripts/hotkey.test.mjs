@@ -55,3 +55,10 @@ test('未知键名与越界 F 键不算合法热键', () => {
   assert.equal(isValidCombo('Ctrl+F24'), true)
   assert.equal(normalizeCombo('Alt+Å'), null)
 })
+
+test('规范名可往返：normalizeCombo 幂等', () => {
+  assert.equal(normalizeCombo('Alt+Up'), 'Alt+ArrowUp')
+  assert.equal(normalizeCombo('Alt+ArrowUp'), 'Alt+ArrowUp')
+  assert.equal(isValidCombo('Alt+ArrowUp'), true)
+  assert.equal(comboFromEvent({ key: 'ArrowUp', code: 'ArrowUp', altKey: true }), 'Alt+ArrowUp')
+})
