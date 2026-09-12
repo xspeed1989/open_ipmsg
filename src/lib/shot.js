@@ -93,3 +93,67 @@ export function nudgeRect(r, key, step, bounds) {
   const d = NUDGE[key]
   return d ? moveRect(r, d[0] * step, d[1] * step, bounds) : r
 }
+
+/**
+ * CSS 像素矩形 → 整幅抓屏图像里的物理像素矩形。
+ * k 用「本屏 slice 宽 ÷ 窗口 CSS 宽」实时算出，不信任 devicePixelRatio：
+ * 本机 KDE Wayland 的 GDK scale_factor 报 2，而真实比例是 1.25。
+ */
+export function cssRectToImageRect(css, slice, cssWidth) {
+  const k = slice.w / cssWidth
+  return {
+    x: slice.x + Math.round(css.x * k),
+    y: slice.y + Math.round(css.y * k),
+    w: Math.max(1, Math.round(css.w * k)),
+    h: Math.max(1, Math.round(css.h * k)),
+  }
+}
+
+/** 马赛克块：对齐到 block 网格，返回覆盖 rect 的块矩形列表 */
+export function mosaicBlocks(rect, block) {
+  const out = []
+  const x0 = Math.floor(rect.x / block) * block
+  const y0 = Math.floor(rect.y / block) * block
+  for (let y = y0; y < rect.y + rect.h; y += block) {
+    for (let x = x0; x < rect.x + rect.w; x += block) {
+      out.push({ x, y, w: block, h: block })
+    }
+  }
+  return out
+}
+
+/** 箭头两翼端点（配合实心三角头部） */
+export function arrowHead(from, to, size = 12) {
+  const dx = to.x - from.x
+  const dy = to.y - from.y
+  const len = Math.hypot(dx, dy) || 1
+  const ux = dx / len
+  const uy = dy / len
+  const bx = to.x - ux * size
+  const by = to.y - uy * size
+  const hx = -uy * size * 0.5
+  const hy = ux * size * 0.5
+  return { p1: { x: bx + hx, y: by + hy }, p2: { x: bx - hx, y: by - hy } }
+}
+
+/** 撤销栈：压入快照并裁到上限（返回新数组，保持不可变便于单测） */
+export function pushUndo(stack, snapshot, limit = 20) {
+  const next = (stack || []).concat([snapshot])
+  return next.length > limit ? next.slice(next.length - limit) : next
+}
+
+/** 工具栏贴合：优先选区下方 → 上方 → 窗口内，横向夹在窗口内 */
+export function toolbarPlacement(sel, win, bar, gap = 8) {
+  let y = sel.y + sel.h + gap
+  let flip = 'below'
+  if (y + bar.h > win.h) {
+    y = sel.y - bar.h - gap
+    flip = 'above'
+  }
+  if (y < 0) {
+    y = Math.min(Math.max(0, sel.y + sel.h - bar.h - gap), Math.max(0, win.h - bar.h))
+    flip = 'inside'
+  }
+  const x = Math.min(Math.max(0, sel.x), Math.max(0, win.w - bar.w))
+  return { x, y, flip }
+}

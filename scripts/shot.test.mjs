@@ -62,3 +62,62 @@ test('移动与方向键微调都夹在窗口内', () => {
   assert.deepEqual(nudgeRect(r, 'ArrowLeft', 10, B), { x: 0, y: 10, w: 50, h: 40 })
   assert.deepEqual(nudgeRect(r, 'KeyQ', 1, B), r)
 })
+
+import {
+  cssRectToImageRect, mosaicBlocks, arrowHead, pushUndo, toolbarPlacement,
+} from '../src/lib/shot.js'
+
+test('CSS 选区换算成整幅图里的物理像素矩形', () => {
+  // 本机实测：副屏 slice 起点 x=2560（物理），窗口 CSS 宽 2048，比例 k=1.25
+  const slice = { x: 2560, y: 0, w: 2560, h: 1440 }
+  assert.deepEqual(
+    cssRectToImageRect({ x: 100, y: 200, w: 400, h: 300 }, slice, 2048),
+    { x: 2560 + 125, y: 250, w: 500, h: 375 },
+  )
+  // 宽高至少 1 像素，避免拖出 0 尺寸导致 toBlob 失败
+  assert.deepEqual(
+    cssRectToImageRect({ x: 0, y: 0, w: 0, h: 0 }, slice, 2048),
+    { x: 2560, y: 0, w: 1, h: 1 },
+  )
+})
+
+test('马赛克块按网格对齐且覆盖整个矩形', () => {
+  const blocks = mosaicBlocks({ x: 10, y: 10, w: 20, h: 20 }, 8)
+  // x: -6? 不 —— 对齐到 8 的网格：起点 8、16、24，覆盖到 30
+  assert.deepEqual(blocks[0], { x: 8, y: 8, w: 8, h: 8 })
+  assert.equal(blocks.length, 9) // 3×3 块覆盖 10..30
+})
+
+test('箭头两翼对称分布在线段两侧', () => {
+  const { p1, p2 } = arrowHead({ x: 0, y: 0 }, { x: 100, y: 0 }, 10)
+  assert.deepEqual(p1, { x: 90, y: 5 })
+  assert.deepEqual(p2, { x: 90, y: -5 })
+  // 零长度线段不产生 NaN
+  const z = arrowHead({ x: 5, y: 5 }, { x: 5, y: 5 }, 10)
+  assert.ok(Number.isFinite(z.p1.x) && Number.isFinite(z.p1.y))
+})
+
+test('撤销栈保留最近 limit 步', () => {
+  let s = []
+  for (let i = 0; i < 25; i++) s = pushUndo(s, `snap${i}`, 20)
+  assert.equal(s.length, 20)
+  assert.equal(s[0], 'snap5')
+  assert.equal(s[19], 'snap24')
+})
+
+test('工具栏优先贴选区下方，越界翻到上方，再越界贴进窗口', () => {
+  const win = { x: 0, y: 0, w: 800, h: 600 }
+  const bar = { w: 300, h: 40 }
+  assert.deepEqual(toolbarPlacement({ x: 100, y: 100, w: 200, h: 150 }, win, bar), {
+    x: 100, y: 258, flip: 'below',
+  })
+  assert.deepEqual(toolbarPlacement({ x: 100, y: 500, w: 200, h: 90 }, win, bar), {
+    x: 100, y: 452, flip: 'above',
+  })
+  // 选区贴满整屏：上下都放不下 → 塞进窗口内
+  assert.deepEqual(toolbarPlacement({ x: 0, y: 0, w: 800, h: 600 }, win, bar), {
+    x: 0, y: 552, flip: 'inside',
+  })
+  // 右边界对齐不外溢
+  assert.equal(toolbarPlacement({ x: 700, y: 100, w: 100, h: 100 }, win, bar).x, 500)
+})
