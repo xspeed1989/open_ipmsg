@@ -197,9 +197,15 @@ export function resizeRect(r, handle, pt, bounds) {
   )
 }
 
-/** 平移整个选区 */
+/** 平移整个选区。
+ *  这里是「整体位移 + 位置夹取」，不是 clampRect 的裁剪语义：
+ *  拖到边界时选区必须保持尺寸被挡住，而不是被压扁（否则用户一拖到边就丢选区）。 */
 export function moveRect(r, dx, dy, bounds) {
-  return clampRect({ ...r, x: r.x + dx, y: r.y + dy }, bounds)
+  const maxX = Math.max(bounds.x, bounds.x + bounds.w - r.w)
+  const maxY = Math.max(bounds.y, bounds.y + bounds.h - r.h)
+  const x = Math.min(Math.max(r.x + dx, bounds.x), maxX)
+  const y = Math.min(Math.max(r.y + dy, bounds.y), maxY)
+  return { ...r, x, y }
 }
 
 const NUDGE = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }
@@ -397,9 +403,9 @@ git commit -m "feat(shot): 图像换算/马赛克/箭头/撤销栈/工具栏定�
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `normalizeCombo(input) -> string|null` (canonical `"Ctrl+Alt+A"`, modifier order `Ctrl,Alt,Shift,CmdOrCtrl`), `isValidCombo(combo) -> boolean` (requires ≥1 modifier), `toAccelerator(combo) -> string|null` (Tauri plugin format), `toPortalTrigger(combo) -> string|null` (XDG shortcuts format, e.g. `"ALT+a"`, `"CTRL+ALT+Return"`), `comboFromEvent(e) -> string|null`.
+- Produces: `normalizeCombo(input) -> string|null` (canonical `"Ctrl+Alt+A"`, modifier order `Ctrl,Alt,Shift,CmdOrCtrl`), `isValidCombo(combo) -> boolean` (requires ≥1 modifier), `toAccelerator(combo) -> string|null` (Tauri plugin format), `comboFromEvent(e) -> string|null`.
 
-The XDG shortcuts specification (https://xdg.pages.freedesktop.org/xdg-specs/shortcuts/latest/) defines triggers as modifiers `CTRL/ALT/SHIFT/NUM/LOGO` plus an xkbcommon keysym identifier without the `XKB_KEY_` prefix, joined by `+`.
+The XDG shortcuts trigger format (`CTRL+ALT+a`) is **not** implemented here: the Wayland portal binding happens in Rust at startup, before any webview exists, so the format only ever matters on that side — Task 11 implements and tests `to_portal_trigger` there. Keeping a second JS copy would be dead code.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -410,7 +416,7 @@ Create `scripts/hotkey.test.mjs`:
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  normalizeCombo, isValidCombo, toAccelerator, toPortalTrigger, comboFromEvent,
+  normalizeCombo, isValidCombo, toAccelerator, comboFromEvent,
 } from '../src/lib/hotkey.js'
 
 test('归一化：大小写/别名/修饰键顺序', () => {
@@ -437,17 +443,6 @@ test('Tauri 插件加速器串就是规范形', () => {
   assert.equal(toAccelerator('a'), null)
 })
 
-test('portal 触发器遵循 XDG shortcuts 规范', () => {
-  assert.equal(toPortalTrigger('Alt+A'), 'ALT+a')
-  assert.equal(toPortalTrigger('Ctrl+Shift+S'), 'CTRL+SHIFT+s')
-  // Super/Windows → LOGO；多修饰键按字母序
-  assert.equal(toPortalTrigger('CmdOrCtrl+Alt+A'), 'ALT+LOGO+a')
-  // 主键用 xkbcommon 键名（不带 XKB_KEY_ 前缀）
-  assert.equal(toPortalTrigger('Ctrl+Enter'), 'CTRL+Return')
-  assert.equal(toPortalTrigger('Alt+Space'), 'ALT+space')
-  assert.equal(toPortalTrigger('F1'), null)
-})
-
 test('从键盘事件录制组合键', () => {
   assert.equal(comboFromEvent({ key: 'a', ctrlKey: false, altKey: true, shiftKey: false, metaKey: false }), 'Alt+A')
   assert.equal(comboFromEvent({ key: 'S', ctrlKey: true, altKey: false, shiftKey: true, metaKey: false }), 'Ctrl+Shift+S')
@@ -470,9 +465,9 @@ Create `src/lib/hotkey.js`:
  * 快捷键串纯函数：内部规范形 ↔ 平台格式。
  *
  * 规范形：修饰键（Ctrl/Alt/Shift/CmdOrCtrl）+ 主键，用 '+' 连接，如 "Ctrl+Alt+A"。
- * - Tauri 插件（Windows/macOS/X11 全局热键）直接用规范形；
- * - Wayland 走 portal GlobalShortcuts，preferred_trigger 必须遵循 XDG shortcuts 规范：
- *   修饰键 CTRL/ALT/SHIFT/NUM/LOGO + xkbcommon 键名（不带 XKB_KEY_ 前缀），如 "ALT+a"。
+ * Tauri global-shortcut 插件（Windows/macOS/X11 全局热键）直接用规范形；
+ * Wayland 的 portal 触发器格式在 Rust 侧（shortcut.rs），因为绑定发生在启动期，
+ * 那时还没有 webview —— 这里不再重复实现一份。
  */
 
 const MOD_ORDER = ['Ctrl', 'Alt', 'Shift', 'CmdOrCtrl']
@@ -485,28 +480,28 @@ const MOD_ALIASES = {
   cmdorctrl: 'CmdOrCtrl',
 }
 
-/** 主键别名 → 规范名（同时给出 portal 需要的 xkbcommon 键名） */
+/** 主键别名 → 规范名 */
 const KEY_ALIASES = {
-  esc: ['Escape', 'Escape'],
-  escape: ['Escape', 'Escape'],
-  space: ['Space', 'space'],
-  spacebar: ['Space', 'space'],
-  enter: ['Enter', 'Return'],
-  return: ['Enter', 'Return'],
-  tab: ['Tab', 'Tab'],
-  backspace: ['Backspace', 'BackSpace'],
-  delete: ['Delete', 'Delete'],
-  del: ['Delete', 'Delete'],
-  insert: ['Insert', 'Insert'],
-  home: ['Home', 'Home'],
-  end: ['End', 'End'],
-  pageup: ['PageUp', 'Page_Up'],
-  pagedown: ['PageDown', 'Page_Down'],
-  up: ['ArrowUp', 'Up'],
-  down: ['ArrowDown', 'Down'],
-  left: ['ArrowLeft', 'Left'],
-  right: ['ArrowRight', 'Right'],
-  printscreen: ['PrintScreen', 'Print'],
+  esc: 'Escape',
+  escape: 'Escape',
+  space: 'Space',
+  spacebar: 'Space',
+  enter: 'Enter',
+  return: 'Enter',
+  tab: 'Tab',
+  backspace: 'Backspace',
+  delete: 'Delete',
+  del: 'Delete',
+  insert: 'Insert',
+  home: 'Home',
+  end: 'End',
+  pageup: 'PageUp',
+  pagedown: 'PageDown',
+  up: 'ArrowUp',
+  down: 'ArrowDown',
+  left: 'ArrowLeft',
+  right: 'ArrowRight',
+  printscreen: 'PrintScreen',
 }
 
 /** 规范化组合键；非法返回 null */
@@ -524,7 +519,7 @@ export function normalizeCombo(input) {
     }
     if (key) return null // 出现第二个非修饰键
     const named = KEY_ALIASES[p.toLowerCase()]
-    if (named) key = named[0]
+    if (named) key = named
     else if (/^f\d{1,2}$/i.test(p)) key = p.toUpperCase()
     else if (p.length === 1) key = p.toUpperCase()
     else key = p[0].toUpperCase() + p.slice(1)
@@ -542,17 +537,6 @@ export function isValidCombo(combo) {
 /** Tauri global-shortcut 插件用的加速器串 */
 export function toAccelerator(combo) {
   return isValidCombo(combo) ? normalizeCombo(combo) : null
-}
-
-/** portal preferred_trigger（XDG shortcuts 规范） */
-export function toPortalTrigger(combo) {
-  if (!isValidCombo(combo)) return null
-  const parts = normalizeCombo(combo).split('+')
-  const key = parts.pop()
-  const mods = parts.map((m) => (m === 'CmdOrCtrl' ? 'LOGO' : m.toUpperCase())).sort()
-  const xkb = KEY_ALIASES[key.toLowerCase()]?.[1]
-  const keyName = xkb || (key.length === 1 ? key.toLowerCase() : key)
-  return [...mods, keyName].join('+')
 }
 
 /** 设置页录制：从键盘事件得到规范形；纯修饰键或无修饰键返回 null */
@@ -574,7 +558,7 @@ export function comboFromEvent(e) {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `node --test scripts/hotkey.test.mjs`
-Expected: PASS — 5 tests green.
+Expected: PASS — 4 tests green.
 
 - [ ] **Step 5: Commit**
 
@@ -810,15 +794,14 @@ Append to the `#[cfg(test)] mod tests` in `src-tauri/src/screenshot.rs`:
 
     #[test]
     fn png_dimensions_are_read_without_decoding_failure() {
-        // 1×1 透明 PNG（最小合法图），保证 image 依赖真的能解出尺寸
-        const TINY: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
-            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
-            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
-        let c = decode_captured(TINY.to_vec()).expect("decode");
+        // 用 image 现场编码一张 1×1 再解回来：不依赖手写 PNG 字节常量
+        // （手写常量一旦 IDAT 长度写错，测试失败会指向错误的方向）
+        use image::ImageEncoder;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[0u8, 0, 0, 0], 1, 1, image::ExtendedColorType::Rgba8)
+            .expect("encode");
+        let c = decode_captured(png).expect("decode");
         assert_eq!((c.width, c.height), (1, 1));
     }
 ```
@@ -1215,7 +1198,7 @@ pub fn begin(app: &tauri::AppHandle, state: &ShotState) -> Result<ShotCapture, S
     }
 
     let cap = capture_png(Duration::from_secs(15))?;
-    let monitors = collect_monitors(app, cap.width, cap.height)?;
+    let monitors = collect_monitors(app, cap.width)?;
     let capture = ShotCapture {
         session: session_id(),
         width: cap.width,
@@ -1234,15 +1217,10 @@ pub fn begin(app: &tauri::AppHandle, state: &ShotState) -> Result<ShotCapture, S
 }
 
 /// 显示器清单：逻辑矩形来自窗口系统的真实布局，物理矩形由 k 推得
-fn collect_monitors(
-    app: &tauri::AppHandle,
-    image_w: u32,
-    image_h: u32,
-) -> Result<Vec<ShotMonitor>, ShotErr> {
+fn collect_monitors(app: &tauri::AppHandle, image_w: u32) -> Result<Vec<ShotMonitor>, ShotErr> {
     let logical = logical_monitors(app)?;
     let bounds = virtual_bounds(&logical.iter().map(|(_, r)| *r).collect::<Vec<_>>());
     let k = scale_for(image_w, bounds.w.max(1));
-    let _ = image_h;
     Ok(logical
         .into_iter()
         .enumerate()
@@ -1637,7 +1615,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import * as ipc from '../lib/ipc'
 import {
   rectFromDrag, clampRect, canConfirm, hitTestHandle, resizeRect, moveRect, nudgeRect,
-  cssRectToImageRect, toolbarPlacement,
+  cssRectToImageRect,
 } from '../lib/shot'
 import { t } from '../lib/i18n'
 
@@ -2588,7 +2566,7 @@ fn default_shot_hotkey() -> String {
 
 and the same two lines in `impl Default for Config`.
 
-Add the fields to `ConfigPatch` (the struct used by `save_config`) as `pub shot_hotkey: Option<String>` and `pub shot_copy_clipboard: Option<bool>`, and map them in `save_config` in `src-tauri/src/lib.rs`:
+Add the fields to `ConfigPatch` — it is a **private struct in `src-tauri/src/lib.rs` around line 117** (not in `state.rs`), whose fields are plain (no `pub`) — as `shot_hotkey: Option<String>` and `shot_copy_clipboard: Option<bool>`, and map them in `save_config` in the same file:
 
 ```rust
         // 截图热键：补丁未携带保留现值；空串视为「不注册全局热键」
