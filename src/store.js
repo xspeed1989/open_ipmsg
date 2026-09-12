@@ -328,7 +328,7 @@ function isChatVisible(key) {
   return store.windowFocused && store.activeKey === key
 }
 
-/** 发送文本到指定会话（转发/批量发送用）；对方离线时后端自动入队，返回的
+/** 发送文本到指定会话（转发/群发用）；对方离线时后端自动入队，返回的
  * 记录带 queued 标记，气泡上显示「离线留言·上线后自动投递」。
  * 后端返回记录**数组**：加密模式下长文本会自动拆成多条发送，每条一条记录、各自气泡。 */
 export async function sendTextTo(key, text, secret = false, password = false) {
@@ -405,12 +405,6 @@ export function setAbsence(on, text) {
 /** 广播群发（BROADCASTOPT 同报；本地不留历史） */
 export function broadcastTo(text) {
   return ipc.broadcastMessage(text)
-}
-
-/** 多选群发（MULTICASTOPT）：同一条文本发往多个会话 */
-export async function sendMulticastTo(keys, text) {
-  if (!keys?.length || !text?.trim()) return
-  await ipc.sendMulticast(keys, text.trim())
 }
 
 /** 主动索取对端不在通知文 */

@@ -304,20 +304,6 @@ async fn broadcast_message(ctx: State<'_, SharedCtx>, text: String) -> Result<()
     net::broadcast_message(&ctx, &text).await
 }
 
-/// 多选群发（MULTICASTOPT）：同一条文本发往多个会话
-#[tauri::command]
-async fn send_multicast(
-    ctx: State<'_, SharedCtx>,
-    keys: Vec<String>,
-    text: String,
-) -> Result<Value, String> {
-    let text = text.trim().to_string();
-    if text.is_empty() {
-        return Err("不能发送空消息".into());
-    }
-    Ok(json!(net::multicast_message(&ctx, &keys, &text).await?))
-}
-
 /// 封书/密码锁开封（校验密码后补发已读回执）
 #[tauri::command]
 async fn unlock_message(
@@ -398,7 +384,6 @@ async fn send_text(
             net::MsgSendOpts {
                 secret: secret.unwrap_or(false),
                 password: password.unwrap_or(false),
-                multicast: false,
                 clip_pos: None,
             },
         )
@@ -428,7 +413,6 @@ async fn send_files(
             net::MsgSendOpts {
                 secret: secret.unwrap_or(false),
                 password: password.unwrap_or(false),
-                multicast: false,
                 clip_pos: None,
             },
         )
@@ -1746,7 +1730,6 @@ pub fn run() {
             set_absence,
             recall_message,
             broadcast_message,
-            send_multicast,
             unlock_message,
             get_absence_info,
             request_hostlist

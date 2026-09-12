@@ -34,7 +34,7 @@ Open IPMsg is a cross-platform LAN instant messenger compatible with [IP Messeng
 | Groups | Contact list grouped by broadcast group |
 | Away mode | "Away" broadcast with auto-reply, configurable away status text |
 | Recall / secret | Recall your own text messages (DELMSG); secret messages (SECRETEX) that only mark as read when opened; password lock (PASSWORDOPT) |
-| Broadcast / multicast | Broadcast to the whole network without receipts; multi-select group send |
+| Broadcast / group send | Broadcast to the whole network without receipts; group send to multiple selected contacts (one message each, with read receipts) |
 | Member master (IPDict) | Directory service with signed full-network member lists (RSA-2048/SHA-256) |
 | NAT proxy | Relay through a configured proxy address |
 | IPv6 | Group-multicast member discovery (`ff15::979` / `ff02::1`), auto-falls back to IPv4 |

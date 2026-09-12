@@ -2437,8 +2437,6 @@ pub struct MsgSendOpts {
     pub secret: bool,
     /// 密码锁（PASSWORDOPT；仅本机启用密码功能时生效）
     pub password: bool,
-    /// 多选群发（MULTICASTOPT：表示同一条消息同时发往多个目标）
-    pub multicast: bool,
     /// 剪贴板贴图插入位置（官方「粘贴图片」语义）：设置后公告首条附件
     /// 带 FILE_CLIPBOARD(0x20) 属性与 CLIPBOARDPOS 扩展段，官方对端内嵌显示
     pub clip_pos: Option<u32>,
@@ -2501,9 +2499,8 @@ pub async fn send_message_opts(
         extra.push(0x07);
     }
 
-    // 文件消息不请求已读回执（减少未知标志组合被对端丢弃的风险）；
-    // 纯文本消息保留回执；多选群发不回执（官方 MULTICASTOPT 语义）
-    let want_rcpt = entries.is_empty() && !opts.multicast;
+    // 文件消息不请求已读回执（减少未知标志组合被对端丢弃的风险）；纯文本消息保留回执
+    let want_rcpt = entries.is_empty();
 
     // 出站加密决策（spec §5/§6）：开关开启且已缓存对方公钥 → 密封完整扩展部
     // （含尾部 \0）。seal_message 内置 UDP 上限保护，超限错误直接抛给前端分段。
@@ -2559,7 +2556,6 @@ pub async fn send_message_opts(
         // 封书 = SECRET|READCHECK（官方 SECRETEXOPT）；密码锁 = PASSWORDOPT
         | if opts.secret { opt::SECRETEXOPT } else { 0 }
         | if opts.password && cfg.password_use { opt::PASSWORDOPT } else { 0 }
-        | if opts.multicast { opt::MULTICASTOPT } else { 0 }
         // 加密公告必须带 ENCEXTMSGOPT：官方解密后只在此位下拆分附件段（spec §5），
         // 缺位则对面只见文字、文件条目丢失（2026-08-26 官方客户端实测）
         | if enc && !entries.is_empty() { opt::ENCEXTMSGOPT } else { 0 }
@@ -2631,13 +2627,12 @@ pub async fn send_message_opts(
         "enc": enc, "sig_ok": true,
         "secret": opts.secret,
         "locked": opts.password && cfg.password_use,
-        "multicast": opts.multicast,
     });
     ctx.st.log_record(key, &rec);
 
     // 在线纯文本消息登记送达重发（官方 §4-12）：无 RECVMSG 时按 4s 间隔
-    // 重发同一包号，累计 RETRY_MAX 次放弃；附件/群发消息不登记
-    if want_rcpt && !opts.multicast {
+    // 重发同一包号，累计 RETRY_MAX 次放弃；附件消息不登记
+    if want_rcpt {
         ctx.st.enqueue_retry(RetryOut {
             key: key.to_string(),
             pkt: pkt_no,
@@ -2765,37 +2760,6 @@ pub async fn broadcast_message(ctx: &NetCtx, text: &str) -> Result<(), String> {
     ctx.st
         .diag(&format!("-> 广播群发「{}」到 {} 个目标", text.trim(), sent));
     Ok(())
-}
-
-/// 多选群发（MULTICASTOPT）：同一条文本依次发往多个会话。
-/// 官方语义：多目标消息不回执；返回各目标的发送记录数组。
-pub async fn multicast_message(
-    ctx: &NetCtx,
-    keys: &[String],
-    text: &str,
-) -> Result<Vec<Value>, String> {
-    if keys.is_empty() {
-        return Err("未选择发送目标".into());
-    }
-    let mut out = Vec::new();
-    for k in keys {
-        match send_message_opts(
-            ctx,
-            k,
-            text,
-            vec![],
-            MsgSendOpts {
-                multicast: true,
-                ..Default::default()
-            },
-        )
-        .await
-        {
-            Ok(rec) => out.push(rec),
-            Err(e) => return Err(format!("发给 {k} 失败：{e}")),
-        }
-    }
-    Ok(out)
 }
 
 /// 封书/密码锁开封：校验密码（密码锁场景）后把记录标记 unlocked，

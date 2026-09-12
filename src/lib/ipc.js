@@ -31,9 +31,6 @@ export const recallMessage = (key, pkt) => invoke('recall_message', { key, pkt }
 /** 广播群发（BROADCASTOPT 同报） */
 export const broadcastMessage = (text) => invoke('broadcast_message', { text })
 
-/** 多选群发（MULTICASTOPT）：同一条文本发往多个会话 */
-export const sendMulticast = (keys, text) => invoke('send_multicast', { keys, text })
-
 /** 封书/密码锁开封（密码锁场景校验 password） */
 export const unlockMessage = (key, pkt, password = null) =>
   invoke('unlock_message', { key, pkt, password })

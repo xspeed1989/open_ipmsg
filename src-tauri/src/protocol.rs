@@ -81,7 +81,6 @@ pub mod opt {
     pub const SERVEROPT: u32 = 0x0000_0200;
     pub const SECRETOPT: u32 = 0x0000_0200; // 与 SERVEROPT 同值（官方历史兼容）
     pub const BROADCASTOPT: u32 = 0x0000_0400;
-    pub const MULTICASTOPT: u32 = 0x0000_0800;
     pub const AUTORETOPT: u32 = 0x0000_2000;
     pub const RETRYOPT: u32 = 0x0000_4000;
     pub const PASSWORDOPT: u32 = 0x0000_8000;
@@ -103,8 +102,9 @@ pub mod opt {
     pub const CAPFILEENCOPT: u32 = 0x0004_0000;
     /// 文件流加密标志（官方 ipmsg.h L119 = 0x00000800）：GETFILEDATA/GETDIRFILES
     /// 置位表示扩展部为密封的取文件请求、正文双向过 AES-CTR 密钥流（spec §7）。
-    /// 官方协议按命令类别复用 0x800（入口类报文里同值是 MULTICASTOPT），
-    /// 与本文件既有 MULTICASTOPT 的并存正是官方语义。
+    /// 官方协议按命令类别复用 0x800：入口类报文里该位是 MULTICASTOPT（多选群发，
+    /// 官方语义为「同一条消息发往多个目标、不回执」）。本客户端收发都按单聊处理，
+    /// 群发走上层逐个单发，因此不再构造该位，仅接收侧按官方语义兼容。
     pub const ENCFILEOPT: u32 = 0x0000_0800;
     pub const CAPUTF8OPT: u32 = 0x0100_0000;
     /// 官方编码协商标志（ipmsg.h L86 铁证）：**文本标志位 = 0x00800000**，

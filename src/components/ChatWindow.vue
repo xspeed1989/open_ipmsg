@@ -6,13 +6,14 @@ import * as ipc from '../lib/ipc'
 import {
   store, sendText, sendFiles, sendFilesTo, downloadFile, clearHistory,
   openChat, displayName, dayLabel, fmtTime, fmtSize, refreshUsers, splitDelayedNote,
-  sendTextTo, recallMsg, unlockMsg, broadcastTo, sendMulticastTo,
+  sendTextTo, recallMsg, unlockMsg, broadcastTo,
 } from '../store'
 import { parseFileUris, highlightParts } from '../lib/text'
 import { computePopupPosition } from '../lib/popup'
 import { composeReplyBody, quotePreview } from '../lib/reply'
 import { recalledEditState } from '../lib/recall'
 import { forwardPayload, mergeForward } from '../lib/forward'
+import { groupPayload, sendToEach } from '../lib/groupsend'
 import { copyTextOf } from '../lib/copymsg'
 import { pendingImgFromB64 } from '../lib/clipimg'
 import { t } from '../lib/i18n'
@@ -124,7 +125,7 @@ function cancelReply() {
   replyTarget.value = null
 }
 
-/* ---------- 转发 / 批量发送 ---------- */
+/* ---------- 转发 / 群发 ---------- */
 const picker = ref(null) // { mode: 'forward'|'batch', payload }
 
 function startForward() {
@@ -165,7 +166,7 @@ async function doUnlock(m) {
   }
 }
 
-/* ---------- 广播 / 群发 ---------- */
+/* ---------- 广播（全网同报 BROADCASTOPT） ---------- */
 function startBroadcast() {
   const text = draft.value.trim()
   if (!text) {
@@ -175,13 +176,6 @@ function startBroadcast() {
   broadcastTo(text)
     .then(() => alert(t('chat.broadcastSent')))
     .catch((e) => alert(t('chat.alertSendFailed', { e })))
-}
-function startMulticast() {
-  if (!canSend.value) {
-    alert(t('chat.alertFillContent'))
-    return
-  }
-  picker.value = { mode: 'multicast', payload: null }
 }
 
 /* ---------- 撤回 ---------- */
@@ -281,9 +275,21 @@ async function onPickerConfirm(keys) {
   const p = picker.value
   picker.value = null
   if (!p || !keys.length) return
-  // 批量发送：待发送附件只落盘一次，多个收件人复用同一批路径
-  let paths = null
-  if (p.mode === 'batch' && pendingList.value.length) {
+
+  // 转发：把已有消息（文本或附件）原样再发一份，不动输入框
+  if (p.mode === 'forward') {
+    const { ok, fails } = await sendToEach(keys, (k) =>
+      p.payload.kind === 'text'
+        ? sendTextTo(k, p.payload.text)
+        : sendFilesTo(k, p.payload.paths)
+    )
+    return reportSendResult(ok, fails, keys)
+  }
+
+  // 群发：输入框内容（文本或待发送附件）发给多个会话，逐个单发、各自保留回执。
+  // 待发送附件只落盘一次，多个收件人复用同一批路径
+  let paths = []
+  if (pendingList.value.length) {
     try {
       paths = await pendingToPaths(pendingList.value)
     } catch (e) {
@@ -291,31 +297,20 @@ async function onPickerConfirm(keys) {
       return
     }
   }
-  const fails = []
-  let ok = 0
-  for (const k of keys) {
-    try {
-      if (p.mode === 'forward') {
-        if (p.payload.kind === 'text') await sendTextTo(k, p.payload.text)
-        else await sendFilesTo(k, p.payload.paths)
-      } else if (p.mode === 'multicast') {
-        await sendTextTo(k, draft.value.replace(/\n{3,}/g, '\n\n').trimEnd())
-      } else {
-        const text = draft.value.replace(/\n{3,}/g, '\n\n').trimEnd()
-        if (paths) await sendFilesTo(k, paths, text)
-        else await sendTextTo(k, text)
-      }
-      ok++
-    } catch (e) {
-      fails.push(k)
-    }
-  }
-  if (p.mode === 'batch') {
-    clearPending()
-    draft.value = ''
-  }
-  const name = (k) => displayName(k) || k
-  const names = keys.map(name).join(t('sep.list'))
+  const payload = groupPayload(draft.value, paths)
+  const { ok, fails } = await sendToEach(keys, (k) =>
+    payload.kind === 'files'
+      ? sendFilesTo(k, payload.paths, payload.text)
+      : sendTextTo(k, payload.text)
+  )
+  clearPending()
+  draft.value = ''
+  reportSendResult(ok, fails, keys)
+}
+
+/** 群发/转发的统一结果提示：全成功报「已发送给 N 人」，有失败报「成功 N 人；失败 M 人」 */
+function reportSendResult(ok, fails, keys) {
+  const names = keys.map((k) => displayName(k) || k).join(t('sep.list'))
   if (!fails.length) alert(t('chat.alertSentTo', { n: ok, names }))
   else alert(t('chat.alertPartial', { ok, fail: fails.length, names }))
 }
@@ -1131,10 +1126,10 @@ watch(
       <button class="ctx-item" @click="enterSelMode">{{ t('chat.multiSelect') }}</button>
     </div>
 
-    <!-- 转发（排除当前会话）/ 批量发送（默认含当前会话）的接收人选择 -->
+    <!-- 转发（排除当前会话）/ 群发（默认含当前会话）的接收人选择 -->
     <RecipientPicker
       v-if="picker"
-      :title="picker.mode === 'forward' ? t('chat.forwardTo') : picker.mode === 'multicast' ? t('chat.multicastTo') : t('chat.batchTo')"
+      :title="picker.mode === 'forward' ? t('chat.forwardTo') : t('chat.batchTo')"
       :exclude-key="picker.mode === 'forward' ? store.activeKey : ''"
       :preselect-key="picker.mode === 'batch' && store.userMap[store.activeKey] ? store.activeKey : ''"
       @confirm="onPickerConfirm"
@@ -1209,12 +1204,6 @@ watch(
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
             <circle cx="12" cy="12" r="2" fill="currentColor" />
             <path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4M4.9 4.9a10 10 0 0 0 0 14.2M19.1 4.9a10 10 0 0 1 0 14.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
-          </svg>
-        </button>
-        <button :title="t('chat.multicast')" @click="startMulticast">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-            <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 3" />
-            <path d="M9.2 9.2a4 4 0 0 0 0 5.6M14.8 9.2a4 4 0 0 1 0 5.6M6.6 6.6a7 7 0 0 0 0 10.8M17.4 6.6a7 7 0 0 1 0 10.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
           </svg>
         </button>
       </div>

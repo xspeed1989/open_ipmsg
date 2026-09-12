@@ -48,7 +48,7 @@
 | ABSENCEOPT / SENDCHECKOPT | 0x100 | 不在模式 / 请回送达确认 | ✅ 双向（含超时重发） |
 | SERVEROPT / SECRETOPT | 0x200 | 服务器预留 / 封书 | ✅ 封书 SECRETEXOPT（开封交互+回执门控） |
 | BROADCASTOPT | 0x400 | 广播群发（同报） | ✅ 广播按钮；不回执；广播会话展示 |
-| MULTICASTOPT | 0x800 | 多选群发 | ✅ 接收人弹窗群发（同文多投） |
+| MULTICASTOPT | 0x800 | 多选群发 | ⚠️ 仅接收兼容；发送路径已移除（群发改为逐个单发，各自保留回执） |
 | AUTORETOPT | 0x2000 | 自动应答防乒乓 | ✅ 回执/应答类报文带 |
 | RETRYOPT | 0x4000 | HOSTLIST 重传标记 | ✅ BR_ISGETLIST 携带 |
 | PASSWORDOPT | 0x8000 | 密码锁（消息/文件） | ✅ 双方约定口令；发送勾选、接收输入后开封 |
