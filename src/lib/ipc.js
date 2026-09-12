@@ -2,6 +2,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
+import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
 
 /** 注册后端事件监听（自动解包 Tauri 事件对象的 payload；返回 unlisten 函数） */
 export const listenEvent = (event, handler) =>
@@ -107,6 +108,65 @@ export const importIpmsgLogs = (paths) => invoke('import_ipmsg_log', { paths })
 /** 写系统剪贴板（右键复制消息内容）。
  *  WebKitGTK 的网页 navigator.clipboard 不可靠，走原生插件保证三平台一致 */
 export const copyText = (text) => writeText(text)
+
+/* ---------------- 自定义表情包 ---------------- */
+
+/** 列出自定义表情（后端会剔除图片已丢失的失效项） */
+export const listEmojis = () => invoke('list_emojis')
+
+/** 本地是否已有可用图片（历史导入的附件只有文件名；下载失败的记录也可能与磁盘不符）。
+ *  返回 { ok, size, path }：path 可能是后端按文件名在下载目录里兜底找到的位置 */
+export const emojiSrcAvailable = (path, name = '') =>
+  invoke('emoji_src_available', { path, name })
+
+/** 读取本地图片为 base64（表情缩略图/聊天内联预览用，超 32MB 拒绝） */
+export const readImageData = (path) => invoke('read_image_data', { path })
+
+/** 从本地图片导入表情（只传路径，读盘与校验都在后端） */
+export const importEmoji = (paths) => invoke('import_emoji', { paths })
+
+/** 删除表情（文件 + 索引） */
+export const deleteEmoji = (ids) => invoke('delete_emoji', { ids })
+
+/** 重命名表情 */
+export const renameEmoji = (id, name) => invoke('rename_emoji', { id, name })
+
+/** 按给定 id 顺序重排表情（拖拽排序） */
+export const reorderEmojis = (ids) => invoke('reorder_emojis', { ids })
+
+/** 发送自定义表情（按官方「粘贴图片」协议公告，对端内嵌显示） */
+export const sendEmoji = (key, id, text = '') => invoke('send_emoji', { key, id, text })
+
+/** 导出表情包（.ipmojis，标准 zip）；ids 为空 = 全部 */
+export const exportEmojiPack = (ids, dest, name) =>
+  invoke('export_emoji_pack', { ids, dest, name })
+
+/** 预览表情包内容（不解压落盘），供导入前勾选 */
+export const inspectEmojiPack = (path) => invoke('inspect_emoji_pack', { path })
+
+/** 导入表情包；files 为空 = 全部可导入项 */
+export const importEmojiPack = (path, files = []) =>
+  invoke('import_emoji_pack', { path, files })
+
+/** 选择本地图片（多选；用于导入表情）。标题交给系统默认，避免在这里引入 i18n 依赖 */
+export const pickImageFiles = () =>
+  openDialog({
+    multiple: true,
+    directory: false,
+    filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] }],
+  })
+
+/** 选择表情包文件（.ipmojis / .zip） */
+export const pickEmojiPack = () =>
+  openDialog({
+    multiple: false,
+    directory: false,
+    filters: [{ name: 'Sticker pack', extensions: ['ipmojis', 'zip'] }],
+  })
+
+/** 选择表情包导出目标路径；取消返回 null */
+export const pickEmojiPackSavePath = (defaultPath) =>
+  saveDialog({ defaultPath, filters: [{ name: 'Sticker pack', extensions: ['ipmojis'] }] })
 
 /** 事件常量 */
 export const EVT = {

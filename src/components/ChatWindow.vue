@@ -6,7 +6,7 @@ import * as ipc from '../lib/ipc'
 import {
   store, sendText, sendFiles, sendFilesTo, downloadFile, clearHistory,
   openChat, displayName, dayLabel, fmtTime, fmtSize, refreshUsers, splitDelayedNote,
-  sendTextTo, recallMsg, unlockMsg, broadcastTo,
+  sendTextTo, recallMsg, unlockMsg, broadcastTo, loadEmojiIndex, sendEmojiTo,
 } from '../store'
 import { parseFileUris, highlightParts } from '../lib/text'
 import { computePopupPosition } from '../lib/popup'
@@ -16,6 +16,7 @@ import { forwardPayload, mergeForward } from '../lib/forward'
 import { groupPayload, sendToEach } from '../lib/groupsend'
 import { copyTextOf } from '../lib/copymsg'
 import { pendingImgFromB64 } from '../lib/clipimg'
+import { addToEmojiPlan, attachPath, importSummary, isStickerFile } from '../lib/emoji'
 import { t } from '../lib/i18n'
 import { open as openFileDialog, confirm as confirmDialog } from '@tauri-apps/plugin-dialog'
 import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -75,6 +76,117 @@ watch(() => msgs.value.length, () => scrollBottom(true))
 /* ---------- 发送 ---------- */
 const draft = ref('')
 const ta = ref(null)
+
+/* ---------- 自定义表情 ---------- */
+
+/** 顶部轻提示（表情收纳等轻量反馈；3 秒后自动消失） */
+const toastMsg = ref('')
+let toastTimer = null
+function toast(text) {
+  toastMsg.value = String(text || '')
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => {
+    toastMsg.value = ''
+  }, 3000)
+}
+
+/**
+ * 等待某个附件下载完成，返回最终落盘路径（失败/超时返回 ''）。
+ * 下载本身由 store.downloadFile 发起，这里只订阅同一个 file-progress 事件。
+ */
+function waitFileDownload(key, pkt, fileId) {
+  return new Promise((resolve) => {
+    let un
+    let done = false
+    const finish = (v) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      un?.()
+      resolve(v)
+    }
+    // 订阅建立失败（正常不会发生）也要有超时兜底，避免永远挂住
+    const timer = setTimeout(() => finish(''), 5 * 60 * 1000)
+    ipc
+      .listenEvent(ipc.EVT.fileProgress, (p) => {
+        if (p?.key !== key || p?.pkt !== pkt || p?.file_id !== fileId) return
+        if (p.error) finish('')
+        else if (p.done) finish(p.path || '')
+      })
+      .then((fn) => {
+        un = fn
+      })
+      .catch(() => finish(''))
+  })
+}
+
+/** 表情库文件名与「已发出的缓存副本名」集合：命中的附件按缩略渲染 */
+const emojiNames = computed(
+  () => new Set([...(store.emojiFiles || []), ...(store.emojiCacheFiles || [])]),
+)
+function isSticker(f) {
+  return isStickerFile(f, emojiNames.value)
+}
+
+/** 点选一张自定义表情：直接作为一条消息发出（不进草稿框） */
+async function sendSticker(entry) {
+  const key = store.activeKey
+  if (!key || !entry?.id) return
+  emojiOpen.value = false
+  try {
+    await sendEmojiTo(key, entry.id)
+  } catch (e) {
+    alert(t('emoji.sendFailed', { e: String(e?.message || e) }))
+  }
+}
+
+/** 附件是否可加入表情库：图片、还没入库（已在库里的不重复给入口）、且可入库 */
+function canAddToEmoji(m) {
+  return (m?.files || []).some((f) => !isSticker(f) && addToEmojiPlan(f).ok)
+}
+
+/**
+ * 把消息里的图片收进表情库（右键菜单「添加到表情」）：
+ * 先让后端确认本地到底有没有这个文件（它会按记录路径找，找不到再按文件名
+ * 去下载目录兜底找）—— 消息上的 state 与 path 都可能不准（下载完整落盘却
+ * 记成 failed、历史导入的附件只有名字等）。
+ * 本地确实没有 → 先下载（失败原因原样透给用户，不再统一糊成一句）。
+ */
+async function addMsgToEmoji() {
+  const m = ctxMenu.value?.msg
+  closeCtx()
+  if (!m) return
+  const f = (m.files || []).find((x) => addToEmojiPlan(x).ok)
+  if (!f) return
+  const key = m.peer_key || m.peer?.key || store.activeKey
+  try {
+    let src = await resolveLocalImage(attachPath(f), f.name)
+    if (!src) {
+      if (m.pkt == null || f.id == null) throw new Error(t('emoji.srcUnavailable'))
+      toast(t('emoji.addNeedDownload'))
+      const wait = waitFileDownload(key, m.pkt, f.id)
+      await downloadFile(m, f)
+      src = await resolveLocalImage(await wait, f.name)
+      if (!src) throw new Error(f.error || t('emoji.srcUnavailable'))
+    }
+    const r = await ipc.importEmoji([src])
+    await loadEmojiIndex()
+    const sum = importSummary(r, t)
+    toast(sum.level === 'warn' ? sum.text : t('emoji.addedToEmoji'))
+  } catch (e) {
+    toast(t('emoji.importFailed', { e: String(e?.message || e) }))
+  }
+}
+
+/** 后端确认本地确有该图片时返回可用路径（可能是兜底找到的那个），否则返回空串 */
+async function resolveLocalImage(candidate, name) {
+  try {
+    const r = await ipc.emojiSrcAvailable(candidate || '', name || '')
+    return r?.ok && r.path ? r.path : ''
+  } catch {
+    return ''
+  }
+}
 
 /* ---------- 右键回复 ---------- */
 /** 正在回复的目标：{ preview, nick }；发送/取消/切换会话后清空 */
@@ -679,34 +791,58 @@ async function pickFolder() {
 
 /* ---------- 表情 ---------- */
 const emojiOpen = ref(false)
-// 面板尺寸估估值：宽度取实际样式，高度按 5 行网格估算（仅用于上下翻转判断）
-const EMOJI_PANEL_W = 264
-const EMOJI_PANEL_H = 176
+// 面板尺寸：宽度固定；高度按内容量（9 列 × 7 行大格子 + 底部行为条）估算，
+// 仅用于「向上弹还是向下弹」。面板出内容后会回调 relayoutEmoji() 用实测高度纠正。
+const EMOJI_PANEL_W = 404
+const EMOJI_PANEL_H = 430
 const emojiBtnRef = ref(null)
 const emojiPanelRef = ref(null)
 const emojiStyle = ref({})
+
+function emojiAnchor() {
+  const btn = emojiBtnRef.value
+  const rect = (btn?.$el || btn)?.getBoundingClientRect?.()
+  return rect || null
+}
+
+function placeEmoji(panelH) {
+  const rect = emojiAnchor()
+  if (!rect) return
+  const { left, top } = computePopupPosition(
+    { left: rect.left, top: rect.top, bottom: rect.bottom, width: rect.width },
+    EMOJI_PANEL_W,
+    panelH,
+    window.innerWidth,
+    window.innerHeight,
+  )
+  // computePopupPosition 只会「上方放不下就翻到下方」，两者都放不下时仍会溢出。
+  // 表情面板做成微信口径后高度接近半个窗口（≈446px），小窗口里底部行为条会被
+  // 裁掉、点不到收藏/导入按钮。这里再夹一次：自上而下对齐到窗口内，
+  // 首选「底边贴住触发按钮」——面板紧贴输入区，视觉上更像微信。
+  const margin = 8
+  const maxTop = Math.max(margin, window.innerHeight - panelH - margin)
+  const preferred = Math.min(rect.top - panelH - 8, maxTop)
+  const top2 = Math.min(Math.max(preferred, margin), maxTop)
+  emojiStyle.value = { position: 'fixed', left: left + 'px', top: top2 + 'px' }
+}
 
 function toggleEmoji() {
   if (emojiOpen.value) {
     emojiOpen.value = false
     return
   }
-  const btn = emojiBtnRef.value
-  const rect = (btn?.$el || btn)?.getBoundingClientRect?.()
-  if (!rect) {
-    emojiOpen.value = true
-    return
-  }
   // 跟随按钮位置弹出（上方优先，越界翻转/夹回），而不是固定挂在右下角
-  const { left, top } = computePopupPosition(
-    { left: rect.left, top: rect.top, bottom: rect.bottom, width: rect.width },
-    EMOJI_PANEL_W,
-    EMOJI_PANEL_H,
-    window.innerWidth,
-    window.innerHeight,
-  )
-  emojiStyle.value = { position: 'fixed', left: left + 'px', top: top + 'px' }
+  placeEmoji(EMOJI_PANEL_H)
   emojiOpen.value = true
+}
+
+/** 面板内容变化（切到自定义页 / 导入多张）后按实测高度重新定位 */
+function relayoutEmoji() {
+  nextTick(() => {
+    const el = emojiPanelRef.value?.$el || emojiPanelRef.value
+    const h = el?.getBoundingClientRect?.().height
+    if (h) placeEmoji(h)
+  })
 }
 
 /** 点击面板和触发按钮之外的地方 / 按 Esc → 关闭面板 */
@@ -934,6 +1070,9 @@ watch(
 
 <template>
   <section class="chat-window">
+    <!-- 轻提示（表情收纳结果等）：不打断操作，自动消失 -->
+    <div v-if="toastMsg" class="cw-toast">{{ toastMsg }}</div>
+
     <!-- 头部 -->
     <header v-if="activeUser" class="cw-head">
       <div class="peer">
@@ -1029,12 +1168,15 @@ watch(
                 <template v-else>{{ bodyOf(v.m) }}</template>
               </div>
               <template v-for="f in v.m.files || []" :key="f.id">
-                <!-- 图片：本地已有内容时直接内联预览，点击查看原图（多选模式下点击改为切换选中） -->
-                <div v-if="isImg(f.name) && f.src" class="img-wrap">
-                  <img :src="f.src" class="chat-img" :title="t('chat.viewImg')" @click="selMode ? toggleSel(v.m) : viewImage(f)" />
+                <!-- 图片：本地已有内容时直接内联预览，点击查看原图（多选模式下点击改为切换选中）；
+                     自定义表情（命中表情库）按缩略尺寸渲染，不占满气泡 -->
+                <div v-if="isImg(f.name) && f.src" class="img-wrap" :class="{ 'sticker-wrap': isSticker(f) }">
+                  <img :src="f.src" class="chat-img" :class="{ 'emoji-sticker': isSticker(f) }"
+                    :title="t('chat.viewImg')" @click="selMode ? toggleSel(v.m) : viewImage(f)"
+                    @contextmenu.prevent="openCtx(v.m, $event)" />
                 </div>
                 <!-- 无预览时显示文件卡片（下载中/失败/非图片/超大图） -->
-                <div v-else class="file-card">
+                <div v-else class="file-card" @contextmenu.prevent="openCtx(v.m, $event)">
                 <div class="fc-icon">
                   <svg v-if="f.dir_entry" width="26" height="26" viewBox="0 0 24 24" fill="none">
                     <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"
@@ -1121,6 +1263,9 @@ watch(
       <button class="ctx-item" @click="copyMsg">{{ t('chat.copy') }}</button>
       <button class="ctx-item" @click="startReply">{{ t('chat.reply') }}</button>
       <button class="ctx-item" @click="startForward">{{ t('chat.forward') }}</button>
+      <button v-if="canAddToEmoji(ctxMenu.msg)" class="ctx-item" @click="addMsgToEmoji">
+        {{ t('emoji.addToEmoji') }}
+      </button>
       <button v-if="ctxMenu.msg?.dir === 'out' && ctxMenu.msg?.kind === 'text' && !ctxMenu.msg?.recalled"
         class="ctx-item danger" @click="startRecall">{{ t('chat.recall') }}</button>
       <button class="ctx-item" @click="enterSelMode">{{ t('chat.multiSelect') }}</button>
@@ -1214,7 +1359,14 @@ watch(
         <button class="rb-x" :title="t('chat.cancelReply')" @click="cancelReply">✕</button>
       </div>
 
-      <EmojiPicker ref="emojiPanelRef" v-if="emojiOpen" :style="emojiStyle" @pick="insertEmoji" />
+      <EmojiPicker
+        ref="emojiPanelRef"
+        v-if="emojiOpen"
+        :style="emojiStyle"
+        @pick="insertEmoji"
+        @pick-sticker="sendSticker"
+        @need-layout="relayoutEmoji"
+      />
 
       <!-- 待发送附件列表：剪贴板图片 / 粘贴的文件；未发送前可逐项移除 -->
       <div v-if="pendingList.length" class="paste-strip">
@@ -1614,6 +1766,34 @@ watch(
   max-height: 200px;
   border-radius: 4px;
   cursor: zoom-in;
+}
+/* 自定义表情：不加白底衬垫，最长边限制在 150px（与 lib/emoji.js 的
+   STICKER_DISPLAY_MAX 同值），避免 16MB 大图把气泡撑满 */
+.img-wrap.sticker-wrap {
+  background: transparent;
+  padding: 0;
+}
+.chat-img.emoji-sticker {
+  max-width: 150px;
+  max-height: 150px;
+  border-radius: 6px;
+}
+
+/* 轻提示 */
+.cw-toast {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 12px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--c-card);
+  background: var(--c-shadow);
+  border-radius: 6px;
+  z-index: 50;
+  max-width: 80%;
+  word-break: break-all;
 }
 
 /* 文件卡片 */

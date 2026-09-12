@@ -62,7 +62,7 @@
 | ENCEXTMSGOPT | 0x4000000 | 加密含附件元数据 | ✅ 入站/出站都带 |
 | CAPUTF8OPT | 0x1000000 | UTF-8 能力声明 | ✅ Entry 恒带 |
 | UTF8OPT | 0x800000 | 报文为 UTF-8 | ✅ SENDMSG 用；⚠️ BR 系也置位（规范 §3-9 禁止，见 §五） |
-| CLIPBOARDOPT | 0x8000000 | 支持粘图附件 | ✅ 声明 + 接收；⚠️ 我方发出粘图不带 FILE_CLIPBOARD 属性（见 §四） |
+| CLIPBOARDOPT | 0x8000000 | 支持粘图附件 | ✅ 声明 + 接收；✅ 发出粘图带 FILE_CLIPBOARD（attr 恰好 0x20，见 §四） |
 | CAPFILEENC_OBSLT | 0x1000 | 废弃 | ✅ 不实现（正确） |
 | CAPFILEENCOPT | 0x40000 | 文件流加密能力 | ✅ 声明 + 使用 |
 | ENCFILEOPT | 0x800 | 文件流加密请求 | ✅ 用 test 钉死线上值 |
@@ -90,10 +90,15 @@
 - 文件名冒号转义：官方用 `::`（protocol.txt §3-5 明文规定）；本端一律替换为 `_`，
   **解析端不识别 `::`** —— 官方发来含冒号文件名时 `splitn(6)` 段错位、条目被丢。
   ⚠️ 真实互通缺口。
-- ~~我方「粘贴图片」发出 attr=REGULAR、名字 `剪贴板图片_*.png`~~ —— 已按官方
-  「粘贴图片」格式落地：公告首条附件带 FILE_CLIPBOARD(0x20)+CLIPBOARDPOS=位置，
-  落盘命名 `ipmsgclip_s_<id>_0.png`（官方 share.cpp 同款），官方对端消息内内嵌显示；
-  接收方向解析 FILE_CLIPBOARD/CLIPBOARDPOS 并自动内联预览仍完整。
+- 我方「粘贴图片」/自定义表情：公告首条附件带 FILE_CLIPBOARD(0x20)+
+  CLIPBOARDPOS=位置，落盘命名 `ipmsgclip_s_<id>_0.png`（官方 share.cpp 同款）。
+  ⚠️ 2026-09 真机修正：attr 必须**恰好是 0x20**。此前写成 `attr |= CLIPBOARD`，
+  普通文件带有 REGULAR(0x01) 使线上值变成 0x21；官方 Windows 客户端按低 8 位的
+  类型值判定（`GET_FILE_TYPE(attr)` 与类型常量比较），0x21 不等于 0x20，于是把图片
+  当普通文件下载 —— 对端只看到一条空消息 + 一个文件，图片不内嵌显示。现由
+  `net::stamp_clipboard_entry` 统一改写低 8 位，并有单测锁死官方样本字节
+  （`clipboard_entry_matches_official_attr_exactly`）。接收方向解析
+  FILE_CLIPBOARD/CLIPBOARDPOS 并自动内联预览保持不变。
 - 目录流条目类型：官方支持 SYMLINK(4)/CDEV(5)/BDEV(6)/FIFO(7)/RESFORK(0x10)；
   本端**发送时跳过符号链接**、接收时跳过不落盘（内容读掉防错位）——安全取舍，但属未实现项。
 - fileattr 高位属性 RONLYOPT/HIDDENOPT/ARCHIVEOPT/SYSTEMOPT 与扩展属性

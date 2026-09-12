@@ -10,6 +10,7 @@ import { splitDelayedNote } from './lib/text'
 import { pickLatestUnread, pickLatestActive, applyUnreadFromSessions } from './lib/unread'
 import { unreadReceiptPkts } from './lib/receipts'
 import { mergeSessions } from './lib/sessions'
+import { normalizeEmojis } from './lib/emoji'
 import { applyTheme } from './lib/theme'
 import { t, setLocale, detectLocale, dayLabel as i18nDayLabel } from './lib/i18n'
 
@@ -43,6 +44,9 @@ export const store = reactive({
   locate: null,
   /** 拖放文件时中栏正在悬停的联系人 key（中栏行高亮用；'' 表示不在联系人上） */
   dragHoverKey: '',
+  /** 自定义表情库：图片文件名 / 已发出的缓存副本名（聊天里识别「表情」按缩略渲染） */
+  emojiFiles: [],
+  emojiCacheFiles: [],
   lastTs: {}, // key -> 最后消息时间戳
   windowFocused: true, // 主窗口是否聚焦（决定是否弹通知/自动已读）
 })
@@ -511,6 +515,34 @@ export function latestUnreadKey() {
   return pickLatestUnread(store.unread, store.unreadTs, store.lastTs)
 }
 
+/* ---------------- 自定义表情库 ---------------- */
+
+/**
+ * 拉取表情库文件名索引（供聊天里把「表情」按缩略渲染）。
+ * emojiFiles：库内文件名；emojiCacheFiles：最近一次发送时缓存目录里的副本名
+ * （自己发出的表情在消息里显示的是缓存副本，只能靠这张映射认出来）。
+ */
+export async function loadEmojiIndex() {
+  const list = normalizeEmojis(await ipc.listEmojis())
+  store.emojiFiles = list.map((e) => e.file)
+  store.emojiCacheFiles = list.map((e) => e.cacheFile).filter(Boolean)
+  return list
+}
+
+/**
+ * 发送一张自定义表情到指定会话。
+ * 后端按官方「粘贴图片」协议公告，返回的记录与 send_text 同构，
+ * 这里走同一条上屏链路（pushMsg），保证气泡、未读、落下与普通消息一致。
+ */
+export async function sendEmojiTo(key, id, text = '') {
+  if (!key || !id) return null
+  const msgs = await ipc.sendEmoji(key, id, text)
+  const list = Array.isArray(msgs) ? msgs : [msgs]
+  for (const m of list) await pushMsg(key, m)
+  await loadEmojiIndex() // 发送会更新「缓存副本名」映射
+  return list[list.length - 1] || null
+}
+
 /* ---------------- 启动 ---------------- */
 
 let bootedOnce = false
@@ -520,6 +552,9 @@ export async function boot() {
   bootedOnce = true
 
   await refreshConfig()
+  // 自定义表情库（文件名集合用于聊天里识别表情并按缩略渲染）；
+  // 失败不阻塞启动：表情面板打开时会自己再拉一次
+  loadEmojiIndex().catch((e) => console.error('list_emojis failed', e))
 
   // 窗口焦点跟踪：失焦时来消息弹通知；重新聚焦自动标记已读
   getCurrentWindow().onFocusChanged(({ payload: focused }) => {

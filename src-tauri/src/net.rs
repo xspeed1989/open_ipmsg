@@ -2258,6 +2258,20 @@ fn stat_file_entries(paths: &[String]) -> Result<Vec<proto::FileEntry>, String> 
     Ok(entries)
 }
 
+/// 把一条附件条目改写成官方「粘贴图片」形态：低 8 位**整个替换**为
+/// `IPMSG_FILE_CLIPBOARD(0x20)`，并带上 `CLIPBOARDPOS=位置` 扩展段。
+///
+/// 官方 5.8.6 实测样本是 `id:ipmsgclip_s_<id>_<pos>.png:size:mtime:20:8=0:` ——
+/// attr 恰好等于 0x20，**没有 REGULAR(0x01) 位**。官方客户端按低 8 位的
+/// 文件类型值判定（`GET_FILE_TYPE(attr)` 与类型常量比较），`0x21` 不等于
+/// 0x20，于是它把图片当普通文件走下载流程：对端只看到一条空消息 + 一个文件，
+/// 图片不会内嵌显示（2026-09 真机实测：官方 Windows 客户端收到的正是「文件」）。
+/// 因此这里必须替换而不是按位或。
+fn stamp_clipboard_entry(e: &mut proto::FileEntry, pos: u32) {
+    e.attr = (e.attr & !0xFF) | fileattr::CLIPBOARD;
+    e.ext_attrs = vec![(proto::extattr::CLIPBOARDPOS, pos.to_string())];
+}
+
 /// 校验路径、分配文件 ID 并登记文件槽（直发与离线重投共用，必须在发包前完成，
 /// 对端可能立刻来取）。返回公告条目与已登记槽位（UDP 发送失败时回滚用）。
 /// `utf8`：公告是否按 UTF-8 发出（对端取文件请求与目录流文件名的编码依据）。
@@ -2485,8 +2499,7 @@ pub async fn send_message_opts(
     // CLIPBOARDPOS=插入位置 扩展段（官方 share.cpp EncodeMsg 同款）
     if let Some(pos) = opts.clip_pos {
         if let Some(e) = entries.first_mut() {
-            e.attr |= fileattr::CLIPBOARD;
-            e.ext_attrs = vec![(proto::extattr::CLIPBOARDPOS, pos.to_string())];
+            stamp_clipboard_entry(e, pos);
         }
     }
 
@@ -5315,6 +5328,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 粘贴图片公告必须与官方 5.8.6 实测样本同形：
+    /// `id:ipmsgclip_s_<id>_<pos>.png:size:mtime:20:8=<pos>:`
+    ///
+    /// 回归背景（2026-09 真机实测）：官方 Windows 客户端把我们的贴图当**文件**
+    /// 收下，图片不内嵌显示。原因是当时写成 `attr |= CLIPBOARD`，普通文件本就带
+    /// `REGULAR(0x01)`，于是线上 attr=0x21；官方客户端按低 8 位的类型值判定，
+    /// 0x21 不等于 IPMSG_FILE_CLIPBOARD(0x20)，走了普通文件分支。
+    #[test]
+    fn clipboard_entry_matches_official_attr_exactly() {
+        let mut e = proto::FileEntry {
+            id: 0x0e,
+            raw_id: String::new(),
+            name: "ipmsgclip_s_14_0.png".into(),
+            size: 0x55,
+            mtime: 0x7b,
+            attr: fileattr::REGULAR, // 普通文件挂上来的原始属性
+            ext_attrs: vec![],
+        };
+        stamp_clipboard_entry(&mut e, 0);
+
+        assert_eq!(
+            e.attr & 0xFF,
+            fileattr::CLIPBOARD,
+            "低 8 位必须恰好是 CLIPBOARD(0x20)，不能带 REGULAR(0x01)"
+        );
+        assert_eq!(e.attr, 0x20, "官方样本 attr=20");
+        assert_eq!(
+            e.serialize("utf-8"),
+            "14:ipmsgclip_s_14_0.png:55:7b:20:8=0:",
+            "必须与官方 share.cpp EncodeMsg 样本逐字节一致"
+        );
+
+        // 高位属性位（只读/隐藏等）不能被贴图标记清掉
+        let mut e2 = proto::FileEntry {
+            attr: fileattr::REGULAR | fileattr::HIDDENOPT,
+            ..e.clone()
+        };
+        stamp_clipboard_entry(&mut e2, 3);
+        assert_eq!(e2.attr & 0xFF, fileattr::CLIPBOARD);
+        assert_eq!(e2.attr & fileattr::HIDDENOPT, fileattr::HIDDENOPT);
+        assert_eq!(e2.ext(proto::extattr::CLIPBOARDPOS), Some("3"));
+    }
+
+    /// 失败判定前的抢救：落盘文件完整时必须采用，不能判失败更不能删
+    /// （2026-09 真机：官方客户端发来的剪贴板图完整落盘却记成 failed）
+    #[test]
+    fn adopt_completed_download_uses_complete_files_only() {
+        let dir = std::env::temp_dir().join(format!("oim-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = "ipmsgclip_s_1_0.png";
+
+        // 1) 本次的临时文件完整 → 改名采用
+        let tmp = dir.join(".oim-1-0.part");
+        std::fs::write(&tmp, b"0123456789").unwrap();
+        let got = adopt_completed_download_pure(&tmp, &dir, name, 10).expect("完整临时文件要采用");
+        assert_eq!(got, dir.join(name));
+        assert!(got.is_file(), "临时文件应被改名到最终路径");
+        assert!(!tmp.exists());
+        std::fs::remove_file(&got).unwrap();
+
+        // 2) 目标文件本身已完整（上一次其实传完了）→ 直接采用，绝不删
+        let done = dir.join(name);
+        std::fs::write(&done, b"0123456789").unwrap();
+        let got2 = adopt_completed_download_pure(&dir.join(".oim-2-0.part"), &dir, name, 10)
+            .expect("已完整的落盘文件要采用");
+        assert_eq!(got2, done);
+        assert!(done.is_file(), "完整文件不能被删掉");
+
+        // 3) 半截文件 → 不采用（走正常失败清理）
+        std::fs::write(&done, b"0123").unwrap();
+        assert!(adopt_completed_download_pure(&dir.join(".oim-3-0.part"), &dir, name, 10).is_none());
+
+        // 4) 公告大小为 0（空文件）不走这条路
+        assert!(adopt_completed_download_pure(&dir.join(".oim-4-0.part"), &dir, name, 0).is_none());
+
+        // 5) 目标同名但大小不符时，完整临时文件仍应被采用（改成 name(1)）
+        std::fs::write(&done, b"short").unwrap();
+        let tmp5 = dir.join(".oim-5-0.part");
+        std::fs::write(&tmp5, b"0123456789").unwrap();
+        let got5 = adopt_completed_download_pure(&tmp5, &dir, name, 10).expect("临时文件完整即采用");
+        assert_ne!(got5, done, "不能覆盖已有文件");
+        assert_eq!(got5.file_name().unwrap().to_string_lossy(), "ipmsgclip_s_1_0(1).png");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn id_candidates_both_bases() {
         assert_eq!(id_candidates("10"), vec![10, 16]); // 十进制优先，十六进制兜底
@@ -6271,8 +6371,20 @@ pub async fn download_file_task(
     }
     match result {
         Ok((0, _)) if expect_size > 0 => {
-            // 对端接受了连接但没有回数据，而公告大小非 0：
-            // 空文件已经在上面的方言循环里直接成功，走到这里必然是传输异常
+            // 对端接受了连接但没有回数据，而公告大小非 0。
+            //
+            // 但「判失败」之前必须先看落盘结果：真机上出现过「数据其实完整落盘，
+            // 追踪却记成 failed」的矛盾记录（2026-09），界面上既显示失败、又不敢
+            // 用这个文件。所以这里先尝试采用已完成的文件，只有确实不完整才判失败。
+            if let Some(path) = adopt_completed_download(ctx, &tmp_path, &dir, &safe_name, expect_size)
+            {
+                ctx.st.diag(&format!(
+                    "dl-adopt {key} pkt={pkt_no} id={file_id:x} -> {} ({expect_size}B，对端未回结束信号但文件已完整)",
+                    path.display()
+                ));
+                emit_download_done(ctx, key, pkt_no, file_id, &path, expect_size);
+                return Ok(path);
+            }
             let _ = tokio::fs::remove_file(&tmp_path).await;
             ctx.st.diag(&format!(
                 "dl-empty {key} pkt={pkt_no} id={file_id:x}: 对端未返回数据"
@@ -6300,17 +6412,7 @@ pub async fn download_file_task(
                 "dl-done {key} pkt={pkt_no} id={file_id:x} -> {} ({total}B) enc={enc}",
                 final_path.display()
             ));
-            ctx.st.emit(
-                "file-progress",
-                json!({"key": key, "pkt": pkt_no, "file_id": file_id,
-                       "transferred": total, "total": total, "done": true,
-                       "enc": enc,
-                       "path": final_path.to_string_lossy()}),
-            );
-            ctx.st.update_history_file(key, pkt_no, file_id, |f| {
-                f["state"] = "done".into();
-                f["path"] = Value::String(final_path.to_string_lossy().into_owned());
-            });
+            emit_download_done(ctx, key, pkt_no, file_id, &final_path, total);
             Ok(final_path)
         }
         Err(e) => {
@@ -6321,6 +6423,77 @@ pub async fn download_file_task(
             Err(e)
         }
     }
+}
+
+/// 前端把「下载完成」落到消息与界面上（进度条收尾 + 历史记录 state=done + path）
+fn emit_download_done(
+    ctx: &NetCtx,
+    key: &str,
+    pkt_no: u32,
+    file_id: u32,
+    path: &std::path::Path,
+    total: u64,
+) {
+    ctx.st.emit(
+        "file-progress",
+        json!({"key": key, "pkt": pkt_no, "file_id": file_id,
+               "transferred": total, "total": total, "done": true,
+               "path": path.to_string_lossy()}),
+    );
+    ctx.st.update_history_file(key, pkt_no, file_id, |f| {
+        f["state"] = "done".into();
+        f["path"] = Value::String(path.to_string_lossy().into_owned());
+    });
+}
+
+/// 失败之前先抢救：数据其实已经完整落盘、只是没拿到对端的结束信号时，
+/// 把这份完整文件认下来（改名到最终路径并返回），不要判失败。
+///
+/// 真机依据（2026-09）：官方客户端发来的剪贴板图，`接收文件/` 里躺着字节数与
+/// 公告完全一致、PNG 以 IEND+CRC 正常收尾的完整文件，而记录却是 failed —— 既
+/// 不敢被「添加到表情」使用，界面上还显示红字失败。
+fn adopt_completed_download(
+    _ctx: &NetCtx,
+    tmp_path: &std::path::Path,
+    dir: &std::path::Path,
+    safe_name: &str,
+    expect_size: u64,
+) -> Option<PathBuf> {
+    adopt_completed_download_pure(tmp_path, dir, safe_name, expect_size)
+}
+
+/// adopt_completed_download 的纯逻辑（不依赖 ctx，便于单测）：
+/// 1) 本次尝试的临时文件已完整 → 改名到最终路径采用；
+/// 2) 目标文件本身已是一份完整文件 → 直接采用（绝不删）。
+/// 拿不出完整文件才返回 None，交给正常失败流程。
+fn adopt_completed_download_pure(
+    tmp_path: &std::path::Path,
+    dir: &std::path::Path,
+    safe_name: &str,
+    expect_size: u64,
+) -> Option<PathBuf> {
+    if expect_size == 0 {
+        return None;
+    }
+    // 1) 本次尝试的临时文件已经完整
+    if file_size(tmp_path) == Some(expect_size) {
+        let final_path = unique_path(&dir.join(safe_name));
+        if std::fs::rename(tmp_path, &final_path).is_ok() {
+            return Some(final_path);
+        }
+    }
+    // 2) 目标文件本身已是一份完整文件（例如上一次尝试其实传完了，只是记录被后来的
+    //    失败覆盖）。这时直接采用它，绝不能再当成失败去删。
+    let candidate = dir.join(safe_name);
+    if file_size(&candidate) == Some(expect_size) {
+        return Some(candidate);
+    }
+    None
+}
+
+/// 文件大小；不存在返回 None
+fn file_size(p: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(p).ok().map(|m| m.len())
 }
 
 /// 客户端：以 GETDIRFILES 流方式接收整个目录树
@@ -6866,6 +7039,21 @@ fn fail_download(ctx: &NetCtx, key: &str, pkt_no: u32, file_id: u32, err: &str) 
                "transferred": 0, "total": 0, "done": false, "error": err}),
     );
     ctx.st.update_history_file(key, pkt_no, file_id, |f| {
+        // 半截文件不留：曾经出现过「追踪状态 failed，但文件其实完整躺在下载目录里」
+        // 的自相矛盾记录（2026-09 真机），界面上既看不到重试入口、又不敢用这个文件。
+        // 清掉落盘结果后，重试下载会重新拉一份完整文件。
+        //
+        // 只在「文件大小与公告不一致」时删：极端时序下（同一路径被别的下载抢先完成
+        // 并改名进来）不误删别人的完整文件。
+        let path = f.get("path").and_then(|p| p.as_str()).map(str::to_string);
+        let expect = f.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+        if let Some(p) = path {
+            let actual = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            if actual != expect {
+                let _ = std::fs::remove_file(&p);
+                f["path"] = Value::Null;
+            }
+        }
         f["state"] = "failed".into();
         f["error"] = Value::String(err.to_string());
     });

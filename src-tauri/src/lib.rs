@@ -13,6 +13,7 @@ macro_rules! oim_log {
 }
 
 mod crypto;
+mod emoji;
 mod ipdict;
 mod ipmsg_import;
 mod net;
@@ -39,8 +40,8 @@ use tauri::tray::{MouseButton, TrayIconEvent};
 #[cfg(target_os = "macos")]
 use tauri::tray::MouseButtonState;
 
-type SharedState = Arc<AppState>;
-type SharedCtx = Arc<net::NetCtx>;
+pub(crate) type SharedState = Arc<AppState>;
+pub(crate) type SharedCtx = Arc<net::NetCtx>;
 
 static EXIT_INFO: OnceLock<(Arc<AppState>, u16)> = OnceLock::new();
 /// 首次隐藏到托盘时提示一次
@@ -1732,7 +1733,17 @@ pub fn run() {
             broadcast_message,
             unlock_message,
             get_absence_info,
-            request_hostlist
+            request_hostlist,
+            emoji::list_emojis,
+            emoji::emoji_src_available,
+            emoji::import_emoji,
+            emoji::delete_emoji,
+            emoji::rename_emoji,
+            emoji::reorder_emojis,
+            emoji::send_emoji,
+            emoji::export_emoji_pack,
+            emoji::inspect_emoji_pack,
+            emoji::import_emoji_pack
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -75,6 +75,9 @@ sha1 = { version = "0.10", features = ["oid"] }
 # oid：PKCS#1 v1.5 签名需要 DigestInfo 前缀（SigningKey/VerifyingKey 要求 AssociatedOid）
 sha2 = { version = "0.10", features = ["oid"] }
 rand = "0.8"
+# 自定义表情包的导入/导出容器：标准 zip（.ipmojis），只开 deflate，
+# 复用已在依赖树里的 flate2，不引入 bzip2/zstd/aes 等额外编译成本
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [features]
 net_debug = []
