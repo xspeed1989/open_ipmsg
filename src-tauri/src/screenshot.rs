@@ -5,6 +5,7 @@
 //! 前端拿到的永远是物理像素矩形。
 
 use serde::Serialize;
+use std::time::Duration;
 
 /// 矩形（x/y 允许为负 —— 多屏时副屏可以排在主屏左侧或上方）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -63,6 +64,173 @@ pub fn bgra_to_rgba(src: &[u8], w: u32, h: u32, stride: usize) -> Vec<u8> {
         }
     }
     out
+}
+
+/// 抓屏失败分类：错误码给前端做分支，文案给用户看
+#[derive(Debug)]
+pub enum ShotErr {
+    /// 系统没有可用的截图服务（未安装/未运行 xdg-desktop-portal）
+    PortalMissing(String),
+    /// portal 返回了非 0 响应码（用户拒绝 / 后端出错）
+    PortalDenied(u32),
+    /// portal 在规定时间内没有回响应
+    Timeout,
+    /// 图像解码失败
+    Decode(String),
+    /// macOS 未授予「屏幕录制」权限
+    MacPermission,
+    /// 平台抓屏 API 失败
+    CaptureFailed(String),
+}
+
+impl ShotErr {
+    pub fn code(&self) -> &'static str {
+        match self {
+            ShotErr::PortalMissing(_) => "PORTAL_MISSING",
+            ShotErr::PortalDenied(_) => "PORTAL_DENIED",
+            ShotErr::Timeout => "PORTAL_TIMEOUT",
+            ShotErr::Decode(_) => "DECODE_FAILED",
+            ShotErr::MacPermission => "MAC_PERMISSION",
+            ShotErr::CaptureFailed(_) => "CAPTURE_FAILED",
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            ShotErr::PortalMissing(e) => format!("系统未提供截图服务（xdg-desktop-portal）：{e}"),
+            ShotErr::PortalDenied(c) => format!("截图请求被系统拒绝（响应码 {c}）"),
+            ShotErr::Timeout => "截图超时：系统未在 15 秒内响应".into(),
+            ShotErr::Decode(e) => format!("截图数据解码失败：{e}"),
+            ShotErr::MacPermission => {
+                "需要「屏幕录制」权限：系统设置 → 隐私与安全性 → 屏幕录制".into()
+            }
+            ShotErr::CaptureFailed(e) => format!("抓屏失败：{e}"),
+        }
+    }
+}
+
+/// 一次抓屏的结果
+pub struct Captured {
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// PNG 字节 → 尺寸（Linux 下 portal 直接给 PNG，无需再编码）
+pub fn decode_captured(png: Vec<u8>) -> Result<Captured, ShotErr> {
+    let img = image::load_from_memory(&png).map_err(|e| ShotErr::Decode(e.to_string()))?;
+    let (width, height) = (img.width(), img.height());
+    Ok(Captured { png, width, height })
+}
+
+/// 抓取整个工作区（原生物理像素）。
+///
+/// 放到独立线程并带超时：portal 的 Response 信号是阻塞等待的，不能占住
+/// Tauri 命令所在的 tokio worker，也不能无限期挂起。
+pub fn capture_png(timeout: Duration) -> Result<Captured, ShotErr> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(capture_png_inner());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(r) => r,
+        Err(_) => Err(ShotErr::Timeout),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capture_png_inner() -> Result<Captured, ShotErr> {
+    let raw = portal::screenshot_png()?;
+    decode_captured(raw)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn capture_png_inner() -> Result<Captured, ShotErr> {
+    platform::capture()
+}
+
+/// xdg-desktop-portal 客户端（Linux：X11 与 Wayland 同一条路径）
+#[cfg(target_os = "linux")]
+mod portal {
+    use super::ShotErr;
+    use std::collections::HashMap;
+    use zbus::blocking::{Connection, Proxy};
+    use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+
+    const DEST: &str = "org.freedesktop.portal.Desktop";
+    const PATH: &str = "/org/freedesktop/portal/desktop";
+
+    /// 非交互抓屏 → PNG 字节
+    pub fn screenshot_png() -> Result<Vec<u8>, ShotErr> {
+        let conn = Connection::session()
+            .map_err(|e| ShotErr::PortalMissing(format!("无法连接会话总线: {e}")))?;
+        // handle 路径可预测：/org/freedesktop/portal/desktop/request/<sender>/<token>
+        let sender = conn
+            .unique_name()
+            .map(|n| n.trim_start_matches(':').replace('.', "_"))
+            .ok_or_else(|| ShotErr::PortalMissing("会话总线没有唯一名".into()))?;
+        let token = format!("oimshot{}", std::process::id());
+        let handle = format!("/org/freedesktop/portal/desktop/request/{sender}/{token}");
+
+        // 必须先订阅再调用：portal 的响应可能早于调用返回
+        let req = Proxy::new(&conn, DEST, handle.as_str(), "org.freedesktop.portal.Request")
+            .map_err(|e| ShotErr::PortalMissing(e.to_string()))?;
+        let mut signals = req
+            .receive_signal("Response")
+            .map_err(|e| ShotErr::PortalMissing(e.to_string()))?;
+
+        let mut options: HashMap<&str, Value<'_>> = HashMap::new();
+        options.insert("handle_token", Value::from(token.as_str()));
+        options.insert("interactive", Value::from(false));
+        options.insert("modal", Value::from(false));
+
+        let shot = Proxy::new(&conn, DEST, PATH, "org.freedesktop.portal.Screenshot")
+            .map_err(|e| ShotErr::PortalMissing(e.to_string()))?;
+        let returned: OwnedObjectPath = shot
+            .call("Screenshot", &("", options))
+            .map_err(|e| ShotErr::PortalMissing(e.to_string()))?;
+        if returned.as_str() != handle {
+            // portal 用了别的 handle（罕见）：改挂到实际路径上再等
+            let req2 = Proxy::new(&conn, DEST, returned.as_str(), "org.freedesktop.portal.Request")
+                .map_err(|e| ShotErr::PortalMissing(e.to_string()))?;
+            signals = req2
+                .receive_signal("Response")
+                .map_err(|e| ShotErr::PortalMissing(e.to_string()))?;
+        }
+
+        let msg = signals
+            .next()
+            .ok_or_else(|| ShotErr::PortalMissing("portal 未返回响应".into()))?;
+        let (code, results): (u32, HashMap<String, OwnedValue>) = msg
+            .body()
+            .deserialize()
+            .map_err(|e| ShotErr::Decode(e.to_string()))?;
+        if code != 0 {
+            return Err(ShotErr::PortalDenied(code));
+        }
+        let uri: &str = results
+            .get("uri")
+            .ok_or_else(|| ShotErr::Decode("响应里没有 uri".into()))?
+            .try_into()
+            .map_err(|_| ShotErr::Decode("uri 不是字符串".into()))?;
+        let path = crate::file_uri_to_path(uri)
+            .ok_or_else(|| ShotErr::Decode(format!("无法解析 uri: {uri}")))?;
+        let bytes = std::fs::read(&path)
+            .map_err(|e| ShotErr::CaptureFailed(format!("读取截图文件失败: {e}")))?;
+        // portal 把 PNG 落在用户图片目录：读完即删，不留垃圾
+        let _ = std::fs::remove_file(&path);
+        Ok(bytes)
+    }
+}
+
+/// 非 Linux 平台的抓屏后端（Windows / macOS，见 Task 12 / Task 13）
+#[cfg(not(target_os = "linux"))]
+mod platform {
+    use super::ShotErr;
+
+    pub fn capture() -> Result<super::Captured, ShotErr> {
+        Err(ShotErr::CaptureFailed("当前平台尚未实现抓屏".into()))
+    }
 }
 
 #[cfg(test)]
@@ -124,5 +292,37 @@ mod tests {
         );
         // 源数据不足时不 panic，缺的部分补全透明黑
         assert_eq!(bgra_to_rgba(&src[..14], 2, 2, 12).len(), 16);
+    }
+
+    #[test]
+    fn error_codes_and_messages_are_stable() {
+        assert_eq!(ShotErr::Timeout.code(), "PORTAL_TIMEOUT");
+        assert_eq!(ShotErr::PortalDenied(2).code(), "PORTAL_DENIED");
+        assert_eq!(ShotErr::MacPermission.code(), "MAC_PERMISSION");
+        assert!(ShotErr::PortalDenied(2).message().contains('2'));
+        // 错误码是给前端做分支判断用的，必须是稳定的大写常量
+        for e in [
+            ShotErr::PortalMissing("x".into()),
+            ShotErr::PortalDenied(1),
+            ShotErr::Timeout,
+            ShotErr::Decode("x".into()),
+            ShotErr::MacPermission,
+            ShotErr::CaptureFailed("x".into()),
+        ] {
+            assert!(e.code().chars().all(|c| c.is_ascii_uppercase() || c == '_'));
+        }
+    }
+
+    #[test]
+    fn png_dimensions_are_read_without_decoding_failure() {
+        // 用 image 现场编码一张 1×1 再解回来：不依赖手写 PNG 字节常量
+        // （手写常量一旦 IDAT 长度写错，测试失败会指向错误的方向）
+        use image::ImageEncoder;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[0u8, 0, 0, 0], 1, 1, image::ExtendedColorType::Rgba8)
+            .expect("encode");
+        let c = decode_captured(png).expect("decode");
+        assert_eq!((c.width, c.height), (1, 1));
     }
 }

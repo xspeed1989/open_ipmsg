@@ -1059,7 +1059,8 @@ async fn clipboard_file_paths(app: tauri::AppHandle) -> Result<Vec<String>, Stri
 }
 
 /// `file:///home/a%20b.txt` → `/home/a b.txt`；非 file 协议返回 None。
-/// 只服务 Linux 下读 GTK 剪贴板的 text/uri-list（Windows/macOS 走插件）。
+/// 服务两处：Linux 下读 GTK 剪贴板的 text/uri-list，以及 xdg-desktop-portal
+/// 截图返回的 uri（两者都可能带百分号编码）。
 #[cfg(target_os = "linux")]
 pub(crate) fn file_uri_to_path(uri: &str) -> Option<String> {
     let rest = uri
@@ -1447,6 +1448,23 @@ pub fn run() {
             gtk::glib::ControlFlow::Break
         });
         gtk::main();
+        std::process::exit(0);
+    }
+
+    // 诊断模式：--shot-test 抓一次屏并落盘，打印尺寸（不启动界面）。
+    // 用于在用户机器上定位抓屏问题：能出图说明后端没问题，问题在遮罩/前端。
+    if std::env::args().any(|a| a == "--shot-test") {
+        match screenshot::capture_png(std::time::Duration::from_secs(15)) {
+            Ok(c) => {
+                let out = std::env::temp_dir().join("oim-shot-test.png");
+                std::fs::write(&out, &c.png).ok();
+                println!("抓屏成功: {}x{} → {}", c.width, c.height, out.display());
+            }
+            Err(e) => {
+                eprintln!("抓屏失败 [{}]: {}", e.code(), e.message());
+                std::process::exit(1);
+            }
+        }
         std::process::exit(0);
     }
 

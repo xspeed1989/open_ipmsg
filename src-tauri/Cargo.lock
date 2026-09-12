@@ -2915,6 +2915,7 @@ dependencies = [
  "gdk",
  "gtk",
  "hostname",
+ "image",
  "ksni",
  "libc",
  "local-ip-address",
@@ -2936,6 +2937,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tokio",
  "windows-sys 0.61.2",
+ "zbus",
  "zip",
 ]
 

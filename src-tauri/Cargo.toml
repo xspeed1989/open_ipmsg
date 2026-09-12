@@ -79,6 +79,14 @@ rand = "0.8"
 # 复用已在依赖树里的 flate2，不引入 bzip2/zstd/aes 等额外编译成本
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# 截图：Linux 抓屏走 xdg-desktop-portal（Wayland 下唯一可行路径）。
+# 必须 default-features = false —— 一旦打开 zbus 的 tokio 特性，Cargo 的特性合并
+# 会把 notify-rust 推回「新建运行时再 block_on」的实现，从 Tauri 命令所在的
+# tokio worker 调用会 panic（见本文件 ksni / notify-rust 段落的同源注释）。
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+# 抓屏结果的编解码：Linux 拿到的已是 PNG（只读尺寸），Windows/macOS 需要编码
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 [features]
 net_debug = []
 
