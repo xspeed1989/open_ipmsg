@@ -3243,10 +3243,17 @@ mod platform {
             DeleteObject(bmp);
             DeleteDC(mem);
             ReleaseDC(std::ptr::null_mut(), screen);
-            if lines == 0 {
-                return Err(ShotErr::CaptureFailed("GetDIBits 失败".into()));
+            if lines != h as i32 {
+                return Err(ShotErr::CaptureFailed(format!(
+                    "GetDIBits 只写回 {lines} 行（应为 {h} 行）"
+                )));
             }
-            let rgba = bgra_to_rgba(&buf, w, h, stride);
+            let mut rgba = bgra_to_rgba(&buf, w, h, stride);
+            // BitBlt 到 DIB 的 alpha 字节是未定义的（实测常见为 0）。若原样当成
+            // 透明度用，PNG 会是一张全透明图 —— 抓屏必须强制不透明。
+            for px in rgba.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
             encode_png(rgba, w, h)
         }
     }
