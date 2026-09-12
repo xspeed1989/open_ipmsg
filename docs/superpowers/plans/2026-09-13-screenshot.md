@@ -482,7 +482,7 @@ Create `src/lib/hotkey.js`:
 /**
  * 快捷键串纯函数：规范化 + 设置页录制。
  *
- * 规范形：修饰键（Ctrl/Alt/Shift/CmdOrCtrl）+ 主键，用 '+' 连接，如 "Ctrl+Alt+A"。
+ * 规范形：修饰键（CmdOrCtrl/Ctrl/Alt/Shift，输出时按此顺序）+ 主键，用 '+' 连接，如 "Ctrl+Alt+A"。
  * 这个字符串直接存进配置，启动时交给 Tauri 的 global-shortcut 插件
  * （Windows/macOS/X11）或由 Rust 转成 portal 触发器（Wayland，见 shortcut.rs）；
  * 两侧都不需要 JS 再转换，所以这里只负责「录入即规范形」。
@@ -520,6 +520,13 @@ const KEY_ALIASES = {
   down: 'ArrowDown',
   left: 'ArrowLeft',
   right: 'ArrowRight',
+  // 规范名自身也要能解析：否则 normalizeCombo('Alt+ArrowUp') 返回 null，
+  // 而 normalizeCombo('Alt+Up') 返回 'Alt+ArrowUp' —— 规范化不幂等，
+  // 设置页会把一个 Rust 其实能注册的串标成「不可用」。
+  arrowup: 'ArrowUp',
+  arrowdown: 'ArrowDown',
+  arrowleft: 'ArrowLeft',
+  arrowright: 'ArrowRight',
   printscreen: 'PrintScreen',
 }
 
@@ -598,7 +605,7 @@ export function comboFromEvent(e) {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `node --test scripts/hotkey.test.mjs`
-Expected: PASS — 6 tests green.
+Expected: PASS — 7 tests green.
 
 - [ ] **Step 5: Commit**
 
@@ -632,6 +639,13 @@ test('未知键名与越界 F 键不算合法热键', () => {
   assert.equal(isValidCombo('Ctrl+F99'), false)
   assert.equal(isValidCombo('Ctrl+F24'), true)
   assert.equal(normalizeCombo('Alt+Å'), null)
+})
+
+test('规范名可往返：normalizeCombo 幂等', () => {
+  assert.equal(normalizeCombo('Alt+Up'), 'Alt+ArrowUp')
+  assert.equal(normalizeCombo('Alt+ArrowUp'), 'Alt+ArrowUp')
+  assert.equal(isValidCombo('Alt+ArrowUp'), true)
+  assert.equal(comboFromEvent({ key: 'ArrowUp', code: 'ArrowUp', altKey: true }), 'Alt+ArrowUp')
 })
 ```
 
@@ -1080,7 +1094,7 @@ In `src-tauri/src/lib.rs`, next to the `--clipboard-test` block, add:
 - [ ] **Step 6: Run tests and the real diagnostic**
 
 Run: `cd src-tauri && cargo test screenshot::`
-Expected: PASS — 6 tests green.
+Expected: PASS — 7 tests green.
 
 Run: `cargo build 2>&1 | tail -5 && ./target/debug/open-ipmsg --shot-test`
 Expected: `抓屏成功: 5120x1440 → /tmp/oim-shot-test.png` (dimensions match this machine's dual-2K workspace; on a single-monitor machine one screen's size). Then verify the file is a real screenshot: open it and confirm it shows the desktop, and confirm no new file was left in the pictures directory.
