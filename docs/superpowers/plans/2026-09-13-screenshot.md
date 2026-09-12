@@ -99,6 +99,15 @@ test('手柄命中：角优先于边，边优先于内部', () => {
   assert.equal(hitTestHandle(r, { x: 90, y: 30 }), 'outside')
 })
 
+test('小选区（3×3）内部仍能命中 inside，不被手柄吃光', () => {
+  // 回归：容差若写成固定 tol=6 的半径，3×3 选区的任何内部点都会落到手柄上，
+  // 于是小选区只能被拉伸、无法整体移动（Task 7 的 move 分支变成死代码）
+  const small = { x: 10, y: 10, w: 3, h: 3 }
+  assert.equal(hitTestHandle(small, { x: 11.5, y: 11.5 }), 'inside')
+  assert.equal(hitTestHandle(small, { x: 10, y: 10 }), 'nw')
+  assert.equal(hitTestHandle(small, { x: 11.5, y: 13 }), 's')
+})
+
 test('拖手柄只动被拖的边，且夹在窗口内', () => {
   const r = { x: 10, y: 10, w: 50, h: 40 }
   assert.deepEqual(resizeRect(r, 'se', { x: 80, y: 70 }, B), { x: 10, y: 10, w: 70, h: 60 })
@@ -161,14 +170,21 @@ export function canConfirm(r, min = 3) {
 
 const CORNERS = ['nw', 'ne', 'se', 'sw']
 
-/** 命中测试：角优先于边，边优先于内部 */
+/** 命中测试：角优先于边，边优先于内部。
+ *
+ *  容差按轴收紧到 min(tol, 边长/3)：canConfirm 允许 3×3 的小选区，如果容差
+ *  固定成 tol=6 的「半径」，那么任何 ≤2×tol（12px）的选区内部点都必然落在
+ *  手柄窗口里，'inside' 永远不可达 —— 小选区就只能被拉伸、无法整体移动。
+ *  收紧后 50×40 的选区行为与固定 tol 完全一致，小选区则始终留有内部命中区。 */
 export function hitTestHandle(r, pt, tol = 6) {
-  const nearL = Math.abs(pt.x - r.x) <= tol
-  const nearR = Math.abs(pt.x - (r.x + r.w)) <= tol
-  const nearT = Math.abs(pt.y - r.y) <= tol
-  const nearB = Math.abs(pt.y - (r.y + r.h)) <= tol
-  const spanX = pt.x >= r.x - tol && pt.x <= r.x + r.w + tol
-  const spanY = pt.y >= r.y - tol && pt.y <= r.y + r.h + tol
+  const tx = Math.min(tol, r.w / 3)
+  const ty = Math.min(tol, r.h / 3)
+  const nearL = Math.abs(pt.x - r.x) <= tx
+  const nearR = Math.abs(pt.x - (r.x + r.w)) <= tx
+  const nearT = Math.abs(pt.y - r.y) <= ty
+  const nearB = Math.abs(pt.y - (r.y + r.h)) <= ty
+  const spanX = pt.x >= r.x - tx && pt.x <= r.x + r.w + tx
+  const spanY = pt.y >= r.y - ty && pt.y <= r.y + r.h + ty
   const corners = { nw: nearL && nearT, ne: nearR && nearT, se: nearR && nearB, sw: nearL && nearB }
   for (const h of CORNERS) {
     if (corners[h]) return h
@@ -220,7 +236,7 @@ export function nudgeRect(r, key, step, bounds) {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `node --test scripts/shot.test.mjs`
-Expected: PASS — all 6 tests green.
+Expected: PASS — all 7 tests green.
 
 - [ ] **Step 5: Commit**
 
@@ -384,7 +400,7 @@ export function toolbarPlacement(sel, win, bar, gap = 8) {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `node --test scripts/shot.test.mjs`
-Expected: PASS — 11 tests green.
+Expected: PASS — 12 tests green.
 
 - [ ] **Step 5: Commit**
 
