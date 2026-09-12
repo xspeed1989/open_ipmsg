@@ -29,7 +29,16 @@ if [[ -z "$VERSION" ]]; then
   VERSION="$(python3 -c "import json;print(json.load(open('$ROOT/src-tauri/tauri.conf.json'))['version'])")"
 fi
 
-[[ -f "$BIN" ]] || { echo "找不到二进制: $BIN（先跑 pnpm build && cargo build --release）" >&2; exit 1; }
+[[ -f "$BIN" ]] || { echo "找不到二进制: $BIN（先跑 pnpm exec tauri build --no-bundle）" >&2; exit 1; }
+
+# 防呆：dev 模式构建不内嵌前端资源，窗口会去加载 devUrl（http://localhost:1420），
+# 用户机上没有 dev server 就是白屏 —— v0.1.4 的 Arch 包正是这样坏掉的。
+# 只有走 tauri CLI 才会带上 tauri/custom-protocol，内嵌资源清单里才有 /assets/。
+if command -v strings >/dev/null && ! strings -a "$BIN" | grep -q "/assets/"; then
+  echo "错误: $BIN 疑似 dev 模式构建（没有内嵌前端资源，运行会白屏）。" >&2
+  echo "      请改用: pnpm exec tauri build --no-bundle" >&2
+  exit 1
+fi
 
 # makepkg 不允许 root 执行：在容器里自动降权重跑一遍
 if [[ "$(id -u)" -eq 0 ]]; then

@@ -16,9 +16,10 @@ sha256sums=('SKIP')
 build() {
   cd "$srcdir/$pkgname"
   pnpm install --frozen-lockfile
-  pnpm build                       # 前端产物 -> dist/
-  cd src-tauri
-  cargo build --release --locked
+  # 必须走 tauri CLI：它会带上 tauri/custom-protocol，并先跑 beforeBuildCommand
+  # 把前端产物生成到 dist/ 再编译。裸 cargo build --release 得到的是 dev 模式二进制：
+  # 不内嵌前端资源，运行时加载 devUrl http://localhost:1420，装出来就是白屏。
+  pnpm exec tauri build --no-bundle
 }
 
 check() {

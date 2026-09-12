@@ -74,8 +74,11 @@ jobs:
       - name: 构建前端与二进制
         run: |
           pnpm install --frozen-lockfile
-          pnpm build
-          cd src-tauri && cargo build --release --locked
+          # 必须走 tauri CLI：只有它会带上 tauri/custom-protocol（CLI 内部先跑
+          # beforeBuildCommand 生成 dist/，再编译）。裸 cargo build --release 编出来的
+          # 是 dev 模式二进制：不内嵌前端资源，运行时去加载 devUrl http://localhost:1420，
+          # 装到没有 dev server 的机器上就是白屏（v0.1.4 的 Arch 包就是这样坏的）。
+          pnpm exec tauri build --no-bundle
 
       - name: 测试
         run: |
@@ -112,13 +115,15 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       # selftest 与测试都要跑在 release 二进制上（与 arch job 顺序一致）：
-      # 先 cargo build --release 产出二进制，再 pnpm 测试 / cargo 测试 / selftest。
+      # 先构建出二进制，再 pnpm 测试 / cargo 测试 / selftest。
+      # 构建同样走 tauri CLI：这样 selftest 跑的就是最终进安装包的那一份
+      # （裸 cargo build --release 是 dev 模式二进制，不内嵌前端；见 arch job 的说明），
+      # 且下一步 tauri build --bundles 因特性一致可直接复用，不会重复编译。
       # 统一 shell: bash（Windows runner 自带 Git Bash），避免 cmd 的 %ErrorLevel% 语义差异
       - name: 构建 release 二进制
         shell: bash
         run: |
-          pnpm build
-          cargo build --release --manifest-path src-tauri/Cargo.toml --locked
+          pnpm exec tauri build --no-bundle
 
       - name: 测试
         shell: bash
