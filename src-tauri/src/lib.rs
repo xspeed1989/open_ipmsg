@@ -1823,6 +1823,7 @@ pub fn run() {
             emoji::inspect_emoji_pack,
             emoji::import_emoji_pack,
             screenshot::start_screenshot,
+            screenshot::shot_overlay_ready,
             screenshot::shot_image,
             screenshot::close_shot_overlays,
             screenshot::save_shot_png,

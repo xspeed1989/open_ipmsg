@@ -23,6 +23,11 @@ const slice = ref({ x: 0, y: 0, w: 1, h: 1 })
 const sel = ref(null)          // 当前选区（CSS 像素），null = 未选
 const busy = ref(false)
 const errMsg = ref('')
+// 底图是否已经画上。遮罩窗口是透明窗，而且建出来就是映射状态（GTK 未映射的窗口里
+// requestAnimationFrame 一次都不会触发，页面没法在隐藏状态下等「帧已提交」）。
+// 「不闪」靠的是：底图画上来之前页面里**没有任何不透明的东西** —— 压暗层与提示
+// 都挂在这个标志上，于是它们与冻结的桌面图在同一帧出现。
+const painted = ref(false)
 
 let drag = null                // { mode:'new'|'move'|'resize', handle, start, origin }
 
@@ -326,6 +331,18 @@ function paintBase() {
   ctx.drawImage(source, slice.value.x, slice.value.y, slice.value.w, slice.value.h, 0, 0, c.width, c.height)
   // 标注层跟着窗口尺寸走：resize 之后窗口变大，标注可画区域必须同步
   paintAnnoSize()
+  // 底图落地：压暗层/提示这一刻才允许出现（见 painted 的注释）
+  painted.value = true
+}
+
+/** 等 n 个动画帧再继续：第 1 帧把这一帧提交上去，第 2 帧确认它已经进了合成管线。
+ *  这里刻意不用定时器 —— 定时器只保证「过了一段时间」，不保证帧真的画出去、
+ *  被合成器取走；帧什么时候提交只有 requestAnimationFrame 说得准。 */
+function nextFrames(n) {
+  return new Promise((resolve) => {
+    const tick = (left) => (left <= 0 ? resolve() : requestAnimationFrame(() => tick(left - 1)))
+    tick(n)
+  })
 }
 
 async function load() {
@@ -343,6 +360,17 @@ async function load() {
     paintBase()
   } catch (e) {
     errMsg.value = String(e?.message || e)
+  } finally {
+    // 底图（或错误提示）画完、帧真的提交出去之后才报「已就绪」。后端拿它做三件事：
+    // 记录一条锚点日志、把窗口端到前台/交回焦点、Wayland 上补一次幂等的指定屏全屏。
+    // 出错也必须报：这条信号是「遮罩这一层已经画完了」的唯一凭据，
+    // 少一次日志里就分不清是页面挂了还是后端没把窗口弄出来
+    await nextFrames(2)
+    try {
+      await ipc.shotOverlayReady(session, index)
+    } catch (e) {
+      console.error('shot overlay ready failed', e)
+    }
   }
 }
 
@@ -526,6 +554,12 @@ function onResize() {
 }
 
 onMounted(() => {
+  // 页面整体必须透明：遮罩窗口本身是透明窗，html/body 若还带着 global.css 的底色
+  // （body 有 var(--c-card)），未绘制完的那一帧就仍是一块白/主题色的窗 —— 「闪一下」
+  // 原样回来。底图与压暗层画上去之后整窗都是不透明的（canvas 铺满窗口），
+  // 所以这里不会把桌面透出来。
+  document.documentElement.style.background = 'transparent'
+  document.body.style.background = 'transparent'
   load()
   window.addEventListener('keydown', onKeydown)
   window.addEventListener('resize', onResize)
@@ -555,8 +589,10 @@ onUnmounted(() => {
          （选区之外的标注和底图一起被压暗） -->
     <canvas ref="annoCanvas" class="anno"></canvas>
     <!-- 还没有选区时整屏压暗（微信行为：进入截图态立刻有反馈）；
-         有选区后改用 box-shadow 挖洞，只暗选区之外 -->
-    <div v-if="!sel" class="dim-full"></div>
+         有选区后改用 box-shadow 挖洞，只暗选区之外。
+         `painted` 之前不画：底图没上来时这一层会先把整屏压暗（透明窗上就是
+         「桌面忽然暗一下」），那正是要修的闪烁 -->
+    <div v-if="!sel && painted" class="dim-full"></div>
     <div v-else class="dim" :style="selStyle">
       <div class="frame"></div>
       <div class="size" v-if="sel">{{ sizeLabel }}</div>
@@ -617,7 +653,7 @@ onUnmounted(() => {
       @pointerdown.stop @pointerup.stop
       @keydown.enter.stop.prevent="commitText" @keydown.esc.stop.prevent="textAt = null"
       @keydown.ctrl.z.stop @keydown.meta.z.stop @blur="commitText" />
-    <div v-if="!sel && !errMsg" class="tip">{{ t('shot.tip') }}</div>
+    <div v-if="!sel && !errMsg && painted" class="tip">{{ t('shot.tip') }}</div>
     <div v-if="errMsg" class="error">{{ errMsg }}</div>
   </div>
 </template>
@@ -627,7 +663,9 @@ onUnmounted(() => {
   position: fixed;
   inset: 0;
   overflow: hidden;
-  background: #000;
+  /* 透明：底图没画上去之前窗口里应当什么都看不到（窗口本身也是透明窗）；
+     画完之后整窗被 canvas + 压暗层盖满，不存在透出桌面的问题 */
+  background: transparent;
   user-select: none;
 }
 .base {

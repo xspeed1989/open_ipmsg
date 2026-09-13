@@ -176,6 +176,10 @@ export const pickEmojiPackSavePath = (defaultPath) =>
 /** 开始截图：后端抓屏并打开遮罩窗口，返回 { session, width, height, monitors } */
 export const startScreenshot = () => invoke('start_screenshot')
 
+/** 遮罩窗口向后台报「底图已画完、帧已提交」：后台据此记日志、把窗口端到前台
+ *  （Wayland 上再补一次指定屏全屏），给「遮罩这一层画好了」留一条凭据 */
+export const shotOverlayReady = (session, index) => invoke('shot_overlay_ready', { session, index })
+
 /** 遮罩窗口取图：返回 { b64, mime, slice, scale, total } */
 export const shotImage = (session, index) => invoke('shot_image', { session, index })
 

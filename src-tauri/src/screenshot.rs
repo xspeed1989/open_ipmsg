@@ -759,6 +759,18 @@ fn overlay_label(session: &str, index: usize) -> String {
 }
 
 /// 建立遮罩窗口
+///
+/// 防闪烁靠两条，缺一不可：
+///  1. **透明窗** + **页面在底图就绪前什么都不画**（见 ScreenshotOverlay.vue 的
+///     `painted`）：建窗到出图之间提交的任何一帧都是全透明的，用户什么都看不到；
+///  2. **指定屏全屏在建窗时就请求**（`schedule_fullscreen`）：底图因此是在最终尺寸上
+///     一次性画好的，不会先以 320×200 占位尺寸露一下。
+///
+/// 注意这里**不能**改成「先隐藏窗口、等页面报就绪再 show」（Task 15 最初的方案）：
+/// GTK 的帧时钟跟着窗口的 map 状态走，未映射的窗口里 `requestAnimationFrame`
+/// **一次都不会触发**（实测：隐藏 1.5 秒内 rAF 计数 0，show_all() 后立刻涨到 62）。
+/// 也就是说页面压根没法在隐藏状态下等到「帧已提交」，那条路只会让就绪信号永远
+/// 迟到，最后靠看门狗在第 3 秒强制显示 —— 实测遮罩要 4.7 秒才出现。
 fn open_overlays(app: &tauri::AppHandle, cap: &ShotCapture) -> Result<(), ShotErr> {
     let wayland = is_wayland();
     let count = if wayland { cap.monitors.len().max(1) } else { 1 };
@@ -783,6 +795,19 @@ fn open_overlays(app: &tauri::AppHandle, cap: &ShotCapture) -> Result<(), ShotEr
                 .skip_taskbar(true)
                 .shadow(false)
                 .focused(true);
+        // 透明窗：窗口建出来就是映射状态（里面必须先有帧，见上面的注释），
+        // 未绘制的部分因此是全透明的 —— 这就是「不闪」的那道保险。
+        //
+        // 透明窗与不透明底色互斥，所以这里不设 background_color。
+        //
+        // macOS 单列出来：那里的 transparent() 要 tauri 的 macos-private-api 特性
+        // （tauri.conf.json 的 macOSPrivateApi + Cargo.toml 的特性），没开这个特性时
+        // 该方法在 macOS 上直接被 cfg 掉、写上去就编译不过；这两个文件不在本任务范围内，
+        // 故 macOS 暂不启用透明窗（macOS 上仍有「未绘制白窗」那一帧，见任务报告）。
+        #[cfg(not(target_os = "macos"))]
+        {
+            builder = builder.transparent(true);
+        }
         if wayland {
             // Wayland 不允许客户端定位窗口：先建小窗，再在 GTK 主线程上指定显示器全屏。
             //
@@ -816,39 +841,74 @@ fn open_overlays(app: &tauri::AppHandle, cap: &ShotCapture) -> Result<(), ShotEr
                 }
             }
         });
+        // 全屏请求必须赶在页面画底图之前：窗口此刻是映射着的（build 出来的窗口就是
+        // 可见状态）、页面还在加载且什么都没画，所以这里显示出来也看不见任何东西。
         if wayland {
             fullscreen_on_monitor(&win, i)?;
         } else {
             let _ = win.set_focus();
         }
+        // 兜底：页面要是始终不报就绪（脚本抛错、webview 卡死、页面根本没加载出来），
+        // 窗口里就永远是一块透明的空窗，而且它盖住整屏、还抢着焦点。
+        // 3 秒后仍未显示（正常路径此时早就显示了）就强制显示一次，至少让它可见可关。
+        let wd = win.clone();
+        let wd_label = label.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            // 读不到可见状态（窗口已销毁等）时按「没显示」处理，强制显示一次
+            if matches!(wd.is_visible(), Ok(true)) {
+                return;
+            }
+            oim_log!("[shot] 遮罩 {wd_label} 3 秒内未收到就绪信号，强制显示兜底");
+            let _ = wd.show();
+            if wayland {
+                let _ = fullscreen_on_monitor(&wd, i);
+            } else {
+                let _ = wd.set_focus();
+            }
+        });
     }
     Ok(())
 }
 
-/// Wayland：请求在指定显示器上全屏（xdg-shell 的 set_fullscreen 支持 output）。
+/// 请求在指定显示器上全屏（xdg-shell 的 set_fullscreen 支持 output）。
+///
+/// **要求调用者已在 GTK 主线程**；跨线程的调用点走 [`fullscreen_on_monitor`]。
 ///
 /// 时序：**先映射、后请求**。GDK 的 xdg_toplevel 是窗口映射时才建出来的，未映射
-/// 就 `fullscreen_on_monitor` 会被丢掉；而 `show_all()` 之后未必立刻映射，所以
-/// 已映射时走 idle、未映射时等 map 信号再进 idle —— 两条路都保证请求发生在
-/// 映射完成之后（也顺带排在 tao/wry 排队的尺寸请求之后）。
+/// 就请求全屏会被丢掉；而 `show_all()` 之后未必立刻映射，所以已映射时走 idle、
+/// 未映射时等 map 信号再进 idle —— 两条路都保证请求发生在映射完成之后
+/// （也顺带排在 tao/wry 排队的尺寸请求之后）。
+///
+/// 这一段原先整块叫 `fullscreen_on_monitor`（含 `run_on_main_thread`）。Task 15 的就绪
+/// 路径本身已经在主线程里，再调那个版本会等自己 → 死锁，于是把主体拆成这个
+/// **只在主线程调用**的版本（就绪路径直接调它）；跨线程那半边仍是
+/// `fullscreen_on_monitor`（建窗路径与看门狗用）。
+#[cfg(target_os = "linux")]
+fn schedule_fullscreen(gw: &gtk::ApplicationWindow, index: usize) {
+    use gtk::prelude::*;
+    // show_all：让窗口进入映射流程（已显示过就是空操作）—— 这就是「先映射」那一步
+    gw.show_all();
+    if gw.is_mapped() {
+        let gw = gw.clone();
+        gtk::glib::idle_add_local_once(move || request_fullscreen(&gw, index));
+    } else {
+        gw.connect_map(move |gw| {
+            let gw = gw.clone();
+            gtk::glib::idle_add_local_once(move || request_fullscreen(&gw, index));
+        });
+    }
+}
+
+/// `schedule_fullscreen` 的跨线程入口：把请求投到 GTK 主线程，并等它执行完。
 #[cfg(target_os = "linux")]
 fn fullscreen_on_monitor(win: &tauri::WebviewWindow, index: usize) -> Result<(), ShotErr> {
     let w = win.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     win.app_handle()
         .run_on_main_thread(move || {
-            use gtk::prelude::*;
             if let Ok(gw) = w.gtk_window() {
-                gw.show_all();
-                if gw.is_mapped() {
-                    let gw = gw.clone();
-                    gtk::glib::idle_add_local_once(move || request_fullscreen(&gw, index));
-                } else {
-                    gw.connect_map(move |gw| {
-                        let gw = gw.clone();
-                        gtk::glib::idle_add_local_once(move || request_fullscreen(&gw, index));
-                    });
-                }
+                schedule_fullscreen(&gw, index);
             }
             let _ = tx.send(());
         })
@@ -857,7 +917,7 @@ fn fullscreen_on_monitor(win: &tauri::WebviewWindow, index: usize) -> Result<(),
     Ok(())
 }
 
-/// 发出全屏请求。**只能在窗口映射之后调用**（见 `fullscreen_on_monitor` 的注释），
+/// 发出全屏请求。**只能在窗口映射之后调用**（见 `schedule_fullscreen` 的注释），
 /// 单独拆出来是为了能同时被「已映射」与「map 信号」两条路径复用。
 #[cfg(target_os = "linux")]
 fn request_fullscreen(gw: &gtk::ApplicationWindow, index: usize) {
@@ -914,6 +974,52 @@ pub async fn start_screenshot(app: tauri::AppHandle) -> Result<ShotCapture, Stri
         capture.session
     );
     Ok(capture)
+}
+
+/// 遮罩页面报告「底图已画完、帧已提交给合成器」。
+///
+/// 窗口在建出来时就已经显示（透明窗 + 页面在底图就绪前什么都不画，见 `open_overlays`
+/// 的注释），所以这里的 `show()` 通常是空操作；它存在的意义是：
+///  · 内容真的上屏之后再把窗口端到前台/交回焦点（X11/Windows 的 `set_focus`）；
+///  · Wayland 上补一次幂等的「指定屏全屏」重试 —— 建窗时那次请求万一被合成器丢了，
+///    这里是第二次机会；
+///  · 给日志留一条「遮罩已就绪并显示」的锚点。
+#[tauri::command]
+pub async fn shot_overlay_ready(
+    app: tauri::AppHandle,
+    session: String,
+    index: usize,
+) -> Result<(), String> {
+    let label = overlay_label(&session, index);
+    let win = app
+        .get_webview_window(&label)
+        .ok_or_else(|| format!("截图遮罩已关闭：{label}"))?;
+    let wayland = is_wayland();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    app.run_on_main_thread(move || {
+        // show + 全屏在**同一个主线程回合**里做完。
+        //
+        // 这里绝不能调 fullscreen_on_monitor：它内部自己会 run_on_main_thread，
+        // 从主线程里再调一次就是等自己 → 死锁。所以主线程这半边单独拆成了
+        // schedule_fullscreen。
+        let _ = win.show();
+        if wayland {
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(gw) = win.gtk_window() {
+                    schedule_fullscreen(&gw, index);
+                }
+            }
+        } else {
+            let _ = win.set_focus();
+        }
+        let _ = tx.send(());
+    })
+    .map_err(|e| format!("显示遮罩失败: {e}"))?;
+    // 只等到「主线程跑完这一段」；全屏请求本身还排在随后的 idle 回调里
+    let _ = rx.recv_timeout(Duration::from_secs(3));
+    oim_log!("[shot] 遮罩已就绪并显示 {label}");
+    Ok(())
 }
 
 #[tauri::command]
