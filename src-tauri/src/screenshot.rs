@@ -795,22 +795,24 @@ fn overlay_label(session: &str, index: usize) -> String {
 /// dev 模式下样式由 vite 用 JS 注入（时机在挂载之前），所以这条规则在 dev 下几乎看不出
 /// 差别 —— 它救的是打包版，别因为 dev 干净就把它删了。
 ///
-/// `document.documentElement` 在文档最早期可能还不存在，所以挂三个入口：立即试一次、
-/// 下一次 `readystatechange`（'loading' 阶段就会触发）、以及首帧之前的
-/// `requestAnimationFrame`（rAF 回调排在绘制之前，赶得上第一帧）。
+/// `document.documentElement` 在文档最早期可能还不存在：先立即试一次，不行就退到
+/// **首帧之前**的 `requestAnimationFrame`（rAF 回调排在绘制之前，赶得上第一帧）——
+/// 这是真正管用的兜底；`readystatechange` 放在最后，它最早也要到 `'interactive'`
+/// （解析结束之后）才触发，属于迟到的补丁，只用于「rAF 也被禁用」的极端情况。
 /// 整段包在 try/catch 里：它绝不能影响后面那句 `window.__OIM_SHOT__` 的赋值。
 const OVERLAY_BOOT_CSS: &str = r#"try{(function(){
-var css='html,body{background:transparent !important}';
+var css='html,body{background:transparent !important}',done=false;
 function put(){
-  if(!document.documentElement)return false;
+  if(done||!document.documentElement)return false;
   var s=document.createElement('style');
   s.textContent=css;
   document.documentElement.appendChild(s);
+  done=true;
   return true;
 }
 if(put())return;
-document.addEventListener('readystatechange',function(){put();},{once:true});
 if(typeof requestAnimationFrame==='function')requestAnimationFrame(put);
+document.addEventListener('readystatechange',put,{once:true});
 })();}catch(e){}"#;
 
 /// 建立遮罩窗口
@@ -911,9 +913,13 @@ fn open_overlays(app: &tauri::AppHandle, cap: &ShotCapture) -> Result<(), ShotEr
         // 兜底看门狗：页面要是始终没报「底图已画完」（模块脚本抛错、webview 卡死、
         // 页面根本没加载出来），窗口里就永远是一块**透明的**全屏置顶窗 —— 用户看不见
         // 它，它却盖住整屏、还抢着输入焦点，会话也一直占着不放。
-        // 8 秒（远高于 dev 模式实测 2.5–3.5 秒的页面加载）后仍未就绪，就把本会话的
-        // 遮罩全部收掉，让屏幕回到可用状态；已经报过就绪的遮罩不受影响
-        // （就绪标记在 ShotState 里，窗口销毁时清掉）。
+        // 8 秒（远高于 dev 模式实测 2.5–3.5 秒的页面加载）后仍未就绪，就把它收掉。
+        //
+        // **只收「自己也没就绪」的遮罩**：看门狗是每个窗口一个，用户在第 8 秒之前
+        // Alt+F4 掉其中一块时，那个窗口从没报过就绪、它的看门狗到点照样会醒 —— 不能让它
+        // 把同一会话里**已经就绪、还活着**的另一块也一起收掉（那会与 Destroyed 处理器
+        // 「只要还有遮罩就保留会话」的约定自相矛盾，双屏下就是「关一块、另一块也消失」）。
+        // 自己那一块已经被关掉时，前缀查不到它，剩下的又都已就绪 → 空集，天然是空操作。
         let wd = win.clone();
         let wd_label = label.clone();
         let wd_session = cap.session.clone();
@@ -923,23 +929,21 @@ fn open_overlays(app: &tauri::AppHandle, cap: &ShotCapture) -> Result<(), ShotEr
             if state.is_ready(&wd_label) {
                 return;
             }
-            // 同一 session 的遮罩一起收：一块没起来，留着另一块也只是半张遮罩
             let prefix = format!("shot-overlay-{wd_session}-");
-            let stale: Vec<tauri::WebviewWindow> = wd
+            let stale: Vec<(String, tauri::WebviewWindow)> = wd
                 .app_handle()
                 .webview_windows()
                 .into_iter()
-                .filter(|(l, _)| l.starts_with(&prefix))
-                .map(|(_, w)| w)
+                .filter(|(l, _)| l.starts_with(&prefix) && !state.is_ready(l))
                 .collect();
             if stale.is_empty() {
                 return;
             }
+            let names = stale.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(", ");
             oim_log!(
-                "[shot] 遮罩未就绪，已关闭 {wd_label}（本会话共 {} 个遮罩）：8 秒内没等到页面报「底图已画完」",
-                stale.len()
+                "[shot] 遮罩未就绪，已关闭 {names}（就绪的遮罩保留）：8 秒内没等到页面报「底图已画完」"
             );
-            for w in stale {
+            for (_, w) in stale {
                 let _ = w.destroy();
             }
         });

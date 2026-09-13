@@ -552,7 +552,8 @@ README.md / README.zh-CN.md            功能表与 Roadmap 勾选
 - [ ] macOS：多显示器拼接正确（Retina 缩放已处理；混合缩放比见 §15.3 限制 1）。
 - [ ] macOS：确认 PNG 通道顺序没有 R/B 互换（`kCGImageAlphaPremultipliedLast` 的字节序），以及创建 bitmap context 后是否需要显式 `ctx.flush()`——若出现全黑或未填充的图，先查这两点。
 - [ ] Windows / macOS：确认后的截图能在其他应用里粘贴。
-- [ ] macOS：**透明遮罩尚未启用**（Task 15 只落到了 Linux/Windows）。`transparent()` 在 macOS 上要求 tauri 的 `macos-private-api`：本仓库已有 app 级转发特性 `macos-private-api = ["tauri/macos-private-api"]`（`src-tauri/Cargo.toml`，`src-tauri/src/screenshot.rs` 的建窗 cfg 门与它同源），另需在 `src-tauri/tauri.conf.json` 设 `macOSPrivateApi: true`（tauri-build 会校验 Cargo.toml 里 tauri 依赖的特性与配置一致）。**在打开之前，macOS 的遮罩是不透明窗，「未绘制的白窗」那一帧仍然存在**；打开后即与 Linux/Windows 一样靠透明窗消除。
+- [ ] macOS：**透明遮罩尚未启用**（Task 15 只落到了 Linux/Windows）。要启用必须**两处都做，缺一不可**：① `src-tauri/tauri.conf.json` 设 `"macOSPrivateApi": true`；② 用 app crate 自己的特性构建 —— `pnpm tauri build --features macos-private-api`（跨平台时就是 `pnpm tauri build --target <macos-target> --features macos-private-api`），或把 `macos-private-api` 加进 `src-tauri/Cargo.toml` 的 `[features] default`（该特性已转发到 `tauri/macos-private-api`）。
+  **只做 ① 是静默失效**：tauri-cli 会把配置里的特性转成 **tauri 依赖的**特性去编译（实测打包命令走 `cargo build --bins --features tauri/custom-protocol` 这个 dep/feature 套路，所以编译干净、看起来「已启用」），而 `src-tauri/src/screenshot.rs` 的建窗 cfg 门 `any(not(target_os = "macos"), feature = "macos-private-api")` 判的是**本 crate** 的特性，仍然为假 → `transparent(true)` 根本不会被调用，遮罩依旧是不透明窗、**「未绘制的白窗」那一帧仍然存在**。两处都做之后，macOS 与 Linux/Windows 一样靠透明窗消除该帧。
 - [ ] Windows / macOS：混合 DPI 多屏下遮罩与图像对齐（这是全平台共用的单一 k，不是平台特例）。
 - [ ] 任意平台：确认后在待发送列表里出现正确的缩略图，`Enter` 发送后对端收到的像素与所见一致（本机目前只验证到「确认 → 剪贴板」）。
 - [ ] 本机：主窗口收进托盘后触发 `Alt+A` → 选区 → 确认，图片仍进入当前会话的待发送列表（事件不依赖主窗口可见）。

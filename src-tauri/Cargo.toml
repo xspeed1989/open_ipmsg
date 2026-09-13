@@ -98,13 +98,16 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [features]
 net_debug = []
-# macOS 透明遮罩（截图窗口不闪的那道保险）需要 tauri 自己的 macos-private-api：
-# 转发一层，`cargo build --features macos-private-api` 即可打开，screenshot.rs 里的
-# `#[cfg(any(not(target_os = "macos"), feature = "macos-private-api"))]` 才会生效。
-# 完整启用还要在 tauri.conf.json 里设 `macOSPrivateApi: true`（tauri-build 会校验
-# Cargo.toml 里 tauri 依赖的特性与配置一致）；维护者待办见
-# docs/superpowers/specs/2026-09-13-screenshot-design.md §15.5 —— 在打开之前，
-# macOS 上遮罩仍是不透明窗，「未绘制白窗」那一帧还在。
+# macOS 透明遮罩（截图窗口不闪的那道保险）：**两处都要开，缺一不可** ——
+#   1) `tauri.conf.json` 设 `"macOSPrivateApi": true`。注意 tauri-cli 会把它转成
+#      **tauri 依赖的**特性去编译（实测打包命令走的就是
+#      `cargo build --bins --features tauri/custom-protocol` 这个 dep/feature 套路），
+#      所以只做这一步编译是干净的、看起来「已经启用」；
+#   2) 还要用 **app crate 自己的**特性构建：`pnpm tauri build --features macos-private-api`
+#      （或把本特性加进 `[features] default`）。`screenshot.rs` 的建窗 cfg 门判的是本
+#      crate 的特性，只做 1) 的话它恒假、`transparent()` 根本不会被调用（**静默失效**）。
+# 两处都做之前，macOS 的遮罩仍是不透明窗，「未绘制的白窗」那一帧还在。
+# 维护者待办见 docs/superpowers/specs/2026-09-13-screenshot-design.md §15.5。
 macos-private-api = ["tauri/macos-private-api"]
 
 # tray-icon 0.24.x 在 Windows 用 CreateIcon 做「单色 mask + XOR」的经典图标，
