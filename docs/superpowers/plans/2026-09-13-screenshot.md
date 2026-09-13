@@ -3141,7 +3141,7 @@ In `src/lib/i18n.js`, both languages:
   'settings.shotHotkeyPh': '点击后按下组合键',
   'settings.shotHotkeyHint': '默认 Alt+A；点进输入框后直接按组合键即可修改，Esc 清空表示不注册',
   'settings.shotHotkeyInvalid': '当前保存的快捷键不可用（缺少修饰键），请重新录制或清空',
-  'settings.shotHotkeyWayland': '当前是 Wayland 会话：首次保存会弹出系统绑定确认；若桌面环境不支持，可用命令行 open-ipmsg --screenshot 自行绑定快捷键',
+  'settings.shotHotkeyWayland': '当前是 Wayland 会话：首次启动应用时会弹出系统绑定确认，改完快捷键需重启应用才生效；若桌面环境不支持，可在系统设置里把命令 open-ipmsg --screenshot 绑成自定义快捷键',
   'settings.shotCopy': '确认后复制到剪贴板',
   // en
   'settings.shot': 'Screenshot',
@@ -3909,7 +3909,7 @@ Add a short 常见问题 entry:
 
 ```markdown
 **Q:截图热键按了没反应?**
-Windows/macOS/X11 由应用注册全局热键；Wayland 下改由桌面环境授权绑定（首次保存设置时会弹确认框），若你的桌面环境不支持，可在系统设置里把命令 `open-ipmsg --screenshot` 绑成自定义快捷键。抓屏本身在 Linux 走 xdg-desktop-portal；若系统没有该服务，截图会提示「系统未提供截图服务」。
+Windows/macOS/X11 由应用注册全局热键；Wayland 下改由桌面环境授权绑定（**首次启动应用**时会弹一次确认框；改完快捷键需**重启应用**才生效），若你的桌面环境不支持，可在系统设置里把命令 `open-ipmsg --screenshot` 绑成自定义快捷键。抓屏本身在 Linux 走 xdg-desktop-portal；若系统没有该服务，**点击工具栏截图**会提示「系统未提供截图服务」（热键/命令行触发只会写日志）。
 ```
 
 - [ ] **Step 2: Record the as-built verification**
