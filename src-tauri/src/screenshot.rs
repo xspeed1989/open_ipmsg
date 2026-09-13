@@ -583,11 +583,24 @@ pub async fn shot_image(
 ) -> Result<Value, String> {
     let cached = state.get(&session).map_err(|e| e.message())?;
     let mon = monitor_at(&cached.monitors, index).map_err(|e| e.message())?;
-    let scale = mon.px.w as f64 / mon.logical.w.max(1) as f64;
+    // Wayland：每块屏一个全屏窗口 → 返回该屏在整幅图里的切片
+    // 其他平台：只有一个覆盖整个虚拟桌面的窗口 → 必须返回整幅图，
+    //           否则双屏下窗口里只会画出 0 号屏的内容（错位 / 缺半屏）
+    let (slice, logical_w) = if is_wayland() {
+        (mon.px, mon.logical.w.max(1))
+    } else {
+        let bounds =
+            virtual_bounds(&cached.monitors.iter().map(|m| m.logical).collect::<Vec<_>>());
+        (
+            Rect { x: 0, y: 0, w: cached.width, h: cached.height },
+            bounds.w.max(1),
+        )
+    };
+    let scale = slice.w as f64 / logical_w as f64;
     Ok(json!({
         "b64": cached.png_b64,
         "mime": "image/png",
-        "slice": mon.px,
+        "slice": slice,
         "scale": scale,
         "total": { "w": cached.width, "h": cached.height },
     }))
