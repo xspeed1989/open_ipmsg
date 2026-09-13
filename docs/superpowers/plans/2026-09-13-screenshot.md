@@ -2796,6 +2796,103 @@ In `src/lib/i18n.js`, add to **both** languages:
   'chat.shotCopyFailed': 'Copy to clipboard failed: {e}',
 ```
 
+**Review round 1 amendments (one Critical + two Important from the Task 9 review, plus one controller ruling on annotation resolution — apply all four):**
+
+**G (Critical).** `Image.fromBytes` returns a **Promise**; the clipboard fallback passed the Promise itself into `writeImage`, which serializes it and always rejects — so 复制/自动复制/the no-chat path were all broken on Windows and macOS (invisible on Linux, which uses the backend GTK path). In `ChatWindow.vue`:
+
+```js
+      await writeImage(await Image.fromBytes(b64ToBytes(b64)))
+```
+
+**H (Important).** In the no-chat branch the clipboard is the *only* sink, yet the toast claimed success unconditionally and a failure was only logged — a silently dropped screenshot. Make the message honest:
+
+```js
+  unlistenShot = await ipc.listenEvent(ipc.EVT.screenshotDone, async (p) => {
+    if (!store.activeKey) {
+      // 没有打开会话：剪贴板是唯一的去处，失败必须说出来，不能谎报「已复制」
+      try {
+        await copyShotToClipboard(p.b64)
+        toast(t('chat.shotNoChat'))
+      } catch (e) {
+        alert(t('chat.shotCopyFailed', { e }))
+      }
+      return
+    }
+    pushShotImage(p)
+    if (store.config?.shot_copy_clipboard !== false) {
+      try { await copyShotToClipboard(p.b64) } catch (e) { console.error('copy shot failed', e) }
+    }
+  })
+```
+
+**I (Important).** The measured toolbar size was only read when `barStyle` was invalidated, and `offsetWidth` is not reactive — switching to the mosaic tool adds three block-size buttons (~70–80 px) without re-measuring, so a right-edge selection pushes the copy/save/✓/✕ buttons off-screen. Re-measure after the DOM settles:
+
+```js
+const barW = ref(560)
+const barH = ref(40)
+const barRef = ref(null)
+
+function measureBar() {
+  const el = barRef.value
+  if (!el) return
+  barW.value = el.offsetWidth
+  barH.value = el.offsetHeight
+}
+
+const barStyle = computed(() => {
+  const p = toolbarPlacement(sel.value || { x: 0, y: 0, w: 0, h: 0 }, winRect.value, {
+    w: barW.value,
+    h: barH.value,
+  })
+  return { left: p.x + 'px', top: p.y + 'px' }
+})
+```
+
+with `onMounted(() => nextTick(measureBar))` and `watch([tool, blockSize, sel], () => nextTick(measureBar))` (the mosaic block buttons are the width-changing case).
+
+**J (controller ruling — annotation resolution).** The annotation canvas's backing store is window CSS pixels, so its strokes are upscaled by `k` (1.25 here, 2 on HiDPI) both on screen and in the exported PNG, while the base image stays 1:1 — annotations come out visibly softer/jagged next to a crisp screenshot. Task 8's reviewed canvas geometry is deliberately not redesigned; instead give the layer a physical backing store and keep all drawing code in CSS coordinates via a context transform:
+
+```js
+/** 标注 canvas：后备像素 = 窗口 CSS 尺寸 × k（与底图同为图像物理像素），
+ *  再用 ctx 变换把绘制坐标保持在 CSS 空间 —— 标注与底图一样 1:1 清晰，
+ *  不会在分数缩放/高分屏上被放大糊掉。 */
+function paintAnnoSize() {
+  const c = annoCanvas.value
+  if (!c) return
+  const k = slice.value.w / Math.max(1, winRect.value.w)
+  const w = Math.max(1, Math.round(winRect.value.w * k))
+  const h = Math.max(1, Math.round(winRect.value.h * k))
+  if (c.width === w && c.height === h) return
+  const keep = c.width && c.height ? c.toDataURL() : ''
+  c.width = w
+  c.height = h
+  // 元素仍按 CSS 尺寸布局，绘制坐标继续用 CSS 像素
+  c.style.width = winRect.value.w + 'px'
+  c.style.height = winRect.value.h + 'px'
+  const ctx = c.getContext('2d')
+  ctx.setTransform(k, 0, 0, k, 0, 0)
+  if (keep) {
+    const im = new Image()
+    im.onload = () => {
+      // 还原是设备像素 1:1 拷贝，必须临时去掉变换
+      ctx.save()
+      ctx.setTransform(1, 0, 0, 1, 0, 0)
+      ctx.drawImage(im, 0, 0)
+      ctx.restore()
+    }
+    im.src = keep
+  }
+}
+```
+
+Consequences to keep in sync: `compositeB64` must take the annotation source rect in device pixels —
+
+```js
+    ctx.drawImage(anno, sel.value.x * k, sel.value.y * k, sel.value.w * k, sel.value.h * k, 0, 0, r.w, r.h)
+```
+
+(where `k = r.w / sel.value.w`), while `snapshot()`/`undo()` keep using device pixels (`getImageData(0,0,c.width,c.height)` and `putImageData`, which ignores the transform) and `applyMosaic`'s CSS-coordinate fills stay as they are (the transform does the scaling for them).
+
 - [ ] **Step 7: Run the full test suite**
 
 Run: `pnpm test`
