@@ -151,13 +151,23 @@ function drawShape(ctx, d) {
   }
 }
 
-/** 马赛克：读底图对应区域的像素，按块平均后回填 */
-function applyMosaic(ctx, rect) {
+/** 马赛克：读底图对应区域的像素，按块平均后回填。
+ *
+ *  坐标系：标注层与选区是 CSS 像素，而 base 画布的后备像素是图像物理像素
+ *  （k = slice.w / 窗口 CSS 宽，本机 1.25）。采样必须乘 k，回填仍用 CSS 坐标，
+ *  否则每个块都取到图上别处的像素，块网格也会与拖拽范围错位。 */
+function applyMosaic(ctx, cssRect) {
   const base = baseCanvas.value
   if (!base) return
   const bctx = base.getContext('2d')
-  for (const b of mosaicBlocks(rect, blockSize.value)) {
-    const data = bctx.getImageData(b.x, b.y, b.w, b.h).data
+  const k = base.width / Math.max(1, winRect.value.w)
+  for (const b of mosaicBlocks(cssRect, blockSize.value)) {
+    const sx = Math.max(0, Math.round(b.x * k))
+    const sy = Math.max(0, Math.round(b.y * k))
+    if (sx >= base.width || sy >= base.height) continue
+    const sw = Math.max(1, Math.min(Math.round(b.w * k), base.width - sx))
+    const sh = Math.max(1, Math.min(Math.round(b.h * k), base.height - sy))
+    const data = bctx.getImageData(sx, sy, sw, sh).data
     let r = 0, g = 0, bl = 0, n = 0
     for (let i = 0; i < data.length; i += 4) {
       r += data[i]; g += data[i + 1]; bl += data[i + 2]; n++
@@ -232,12 +242,15 @@ function onPointerDown(ev) {
   // 选中了标注工具、且落点在选区内部：本笔属于标注，不再是移动/新建选区
   if (hit === 'inside' && tool.value !== 'move' && sel.value) {
     if (tool.value === 'text') {
+      // 阻止 mousedown 的默认聚焦行为：否则刚建出来的输入框立刻失焦 → blur 提交空值
+      ev.preventDefault()
       textAt.value = { x: p.x, y: p.y, value: '' }
       nextTick(() => textInput.value?.focus())
       return
     }
     pushSnapshot()
     drawing = { tool: tool.value, from: p, to: p, points: [p] }
+    root.value.setPointerCapture?.(ev.pointerId)
     return
   }
   if (hit === 'inside') {
@@ -252,6 +265,7 @@ function onPointerDown(ev) {
 }
 
 function onPointerMove(ev) {
+  if (drawing && ev.buttons === 0) onPointerUp()   // 丢过 pointerup：按松手处理，别粘住
   const p = localPoint(ev)
   // 正在画：每帧从上一张快照重画，避免拖拽预览越描越黑
   if (drawing) {
@@ -260,7 +274,7 @@ function onPointerMove(ev) {
     if (snap) ctx.putImageData(snap, 0, 0)
     drawing.to = p
     if (drawing.tool === 'pen') drawing.points.push(p)
-    if (drawing.tool === 'mosaic') applyMosaic(ctx, { x: drawing.from.x, y: drawing.from.y, w: p.x - drawing.from.x, h: p.y - drawing.from.y })
+    if (drawing.tool === 'mosaic') applyMosaic(ctx, rectFromDrag(drawing.from, p, winRect.value))
     else drawShape(ctx, drawing)
     return
   }
@@ -341,6 +355,7 @@ onUnmounted(() => {
     @pointerdown="onPointerDown"
     @pointermove="onPointerMove"
     @pointerup="onPointerUp"
+    @pointercancel="onPointerUp"
     @contextmenu.prevent="cancel"
   >
     <canvas ref="baseCanvas" class="base"></canvas>
@@ -386,7 +401,9 @@ onUnmounted(() => {
     </div>
     <input v-if="textAt" ref="textInput" v-model="textAt.value" class="text-in"
       :style="{ left: textAt.x + 'px', top: textAt.y + 'px' }"
-      @keydown.enter.prevent="commitText" @keydown.esc.prevent="textAt = null" @blur="commitText" />
+      @pointerdown.stop @pointerup.stop
+      @keydown.enter.stop.prevent="commitText" @keydown.esc.stop.prevent="textAt = null"
+      @keydown.ctrl.z.stop @keydown.meta.z.stop @blur="commitText" />
     <div v-if="!sel && !errMsg" class="tip">{{ t('shot.tip') }}</div>
     <div v-if="errMsg" class="error">{{ errMsg }}</div>
     <div v-if="hint" class="tip bottom">{{ hint }}</div>
