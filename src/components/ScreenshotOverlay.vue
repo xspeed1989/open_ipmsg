@@ -302,6 +302,8 @@ function onPointerUp() {
 }
 
 function onKeydown(ev) {
+  // 文字输入进行中：键盘归输入框（Enter/Esc 已 .stop，其余按键不应影响画布与选区）
+  if (textAt.value) return
   if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'z') {
     ev.preventDefault()
     return undo()
