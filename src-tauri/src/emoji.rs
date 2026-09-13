@@ -1330,12 +1330,17 @@ mod tests {
     #[test]
     fn src_available_prefers_recorded_path_then_falls_back_to_download_dir() {
         let dir = tmp_data("srcavail");
-        // 下载目录：写进 config.json，模拟用户的真实配置
-        let dl = dir.join("下载");
+        // 下载目录：写进 config.json，模拟用户的真实配置。必须和 persist_config 一样
+        // 走 serde_json —— 手拼 format! 在 Windows 上会把 `C:\Users\...` 写成 `\U`
+        // 这种非法 JSON 转义，解析失败后 download_dir() 退回 <data_dir>/接收文件，
+        // 兜底必然落空（CI 的 Windows job 就是这么红的）。
+        // 目录名里特意带一个反斜杠，让这个坑在任何平台上都被这个用例守住。
+        let dl = dir.join(r"下载\子目录");
         std::fs::create_dir_all(&dl).unwrap();
         std::fs::write(
             dir.join("config.json"),
-            format!(r#"{{"download_dir":"{}"}}"#, dl.display()),
+            serde_json::to_vec(&serde_json::json!({ "download_dir": dl.to_string_lossy() }))
+                .unwrap(),
         )
         .unwrap();
         let png = dir.join("a.png");
