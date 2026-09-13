@@ -1,6 +1,6 @@
 [package]
 name = "open-ipmsg"
-version = "0.1.5"
+version = "0.1.6"
 description = "跨平台 IP Messenger 客户端（Tauri v2，仿微信PC界面）"
 authors = ["allen"]
 edition = "2021"
