@@ -139,24 +139,27 @@ function snapshot() {
   return c.getContext('2d').getImageData(0, 0, c.width, c.height)
 }
 
-/** 撤销栈的字节预算：快照是设备分辨率的 ImageData（本机 2560×1440 每张约 14MB），
- *  只按 pushUndo 的 20 张条数上限会一直吃到几百 MB。
- *  这里从最旧的一端按 width*height*4 裁剪，且至少保留最新 1 张。 */
+/** 撤销栈：64MiB 是**预算上限**（cap），不是历史下限 —— 快照是设备分辨率的
+ *  ImageData（本机 2560×1440 每张约 14MB，4K 屏单张就有 33MB），只按 pushUndo
+ *  的 20 张条数上限会一直吃到几百 MB。
+ *  从最旧的一端一直丢到总量进预算为止；但撤销是标注工具的核心操作，
+ *  4K 单张 33MB 时 64MiB 只够一步、等于没有，故**至少保留最新 3 步**，
+ *  即使因此超出预算。 */
 const UNDO_BYTES = 64 * 1024 * 1024
+const UNDO_MIN_STEPS = 3
 
 function trimUndo() {
   const stack = undoStack.value
   let total = 0
-  let keep = 0
-  for (let i = stack.length - 1; i >= 0; i--) {
-    const s = stack[i]
-    const bytes = (s?.width || 0) * (s?.height || 0) * 4
-    // 至少留最新 1 张；再加一张就超预算时，从这一张开始（更旧的）全丢
-    if (keep > 0 && total + bytes > UNDO_BYTES) break
-    total += bytes
-    keep++
+  for (const s of stack) total += (s?.width || 0) * (s?.height || 0) * 4
+  let drop = 0
+  // 丢最旧的一张直到进预算；`stack.length - drop > 3` 是步数下限，超预算也认
+  while (total > UNDO_BYTES && stack.length - drop > UNDO_MIN_STEPS) {
+    const s = stack[drop]
+    total -= (s?.width || 0) * (s?.height || 0) * 4
+    drop++
   }
-  if (keep < stack.length) undoStack.value = stack.slice(stack.length - keep)
+  if (drop) undoStack.value = stack.slice(drop)
 }
 
 function pushSnapshot() {
