@@ -1,10 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主窗口与图片查看器窗口的能力：核心权限 + 窗口控制 + 文件对话框 + 打开文件/文件夹",
+  "description": "主窗口、图片查看器与截图遮罩窗口的能力：核心权限 + 窗口控制 + 文件对话框 + 打开文件/文件夹 + 剪贴板图片写入",
   "windows": [
     "main",
-    "image-viewer-*"
+    "image-viewer-*",
+    "shot-overlay-*"
   ],
   "permissions": [
     "core:default",
@@ -18,6 +19,7 @@
     "dialog:default",
     "notification:default",
     "clipboard-manager:allow-write-text",
+    "clipboard-manager:allow-write-image",
     "opener:default",
     {
       "identifier": "opener:allow-open-path",

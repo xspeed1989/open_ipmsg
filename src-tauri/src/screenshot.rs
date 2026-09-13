@@ -4,8 +4,12 @@
 //! `px` 是整幅抓屏图像里的物理像素（裁剪用）。两者的换算只在这里做一次，
 //! 前端拿到的永远是物理像素矩形。
 
+use base64::Engine as _;
 use serde::Serialize;
+use serde_json::{json, Value};
+use std::sync::Mutex;
 use std::time::Duration;
+use tauri::Manager;
 
 /// 矩形（x/y 允许为负 —— 多屏时副屏可以排在主屏左侧或上方）
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -233,6 +237,439 @@ mod platform {
     }
 }
 
+/// 单块显示器（index 是主键：Linux 上两块同型号屏的 name 会重名）
+#[derive(Clone, Debug, Serialize)]
+pub struct ShotMonitor {
+    pub index: usize,
+    pub name: String,
+    /// 在整幅图像里的物理像素矩形（前端裁剪用）
+    pub px: Rect,
+    /// 逻辑像素矩形（开窗定位用）
+    pub logical: Rect,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ShotCapture {
+    pub session: String,
+    pub width: u32,
+    pub height: u32,
+    pub monitors: Vec<ShotMonitor>,
+}
+
+pub struct CachedShot {
+    pub session: String,
+    pub png_b64: String,
+    pub width: u32,
+    pub height: u32,
+    pub monitors: Vec<ShotMonitor>,
+}
+
+/// 同一时刻只保留一个截图会话：遮罩窗口凭 session 取图，旧会话立即失效
+#[derive(Default)]
+pub struct ShotState(Mutex<Option<CachedShot>>);
+
+impl ShotState {
+    pub fn put(&self, shot: CachedShot) {
+        *self.0.lock().unwrap() = Some(shot);
+    }
+
+    pub fn get(&self, session: &str) -> Result<CachedShot, ShotErr> {
+        let guard = self.0.lock().unwrap();
+        match guard.as_ref() {
+            Some(s) if s.session == session => Ok(CachedShot {
+                session: s.session.clone(),
+                png_b64: s.png_b64.clone(),
+                width: s.width,
+                height: s.height,
+                monitors: s.monitors.clone(),
+            }),
+            _ => Err(ShotErr::CaptureFailed("截图会话已失效，请重新截图".into())),
+        }
+    }
+
+    pub fn clear(&self) {
+        *self.0.lock().unwrap() = None;
+    }
+
+    pub fn active_session(&self) -> Option<String> {
+        self.0.lock().unwrap().as_ref().map(|s| s.session.clone())
+    }
+}
+
+pub fn monitor_at(monitors: &[ShotMonitor], index: usize) -> Result<ShotMonitor, ShotErr> {
+    monitors
+        .get(index)
+        .cloned()
+        .ok_or_else(|| ShotErr::CaptureFailed(format!("显示器序号越界: {index}")))
+}
+
+fn session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{ms:x}-{n}")
+}
+
+/// 抓屏并写缓存（**阻塞**，最长 15s）—— 只做重活，不开窗。
+///
+/// 必须从「非 tokio worker」的上下文调用（命令用 `spawn_blocking`，热键/命令行
+/// 用自己的线程）：portal 的 Response 是阻塞等待，直接放在 async 命令里会占住
+/// 一个 tokio worker 最长 15 秒。
+pub fn capture_and_cache(
+    app: &tauri::AppHandle,
+    state: &ShotState,
+) -> Result<ShotCapture, ShotErr> {
+    // 已有一个会话：直接把现有会话还回去（不重复抓屏）
+    if let Some(session) = state.active_session() {
+        if let Ok(cached) = state.get(&session) {
+            return Ok(ShotCapture {
+                session: cached.session,
+                width: cached.width,
+                height: cached.height,
+                monitors: cached.monitors,
+            });
+        }
+        state.clear();
+    }
+
+    let cap = capture_png(Duration::from_secs(15))?;
+    let monitors = collect_monitors(app, cap.width)?;
+    let capture = ShotCapture {
+        session: session_id(),
+        width: cap.width,
+        height: cap.height,
+        monitors,
+    };
+    state.put(CachedShot {
+        session: capture.session.clone(),
+        png_b64: base64::engine::general_purpose::STANDARD.encode(&cap.png),
+        width: capture.width,
+        height: capture.height,
+        monitors: capture.monitors.clone(),
+    });
+    Ok(capture)
+}
+
+/// 真正的入口（工具栏 / 热键 / 命令行都汇到这里）：抓屏 + 建遮罩窗口。
+///
+/// 抓屏在调用线程上阻塞完成（调用方保证这不是 tokio worker）；开窗沿用
+/// `open_image_viewer` 已验证的写法 —— 直接在命令/事件线程上 build。
+/// 会话已存在时 `capture_and_cache` 会直接返回旧会话，`open_overlays` 发现
+/// 对应 label 的窗口已在，只做聚焦 —— 两层遮罩不会叠加。
+pub fn begin_blocking(app: &tauri::AppHandle, state: &ShotState) -> Result<ShotCapture, ShotErr> {
+    let capture = capture_and_cache(app, state)?;
+    open_overlays(app, &capture)?;
+    Ok(capture)
+}
+
+/// 显示器清单：逻辑矩形来自窗口系统的真实布局，物理矩形由 k 推得
+fn collect_monitors(app: &tauri::AppHandle, image_w: u32) -> Result<Vec<ShotMonitor>, ShotErr> {
+    let logical = logical_monitors(app)?;
+    let bounds = virtual_bounds(&logical.iter().map(|(_, r)| *r).collect::<Vec<_>>());
+    let k = scale_for(image_w, bounds.w.max(1));
+    Ok(logical
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, r))| ShotMonitor {
+            index: i,
+            name,
+            px: slice_for_monitor(r, bounds, k),
+            logical: r,
+        })
+        .collect())
+}
+
+/// Linux：逻辑几何必须直接问 GDK。
+///
+/// tao 的 `Monitor::position()/size()` 是「GDK 逻辑 × GDK 整数缩放」，本机
+/// 真实比例 1.25 却按 2 乘，会得到第三套坐标，遮罩必然错位。
+#[cfg(target_os = "linux")]
+fn logical_monitors(app: &tauri::AppHandle) -> Result<Vec<(String, Rect)>, ShotErr> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        use gtk::prelude::*;
+        let list = gtk::gdk::Display::default()
+            .map(|d| {
+                // GDK3（gtk 0.18）没有 `display.monitors()`：按序号逐个取，
+                // 这样 index 与 `fullscreen_on_monitor` 用的序号同源
+                (0..d.n_monitors())
+                    .filter_map(|i| {
+                        let m = d.monitor(i)?;
+                        let g = m.geometry();
+                        let name = m
+                            .model()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("monitor-{i}"));
+                        Some((
+                            name,
+                            Rect { x: g.x(), y: g.y(), w: g.width() as u32, h: g.height() as u32 },
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let _ = tx.send(list);
+    })
+    .map_err(|e| ShotErr::CaptureFailed(format!("枚举显示器失败: {e}")))?;
+    rx.recv_timeout(Duration::from_secs(3))
+        .map_err(|_| ShotErr::CaptureFailed("枚举显示器超时".into()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn logical_monitors(app: &tauri::AppHandle) -> Result<Vec<(String, Rect)>, ShotErr> {
+    let mons = app
+        .available_monitors()
+        .map_err(|e| ShotErr::CaptureFailed(format!("枚举显示器失败: {e}")))?;
+    Ok(mons
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let scale = m.scale_factor().max(0.1);
+            let pos = m.position();
+            let size = m.size();
+            (
+                m.name().cloned().unwrap_or_else(|| format!("monitor-{i}")),
+                Rect {
+                    x: (pos.x as f64 / scale).round() as i32,
+                    y: (pos.y as f64 / scale).round() as i32,
+                    w: (size.width as f64 / scale).round() as u32,
+                    h: (size.height as f64 / scale).round() as u32,
+                },
+            )
+        })
+        .collect())
+}
+
+/// 是否 Wayland 会话（决定遮罩窗口是「每屏一个全屏」还是「一个跨虚拟桌面」）
+pub fn is_wayland() -> bool {
+    std::env::var("XDG_SESSION_TYPE").map(|v| v == "wayland").unwrap_or(false)
+        || std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+/// 建立遮罩窗口
+fn open_overlays(app: &tauri::AppHandle, cap: &ShotCapture) -> Result<(), ShotErr> {
+    let wayland = is_wayland();
+    let count = if wayland { cap.monitors.len().max(1) } else { 1 };
+    for i in 0..count {
+        let label = format!("shot-overlay-{i}");
+        if let Some(w) = app.get_webview_window(&label) {
+            let _ = w.set_focus();
+            continue;
+        }
+        let url = format!("index.html?viewer=shot&session={}&i={i}", cap.session);
+        let boot = format!(
+            "window.__OIM_SHOT__ = {};",
+            json!({ "session": cap.session, "index": i })
+        );
+        let mut builder =
+            tauri::WebviewWindowBuilder::new(app, &label, tauri::WebviewUrl::App(url.into()))
+                .initialization_script(boot)
+                .title("Screenshot")
+                .decorations(false)
+                .always_on_top(true)
+                .skip_taskbar(true)
+                .resizable(false)
+                .shadow(false)
+                .focused(true);
+        if wayland {
+            // Wayland 不允许客户端定位窗口：先建小窗，再在 GTK 主线程上指定显示器全屏
+            builder = builder.inner_size(320.0, 200.0);
+        } else {
+            let bounds = virtual_bounds(&cap.monitors.iter().map(|m| m.logical).collect::<Vec<_>>());
+            builder = builder
+                .position(bounds.x as f64, bounds.y as f64)
+                .inner_size(bounds.w.max(1) as f64, bounds.h.max(1) as f64);
+        }
+        let win = builder
+            .build()
+            .map_err(|e| ShotErr::CaptureFailed(format!("创建遮罩窗口失败: {e}")))?;
+        // 用户 Alt+F4 关掉遮罩时也要释放会话缓存，否则下次触发会拿到陈旧会话
+        let watcher = app.clone();
+        win.on_window_event(move |e| {
+            if matches!(e, tauri::WindowEvent::Destroyed) {
+                let remaining = watcher
+                    .webview_windows()
+                    .keys()
+                    .any(|l| l.starts_with("shot-overlay-"));
+                if !remaining {
+                    watcher.state::<ShotState>().clear();
+                    oim_log!("[shot] 遮罩全部关闭，会话缓存已释放");
+                }
+            }
+        });
+        if wayland {
+            fullscreen_on_monitor(&win, i)?;
+        } else {
+            let _ = win.set_focus();
+        }
+    }
+    Ok(())
+}
+
+/// Wayland：请求在指定显示器上全屏（xdg-shell 的 set_fullscreen 支持 output）
+#[cfg(target_os = "linux")]
+fn fullscreen_on_monitor(win: &tauri::WebviewWindow, index: usize) -> Result<(), ShotErr> {
+    let w = win.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    win.app_handle()
+        .run_on_main_thread(move || {
+            use gtk::prelude::*;
+            if let Ok(gw) = w.gtk_window() {
+                // GDK3 的签名是 `fullscreen_on_monitor(&Screen, monitor 序号)`，
+                // 屏幕取窗口自身所在的那块（取不到再退默认屏）；
+                // `screen` 在 GtkWindowExt 与 WidgetExt 上都有，必须写全路径
+                let screen = gtk::prelude::GtkWindowExt::screen(&gw)
+                    .or_else(gtk::gdk::Screen::default);
+                let exists = gtk::gdk::Display::default()
+                    .and_then(|d| d.monitor(index as i32))
+                    .is_some();
+                match (screen, exists) {
+                    (Some(s), true) => gw.fullscreen_on_monitor(&s, index as i32),
+                    // 取不到该显示器就退化为普通全屏（落在窗口当前所在屏）
+                    _ => gw.fullscreen(),
+                }
+                gw.show_all();
+            }
+            let _ = tx.send(());
+        })
+        .map_err(|e| ShotErr::CaptureFailed(format!("请求全屏失败: {e}")))?;
+    let _ = rx.recv_timeout(Duration::from_secs(3));
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fullscreen_on_monitor(win: &tauri::WebviewWindow, _index: usize) -> Result<(), ShotErr> {
+    win.set_fullscreen(true)
+        .map_err(|e| ShotErr::CaptureFailed(format!("请求全屏失败: {e}")))
+}
+
+/* ---------------- Tauri 命令 ---------------- */
+
+#[tauri::command]
+pub async fn start_screenshot(app: tauri::AppHandle) -> Result<ShotCapture, String> {
+    // 抓屏最长阻塞 15s：放到 blocking 线程，绝不占住 tokio worker
+    let app2 = app.clone();
+    let capture = tauri::async_runtime::spawn_blocking(move || {
+        let state = app2.state::<ShotState>();
+        capture_and_cache(&app2, &state)
+    })
+    .await
+    .map_err(|e| format!("CAPTURE_FAILED|抓屏任务失败: {e}"))?
+    .map_err(|e| format!("{}|{}", e.code(), e.message()))?;
+
+    // 开窗回到命令线程：与 open_image_viewer 同一写法（已在本仓库验证过）
+    if let Err(e) = open_overlays(&app, &capture) {
+        return Err(format!("{}|{}", e.code(), e.message()));
+    }
+    oim_log!(
+        "[shot] 抓屏成功 {}x{}，{} 块屏，会话 {}",
+        capture.width,
+        capture.height,
+        capture.monitors.len(),
+        capture.session
+    );
+    Ok(capture)
+}
+
+#[tauri::command]
+pub async fn shot_image(
+    session: String,
+    index: usize,
+    state: tauri::State<'_, ShotState>,
+) -> Result<Value, String> {
+    let cached = state.get(&session).map_err(|e| e.message())?;
+    let mon = monitor_at(&cached.monitors, index).map_err(|e| e.message())?;
+    let scale = mon.px.w as f64 / mon.logical.w.max(1) as f64;
+    Ok(json!({
+        "b64": cached.png_b64,
+        "mime": "image/png",
+        "slice": mon.px,
+        "scale": scale,
+        "total": { "w": cached.width, "h": cached.height },
+    }))
+}
+
+#[tauri::command]
+pub async fn close_shot_overlays(
+    app: tauri::AppHandle,
+    session: String,
+    state: tauri::State<'_, ShotState>,
+) -> Result<(), String> {
+    for (label, w) in app.webview_windows() {
+        if label.starts_with("shot-overlay-") {
+            let _ = w.destroy();
+        }
+    }
+    if state.active_session().as_deref() == Some(session.as_str()) {
+        state.clear();
+    }
+    oim_log!("[shot] 遮罩已关闭 session={session}");
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn save_shot_png(b64: String, path: String) -> Result<(), String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| format!("图片数据非法: {e}"))?;
+    std::fs::write(&path, bytes).map_err(|e| format!("保存失败: {e}"))
+}
+
+/// 把 PNG 写进系统剪贴板（Linux 走 GTK：与现有 clipboard_image 读路径对称）
+#[tauri::command]
+pub async fn copy_image_to_clipboard(app: tauri::AppHandle, b64: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .map_err(|e| format!("图片数据非法: {e}"))?;
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        app.run_on_main_thread(move || {
+            use gtk::prelude::*;
+            let loader = gtk::gdk_pixbuf::PixbufLoader::new();
+            let ok = loader.write(&bytes).is_ok()
+                && loader.close().is_ok()
+                && loader.pixbuf().is_some_and(|pb| {
+                    gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD).set_image(&pb);
+                    true
+                });
+            let _ = tx.send(ok);
+        })
+        .map_err(|e| format!("写剪贴板失败: {e}"))?;
+        return match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("剪贴板写入失败（图片解码失败）".into()),
+            Err(_) => Err("写剪贴板超时".into()),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Windows/macOS 由前端用 clipboard-manager 插件写图片
+        let _ = (app, b64);
+        Err("PLUGIN".into())
+    }
+}
+
+/// 供 shortcut.rs / 命令行调用：抓屏并建遮罩。
+///
+/// 这两个调用点都在主线程上（插件回调 / setup / 单实例回调），而抓屏要阻塞
+/// 十几秒 —— 所以自己起线程做完整流程（Tauri 的建窗可以从任意线程发起，
+/// 与 `open_image_viewer` 同一个机制），主线程立刻返回。
+pub fn trigger(app: &tauri::AppHandle) -> Result<(), ShotErr> {
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let state = app2.state::<ShotState>();
+        if let Err(e) = begin_blocking(&app2, &state) {
+            oim_log!("[shot] 触发失败 [{}]：{}", e.code(), e.message());
+        }
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +761,47 @@ mod tests {
             .expect("encode");
         let c = decode_captured(png).expect("decode");
         assert_eq!((c.width, c.height), (1, 1));
+    }
+
+    #[test]
+    fn shot_cache_expires_and_is_single_slot() {
+        let cache = ShotState::default();
+        assert!(cache.get("s1").is_err(), "空缓存应取不到");
+        cache.put(CachedShot {
+            session: "s1".into(),
+            png_b64: "AAA".into(),
+            width: 10,
+            height: 10,
+            monitors: vec![],
+        });
+        assert_eq!(cache.get("s1").unwrap().png_b64, "AAA");
+        // 会话 id 不匹配（旧遮罩窗口）取不到
+        assert!(cache.get("s0").is_err());
+        // 新会话替换旧会话：旧 id 立即失效
+        cache.put(CachedShot {
+            session: "s2".into(),
+            png_b64: "BBB".into(),
+            width: 10,
+            height: 10,
+            monitors: vec![],
+        });
+        assert!(cache.get("s1").is_err());
+        assert_eq!(cache.get("s2").unwrap().png_b64, "BBB");
+        // close 幂等
+        cache.clear();
+        cache.clear();
+        assert!(cache.get("s2").is_err());
+    }
+
+    #[test]
+    fn monitor_index_out_of_range_is_rejected() {
+        let mons = vec![ShotMonitor {
+            index: 0,
+            name: "DP-1".into(),
+            px: Rect { x: 0, y: 0, w: 8, h: 8 },
+            logical: Rect { x: 0, y: 0, w: 8, h: 8 },
+        }];
+        assert!(monitor_at(&mons, 0).is_ok());
+        assert_eq!(monitor_at(&mons, 3).unwrap_err().code(), "CAPTURE_FAILED");
     }
 }

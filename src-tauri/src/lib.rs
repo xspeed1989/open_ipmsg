@@ -1600,6 +1600,8 @@ pub fn run() {
 
             app.manage(st);
             app.manage(ctx.clone());
+            // 截图会话缓存（单槽：新截图立刻让旧遮罩失效）
+            app.manage(screenshot::ShotState::default());
 
             /* ---------- 系统托盘 ---------- */
             // Linux：先尝试自己注册 StatusNotifierItem（能拿到单击事件与悬停提示），
@@ -1762,7 +1764,12 @@ pub fn run() {
             emoji::send_emoji,
             emoji::export_emoji_pack,
             emoji::inspect_emoji_pack,
-            emoji::import_emoji_pack
+            emoji::import_emoji_pack,
+            screenshot::start_screenshot,
+            screenshot::shot_image,
+            screenshot::close_shot_overlays,
+            screenshot::save_shot_png,
+            screenshot::copy_image_to_clipboard
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
