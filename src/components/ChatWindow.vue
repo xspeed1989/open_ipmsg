@@ -728,7 +728,7 @@ async function copyShotToClipboard(b64) {
     if (String(e) === 'PLUGIN') {
       const { writeImage } = await import('@tauri-apps/plugin-clipboard-manager')
       const { Image } = await import('@tauri-apps/api/image')
-      await writeImage(Image.fromBytes(b64ToBytes(b64)))
+      await writeImage(await Image.fromBytes(b64ToBytes(b64)))
     } else {
       throw e
     }
@@ -770,9 +770,13 @@ onMounted(async () => {
 
   unlistenShot = await ipc.listenEvent(ipc.EVT.screenshotDone, async (p) => {
     if (!store.activeKey) {
-      // 没有打开会话：不静默丢弃 —— 复制到剪贴板并提示
-      try { await copyShotToClipboard(p.b64) } catch (e) { console.error('copy shot failed', e) }
-      toast(t('chat.shotNoChat'))
+      // 没有打开会话：剪贴板是唯一的去处，失败必须说出来，不能谎报「已复制」
+      try {
+        await copyShotToClipboard(p.b64)
+        toast(t('chat.shotNoChat'))
+      } catch (e) {
+        alert(t('chat.shotCopyFailed', { e }))
+      }
       return
     }
     pushShotImage(p)

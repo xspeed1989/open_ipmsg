@@ -1,7 +1,7 @@
 <script setup>
 // 截图遮罩窗口：底图 + 变暗挖洞 + 拖拽选区 + 标注层（矩形/椭圆/箭头/画笔/文字/马赛克）。
 // 「确认/复制/另存为」在这里把选区 + 标注合成 PNG 导出（确认/复制回主窗口，另存为落盘）。
-import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import * as ipc from '../lib/ipc'
 import {
   rectFromDrag, clampRect, canConfirm, hitTestHandle, resizeRect, moveRect, nudgeRect,
@@ -76,28 +76,54 @@ const WIDTHS = [2, 3, 5]
 const BLOCKS = [6, 10, 16]
 
 /** 工具栏贴合：优先选区下方，放不下翻到上方，最后夹进窗口。
- *  尺寸必须实测：工具栏加了确认组之后更宽，写死的宽度会让右端的按钮被夹出窗口。 */
+ *  尺寸必须实测：工具栏加了确认组之后更宽，写死的宽度会让右端的按钮被夹出窗口；
+ *  切到马赛克会再多出三个块尺寸按钮，所以每次工具/块尺寸/选区变化后都要重新量。 */
+const barW = ref(560)
+const barH = ref(40)
 const barRef = ref(null)
-const barStyle = computed(() => {
+
+function measureBar() {
   const el = barRef.value
-  const bar = { w: el?.offsetWidth || 560, h: el?.offsetHeight || 40 }
-  const p = toolbarPlacement(sel.value || { x: 0, y: 0, w: 0, h: 0 }, winRect.value, bar)
+  if (!el) return
+  barW.value = el.offsetWidth
+  barH.value = el.offsetHeight
+}
+
+const barStyle = computed(() => {
+  const p = toolbarPlacement(sel.value || { x: 0, y: 0, w: 0, h: 0 }, winRect.value, {
+    w: barW.value,
+    h: barH.value,
+  })
   return { left: p.x + 'px', top: p.y + 'px' }
 })
 
-/** 标注 canvas 与窗口同尺寸（CSS 像素 1:1，导出时再乘 k） */
+/** 标注 canvas：后备像素 = 窗口 CSS 尺寸 × k（与底图同为图像物理像素），
+ *  再用 ctx 变换把绘制坐标保持在 CSS 空间 —— 标注与底图一样 1:1 清晰，
+ *  不会在分数缩放/高分屏上被放大糊掉。 */
 function paintAnnoSize() {
   const c = annoCanvas.value
   if (!c) return
-  const w = winRect.value.w
-  const h = winRect.value.h
+  const k = slice.value.w / Math.max(1, winRect.value.w)
+  const w = Math.max(1, Math.round(winRect.value.w * k))
+  const h = Math.max(1, Math.round(winRect.value.h * k))
   if (c.width === w && c.height === h) return
   const keep = c.width && c.height ? c.toDataURL() : ''
   c.width = w
   c.height = h
+  // 元素仍按 CSS 尺寸布局，绘制坐标继续用 CSS 像素
+  c.style.width = winRect.value.w + 'px'
+  c.style.height = winRect.value.h + 'px'
+  const ctx = c.getContext('2d')
+  ctx.setTransform(k, 0, 0, k, 0, 0)
   if (keep) {
     const im = new Image()
-    im.onload = () => c.getContext('2d').drawImage(im, 0, 0)
+    im.onload = () => {
+      // 还原是设备像素 1:1 拷贝，必须临时去掉变换
+      ctx.save()
+      ctx.setTransform(1, 0, 0, 1, 0, 0)
+      ctx.drawImage(im, 0, 0)
+      ctx.restore()
+    }
     im.src = keep
   }
 }
@@ -330,10 +356,12 @@ function compositeB64() {
   // 标注层按同一比例缩放贴上去（在物理像素上重绘，避免放大糊掉）
   const anno = annoCanvas.value
   if (anno) {
+    // 标注层后备像素 = 窗口 CSS × k，取样矩形必须换算到设备像素，否则会取错/缩小
+    const k = r.w / sel.value.w
     ctx.imageSmoothingEnabled = false
     ctx.drawImage(
       anno,
-      sel.value.x, sel.value.y, sel.value.w, sel.value.h,
+      sel.value.x * k, sel.value.y * k, sel.value.w * k, sel.value.h * k,
       0, 0, r.w, r.h,
     )
   }
@@ -407,6 +435,9 @@ onMounted(() => {
   window.addEventListener('keydown', onKeydown)
   window.addEventListener('resize', onResize)
 })
+// 工具栏元素与它的宽度都随工具/选区变化：等 DOM 落地后重新量一次，再夹位置
+onMounted(() => nextTick(measureBar))
+watch([tool, blockSize, sel], () => nextTick(measureBar))
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('resize', onResize)
