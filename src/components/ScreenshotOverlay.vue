@@ -1,6 +1,6 @@
 <script setup>
 // 截图遮罩窗口：底图 + 变暗挖洞 + 拖拽选区 + 标注层（矩形/椭圆/箭头/画笔/文字/马赛克）。
-// 「确认/复制/另存为」的合成导出在 Task 9 接入，本任务只画不导出。
+// 「确认/复制/另存为」在这里把选区 + 标注合成 PNG 导出（确认/复制回主窗口，另存为落盘）。
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import * as ipc from '../lib/ipc'
 import {
@@ -8,6 +8,7 @@ import {
   cssRectToImageRect, toolbarPlacement, mosaicBlocks, arrowHead, pushUndo,
 } from '../lib/shot'
 import { t } from '../lib/i18n'
+import { save as saveDialog } from '@tauri-apps/plugin-dialog'
 
 const boot = window.__OIM_SHOT__ || {}
 const qs = new URLSearchParams(location.search)
@@ -22,7 +23,6 @@ const slice = ref({ x: 0, y: 0, w: 1, h: 1 })
 const sel = ref(null)          // 当前选区（CSS 像素），null = 未选
 const busy = ref(false)
 const errMsg = ref('')
-const hint = ref('')
 
 let drag = null                // { mode:'new'|'move'|'resize', handle, start, origin }
 
@@ -75,9 +75,12 @@ const COLORS = ['#e64340', '#ff8c00', '#ffd400', '#1aad19', '#1e6fff', '#000000'
 const WIDTHS = [2, 3, 5]
 const BLOCKS = [6, 10, 16]
 
-/** 工具栏贴合：优先选区下方，放不下翻到上方，最后夹进窗口 */
+/** 工具栏贴合：优先选区下方，放不下翻到上方，最后夹进窗口。
+ *  尺寸必须实测：工具栏加了确认组之后更宽，写死的宽度会让右端的按钮被夹出窗口。 */
+const barRef = ref(null)
 const barStyle = computed(() => {
-  const bar = { w: 420, h: 40 }
+  const el = barRef.value
+  const bar = { w: el?.offsetWidth || 560, h: el?.offsetHeight || 40 }
   const p = toolbarPlacement(sel.value || { x: 0, y: 0, w: 0, h: 0 }, winRect.value, bar)
   return { left: p.x + 'px', top: p.y + 'px' }
 })
@@ -316,9 +319,70 @@ function onKeydown(ev) {
   }
 }
 
+/** 合成导出：按选区把底图 + 标注裁剪成 PNG base64（在图像物理像素上裁剪） */
+function compositeB64() {
+  const r = cssRectToImageRect(sel.value, slice.value, winRect.value.w)
+  const out = document.createElement('canvas')
+  out.width = r.w
+  out.height = r.h
+  const ctx = out.getContext('2d')
+  ctx.drawImage(img.value, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h)
+  // 标注层按同一比例缩放贴上去（在物理像素上重绘，避免放大糊掉）
+  const anno = annoCanvas.value
+  if (anno) {
+    ctx.imageSmoothingEnabled = false
+    ctx.drawImage(
+      anno,
+      sel.value.x, sel.value.y, sel.value.w, sel.value.h,
+      0, 0, r.w, r.h,
+    )
+  }
+  const url = out.toDataURL('image/png')
+  return { b64: url.slice(url.indexOf(',') + 1), width: r.w, height: r.h }
+}
+
 async function confirm() {
   if (!canOk.value || busy.value) return
-  hint.value = t('shot.todoConfirm')
+  busy.value = true
+  try {
+    const { b64, width, height } = compositeB64()
+    const bytes = Math.floor((b64.length * 3) / 4)
+    if (bytes > 32 * 1024 * 1024) throw new Error(t('shot.tooLarge'))
+    await ipc.emitToMain(ipc.EVT.screenshotDone, { b64, mime: 'image/png', size: bytes, width, height })
+    await ipc.closeShotOverlays(session)
+  } catch (e) {
+    errMsg.value = String(e?.message || e)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function copyOnly() {
+  if (!canOk.value || busy.value) return
+  busy.value = true
+  try {
+    const { b64, width, height } = compositeB64()
+    await ipc.emitToMain(ipc.EVT.screenshotCopy, { b64, mime: 'image/png', size: Math.floor((b64.length * 3) / 4), width, height })
+    await ipc.closeShotOverlays(session)
+  } catch (e) {
+    errMsg.value = String(e?.message || e)
+  } finally {
+    busy.value = false
+  }
+}
+
+/** 保存：不关闭遮罩，方便继续调整后再发 */
+async function saveAs() {
+  if (!canOk.value) return
+  try {
+    const { b64 } = compositeB64()
+    const base = `screenshot-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')}.png`
+    const path = await saveDialog({ defaultPath: base, filters: [{ name: 'PNG', extensions: ['png'] }] })
+    if (!path) return
+    await ipc.saveShotPng(b64, path)
+  } catch (e) {
+    errMsg.value = String(e?.message || e)
+  }
 }
 
 async function cancel() {
@@ -372,7 +436,7 @@ onUnmounted(() => {
       <div class="size" v-if="sel">{{ sizeLabel }}</div>
       <span v-for="h in ['nw','n','ne','e','se','s','sw','w']" :key="h" :class="['handle', h]"></span>
     </div>
-    <div v-if="sel" class="toolbar" :style="barStyle" @pointerdown.stop @pointerup.stop>
+    <div v-if="sel" ref="barRef" class="toolbar" :style="barStyle" @pointerdown.stop @pointerup.stop>
       <button v-for="tl in TOOLS" :key="tl" :class="{ on: tool === tl }" :title="t('shot.tool.' + tl)"
         @click="tool = tl">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -400,6 +464,27 @@ onUnmounted(() => {
           <path d="M9 7L4 12l5 5M4 12h10a5 5 0 0 1 0 10" />
         </svg>
       </button>
+      <span class="sep"></span>
+      <button :title="t('shot.copy')" @click="copyOnly">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V5h10" />
+        </svg>
+      </button>
+      <button :title="t('shot.save')" @click="saveAs">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path d="M12 4v10m0 0l-4-4m4 4l4-4M5 19h14" />
+        </svg>
+      </button>
+      <button class="ok" :disabled="!canOk" :title="t('shot.confirm')" @click="confirm">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M5 13l4 4L19 7" />
+        </svg>
+      </button>
+      <button :title="t('shot.cancel')" @click="cancel">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M6 6l12 12M18 6L6 18" />
+        </svg>
+      </button>
     </div>
     <input v-if="textAt" ref="textInput" v-model="textAt.value" class="text-in"
       :style="{ left: textAt.x + 'px', top: textAt.y + 'px' }"
@@ -408,7 +493,6 @@ onUnmounted(() => {
       @keydown.ctrl.z.stop @keydown.meta.z.stop @blur="commitText" />
     <div v-if="!sel && !errMsg" class="tip">{{ t('shot.tip') }}</div>
     <div v-if="errMsg" class="error">{{ errMsg }}</div>
-    <div v-if="hint" class="tip bottom">{{ hint }}</div>
   </div>
 </template>
 
@@ -521,6 +605,9 @@ onUnmounted(() => {
 .toolbar button.on {
   color: #1aad19;
 }
+.toolbar .ok {
+  color: #1aad19;
+}
 .sep {
   width: 1px;
   height: 18px;
@@ -552,7 +639,6 @@ onUnmounted(() => {
   color: #000;
   font-size: 14px;
 }
-.tip.bottom { top: auto; bottom: 24px; }
 .error {
   position: absolute;
   left: 50%;

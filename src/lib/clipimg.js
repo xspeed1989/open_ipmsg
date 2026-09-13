@@ -25,3 +25,11 @@ export function pendingImgFromB64(b64, mime = 'image/png', size) {
   const blob = b64ToBlob(b64, mime)
   return { b64, mime, size: size ?? blob.size, blob }
 }
+
+/** base64 → Uint8Array（写剪贴板图片时给 Tauri 的 Image.fromBytes 用） */
+export function b64ToBytes(b64) {
+  const bin = atob(b64 || '')
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}

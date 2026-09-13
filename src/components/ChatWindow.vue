@@ -15,7 +15,7 @@ import { recalledEditState } from '../lib/recall'
 import { forwardPayload, mergeForward } from '../lib/forward'
 import { groupPayload, sendToEach } from '../lib/groupsend'
 import { copyTextOf } from '../lib/copymsg'
-import { pendingImgFromB64 } from '../lib/clipimg'
+import { pendingImgFromB64, b64ToBytes } from '../lib/clipimg'
 import { addToEmojiPlan, attachPath, importSummary, isStickerFile } from '../lib/emoji'
 import { t } from '../lib/i18n'
 import { open as openFileDialog, confirm as confirmDialog } from '@tauri-apps/plugin-dialog'
@@ -690,6 +690,51 @@ function attachToPending(key, paths) {
   pendingOf(key).push(...pendingFileItems(paths))
 }
 
+/* ---------- 截图（遮罩窗口确认后回到这里） ---------- */
+let unlistenShot = null
+let unlistenShotCopy = null
+
+/** 触发截图；后端抓屏并打开遮罩窗口 */
+async function startShot() {
+  try {
+    await ipc.startScreenshot()
+  } catch (e) {
+    alert(shotErrorText(e))
+  }
+}
+
+/** 后端错误串形如 "ERROR_CODE|文案"；有文案就直接给用户看 */
+function shotErrorText(e) {
+  const s = String(e?.message || e)
+  const i = s.indexOf('|')
+  return i > 0 ? s.slice(i + 1) : s
+}
+
+/** 把截图按「粘贴图片」的同一形状放进待发送列表 */
+function pushShotImage({ b64, mime = 'image/png', size }) {
+  const p = pendingImgFromB64(b64, mime, size)
+  pendingOf(store.activeKey).push({
+    kind: 'img', b64: p.b64, mime: p.mime, size: p.size,
+    url: URL.createObjectURL(p.blob), name: imgItemName(p.mime),
+  })
+  nextTick(() => ta.value?.focus())
+}
+
+async function copyShotToClipboard(b64) {
+  try {
+    await ipc.copyShotImage(b64)
+  } catch (e) {
+    // Linux 之外由插件写图片
+    if (String(e) === 'PLUGIN') {
+      const { writeImage } = await import('@tauri-apps/plugin-clipboard-manager')
+      const { Image } = await import('@tauri-apps/api/image')
+      await writeImage(Image.fromBytes(b64ToBytes(b64)))
+    } else {
+      throw e
+    }
+  }
+}
+
 onMounted(async () => {
   try {
     unlistenDrop = await getCurrentWindow().onDragDropEvent(async ({ payload }) => {
@@ -722,6 +767,23 @@ onMounted(async () => {
   } catch (e) {
     /* 拿不到窗口事件时静默降级：仍可用「发送文件」按钮 */
   }
+
+  unlistenShot = await ipc.listenEvent(ipc.EVT.screenshotDone, async (p) => {
+    if (!store.activeKey) {
+      // 没有打开会话：不静默丢弃 —— 复制到剪贴板并提示
+      try { await copyShotToClipboard(p.b64) } catch (e) { console.error('copy shot failed', e) }
+      toast(t('chat.shotNoChat'))
+      return
+    }
+    pushShotImage(p)
+    if (store.config?.shot_copy_clipboard !== false) {
+      try { await copyShotToClipboard(p.b64) } catch (e) { console.error('copy shot failed', e) }
+    }
+  })
+
+  unlistenShotCopy = await ipc.listenEvent(ipc.EVT.screenshotCopy, async (p) => {
+    try { await copyShotToClipboard(p.b64) } catch (e) { alert(t('chat.shotCopyFailed', { e })) }
+  })
 })
 function onFindHotkey(e) {
   const k = e.key?.toLowerCase()
@@ -741,6 +803,8 @@ onMounted(() => {
 })
 onUnmounted(() => {
   if (unlistenDrop) unlistenDrop()
+  unlistenShot?.()
+  unlistenShotCopy?.()
   window.removeEventListener('paste', onPaste)
   window.removeEventListener('keydown', onPasteHotkey)
   window.removeEventListener('keydown', onFindHotkey)
@@ -1329,6 +1393,13 @@ watch(
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
             <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"
               stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+          </svg>
+        </button>
+        <button :title="t('chat.screenshot')" @click="startShot">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+            <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"
+              stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+            <path d="M8 10l3 3 2-2 3 3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
           </svg>
         </button>
         <button v-if="store.config?.password_use" :class="{ on: pwdOn }" :title="t('chat.pwdLock')" @click="pwdOn = !pwdOn">

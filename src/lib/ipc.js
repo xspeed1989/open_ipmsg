@@ -1,12 +1,15 @@
 // 后端命令统一封装：避免组件里直接散落 invoke 字符串
 import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { listen, emit } from '@tauri-apps/api/event'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
 
 /** 注册后端事件监听（自动解包 Tauri 事件对象的 payload；返回 unlisten 函数） */
 export const listenEvent = (event, handler) =>
   listen(event, (e) => handler(e.payload))
+
+/** 从独立窗口（遮罩/查看器）向所有窗口广播事件 */
+export const emitToMain = (event, payload) => emit(event, payload)
 
 /** 获取配置（含本机信息 hostname / ips、加密开关 encrypt 与公钥指纹 key_fp） */
 export const getConfig = () => invoke('get_config')

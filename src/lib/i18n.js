@@ -175,6 +175,9 @@ const zh = {
   'chat.sendFiles': '发送文件',
   'chat.sendFolder': '发送文件夹',
   'chat.screenshotSoon': '截图功能开发中',
+  'chat.screenshot': '截图',
+  'chat.shotNoChat': '请先打开一个会话（截图已复制到剪贴板）',
+  'chat.shotCopyFailed': '复制到剪贴板失败：{e}',
   'chat.emoji': '表情',
   // ---- 自定义表情包 ----
   'emoji.tabUnicode': '表情',
@@ -299,7 +302,8 @@ const zh = {
   'viewer.saveFailed': '保存失败：{e}',
   // ---- 截图遮罩 ----
   'shot.tip': '拖拽选择截图区域，Enter 确认，Esc 取消',
-  'shot.todoConfirm': '确认链路将在下一步接通',
+  'shot.copy': '复制', 'shot.save': '保存', 'shot.confirm': '确认', 'shot.cancel': '取消',
+  'shot.tooLarge': '截图过大（超过 32MB），无法发送',
   'shot.tool.move': '移动/调整选区', 'shot.tool.rect': '矩形', 'shot.tool.ellipse': '椭圆',
   'shot.tool.arrow': '箭头', 'shot.tool.pen': '画笔', 'shot.tool.text': '文字', 'shot.tool.mosaic': '马赛克',
   'shot.undo': '撤销',
@@ -432,6 +436,9 @@ const en = {
   'chat.sendFiles': 'Send file',
   'chat.sendFolder': 'Send folder',
   'chat.screenshotSoon': 'Screenshot (coming soon)',
+  'chat.screenshot': 'Screenshot',
+  'chat.shotNoChat': 'Open a chat first (screenshot copied to clipboard)',
+  'chat.shotCopyFailed': 'Copy to clipboard failed: {e}',
   'chat.emoji': 'Emoji',
   // ---- Custom sticker library ----
   'emoji.tabUnicode': 'Emoji',
@@ -556,7 +563,8 @@ const en = {
   'viewer.saveFailed': 'Failed to save: {e}',
   // ---- 截图遮罩 ----
   'shot.tip': 'Drag to select an area. Enter to confirm, Esc to cancel',
-  'shot.todoConfirm': 'Confirm pipeline lands in the next step',
+  'shot.copy': 'Copy', 'shot.save': 'Save', 'shot.confirm': 'Confirm', 'shot.cancel': 'Cancel',
+  'shot.tooLarge': 'Screenshot too large (over 32MB)',
   'shot.tool.move': 'Move/resize selection', 'shot.tool.rect': 'Rectangle', 'shot.tool.ellipse': 'Ellipse',
   'shot.tool.arrow': 'Arrow', 'shot.tool.pen': 'Pen', 'shot.tool.text': 'Text', 'shot.tool.mosaic': 'Mosaic',
   'shot.undo': 'Undo',

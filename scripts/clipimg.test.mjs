@@ -35,3 +35,11 @@ test('pendingImgFromB64 接受后端下发的尺寸', () => {
 test('非法 base64 直接抛出（交由调用方提示）', () => {
   assert.throws(() => b64ToBlob('@@not-base64@@'))
 })
+
+import { b64ToBytes } from '../src/lib/clipimg.js'
+
+test('base64 → 字节数组（剪贴板图片与截图共用的转换）', () => {
+  // "AQID" = [1,2,3]
+  assert.deepEqual(Array.from(b64ToBytes('AQID')), [1, 2, 3])
+  assert.deepEqual(Array.from(b64ToBytes('')), [])
+})
