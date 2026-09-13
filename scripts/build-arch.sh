@@ -33,8 +33,16 @@ fi
 
 # 防呆：dev 模式构建不内嵌前端资源，窗口会去加载 devUrl（http://localhost:1420），
 # 用户机上没有 dev server 就是白屏 —— v0.1.4 的 Arch 包正是这样坏掉的。
-# 只有走 tauri CLI 才会带上 tauri/custom-protocol，内嵌资源清单里才有 /assets/。
-if command -v strings >/dev/null && ! strings -a "$BIN" | grep -q "/assets/"; then
+# 只有走 tauri CLI 才会带上 tauri/custom-protocol，内嵌资源清单里才有 Vite 的
+# /assets/ 条目。查的是资源「键」（AssetKey 一律带根前缀，如 /assets/index-xxx.js），
+# 不是文件内容 —— release 下内容被 brotli 压过，只有键是明文字符串。
+# 实测：release 二进制 2 处命中，dev 二进制 0 处。
+#
+# 这里直接 grep -a 扫原始字节，**不要**改回 `strings -a "$BIN" | grep -q ...`：
+# grep -q 命中即退出，上游还在写的 strings 会收到 SIGPIPE 并以 141 结束；脚本开着
+# pipefail，整条管道就被判成失败 —— 好端端的 release 二进制也会被拦下。v0.1.5 的
+# CI（archlinux 容器）就是这样红的：strings=141 而 grep=0，二进制本身没问题。
+if ! grep -aq "/assets/" "$BIN"; then
   echo "错误: $BIN 疑似 dev 模式构建（没有内嵌前端资源，运行会白屏）。" >&2
   echo "      请改用: pnpm exec tauri build --no-bundle" >&2
   exit 1
