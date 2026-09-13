@@ -1974,6 +1974,8 @@ onUnmounted(() => {
     @contextmenu.prevent="cancel"
   >
     <canvas ref="baseCanvas" class="base"></canvas>
+    <!-- 标注层：与窗口同尺寸（CSS 像素 1:1），合成时才按选区缩放贴到物理像素上 -->
+    <canvas ref="annoCanvas" class="anno"></canvas>
     <!-- 还没有选区时整屏压暗（微信行为：进入截图态立刻有反馈）；
          有选区后改用 box-shadow 挖洞，只暗选区之外 -->
     <div v-if="!sel" class="dim-full"></div>
@@ -2001,6 +2003,12 @@ onUnmounted(() => {
   left: 0;
   top: 0;
   image-rendering: pixelated;
+}
+/* 标注层必须与 base 完全重叠：这里不写 width/height，让属性尺寸即 CSS 尺寸 */
+.anno {
+  position: absolute;
+  left: 0;
+  top: 0;
 }
 /* 变暗用「挖洞」实现：选区那一块不盖黑罩，靠超大 box-shadow 覆盖其余区域。
    比每帧重绘底图便宜得多（GPU 合成），拖拽 100% 跟手。 */
@@ -2152,7 +2160,7 @@ git commit -m "feat(shot): 遮罩窗口组件（取图/变暗挖洞/拖拽选区
 
 **Interfaces:**
 - Consumes: Task 2's `mosaicBlocks`, `arrowHead`, `pushUndo`, `toolbarPlacement`; Task 7's component state.
-- Produces: annotation tools `rect | ellipse | arrow | pen | text | mosaic`, undo via `Ctrl+Z`, toolbar rendered from `toolbarPlacement`, and a `composite()` function returning a PNG data URL of the cropped, annotated selection (consumed by Task 9).
+- Produces: annotation tools `rect | ellipse | arrow | pen | text | mosaic`, undo via `Ctrl+Z`, a toolbar rendered from `toolbarPlacement`, and a **window-sized annotation canvas (`ref="annoCanvas"`, CSS pixels 1:1)** that Task 9 composites at the selection via `compositeB64()`. (There is no function named `composite()`.)
 
 - [ ] **Step 1: Add annotation state and drawing**
 
@@ -2411,6 +2419,87 @@ Run: `pnpm tauri dev`, trigger `invoke('start_screenshot')` from the main window
 ```bash
 git add src/components/ScreenshotOverlay.vue src/lib/i18n.js
 git commit -m "feat(shot): 标注工具（矩形/椭圆/箭头/画笔/文字/马赛克）与撤销"
+```
+
+**Review round 1 amendments (five Important defects found by the review and the implementer's own browser probes — apply all five):**
+
+**A. Mosaic sampled the base canvas in the wrong coordinate space.** The annotation layer and the selection live in CSS pixels, but the base canvas's backing store is image pixels (`k = slice.w / winW`, 1.25 on this machine). The original `applyMosaic` fed CSS coordinates straight into `getImageData`, so every block averaged pixels from somewhere else in the screenshot. Replace it with:
+
+```js
+/** 马赛克：读底图对应区域的像素，按块平均后回填。
+ *
+ *  坐标系：标注层与选区是 CSS 像素，而 base 画布的后备像素是图像物理像素
+ *  （k = slice.w / 窗口 CSS 宽，本机 1.25）。采样必须乘 k，回填仍用 CSS 坐标，
+ *  否则每个块都取到图上别处的像素，块网格也会与拖拽范围错位。 */
+function applyMosaic(ctx, cssRect) {
+  const base = baseCanvas.value
+  if (!base) return
+  const bctx = base.getContext('2d')
+  const k = base.width / Math.max(1, winRect.value.w)
+  for (const b of mosaicBlocks(cssRect, blockSize.value)) {
+    const sx = Math.max(0, Math.round(b.x * k))
+    const sy = Math.max(0, Math.round(b.y * k))
+    if (sx >= base.width || sy >= base.height) continue
+    const sw = Math.max(1, Math.min(Math.round(b.w * k), base.width - sx))
+    const sh = Math.max(1, Math.min(Math.round(b.h * k), base.height - sy))
+    const data = bctx.getImageData(sx, sy, sw, sh).data
+    let r = 0, g = 0, bl = 0, n = 0
+    for (let i = 0; i < data.length; i += 4) {
+      r += data[i]; g += data[i + 1]; bl += data[i + 2]; n++
+    }
+    if (!n) continue
+    ctx.fillStyle = `rgb(${Math.round(r / n)},${Math.round(g / n)},${Math.round(bl / n)})`
+    ctx.fillRect(b.x, b.y, b.w, b.h)
+  }
+}
+```
+
+**B. Mosaic drew nothing for three of the four drag directions.** The pointer-move branch passed the raw rect (`w: p.x - from.x`), and `mosaicBlocks` iterates `x < rect.x + rect.w`, so a negative width or height produced an empty block list. Normalize first — `rectFromDrag` is already imported:
+
+```js
+    if (drawing.tool === 'mosaic') applyMosaic(ctx, rectFromDrag(drawing.from, p, winRect.value))
+    else drawShape(ctx, drawing)
+```
+
+**C. The text input's Enter/Esc leaked to the window handlers.** `onKeydown` is a live `window` listener, so `Enter` burned the text *and* ran `confirm()` (which becomes the export path in Task 9), `Esc` removed the input *and* called `cancel()` (closing the whole overlay), and `Ctrl+Z` undid a canvas stroke instead of the text. Add `.stop` to both modifiers and stop pointer events on the input:
+
+```html
+    <input v-if="textAt" ref="textInput" v-model="textAt.value" class="text-in"
+      :style="{ left: textAt.x + 'px', top: textAt.y + 'px' }"
+      @pointerdown.stop @pointerup.stop
+      @keydown.enter.stop.prevent="commitText" @keydown.esc.stop.prevent="textAt = null" @blur="commitText" />
+```
+
+**D. The drawing path dropped pointer capture.** The tool branch returned before `setPointerCapture`, and there is no `pointercancel` handler, so a pointerup that lands on the toolbar (`@pointerup.stop`) or outside the window left `drawing` set and the shape kept following the cursor with no button pressed. In the drawing branch, capture as the selection paths do:
+
+```js
+    pushSnapshot()
+    drawing = { tool: tool.value, from: p, to: p, points: [p] }
+    root.value.setPointerCapture?.(ev.pointerId)
+    return
+```
+
+and make the move branch defensive plus add a cancel path:
+
+```js
+function onPointerMove(ev) {
+  if (drawing && ev.buttons === 0) onPointerUp()   // 丢过 pointerup：按松手处理，别粘住
+  ...
+```
+```html
+    @pointercancel="onPointerUp"
+```
+
+**E. The text tool was likely unusable with a real mouse.** The implementer reproduced this in Chromium: the press focuses the new input, then the browser's default mousedown focus handling blurs it, `@blur=commitText` fires with an empty value and `textAt` becomes null ~300 ms later. Prevent the compatibility mouse events for the text branch:
+
+```js
+    if (tool.value === 'text') {
+      // 阻止 mousedown 的默认聚焦行为：否则刚建出来的输入框立刻失焦 → blur 提交空值
+      ev.preventDefault()
+      textAt.value = { x: p.x, y: p.y, value: '' }
+      nextTick(() => textInput.value?.focus())
+      return
+    }
 ```
 
 ---
