@@ -1272,13 +1272,18 @@ fn session_id() -> String {
     format!("{ms:x}-{n}")
 }
 
-/// 抓屏 + 建立遮罩窗口（真正的入口，工具栏/热键/命令行都汇到这里）
-pub fn begin(app: &tauri::AppHandle, state: &ShotState) -> Result<ShotCapture, ShotErr> {
-    // 已有一个会话：聚焦已有遮罩，不叠第二层
+/// 抓屏并写缓存（**阻塞**，最长 15s）—— 只做重活，不开窗。
+///
+/// 必须从「非 tokio worker」的上下文调用（命令用 `spawn_blocking`，热键/命令行
+/// 用自己的线程）：portal 的 Response 是阻塞等待，直接放在 async 命令里会占住
+/// 一个 tokio worker 最长 15 秒。
+pub fn capture_and_cache(
+    app: &tauri::AppHandle,
+    state: &ShotState,
+) -> Result<ShotCapture, ShotErr> {
+    // 已有一个会话：直接把现有会话还回去（不重复抓屏）
     if let Some(session) = state.active_session() {
-        if let Some(w) = app.get_webview_window("shot-overlay-0") {
-            let _ = w.set_focus();
-            let cached = state.get(&session)?;
+        if let Ok(cached) = state.get(&session) {
             return Ok(ShotCapture {
                 session: cached.session,
                 width: cached.width,
@@ -1304,6 +1309,17 @@ pub fn begin(app: &tauri::AppHandle, state: &ShotState) -> Result<ShotCapture, S
         height: capture.height,
         monitors: capture.monitors.clone(),
     });
+    Ok(capture)
+}
+
+/// 真正的入口（工具栏 / 热键 / 命令行都汇到这里）：抓屏 + 建遮罩窗口。
+///
+/// 抓屏在调用线程上阻塞完成（调用方保证这不是 tokio worker）；开窗沿用
+/// `open_image_viewer` 已验证的写法 —— 直接在命令/事件线程上 build。
+/// 会话已存在时 `capture_and_cache` 会直接返回旧会话，`open_overlays` 发现
+/// 对应 label 的窗口已在，只做聚焦 —— 两层遮罩不会叠加。
+pub fn begin_blocking(app: &tauri::AppHandle, state: &ShotState) -> Result<ShotCapture, ShotErr> {
+    let capture = capture_and_cache(app, state)?;
     open_overlays(app, &capture)?;
     Ok(capture)
 }
@@ -1485,19 +1501,29 @@ fn fullscreen_on_monitor(win: &tauri::WebviewWindow, _index: usize) -> Result<()
 /* ---------------- Tauri 命令 ---------------- */
 
 #[tauri::command]
-pub async fn start_screenshot(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, ShotState>,
-) -> Result<ShotCapture, String> {
-    let cap = begin(&app, &state).map_err(|e| format!("{}|{}", e.code(), e.message()))?;
+pub async fn start_screenshot(app: tauri::AppHandle) -> Result<ShotCapture, String> {
+    // 抓屏最长阻塞 15s：放到 blocking 线程，绝不占住 tokio worker
+    let app2 = app.clone();
+    let capture = tauri::async_runtime::spawn_blocking(move || {
+        let state = app2.state::<ShotState>();
+        capture_and_cache(&app2, &state)
+    })
+    .await
+    .map_err(|e| format!("CAPTURE_FAILED|抓屏任务失败: {e}"))?
+    .map_err(|e| format!("{}|{}", e.code(), e.message()))?;
+
+    // 开窗回到命令线程：与 open_image_viewer 同一写法（已在本仓库验证过）
+    if let Err(e) = open_overlays(&app, &capture) {
+        return Err(format!("{}|{}", e.code(), e.message()));
+    }
     oim_log!(
         "[shot] 抓屏成功 {}x{}，{} 块屏，会话 {}",
-        cap.width,
-        cap.height,
-        cap.monitors.len(),
-        cap.session
+        capture.width,
+        capture.height,
+        capture.monitors.len(),
+        capture.session
     );
-    Ok(cap)
+    Ok(capture)
 }
 
 #[tauri::command]
@@ -1579,10 +1605,20 @@ pub async fn copy_image_to_clipboard(app: tauri::AppHandle, b64: String) -> Resu
     }
 }
 
-/// 供 shortcut.rs / 命令行调用：抓屏并只把结果交给遮罩（与 start_screenshot 等价）
+/// 供 shortcut.rs / 命令行调用：抓屏并建遮罩。
+///
+/// 这两个调用点都在主线程上（插件回调 / setup / 单实例回调），而抓屏要阻塞
+/// 十几秒 —— 所以自己起线程做完整流程（Tauri 的建窗可以从任意线程发起，
+/// 与 `open_image_viewer` 同一个机制），主线程立刻返回。
 pub fn trigger(app: &tauri::AppHandle) -> Result<(), ShotErr> {
-    let state = app.state::<ShotState>();
-    begin(app, &state).map(|_| ())
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let state = app2.state::<ShotState>();
+        if let Err(e) = begin_blocking(&app2, &state) {
+            oim_log!("[shot] 触发失败 [{}]：{}", e.code(), e.message());
+        }
+    });
+    Ok(())
 }
 ```
 
