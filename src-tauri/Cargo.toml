@@ -27,13 +27,16 @@ ksni = { version = "0.3.6", default-features = false, features = ["async-io"] }
 # 版本与默认特性跟随传递依赖（zbus + async-io，与 ksni 一致），不引入新的运行时
 notify-rust = "4.18"
 
-# Windows 下枚举 IPv6 网卡及接口索引，用于逐接口加入/发送 IPMsg 组播。
+# Windows 下枚举 IPv6 网卡及接口索引，用于逐接口加入/发送 IPMsg 组播；
+# 截图抓屏走 GDI BitBlt（Graphics_Gdi + UI_WindowsAndMessaging 取虚拟桌面尺寸）。
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dependencies]

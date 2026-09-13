@@ -227,13 +227,111 @@ mod portal {
     }
 }
 
-/// 非 Linux 平台的抓屏后端（Windows / macOS，见 Task 12 / Task 13）
-#[cfg(not(target_os = "linux"))]
+/// 其余平台（非 Linux / Windows / macOS）：占位，保持 `platform::capture()` 在
+/// 任何 target 上都存在，不参与实际功能。
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows"), not(target_os = "macos")))]
 mod platform {
     use super::ShotErr;
 
     pub fn capture() -> Result<super::Captured, ShotErr> {
         Err(ShotErr::CaptureFailed("当前平台尚未实现抓屏".into()))
+    }
+}
+
+/// Windows：GDI BitBlt 抓整个虚拟桌面。
+///
+/// 选 BitBlt 而不是 DXGI Desktop Duplication：后者要求 D3D11 设备、在混合
+/// 显卡/远程桌面下容易失败，而抓屏只需要「屏幕现在长什么样」这一件事。
+#[cfg(target_os = "windows")]
+mod platform {
+    use super::{bgra_to_rgba, Captured, ShotErr};
+    use windows_sys::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
+        DIB_RGB_COLORS, SRCCOPY,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+
+    pub fn capture() -> Result<Captured, ShotErr> {
+        unsafe {
+            // 虚拟桌面（所有显示的并集）：副屏在主屏左侧时 x 为负，必须按
+            // 「虚拟桌面原点」抓，而不是按主屏原点
+            let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let w = GetSystemMetrics(SM_CXVIRTUALSCREEN) as u32;
+            let h = GetSystemMetrics(SM_CYVIRTUALSCREEN) as u32;
+            if w == 0 || h == 0 {
+                return Err(ShotErr::CaptureFailed("虚拟桌面尺寸为 0".into()));
+            }
+            let screen = GetDC(std::ptr::null_mut());
+            let mem = CreateCompatibleDC(screen);
+            let bmp = CreateCompatibleBitmap(screen, w as i32, h as i32);
+            let old = SelectObject(mem, bmp);
+            // CAPTUREBLT 才能抓到分层窗口（否则只有桌面壁纸）
+            let ok = BitBlt(mem, 0, 0, w as i32, h as i32, screen, x, y, SRCCOPY | CAPTUREBLT);
+            if ok == 0 {
+                ReleaseDC(std::ptr::null_mut(), screen);
+                DeleteObject(bmp);
+                DeleteDC(mem);
+                return Err(ShotErr::CaptureFailed("BitBlt 失败".into()));
+            }
+            let stride = ((w * 32 + 31) / 32 * 4) as usize;
+            let mut buf = vec![0u8; stride * h as usize];
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w as i32,
+                    // 负高度 = 自顶向下，省掉一次翻转
+                    biHeight: -(h as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let lines = GetDIBits(
+                mem,
+                bmp,
+                0,
+                h,
+                buf.as_mut_ptr() as *mut _,
+                &mut info,
+                DIB_RGB_COLORS,
+            );
+            SelectObject(mem, old);
+            DeleteObject(bmp);
+            DeleteDC(mem);
+            ReleaseDC(std::ptr::null_mut(), screen);
+            // GetDIBits 返回「实际写回的行数」：少于 h 说明只拿到部分图像，
+            // 当成成功会得到一张下半截全黑的图（比直接报错更难排查）
+            if lines != h as i32 {
+                return Err(ShotErr::CaptureFailed(format!(
+                    "GetDIBits 只写回 {lines} 行（应为 {h} 行）"
+                )));
+            }
+            let mut rgba = bgra_to_rgba(&buf, w, h, stride);
+            // BitBlt 到 DIB 的 alpha 字节是未定义的（实测常见为 0）。若原样当成
+            // 透明度用，PNG 会是一张全透明图 —— 抓屏必须强制不透明。
+            for px in rgba.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+            encode_png(rgba, w, h)
+        }
+    }
+
+    fn encode_png(rgba: Vec<u8>, w: u32, h: u32) -> Result<Captured, ShotErr> {
+        use image::ImageEncoder;
+        let img = image::RgbaImage::from_raw(w, h, rgba)
+            .ok_or_else(|| ShotErr::CaptureFailed("缓冲尺寸不匹配".into()))?;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(img.as_raw(), w, h, image::ExtendedColorType::Rgba8)
+            .map_err(|e| ShotErr::CaptureFailed(format!("PNG 编码失败: {e}")))?;
+        Ok(Captured { png, width: w, height: h })
     }
 }
 
@@ -774,6 +872,18 @@ mod tests {
         );
         // 源数据不足时不 panic，缺的部分补全透明黑
         assert_eq!(bgra_to_rgba(&src[..14], 2, 2, 12).len(), 16);
+    }
+
+    #[test]
+    fn bgra_to_rgba_handles_odd_width_rows() {
+        // 3×1 行宽 12 字节，stride 16（GDI 常见 4 字节对齐）
+        let src = vec![
+            10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 0, 0, 0, 0,
+        ];
+        assert_eq!(
+            bgra_to_rgba(&src, 3, 1, 16),
+            vec![30, 20, 10, 255, 60, 50, 40, 255, 90, 80, 70, 255],
+        );
     }
 
     #[test]
