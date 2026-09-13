@@ -3032,6 +3032,8 @@ fn default_shot_hotkey() -> String {
 
 and the same two lines in `impl Default for Config`.
 
+**`get_config` does not serialize `Config`** — it builds an explicit `json!` whitelist (around `src-tauri/src/lib.rs:177`). The two new fields MUST be added there as `"shot_hotkey": cfg.shot_hotkey,` and `"shot_copy_clipboard": cfg.shot_copy_clipboard,`, or the settings form can never refill the stored hotkey and `store.config?.shot_copy_clipboard !== false` stays `undefined !== false` — i.e. the auto-copy toggle could never be switched off. (The same whitelist also omits `absence_*`, `password_*`, `agent_addr`, `master_addr`, `allow_send_list`, `ipdict_enabled`, `dir_mode`, `v6_mcast`: a pre-existing repo bug — those settings show defaults after a restart. Recorded for the maintainer; do NOT fix it in this task.)
+
 Add the fields to `ConfigPatch` — it is a **private struct in `src-tauri/src/lib.rs` around line 117** (not in `state.rs`), whose fields are plain (no `pub`) — as `shot_hotkey: Option<String>` and `shot_copy_clipboard: Option<bool>`, and map them in `save_config` in the same file:
 
 ```rust
@@ -3045,8 +3047,10 @@ Add the fields to `ConfigPatch` — it is a **private struct in `src-tauri/src/l
 In `src/components/SettingsModal.vue`, add a screenshot section (follow the existing section markup pattern in that file) with:
 
 ```html
-      <section class="si-section">
-        <h3 class="si-title">{{ t('settings.shot') }}</h3>
+      <!-- 沿用 SettingsModal.vue 既有的分区标记（selfinfo / si-title / si-row），
+           这里原 brief 写的 si-section/si-hint 在该文件里并不存在 -->
+      <div class="selfinfo">
+        <div class="si-title">{{ t('settings.shot') }}</div>
         <div class="si-row">
           <label>{{ t('settings.shotHotkey') }}</label>
           <input
@@ -3063,8 +3067,8 @@ In `src/components/SettingsModal.vue`, add a screenshot section (follow the exis
           <label>{{ t('settings.shotCopy') }}</label>
           <input type="checkbox" v-model="form.shot_copy_clipboard" />
         </div>
-        <p class="si-hint">{{ hotkeyHint }}</p>
-      </section>
+        <p class="import-hint">{{ hotkeyHint }}</p>
+      </div>
 ```
 
 script additions:
@@ -3106,13 +3110,15 @@ export function isWaylandUA(ua = '') {
 Add the styles:
 
 ```css
+/* 变量名必须用本仓库 global.css 里真实存在的 --c-*（与 .dir-input 同款），
+   想当然写 --line/--bg-soft/--fg 会被整条丢弃 → 变成无边框透明框 */
 .hotkey-input {
   width: 160px;
   padding: 4px 8px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--c-border);
   border-radius: 4px;
-  background: var(--bg-soft);
-  color: var(--fg);
+  background: var(--c-card-alt);
+  color: var(--c-text);
   text-align: center;
   cursor: pointer;
 }
