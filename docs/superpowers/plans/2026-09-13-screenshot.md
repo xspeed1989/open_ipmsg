@@ -3972,3 +3972,27 @@ git commit -m "docs(shot): 截图功能说明、FAQ 与实现记录"
 - [ ] macOS: first capture triggers the 屏幕录制 permission prompt; denying it shows the guidance message instead of a blank screenshot.
 - [ ] macOS: multi-display capture is stitched correctly (Retina scale handled).
 - [ ] Both: clipboard paste of the confirmed screenshot works in another application.
+
+---
+
+### Task 15: 遮罩窗口无闪烁显示（后续优化，用户实测反馈）
+
+**背景（用户实测）**：Linux 与 Windows 上截图时"闪一下"。原因是 `open_overlays` 里 `build()` 出来窗口**立刻可见**，而 webview 还没绘制 —— 用户先看到一块未绘制的白窗，过 ~100–300ms 才出现冻结的桌面图。Wayland 下还有第二个来源：窗口先以 320×200 占位尺寸被映射，之后才请求指定屏全屏。
+
+**用户裁决**：A+B 一起做 —— 事件驱动显示（页面报"画完了"再显）**并且**遮罩窗口改为透明窗。后者推翻了本设计早先"不做透明窗"的保守选择（§6.2），代价是 Windows/macOS 需真机确认透明窗行为。
+
+**Files:**
+- Modify: `src-tauri/src/screenshot.rs`, `src-tauri/src/lib.rs`, `src/components/ScreenshotOverlay.vue`, `src/lib/ipc.js`
+
+**实现要点**
+
+1. 建窗时加 `.transparent(true)` 与 `.visible(false)`，**不要**再设不透明底色（与透明互斥）。这样未绘制的那一帧用户看到的是"什么都没有"。
+2. 页面报就绪：`load()` 里底图 `paintBase()` 之后 `await nextFrames(2)`（双 `requestAnimationFrame` —— 第一帧提交，第二帧确认进了合成管线；**不用定时器**），再 `invoke('shot_overlay_ready', {session, index})`。用 `try/finally` 保证**出错也要报**，否则窗口永远隐藏、用户只看到"按了没反应"。
+3. 后端 `shot_overlay_ready`：在主线程**同一个回合**里 `show()` + 请求指定屏全屏。注意 `fullscreen_on_monitor` 内部自己会 `run_on_main_thread`，从主线程里再调会死锁 —— 把它的主体拆成 `schedule_fullscreen(&gw, index)`（要求已在主线程），建窗路径与就绪路径共用。
+4. 兜底：建窗时起一个 3 秒看门狗线程，若到点仍 `!is_visible()` 就强制 `show()`，避免页面彻底挂掉时留下一个永远不出现的会话。
+5. 页面透明：`.shot-root` 背景改 `transparent`，并在挂载时把 `documentElement/body` 的行内背景也设为 `transparent`（`global.css` 会给 body 上底色，不清掉就白闪）。
+
+**验证**
+- `pnpm test`（147）、`cargo test`（226 passed / 1 ignored）、`pnpm build`、`cargo check --target x86_64-pc-windows-gnu`。
+- 本机真触发：日志出现 `[shot] 遮罩已就绪并显示`；遮罩仍正确铺满两块屏（≈0.55 压暗）；用 `GDK_BACKEND=x11` + XTEST 重跑一次"拖拽→标注→回车→剪贴板 750×400"的端到端，确认透明窗没有破坏合成（画布必须不透明地盖住整个窗口）。
+- Windows/macOS：透明窗行为需维护者真机确认（清单 §15.5）。
