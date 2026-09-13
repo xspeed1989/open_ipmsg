@@ -3916,6 +3916,25 @@ Windows/macOS/X11 由应用注册全局热键；Wayland 下改由桌面环境授
 
 Append a short 实现记录 section to the spec listing anything that differed from the design (for example: measured capture latency, the `--shot-test` diagnostic, any platform backend that could not be verified on this machine), then commit.
 
+**Review round 1 amendments (two Important doc-accuracy defects + four Minor items — apply all):**
+
+**O (Important).** Both READMEs (and the shipped settings string) claim the Wayland binding dialog appears "on the first save". The code registers the shortcut **once at startup** (`shortcut::register` has exactly one call site, in `setup`), `save_config` only persists the value, and there is no rebind command — so a changed hotkey does nothing until the app restarts. Fix the wording (zh and en) to say the dialog appears on **first launch** and a changed shortcut takes effect **after a restart**, and scope the PORTAL_MISSING sentence to the toolbar path (the hotkey/CLI paths only log). The same wrong claim is in the shipped UI string, which this round may also fix (two lines, both languages):
+
+```js
+  'settings.shotHotkeyWayland': '当前是 Wayland 会话：首次启动应用时会弹出系统绑定确认，改完快捷键需重启应用才生效；若桌面环境不支持，可在系统设置里把命令 open-ipmsg --screenshot 绑成自定义快捷键',
+```
+```js
+  'settings.shotHotkeyWayland': 'Wayland session: the desktop asks you to confirm the shortcut on first launch, and a changed shortcut takes effect only after restarting the app. If your desktop does not support it, bind "open-ipmsg --screenshot" yourself',
+```
+
+**P (Important).** The as-built §15.1 table claims to record the design deltas but omits two design items that were **never built**: §10's "Wayland 下显示 portal 绑定状态" and §11's "PORTAL_MISSING → 设置页给安装提示". No status IPC exists and the settings page renders only a static UA string. Add both as explicit "设计有、未实现" rows — an as-built record that silently drops unbuilt items is worse than no record.
+
+**Q (Minor).** Reword the README line that says macOS was "cross-compile checked": the full app never compiles for `aarch64-apple-darwin` (it fails inside `objc2-exception-helper`, which is pre-existing); only the new arm type-checked in isolation. Point at §15.4.
+
+**R (Minor).** §15.2/§15.4 must record the controller's post-commit end-to-end pass, which closes the "no on-site evidence" gap they currently describe: with the app on the X11 backend (`GDK_BACKEND=x11`) so XTEST can drive it, a real drag on the live WebKitGTK overlay produced a green-bordered selection with the dim applied to both monitors, `Enter` confirmed it, and an independent client read back a **750×400** PNG from the clipboard — exactly the CSS 600×320 selection × k(1.25). Two overlays appeared at the correct per-monitor geometry (0,0 and 2560,0, each 2560×1440). Add the pending-list/send hop and the tray-hidden trigger to the maintainer checklist, note the mixed-DPI limitation as app-wide rather than Windows/macOS-only, and add the macOS channel-order/flush checks the macOS report deferred.
+
+**S (Minor).** Keep the `open-ipmsg.desktop` rename untouched except to confirm no reference remains.
+
 - [ ] **Step 3: Run everything**
 
 ```bash
