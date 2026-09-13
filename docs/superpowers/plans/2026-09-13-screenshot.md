@@ -2893,6 +2893,39 @@ Consequences to keep in sync: `compositeB64` must take the annotation source rec
 
 (where `k = r.w / sel.value.w`), while `snapshot()`/`undo()` keep using device pixels (`getImageData(0,0,c.width,c.height)` and `putImageData`, which ignores the transform) and `applyMosaic`'s CSS-coordinate fills stay as they are (the transform does the scaling for them).
 
+**K (controller ruling, follows from J).** With the annotation layer on a physical backing store, a CSS-space block grid lands on fractional device pixels (10 CSS px × k = 12.5 device px here), so neighbouring `fillRect`s each cover half of the boundary pixel and leave a 1-device-pixel hairline at ~75% opacity every 12.5 px — the original content bleeds through the mosaic. Mosaic exists to hide content, so the fill must be device-pixel exact. Snap each block to device-pixel bounds and derive the far edge from the rounded end (so adjacent blocks tile with no gap):
+
+```js
+function applyMosaic(ctx, cssRect) {
+  const base = baseCanvas.value
+  if (!base) return
+  const bctx = base.getContext('2d')
+  const k = base.width / Math.max(1, winRect.value.w)
+  // 回填也走设备像素：CSS 块网格在分数缩放下会落在半像素上，
+  // 相邻两块各盖一半 → 每个块缝漏出一条 25% 透光的原图细线（打码就白打了）
+  ctx.save()
+  ctx.setTransform(1, 0, 0, 1, 0, 0)
+  for (const b of mosaicBlocks(cssRect, blockSize.value)) {
+    const dx = Math.round(b.x * k)
+    const dy = Math.round(b.y * k)
+    const dw = Math.max(1, Math.round((b.x + b.w) * k) - dx)
+    const dh = Math.max(1, Math.round((b.y + b.h) * k) - dy)
+    if (dx >= base.width || dy >= base.height) continue
+    const sw = Math.max(1, Math.min(dw, base.width - dx))
+    const sh = Math.max(1, Math.min(dh, base.height - dy))
+    const data = bctx.getImageData(dx, dy, sw, sh).data
+    let r = 0, g = 0, bl = 0, n = 0
+    for (let i = 0; i < data.length; i += 4) {
+      r += data[i]; g += data[i + 1]; bl += data[i + 2]; n++
+    }
+    if (!n) continue
+    ctx.fillStyle = `rgb(${Math.round(r / n)},${Math.round(g / n)},${Math.round(bl / n)})`
+    ctx.fillRect(dx, dy, dw, dh)
+  }
+  ctx.restore()
+}
+```
+
 - [ ] **Step 7: Run the full test suite**
 
 Run: `pnpm test`
