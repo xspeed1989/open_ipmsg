@@ -269,14 +269,32 @@ mod platform {
             let screen = GetDC(std::ptr::null_mut());
             let mem = CreateCompatibleDC(screen);
             let bmp = CreateCompatibleBitmap(screen, w as i32, h as i32);
+            // 句柄创建失败必须显式拒绝：CreateCompatibleBitmap 返回 NULL 时 BitBlt 会
+            // 「成功」地画进 DC 自带的 1×1 单色位图，GetDIBits 再把它转成 32bpp ——
+            // 结果是返回一张全屏黑白图，比直接报错难查得多。
+            if mem.is_null() || bmp.is_null() {
+                if !bmp.is_null() {
+                    DeleteObject(bmp);
+                }
+                if !mem.is_null() {
+                    DeleteDC(mem);
+                }
+                ReleaseDC(std::ptr::null_mut(), screen);
+                return Err(ShotErr::CaptureFailed("创建 GDI 位图失败".into()));
+            }
             let old = SelectObject(mem, bmp);
             // CAPTUREBLT 才能抓到分层窗口（否则只有桌面壁纸）
             let ok = BitBlt(mem, 0, 0, w as i32, h as i32, screen, x, y, SRCCOPY | CAPTUREBLT);
+            // 先摘下位图再谈别的：
+            //  · DeleteObject 对「仍被选入 DC」的位图不会真正释放（每次失败泄漏一张全屏位图）
+            //  · GetDIBits 的文档前置条件同样要求 hbmp 未被选入任何 DC
+            SelectObject(mem, old);
             if ok == 0 {
-                ReleaseDC(std::ptr::null_mut(), screen);
+                let e = std::io::Error::last_os_error();
                 DeleteObject(bmp);
                 DeleteDC(mem);
-                return Err(ShotErr::CaptureFailed("BitBlt 失败".into()));
+                ReleaseDC(std::ptr::null_mut(), screen);
+                return Err(ShotErr::CaptureFailed(format!("BitBlt 失败（{e}）")));
             }
             let stride = ((w * 32 + 31) / 32 * 4) as usize;
             let mut buf = vec![0u8; stride * h as usize];
@@ -302,7 +320,6 @@ mod platform {
                 &mut info,
                 DIB_RGB_COLORS,
             );
-            SelectObject(mem, old);
             DeleteObject(bmp);
             DeleteDC(mem);
             ReleaseDC(std::ptr::null_mut(), screen);
