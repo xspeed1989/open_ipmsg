@@ -106,7 +106,11 @@ impl ShotErr {
             ShotErr::Timeout => "截图超时：系统未在 15 秒内响应".into(),
             ShotErr::Decode(e) => format!("截图数据解码失败：{e}"),
             ShotErr::MacPermission => {
-                "需要「屏幕录制」权限：系统设置 → 隐私与安全性 → 屏幕录制".into()
+                // 「必须重启」不是客套：TCC 的屏幕录制授权对已运行的进程不生效，
+                // 不重启的话用户授了权也还是抓不到图（见 platform::has_permission）
+                "需要「屏幕录制」权限：系统设置 → 隐私与安全性 → 屏幕录制，\
+                 勾选本应用后重启应用生效"
+                    .into()
             }
             ShotErr::CaptureFailed(e) => format!("抓屏失败：{e}"),
         }
@@ -448,7 +452,7 @@ mod platform {
         Ok(Captured { png, width: w, height: h })
     }
 
-    /// macOS 的 TCC 屏幕录制权限预检。
+    /// macOS 的 TCC 屏幕录制权限预检 + 申请。
     ///
     /// 简报的写法是自己声明
     /// `extern "C" { fn CGPreflightScreenCaptureAccess() -> bool; }`，
@@ -458,8 +462,24 @@ mod platform {
     /// 另外该符号的 C 原型返回 `boolean_t`（c_uint，4 字节），而 Rust 的 `bool`
     /// 只有 1 字节，手写 `-> bool` 是 ABI 不匹配（aarch64 上属未定义行为）。
     /// 因此改为复用 crate 自带的封装，不再自行声明外部符号。
+    ///
+    /// 同样用 `ScreenCaptureAccess::request()`（同一个 crate 源码里
+    /// `CGRequestScreenCaptureAccess()` 的封装，返回值同样是 `boolean_t` 比较后再转
+    /// `bool`）：**只 preflight 不 request 是一个死循环** —— 系统设置里那份
+    /// 「屏幕录制」清单只登记「申请过」的应用，首次运行的应用根本不在列表里，
+    /// 用户按提示去设置里翻不到本应用，也就永远授权不了；而 preflight 又永远失败。
+    /// 所以预检失败时必须发出一次申请，让系统把本应用登记进去。
     fn has_permission() -> bool {
-        core_graphics::access::ScreenCaptureAccess.preflight()
+        let access = core_graphics::access::ScreenCaptureAccess;
+        if access.preflight() {
+            return true;
+        }
+        // 申请本身在首次运行时可能返回 false（用户还没点授权），也可能已经 true；
+        // 这次调用的意义在于「让本应用出现在系统设置的清单里」，返回值不作为放行依据，
+        // 一律回到预检结论：本次仍按未授权处理，用户授权并重启后才能抓屏。
+        let granted_now = access.request();
+        oim_log!("[shot] 屏幕录制权限未授予（本次申请结果：{granted_now}），已请求系统登记本应用");
+        false
     }
 }
 
@@ -492,15 +512,50 @@ pub struct CachedShot {
 
 /// 同一时刻只保留一个截图会话：遮罩窗口凭 session 取图，旧会话立即失效
 #[derive(Default)]
-pub struct ShotState(Mutex<Option<CachedShot>>);
+pub struct ShotState {
+    cache: Mutex<Option<CachedShot>>,
+    /// 抓屏在途标记：抓屏最长阻塞 15 秒，期间必须挡住第二次触发
+    capturing: Mutex<bool>,
+}
+
+/// 在途抓屏的 RAII 凭据：Drop 即释放标记，任何返回路径（含 `?` 提前返回）都不会漏放
+struct CaptureGuard<'a> {
+    busy: &'a Mutex<bool>,
+}
+
+impl Drop for CaptureGuard<'_> {
+    fn drop(&mut self) {
+        // 不用 unwrap：panic 毒化了锁也只该让标记保持「忙」，绝不能在 drop 里再 panic
+        if let Ok(mut b) = self.busy.lock() {
+            *b = false;
+        }
+    }
+}
 
 impl ShotState {
+    /// 认领一次抓屏。已有人在抓则返回 `None`（**不阻塞**：portal 可能要等 15 秒，
+    /// 第二次触发要的是立刻被拒，而不是排队到最后拿到一个已被覆盖的会话）。
+    fn claim(&self) -> Option<CaptureGuard<'_>> {
+        match self.capturing.try_lock() {
+            Ok(mut busy) if !*busy => {
+                *busy = true;
+                Some(CaptureGuard { busy: &self.capturing })
+            }
+            _ => None,
+        }
+    }
+
+    /// 「正在截屏」拒绝文案只此一处，测试与调用点共用
+    fn busy_err() -> ShotErr {
+        ShotErr::CaptureFailed("正在截屏，请稍候".into())
+    }
+
     pub fn put(&self, shot: CachedShot) {
-        *self.0.lock().unwrap() = Some(shot);
+        *self.cache.lock().unwrap() = Some(shot);
     }
 
     pub fn get(&self, session: &str) -> Result<CachedShot, ShotErr> {
-        let guard = self.0.lock().unwrap();
+        let guard = self.cache.lock().unwrap();
         match guard.as_ref() {
             Some(s) if s.session == session => Ok(CachedShot {
                 session: s.session.clone(),
@@ -514,11 +569,11 @@ impl ShotState {
     }
 
     pub fn clear(&self) {
-        *self.0.lock().unwrap() = None;
+        *self.cache.lock().unwrap() = None;
     }
 
     pub fn active_session(&self) -> Option<String> {
-        self.0.lock().unwrap().as_ref().map(|s| s.session.clone())
+        self.cache.lock().unwrap().as_ref().map(|s| s.session.clone())
     }
 }
 
@@ -549,6 +604,22 @@ pub fn capture_and_cache(
     app: &tauri::AppHandle,
     state: &ShotState,
 ) -> Result<ShotCapture, ShotErr> {
+    // 先认领再干活：抓屏那 1~15 秒里第二次触发必须立刻被拒。
+    //
+    // 这一步**必须**排在「已有会话就直接返回」之前：否则第二次触发会绕过在途检查，
+    // 抓出第二张图覆盖第一张，而按旧 session 建出来的遮罩窗口拿不到图，
+    // 只能报「截图会话已失效，请重新截图」—— 双击按钮就能造出一个死窗口。
+    let _claim = match state.claim() {
+        Some(g) => g,
+        None => {
+            oim_log!(
+                "[shot] 已有抓屏在途，忽略本次触发：{}",
+                ShotState::busy_err().message()
+            );
+            return Err(ShotState::busy_err());
+        }
+    };
+
     // 已有一个会话：直接把现有会话还回去（不重复抓屏）
     if let Some(session) = state.active_session() {
         if let Ok(cached) = state.get(&session) {
@@ -584,8 +655,9 @@ pub fn capture_and_cache(
 ///
 /// 抓屏在调用线程上阻塞完成（调用方保证这不是 tokio worker）；开窗沿用
 /// `open_image_viewer` 已验证的写法 —— 直接在命令/事件线程上 build。
-/// 会话已存在时 `capture_and_cache` 会直接返回旧会话，`open_overlays` 发现
-/// 对应 label 的窗口已在，只做聚焦 —— 两层遮罩不会叠加。
+/// 抓屏在途时的第二次触发会被 `capture_and_cache` 直接拒掉（不排队、不建第二层
+/// 遮罩）；会话已存在时会复用旧会话，`open_overlays` 按本会话的 label 找到窗口后
+/// 只做聚焦 —— 两种情况都不会叠加遮罩。
 pub fn begin_blocking(app: &tauri::AppHandle, state: &ShotState) -> Result<ShotCapture, ShotErr> {
     let capture = capture_and_cache(app, state)?;
     open_overlays(app, &capture)?;
@@ -676,12 +748,23 @@ pub fn is_wayland() -> bool {
         || std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
 }
 
+/// 遮罩窗口 label：`shot-overlay-<会话号>-<显示器序号>`。
+///
+/// 带上会话号是必须的：label 若只按序号命名，上一次截图残留的窗口（例如前端关闭
+/// 时漏掉一个）会被新会话原样复用，而它的 URL 与 `window.__OIM_SHOT__` 绑的是旧
+/// 会话 —— 新图永远进不去，只能报「截图会话已失效」。前缀在，按前缀查找的
+/// close_shot_overlays / Destroyed / capabilities 通配都不受影响。
+fn overlay_label(session: &str, index: usize) -> String {
+    format!("shot-overlay-{session}-{index}")
+}
+
 /// 建立遮罩窗口
 fn open_overlays(app: &tauri::AppHandle, cap: &ShotCapture) -> Result<(), ShotErr> {
     let wayland = is_wayland();
     let count = if wayland { cap.monitors.len().max(1) } else { 1 };
     for i in 0..count {
-        let label = format!("shot-overlay-{i}");
+        // 只认本次会话的 label：旧会话残留的窗口绝不会被这条路「复用」
+        let label = overlay_label(&cap.session, i);
         if let Some(w) = app.get_webview_window(&label) {
             let _ = w.set_focus();
             continue;
@@ -1074,6 +1157,32 @@ mod tests {
         cache.clear();
         cache.clear();
         assert!(cache.get("s2").is_err());
+    }
+
+    #[test]
+    fn in_flight_capture_claim_refuses_second_trigger_and_releases() {
+        let state = ShotState::default();
+        // 第一次触发认领成功
+        let claim = state.claim().expect("首次认领应当成功");
+        // 抓屏在途（1~15 秒）时的第二次触发：立刻被拒，绝不能放第二个抓屏进去
+        assert!(state.claim().is_none());
+        let e = ShotState::busy_err();
+        assert_eq!(e.code(), "CAPTURE_FAILED");
+        assert!(e.message().contains("正在截屏"));
+        // 释放后可以再次截屏（RAII：任何返回路径都会走到这一步）
+        drop(claim);
+        assert!(state.claim().is_some(), "释放后应当能再次认领");
+    }
+
+    #[test]
+    fn overlay_labels_are_session_scoped_but_keep_the_prefix() {
+        let a = overlay_label("abc-1", 0);
+        assert_eq!(a, "shot-overlay-abc-1-0");
+        // 序号相同、会话不同 → label 不同（旧窗口不会被新会话复用）
+        assert_ne!(a, overlay_label("def-2", 0));
+        // 前缀保持：close_shot_overlays / Destroyed 的处理与 capabilities 的
+        // `shot-overlay-*` 通配都靠它
+        assert!(a.starts_with("shot-overlay-"));
     }
 
     #[test]

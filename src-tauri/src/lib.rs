@@ -1470,7 +1470,17 @@ pub fn run() {
         match screenshot::capture_png(std::time::Duration::from_secs(15)) {
             Ok(c) => {
                 let out = std::env::temp_dir().join("oim-shot-test.png");
-                std::fs::write(&out, &c.png).ok();
+                // 落盘失败必须报出来并退非 0：这个诊断是用来判断「后端能不能出图」的，
+                // 写不进去却打印「抓屏成功 → 路径」，会让人拿着一个不存在的文件去排查
+                if let Err(e) = std::fs::write(&out, &c.png) {
+                    eprintln!(
+                        "抓屏成功: {}x{}，但写入 {} 失败: {e}",
+                        c.width,
+                        c.height,
+                        out.display()
+                    );
+                    std::process::exit(1);
+                }
                 println!("抓屏成功: {}x{} → {}", c.width, c.height, out.display());
             }
             Err(e) => {
