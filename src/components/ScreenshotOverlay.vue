@@ -25,11 +25,12 @@ const hint = ref('')
 
 let drag = null                // { mode:'new'|'move'|'resize', handle, start, origin }
 
-const winRect = computed(() => ({
-  x: 0, y: 0,
-  w: root.value?.clientWidth || window.innerWidth,
-  h: root.value?.clientHeight || window.innerHeight,
-}))
+// 窗口尺寸必须是响应式的：computed 直接读 DOM（clientWidth）只会求值一次，
+// 之后 resize 既不重算也不触发重绘 —— 而 Wayland 上遮罩是先建成 320x200
+// 再全屏的，首次绘制会与那次 resize 竞争，赢在错误的一侧就会把整层画进角落。
+const winW = ref(window.innerWidth)
+const winH = ref(window.innerHeight)
+const winRect = computed(() => ({ x: 0, y: 0, w: winW.value, h: winH.value }))
 
 const selStyle = computed(() => {
   const s = sel.value
@@ -156,6 +157,9 @@ async function cancel() {
 }
 
 function onResize() {
+  // 先取新尺寸再重绘：paintBase 用的是 winRect（= winW/winH）
+  winW.value = window.innerWidth
+  winH.value = window.innerHeight
   paintBase()
 }
 
@@ -181,7 +185,10 @@ onUnmounted(() => {
     @contextmenu.prevent="cancel"
   >
     <canvas ref="baseCanvas" class="base"></canvas>
-    <div class="dim" :style="selStyle">
+    <!-- 还没有选区时整屏压暗（微信行为：进入截图态立刻有反馈）；
+         有选区后改用 box-shadow 挖洞，只暗选区之外 -->
+    <div v-if="!sel" class="dim-full"></div>
+    <div v-else class="dim" :style="selStyle">
       <div class="frame"></div>
       <div class="size" v-if="sel">{{ sizeLabel }}</div>
       <span v-for="h in ['nw','n','ne','e','se','s','sw','w']" :key="h" :class="['handle', h]"></span>
@@ -208,6 +215,11 @@ onUnmounted(() => {
 }
 /* 变暗用「挖洞」实现：选区那一块不盖黑罩，靠超大 box-shadow 覆盖其余区域。
    比每帧重绘底图便宜得多（GPU 合成），拖拽 100% 跟手。 */
+.dim-full {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+}
 .dim {
   position: absolute;
   box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
