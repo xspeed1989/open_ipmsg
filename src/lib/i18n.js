@@ -121,7 +121,7 @@ const zh = {
   'settings.shotHotkeyPh': '点击后按下组合键',
   'settings.shotHotkeyHint': '默认 Alt+A；点进输入框后直接按组合键即可修改，Esc 清空表示不注册',
   'settings.shotHotkeyInvalid': '当前保存的快捷键不可用（缺少修饰键），请重新录制或清空',
-  'settings.shotHotkeyWayland': '当前是 Wayland 会话：首次保存会弹出系统绑定确认；若桌面环境不支持，可用命令行 open-ipmsg --screenshot 自行绑定快捷键',
+  'settings.shotHotkeyWayland': '当前是 Wayland 会话：首次启动应用时会弹出系统绑定确认，改完快捷键需重启应用才生效；若桌面环境不支持，可在系统设置里把命令 open-ipmsg --screenshot 绑成自定义快捷键',
   'settings.shotCopy': '确认后复制到剪贴板',
 
   'settings.fpLabel': '本机密钥指纹',
@@ -390,7 +390,7 @@ const en = {
   'settings.shotHotkeyPh': 'Click, then press keys',
   'settings.shotHotkeyHint': 'Default Alt+A. Click the field and press a combination; Esc clears it (no global shortcut)',
   'settings.shotHotkeyInvalid': 'The saved shortcut is unusable (no modifier key) — record a new one or clear it',
-  'settings.shotHotkeyWayland': 'Wayland session: the first save asks the desktop to bind the shortcut. If your desktop does not support it, bind "open-ipmsg --screenshot" yourself',
+  'settings.shotHotkeyWayland': 'Wayland session: the desktop asks you to confirm the shortcut on first launch, and a changed shortcut takes effect only after restarting the app. If your desktop does not support it, bind "open-ipmsg --screenshot" yourself',
   'settings.shotCopy': 'Copy to clipboard on confirm',
   'settings.fpLabel': 'Local key fingerprint',
   'settings.fpTitle': 'Click to copy the local key fingerprint',
