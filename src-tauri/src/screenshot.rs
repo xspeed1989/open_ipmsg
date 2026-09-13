@@ -7,6 +7,7 @@
 use base64::Engine as _;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::Manager;
@@ -516,6 +517,12 @@ pub struct ShotState {
     cache: Mutex<Option<CachedShot>>,
     /// 抓屏在途标记：抓屏最长阻塞 15 秒，期间必须挡住第二次触发
     capturing: Mutex<bool>,
+    /// 已报「底图已画完」（`shot_overlay_ready`）的遮罩 label。
+    ///
+    /// 看门狗靠它判断某个遮罩是不是**彻底没起来**：窗口是透明窗，页面没跑起来时
+    /// 它就是一块看不见的全屏置顶窗，还吃着输入焦点 —— 那种会话必须收掉，
+    /// 不能靠「显示窗口」来兜底（窗口本来就已经显示了）。
+    ready: Mutex<HashSet<String>>,
 }
 
 /// 在途抓屏的 RAII 凭据：Drop 即释放标记，任何返回路径（含 `?` 提前返回）都不会漏放
@@ -570,6 +577,26 @@ impl ShotState {
 
     pub fn clear(&self) {
         *self.cache.lock().unwrap() = None;
+    }
+
+    /// 遮罩页面报「底图已画完」：登记这个 label，看门狗不再收它
+    pub fn mark_ready(&self, label: &str) {
+        self.ready.lock().unwrap().insert(label.to_string());
+    }
+
+    /// 这个遮罩是不是已经报过就绪（没报过的会被看门狗收掉）
+    pub fn is_ready(&self, label: &str) -> bool {
+        self.ready.lock().unwrap().contains(label)
+    }
+
+    /// 窗口销毁时忘掉它：同名 label 再来必然是全新一轮，必须重新等就绪
+    pub fn forget_ready(&self, label: &str) {
+        self.ready.lock().unwrap().remove(label);
+    }
+
+    /// 整个会话结束时清空
+    pub fn clear_ready(&self) {
+        self.ready.lock().unwrap().clear();
     }
 
     pub fn active_session(&self) -> Option<String> {
@@ -758,6 +785,34 @@ fn overlay_label(session: &str, index: usize) -> String {
     format!("shot-overlay-{session}-{index}")
 }
 
+/// 遮罩窗口的初始化脚本前缀：把 html/body 的底色在**任何页面脚本之前**钉成透明。
+///
+/// 打包版 `index.html` 用 `<link>` 引入 `global.css`，里面 `body{background:var(--c-card)}`
+/// 会在模块脚本（以及组件 `onMounted` 里那句兜底）执行之前就被应用、被画出去；
+/// 而遮罩窗口建出来即已映射 —— 那一帧就是用户看到的闪。初始化脚本先于页面脚本运行，
+/// 这里插一条 `!important` 规则，与样式表先后顺序无关。
+///
+/// dev 模式下样式由 vite 用 JS 注入（时机在挂载之前），所以这条规则在 dev 下几乎看不出
+/// 差别 —— 它救的是打包版，别因为 dev 干净就把它删了。
+///
+/// `document.documentElement` 在文档最早期可能还不存在，所以挂三个入口：立即试一次、
+/// 下一次 `readystatechange`（'loading' 阶段就会触发）、以及首帧之前的
+/// `requestAnimationFrame`（rAF 回调排在绘制之前，赶得上第一帧）。
+/// 整段包在 try/catch 里：它绝不能影响后面那句 `window.__OIM_SHOT__` 的赋值。
+const OVERLAY_BOOT_CSS: &str = r#"try{(function(){
+var css='html,body{background:transparent !important}';
+function put(){
+  if(!document.documentElement)return false;
+  var s=document.createElement('style');
+  s.textContent=css;
+  document.documentElement.appendChild(s);
+  return true;
+}
+if(put())return;
+document.addEventListener('readystatechange',function(){put();},{once:true});
+if(typeof requestAnimationFrame==='function')requestAnimationFrame(put);
+})();}catch(e){}"#;
+
 /// 建立遮罩窗口
 ///
 /// 防闪烁靠两条，缺一不可：
@@ -783,7 +838,7 @@ fn open_overlays(app: &tauri::AppHandle, cap: &ShotCapture) -> Result<(), ShotEr
         }
         let url = format!("index.html?viewer=shot&session={}&i={i}", cap.session);
         let boot = format!(
-            "window.__OIM_SHOT__ = {};",
+            "{OVERLAY_BOOT_CSS}window.__OIM_SHOT__ = {};",
             json!({ "session": cap.session, "index": i })
         );
         let mut builder =
@@ -800,11 +855,12 @@ fn open_overlays(app: &tauri::AppHandle, cap: &ShotCapture) -> Result<(), ShotEr
         //
         // 透明窗与不透明底色互斥，所以这里不设 background_color。
         //
-        // macOS 单列出来：那里的 transparent() 要 tauri 的 macos-private-api 特性
-        // （tauri.conf.json 的 macOSPrivateApi + Cargo.toml 的特性），没开这个特性时
-        // 该方法在 macOS 上直接被 cfg 掉、写上去就编译不过；这两个文件不在本任务范围内，
-        // 故 macOS 暂不启用透明窗（macOS 上仍有「未绘制白窗」那一帧，见任务报告）。
-        #[cfg(not(target_os = "macos"))]
+        // macOS 用 tauri 自己的门：那边的 `transparent()` 要 `macos-private-api`
+        // 特性（`tauri.conf.json` 的 `macOSPrivateApi: true` + `tauri/macos-private-api`）。
+        // 没开该特性时这个方法在 macOS 上被整个 cfg 掉，写上去会编译不过；开了就自动
+        // 生效 —— 所以这里照抄 tauri 的条件，而不是写死 `not(target_os = "macos")`。
+        // 维护者待办见设计文档 §15.5（macOS 透明窗未开启前，那边仍有「未绘制白窗」一闪）。
+        #[cfg(any(not(target_os = "macos"), feature = "macos-private-api"))]
         {
             builder = builder.transparent(true);
         }
@@ -829,14 +885,18 @@ fn open_overlays(app: &tauri::AppHandle, cap: &ShotCapture) -> Result<(), ShotEr
             .map_err(|e| ShotErr::CaptureFailed(format!("创建遮罩窗口失败: {e}")))?;
         // 用户 Alt+F4 关掉遮罩时也要释放会话缓存，否则下次触发会拿到陈旧会话
         let watcher = app.clone();
+        let watcher_label = label.clone();
         win.on_window_event(move |e| {
             if matches!(e, tauri::WindowEvent::Destroyed) {
+                let state = watcher.state::<ShotState>();
+                // 就绪标记跟着窗口走：同一个 label 再来是全新一轮，必须重新等就绪
+                state.forget_ready(&watcher_label);
                 let remaining = watcher
                     .webview_windows()
                     .keys()
                     .any(|l| l.starts_with("shot-overlay-"));
                 if !remaining {
-                    watcher.state::<ShotState>().clear();
+                    state.clear();
                     oim_log!("[shot] 遮罩全部关闭，会话缓存已释放");
                 }
             }
@@ -848,23 +908,39 @@ fn open_overlays(app: &tauri::AppHandle, cap: &ShotCapture) -> Result<(), ShotEr
         } else {
             let _ = win.set_focus();
         }
-        // 兜底：页面要是始终不报就绪（脚本抛错、webview 卡死、页面根本没加载出来），
-        // 窗口里就永远是一块透明的空窗，而且它盖住整屏、还抢着焦点。
-        // 3 秒后仍未显示（正常路径此时早就显示了）就强制显示一次，至少让它可见可关。
+        // 兜底看门狗：页面要是始终没报「底图已画完」（模块脚本抛错、webview 卡死、
+        // 页面根本没加载出来），窗口里就永远是一块**透明的**全屏置顶窗 —— 用户看不见
+        // 它，它却盖住整屏、还抢着输入焦点，会话也一直占着不放。
+        // 8 秒（远高于 dev 模式实测 2.5–3.5 秒的页面加载）后仍未就绪，就把本会话的
+        // 遮罩全部收掉，让屏幕回到可用状态；已经报过就绪的遮罩不受影响
+        // （就绪标记在 ShotState 里，窗口销毁时清掉）。
         let wd = win.clone();
         let wd_label = label.clone();
+        let wd_session = cap.session.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(3));
-            // 读不到可见状态（窗口已销毁等）时按「没显示」处理，强制显示一次
-            if matches!(wd.is_visible(), Ok(true)) {
+            std::thread::sleep(Duration::from_secs(8));
+            let state = wd.state::<ShotState>();
+            if state.is_ready(&wd_label) {
                 return;
             }
-            oim_log!("[shot] 遮罩 {wd_label} 3 秒内未收到就绪信号，强制显示兜底");
-            let _ = wd.show();
-            if wayland {
-                let _ = fullscreen_on_monitor(&wd, i);
-            } else {
-                let _ = wd.set_focus();
+            // 同一 session 的遮罩一起收：一块没起来，留着另一块也只是半张遮罩
+            let prefix = format!("shot-overlay-{wd_session}-");
+            let stale: Vec<tauri::WebviewWindow> = wd
+                .app_handle()
+                .webview_windows()
+                .into_iter()
+                .filter(|(l, _)| l.starts_with(&prefix))
+                .map(|(_, w)| w)
+                .collect();
+            if stale.is_empty() {
+                return;
+            }
+            oim_log!(
+                "[shot] 遮罩未就绪，已关闭 {wd_label}（本会话共 {} 个遮罩）：8 秒内没等到页面报「底图已画完」",
+                stale.len()
+            );
+            for w in stale {
+                let _ = w.destroy();
             }
         });
     }
@@ -983,17 +1059,21 @@ pub async fn start_screenshot(app: tauri::AppHandle) -> Result<ShotCapture, Stri
 ///  · 内容真的上屏之后再把窗口端到前台/交回焦点（X11/Windows 的 `set_focus`）；
 ///  · Wayland 上补一次幂等的「指定屏全屏」重试 —— 建窗时那次请求万一被合成器丢了，
 ///    这里是第二次机会；
-///  · 给日志留一条「遮罩已就绪并显示」的锚点。
+///  · 给 `ShotState` 打上「这个遮罩已经起来了」的标记（建窗时的 8 秒看门狗据此
+///    决定要不要把这个会话收掉），并在日志里留一条锚点。
 #[tauri::command]
 pub async fn shot_overlay_ready(
     app: tauri::AppHandle,
     session: String,
     index: usize,
+    state: tauri::State<'_, ShotState>,
 ) -> Result<(), String> {
     let label = overlay_label(&session, index);
     let win = app
         .get_webview_window(&label)
         .ok_or_else(|| format!("截图遮罩已关闭：{label}"))?;
+    // 先登记再动手：看门狗可能正好在 8 秒这一拍上醒来，先登记能让它不再收这个会话
+    state.mark_ready(&label);
     let wayland = is_wayland();
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     app.run_on_main_thread(move || {
@@ -1016,9 +1096,14 @@ pub async fn shot_overlay_ready(
         let _ = tx.send(());
     })
     .map_err(|e| format!("显示遮罩失败: {e}"))?;
-    // 只等到「主线程跑完这一段」；全屏请求本身还排在随后的 idle 回调里
-    let _ = rx.recv_timeout(Duration::from_secs(3));
-    oim_log!("[shot] 遮罩已就绪并显示 {label}");
+    // 只等到「主线程跑完这一段」；全屏请求本身还排在随后的 idle 回调里。
+    // 这一步超时不能报成「已就绪并显示」—— 那就成了没显示却说显示成功
+    match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(()) => oim_log!("[shot] 遮罩已就绪并显示 {label}"),
+        Err(_) => oim_log!(
+            "[shot] 遮罩 {label} 已报就绪，但主线程显示请求等待超时（窗口可能没能前置/全屏）"
+        ),
+    }
     Ok(())
 }
 
@@ -1067,6 +1152,8 @@ pub async fn close_shot_overlays(
     if state.active_session().as_deref() == Some(session.as_str()) {
         state.clear();
     }
+    // 遮罩全没了，就绪标记没必要留着（Destroyed 处理器也会逐个清）
+    state.clear_ready();
     oim_log!("[shot] 遮罩已关闭 session={session}");
     Ok(())
 }

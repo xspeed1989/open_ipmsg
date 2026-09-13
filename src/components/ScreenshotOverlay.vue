@@ -554,10 +554,13 @@ function onResize() {
 }
 
 onMounted(() => {
-  // 页面整体必须透明：遮罩窗口本身是透明窗，html/body 若还带着 global.css 的底色
-  // （body 有 var(--c-card)），未绘制完的那一帧就仍是一块白/主题色的窗 —— 「闪一下」
-  // 原样回来。底图与压暗层画上去之后整窗都是不透明的（canvas 铺满窗口），
-  // 所以这里不会把桌面透出来。
+  // 兜底层：把 html/body 的底色清成透明（global.css 给 body 上了 var(--c-card)）。
+  //
+  // 真正救命的是后端建窗时注入的初始化脚本（`open_overlays` 里的 OVERLAY_BOOT_CSS）：
+  // 打包版 index.html 用 <link> 引入 global.css，底色**在模块脚本执行之前**就被涂上，
+  // 而遮罩窗口建出来即已映射 —— 那一帧只有「文档脚本之前生效的 !important 规则」拦得住，
+  // 这句 onMounted 太晚、拦不住。两处都留着：这句在 dev 下立即生效，也能兜住
+  // 初始化脚本失效的情况；底图与压暗层画上去之后整窗不透明（canvas 铺满窗口）。
   document.documentElement.style.background = 'transparent'
   document.body.style.background = 'transparent'
   load()

@@ -98,6 +98,14 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [features]
 net_debug = []
+# macOS 透明遮罩（截图窗口不闪的那道保险）需要 tauri 自己的 macos-private-api：
+# 转发一层，`cargo build --features macos-private-api` 即可打开，screenshot.rs 里的
+# `#[cfg(any(not(target_os = "macos"), feature = "macos-private-api"))]` 才会生效。
+# 完整启用还要在 tauri.conf.json 里设 `macOSPrivateApi: true`（tauri-build 会校验
+# Cargo.toml 里 tauri 依赖的特性与配置一致）；维护者待办见
+# docs/superpowers/specs/2026-09-13-screenshot-design.md §15.5 —— 在打开之前，
+# macOS 上遮罩仍是不透明窗，「未绘制白窗」那一帧还在。
+macos-private-api = ["tauri/macos-private-api"]
 
 # tray-icon 0.24.x 在 Windows 用 CreateIcon 做「单色 mask + XOR」的经典图标，
 # 没有真 alpha 通道：全 0 像素的透明帧会被任务栏画成黑块/马赛克（闪烁帧 bug）。

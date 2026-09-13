@@ -1,6 +1,7 @@
 // node --test scripts/ —— 截图选区几何纯函数单测（不依赖 Tauri / 浏览器）
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import {
   rectFromDrag, clampRect, canConfirm, hitTestHandle,
   resizeRect, moveRect, nudgeRect,
@@ -120,4 +121,30 @@ test('工具栏优先贴选区下方，越界翻到上方，再越界贴进窗�
   })
   // 右边界对齐不外溢
   assert.equal(toolbarPlacement({ x: 700, y: 100, w: 100, h: 100 }, win, bar).x, 500)
+})
+
+/* ---------------- 遮罩「不闪」的源码级约定（Task 15） ----------------
+ *
+ * 没有 DOM 夹具（node --test，无 jsdom），所以这里做源码级断言：遮罩窗口是**透明窗**
+ * 且建出来即已映射，「不闪」靠的是「底图落地之前页面里没有任何不透明内容」。
+ * 这条约定一旦被破坏（压暗层/提示不再挂 painted、或 .shot-root 又写上底色），
+ * 用户看到的就是「桌面忽然暗一下 / 白闪」——而构建、既有测试、肉眼 dev 全都不报错。
+ */
+const overlaySrc = readFileSync(new URL('../src/components/ScreenshotOverlay.vue', import.meta.url), 'utf8')
+
+test('底图落地前不画任何不透明层：压暗层/提示都挂在 painted 上', () => {
+  // 两个不透明层必须带 painted 条件
+  assert.match(overlaySrc, /v-if="!sel && painted"\s+class="dim-full"/,
+    '.dim-full 必须先判断 painted，否则底图没上来就先把整屏压暗')
+  assert.match(overlaySrc, /v-if="!sel && !errMsg && painted"\s+class="tip"/,
+    '.tip 必须先判断 painted，否则透明窗上会先冒出一块提示')
+  // 根节点不能有底色（透明窗上就是个色块）
+  assert.match(overlaySrc, /\.shot-root\s*\{[^}]*background:\s*transparent/,
+    '.shot-root 背景必须是 transparent')
+  // painted 只能在 paintBase() 里、drawImage 之后置真
+  const paint = overlaySrc.slice(overlaySrc.indexOf('function paintBase()'))
+  const body = paint.slice(0, paint.indexOf('\n}'))
+  assert.ok(body.includes('painted.value = true'), 'paintBase() 里必须置 painted')
+  assert.ok(body.indexOf('drawImage') < body.indexOf('painted.value = true'),
+    'painted 必须在底图 drawImage 之后才置真')
 })
