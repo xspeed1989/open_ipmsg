@@ -300,6 +300,9 @@ const zh = {
   // ---- 截图遮罩 ----
   'shot.tip': '拖拽选择截图区域，Enter 确认，Esc 取消',
   'shot.todoConfirm': '确认链路将在下一步接通',
+  'shot.tool.move': '移动/调整选区', 'shot.tool.rect': '矩形', 'shot.tool.ellipse': '椭圆',
+  'shot.tool.arrow': '箭头', 'shot.tool.pen': '画笔', 'shot.tool.text': '文字', 'shot.tool.mosaic': '马赛克',
+  'shot.undo': '撤销',
   // ---- 转发/引用（发送文本里的本地标记） ----
   'forward.noContent': '没有可转发的内容',
   'forward.notDownloaded': '「{name}」尚未下载，无法转发',
@@ -554,6 +557,9 @@ const en = {
   // ---- 截图遮罩 ----
   'shot.tip': 'Drag to select an area. Enter to confirm, Esc to cancel',
   'shot.todoConfirm': 'Confirm pipeline lands in the next step',
+  'shot.tool.move': 'Move/resize selection', 'shot.tool.rect': 'Rectangle', 'shot.tool.ellipse': 'Ellipse',
+  'shot.tool.arrow': 'Arrow', 'shot.tool.pen': 'Pen', 'shot.tool.text': 'Text', 'shot.tool.mosaic': 'Mosaic',
+  'shot.undo': 'Undo',
   // ---- 转发/引用（发送文本里的本地标记） ----
   'forward.noContent': 'Nothing to forward',
   'forward.notDownloaded': '"{name}" hasn\'t been downloaded yet and can\'t be forwarded',
