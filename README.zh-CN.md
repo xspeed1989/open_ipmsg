@@ -109,13 +109,13 @@ sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
 聊天记录存放在应用数据目录,每个会话一个文件;打开会话时自动加载最近记录。
 
 **Q:截图热键按了没反应?**
-Windows/macOS/X11 由应用注册全局热键；Wayland 下改由桌面环境授权绑定（首次保存设置时会弹确认框），若你的桌面环境不支持，可在系统设置里把命令 `open-ipmsg --screenshot` 绑成自定义快捷键。抓屏本身在 Linux 走 xdg-desktop-portal；若系统没有该服务，截图会提示「系统未提供截图服务」。
+Windows/macOS/X11 由应用注册全局热键；Wayland 下改由桌面环境授权绑定：应用只在启动时注册一次，首次启动会弹一次系统确认框，之后在设置里改了快捷键要重启应用才生效。若你的桌面环境不支持，可在系统设置里把命令 `open-ipmsg --screenshot` 绑成自定义快捷键。抓屏本身在 Linux 走 xdg-desktop-portal：从工具栏点「截图」时，系统缺少该服务会直接提示「系统未提供截图服务」；热键与 `--screenshot` 这两条路径只在日志里记录失败原因。
 
 **Q:Wayland 下热键只在安装版里不可用?**
 桌面环境用「已安装桌面文件名」给应用分配 portal app id：KDE 从 systemd scope `app-<appid>-<随机>.scope` 反推，而 scope 名取自 `.desktop` 的 basename。旧包把桌面文件装成与应用同名的 `open-ipmsg`（加 `.desktop` 后缀），portal 会把 `open-` 当成启动器前缀、解析出 `ipmsg`，找不到对应桌面文件 → 没有 app id → `org.freedesktop.portal.GlobalShortcuts.CreateSession` 被拒（`NotAllowed: An app id is required`），热键降级为禁用；`tauri dev` 直接启动没有这个 scope，所以开发时反而正常。仓库已把桌面文件改名为 `io.github.open-ipmsg.app.desktop`（与 `src-tauri/tauri.conf.json` 的 `identifier` 一致），自行打包时请保持该文件名，否则仍可用 `open-ipmsg --screenshot` 兜底。
 
 **Q:截图有哪些已知限制?**
-混合 DPI 多屏（如一屏 100% + 一屏 200%）目前按整幅图使用同一个缩放比例换算，副屏可能错位；标注层按设备像素合成，撤销栈最多 20 步、每步约 12MB（k=1.25 时整栈约 247MB）。Windows 与 macOS 的抓屏/热键代码已实现并通过交叉编译检查，但未在真机上运行过，验收清单见 `docs/superpowers/specs/2026-09-13-screenshot-design.md`。另外，设置页录制的 `CmdOrCtrl` 在 Wayland 映射为 Super，在 Windows/X11 映射为 Ctrl。
+混合 DPI 多屏（所有平台都是同一套换算逻辑，如一屏 100% + 一屏 200%）目前按整幅图使用同一个缩放比例，副屏可能错位；标注层按设备像素合成，撤销栈最多 20 步、每步约 12MB（k=1.25 时整栈约 247MB）。Windows 与 macOS 的抓屏/热键代码已实现，但从未在真机上运行过：Windows 分支能通过交叉类型检查（`cargo check --target x86_64-pc-windows-gnu`），macOS 分支只在隔离夹具里类型检查过——完整应用对 `aarch64-apple-darwin` 编译会卡在既有依赖 `objc2-exception-helper`（需要 macOS SDK），详见设计文档 §15.4。另外，设置页录制的 `CmdOrCtrl` 在 Wayland 映射为 Super，在 Windows/X11 映射为 Ctrl。
 
 ---
 
