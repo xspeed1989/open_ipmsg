@@ -33,6 +33,11 @@ const winW = ref(window.innerWidth)
 const winH = ref(window.innerHeight)
 const winRect = computed(() => ({ x: 0, y: 0, w: winW.value, h: winH.value }))
 
+/** 唯一缩放来源：图像物理像素 ÷ 窗口 CSS 像素。
+ *  标注层后备像素、马赛克采样与导出裁剪必须同源 —— 之前三处各算一次，
+ *  导出那处还用了四舍五入后的 r.w/sel.w，导致标注层被读偏几十像素。 */
+const kWin = computed(() => slice.value.w / Math.max(1, winRect.value.w))
+
 const selStyle = computed(() => {
   const s = sel.value
   if (!s) return { display: 'none' }
@@ -97,13 +102,13 @@ const barStyle = computed(() => {
   return { left: p.x + 'px', top: p.y + 'px' }
 })
 
-/** 标注 canvas：后备像素 = 窗口 CSS 尺寸 × k（与底图同为图像物理像素），
+/** 标注 canvas：后备像素 = 窗口 CSS 尺寸 × kWin（与底图同为图像物理像素），
  *  再用 ctx 变换把绘制坐标保持在 CSS 空间 —— 标注与底图一样 1:1 清晰，
  *  不会在分数缩放/高分屏上被放大糊掉。 */
 function paintAnnoSize() {
   const c = annoCanvas.value
   if (!c) return
-  const k = slice.value.w / Math.max(1, winRect.value.w)
+  const k = kWin.value
   const w = Math.max(1, Math.round(winRect.value.w * k))
   const h = Math.max(1, Math.round(winRect.value.h * k))
   if (c.width === w && c.height === h) return
@@ -134,8 +139,29 @@ function snapshot() {
   return c.getContext('2d').getImageData(0, 0, c.width, c.height)
 }
 
+/** 撤销栈的字节预算：快照是设备分辨率的 ImageData（本机 2560×1440 每张约 14MB），
+ *  只按 pushUndo 的 20 张条数上限会一直吃到几百 MB。
+ *  这里从最旧的一端按 width*height*4 裁剪，且至少保留最新 1 张。 */
+const UNDO_BYTES = 64 * 1024 * 1024
+
+function trimUndo() {
+  const stack = undoStack.value
+  let total = 0
+  let keep = 0
+  for (let i = stack.length - 1; i >= 0; i--) {
+    const s = stack[i]
+    const bytes = (s?.width || 0) * (s?.height || 0) * 4
+    // 至少留最新 1 张；再加一张就超预算时，从这一张开始（更旧的）全丢
+    if (keep > 0 && total + bytes > UNDO_BYTES) break
+    total += bytes
+    keep++
+  }
+  if (keep < stack.length) undoStack.value = stack.slice(stack.length - keep)
+}
+
 function pushSnapshot() {
   undoStack.value = pushUndo(undoStack.value, snapshot(), 20)
+  trimUndo()
 }
 
 function undo() {
@@ -148,6 +174,13 @@ function undo() {
 }
 
 function drawShape(ctx, d) {
+  // 裁剪到选区：屏幕上看得到的笔迹，导出裁剪里必须也在（否则「画了却导不出」）
+  ctx.save()
+  if (sel.value) {
+    ctx.beginPath()
+    ctx.rect(sel.value.x, sel.value.y, sel.value.w, sel.value.h)
+    ctx.clip()
+  }
   ctx.strokeStyle = color.value
   ctx.fillStyle = color.value
   ctx.lineWidth = width.value
@@ -178,22 +211,24 @@ function drawShape(ctx, d) {
     d.points.forEach((pt, i) => (i ? ctx.lineTo(pt.x, pt.y) : ctx.moveTo(pt.x, pt.y)))
     ctx.stroke()
   }
+  ctx.restore()
 }
 
 /** 马赛克：读底图对应区域的像素，按块平均后回填。
  *
  *  坐标系：标注层与选区是 CSS 像素，而 base 画布的后备像素是图像物理像素
  *  （k = slice.w / 窗口 CSS 宽，本机 1.25）。采样必须乘 k；回填也走设备像素，
- *  否则每个块都取到图上别处的像素，块网格也会与拖拽范围错位。 */
+ *  否则每个块都取到图上别处的像素，块网格也会与拖拽范围错位。
+ *
+ *  每次调用只整片读一次底图（原先每块一次 getImageData，拖拽时每帧几十次读回，
+ *  既慢又让同一帧里的块取到不同时刻的像素）；块的设备像素对齐算法保持不变。 */
 function applyMosaic(ctx, cssRect) {
   const base = baseCanvas.value
   if (!base) return
   const bctx = base.getContext('2d')
-  const k = base.width / Math.max(1, winRect.value.w)
-  // 回填也走设备像素：CSS 块网格在分数缩放下会落在半像素上，
-  // 相邻两块各盖一半 → 每个块缝漏出一条 25% 透光的原图细线（打码就白打了）
-  ctx.save()
-  ctx.setTransform(1, 0, 0, 1, 0, 0)
+  const k = kWin.value
+  // 块的设备像素矩形：与旧实现逐字一致，只把「逐块读取」换成「一次读取 + 按块平均」
+  const blocks = []
   for (const b of mosaicBlocks(cssRect, blockSize.value)) {
     const dx = Math.round(b.x * k)
     const dy = Math.round(b.y * k)
@@ -202,19 +237,53 @@ function applyMosaic(ctx, cssRect) {
     if (dx >= base.width || dy >= base.height) continue
     const sw = Math.max(1, Math.min(dw, base.width - dx))
     const sh = Math.max(1, Math.min(dh, base.height - dy))
-    const data = bctx.getImageData(dx, dy, sw, sh).data
+    blocks.push({ dx, dy, dw, dh, sw, sh })
+  }
+  if (!blocks.length) return
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
+  for (const b of blocks) {
+    x0 = Math.min(x0, b.dx)
+    y0 = Math.min(y0, b.dy)
+    x1 = Math.max(x1, b.dx + b.sw)
+    y1 = Math.max(y1, b.dy + b.sh)
+  }
+  const region = bctx.getImageData(x0, y0, x1 - x0, y1 - y0)
+  const rd = region.data
+  const rw = region.width
+  // 回填也走设备像素：CSS 块网格在分数缩放下会落在半像素上，
+  // 相邻两块各盖一半 → 每个块缝漏出一条 25% 透光的原图细线（打码就白打了）
+  ctx.save()
+  // 先按当前（CSS）变换设好裁剪，再切到设备像素坐标
+  if (sel.value) {
+    ctx.beginPath()
+    ctx.rect(sel.value.x, sel.value.y, sel.value.w, sel.value.h)
+    ctx.clip()
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0)
+  for (const b of blocks) {
     let r = 0, g = 0, bl = 0, n = 0
-    for (let i = 0; i < data.length; i += 4) {
-      r += data[i]; g += data[i + 1]; bl += data[i + 2]; n++
+    for (let y = b.dy; y < b.dy + b.sh; y++) {
+      const row = (y - y0) * rw - x0
+      for (let x = b.dx; x < b.dx + b.sw; x++) {
+        const i = (row + x) * 4
+        r += rd[i]; g += rd[i + 1]; bl += rd[i + 2]; n++
+      }
     }
     if (!n) continue
     ctx.fillStyle = `rgb(${Math.round(r / n)},${Math.round(g / n)},${Math.round(bl / n)})`
-    ctx.fillRect(dx, dy, dw, dh)
+    ctx.fillRect(b.dx, b.dy, b.dw, b.dh)
   }
   ctx.restore()
 }
 
-/** 文字工具：Enter / 失焦把输入框里的字烧进标注层，空串直接丢弃 */
+/** 文字工具的输入框与烧录字号同源：改动时两处必须一起改 */
+const textFontSize = computed(() => 12 + width.value * 4)
+/** 提交点要跳过输入框的边框(1px)与内边距(6px/2px)，否则烧录的文字会比预览往左上跳 */
+const TEXT_ORIGIN = { x: 1 + 6, y: 1 + 2 }
+
+/** 文字工具：Enter / 失焦把输入框里的字烧进标注层，空串直接丢弃。
+ *  字号与输入框同一公式（textFontSize），起点用输入框的内容框原点，
+ *  这样预览什么样、烧出来就是什么样。 */
 function commitText() {
   const at = textAt.value
   if (!at || !annoCanvas.value) return
@@ -222,10 +291,18 @@ function commitText() {
   if (value) {
     const ctx = annoCanvas.value.getContext('2d')
     pushSnapshot()
+    ctx.save()
+    // 与 drawShape 同理：超出选区的文字不该只活在屏幕上
+    if (sel.value) {
+      ctx.beginPath()
+      ctx.rect(sel.value.x, sel.value.y, sel.value.w, sel.value.h)
+      ctx.clip()
+    }
     ctx.fillStyle = color.value
-    ctx.font = `${12 + width.value * 4}px system-ui, sans-serif`
+    ctx.font = `${textFontSize.value}px system-ui, sans-serif`
     ctx.textBaseline = 'top'
-    ctx.fillText(value, at.x, at.y)
+    ctx.fillText(value, at.x + TEXT_ORIGIN.x, at.y + TEXT_ORIGIN.y)
+    ctx.restore()
   }
   textAt.value = null
 }
@@ -301,7 +378,8 @@ function onPointerDown(ev) {
 }
 
 function onPointerMove(ev) {
-  if (drawing && ev.buttons === 0) onPointerUp()   // 丢过 pointerup：按松手处理，别粘住
+  // 丢过 pointerup：按松手处理，别粘住（标注收笔与选区拖拽都要兜）
+  if (ev.buttons === 0 && (drawing || drag)) onPointerUp()
   const p = localPoint(ev)
   // 正在画：每帧从上一张快照重画，避免拖拽预览越描越黑
   if (drawing) {
@@ -363,8 +441,9 @@ function compositeB64() {
   // 标注层按同一比例缩放贴上去（在物理像素上重绘，避免放大糊掉）
   const anno = annoCanvas.value
   if (anno) {
-    // 标注层后备像素 = 窗口 CSS × k，取样矩形必须换算到设备像素，否则会取错/缩小
-    const k = r.w / sel.value.w
+    // 标注层后备像素 = 窗口 CSS × kWin，取样矩形必须换算到设备像素，否则会取错/缩小。
+    // 只能用 kWin：拿四舍五入后的 r.w / sel.w 当比例，会让取样原点偏 sel.x*(k-k0) 个像素
+    const k = kWin.value
     ctx.imageSmoothingEnabled = false
     ctx.drawImage(
       anno,
@@ -378,6 +457,7 @@ function compositeB64() {
 
 async function confirm() {
   if (!canOk.value || busy.value) return
+  errMsg.value = ''
   busy.value = true
   try {
     const { b64, width, height } = compositeB64()
@@ -394,6 +474,7 @@ async function confirm() {
 
 async function copyOnly() {
   if (!canOk.value || busy.value) return
+  errMsg.value = ''
   busy.value = true
   try {
     const { b64, width, height } = compositeB64()
@@ -408,7 +489,9 @@ async function copyOnly() {
 
 /** 保存：不关闭遮罩，方便继续调整后再发 */
 async function saveAs() {
-  if (!canOk.value) return
+  if (!canOk.value || busy.value) return
+  errMsg.value = ''
+  busy.value = true
   try {
     const { b64 } = compositeB64()
     const base = `screenshot-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')}.png`
@@ -417,6 +500,8 @@ async function saveAs() {
     await ipc.saveShotPng(b64, path)
   } catch (e) {
     errMsg.value = String(e?.message || e)
+  } finally {
+    busy.value = false
   }
 }
 
@@ -525,7 +610,7 @@ onUnmounted(() => {
       </button>
     </div>
     <input v-if="textAt" ref="textInput" v-model="textAt.value" class="text-in"
-      :style="{ left: textAt.x + 'px', top: textAt.y + 'px' }"
+      :style="{ left: textAt.x + 'px', top: textAt.y + 'px', fontSize: textFontSize + 'px' }"
       @pointerdown.stop @pointerup.stop
       @keydown.enter.stop.prevent="commitText" @keydown.esc.stop.prevent="textAt = null"
       @keydown.ctrl.z.stop @keydown.meta.z.stop @blur="commitText" />
@@ -548,8 +633,9 @@ onUnmounted(() => {
   top: 0;
   image-rendering: pixelated;
 }
-/* 标注层：CSS 像素 1:1（canvas 后备像素 = 窗口 CSS 尺寸），
-   与 .base 同位置即可对齐；不设 image-rendering，图形保持抗锯齿 */
+/* 标注层：后备像素是设备分辨率（窗口 CSS 尺寸 × kWin，与底图同源），
+   元素仍按 CSS 尺寸布局，故与 .base 同位置即可对齐；
+   不设 image-rendering，图形保持抗锯齿 */
 .anno {
   position: absolute;
   left: 0;
@@ -675,7 +761,9 @@ onUnmounted(() => {
   outline: none;
   background: #fff;
   color: #000;
-  font-size: 14px;
+  /* 字号由内联样式绑定 textFontSize（与烧录同一公式，别在这里再写死一个）；
+     字族也要与 canvas 的 system-ui 一致，否则预览与烧录的字宽对不上 */
+  font-family: system-ui, sans-serif;
 }
 .error {
   position: absolute;

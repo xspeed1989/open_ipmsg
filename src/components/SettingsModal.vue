@@ -61,11 +61,9 @@ watch(
 
 const canClose = computed(() => !store.firstRun)
 
-const recording = ref(false)
-
 /** 录制：按下的组合键直接写进表单；Esc 清空（= 不注册全局热键） */
 function onHotkeyKeydown(e) {
-  // 裸 Tab 放行：否则 preventDefault 会把焦点困在录制框里（键盘用户出不去）；
+  // 裸 Tab 与 Shift+Tab 都放行：否则 preventDefault 会把焦点困在录制框里（键盘用户出不去）；
   // 带修饰键的 Ctrl/Alt+Tab 仍按普通组合键录制
   if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) return
   e.preventDefault()
@@ -353,8 +351,6 @@ async function save() {
               :value="form.shot_hotkey || ''"
               :placeholder="t('settings.shotHotkeyPh')"
               @keydown="onHotkeyKeydown"
-              @focus="recording = true"
-              @blur="recording = false"
             />
           </div>
           <div class="si-row">

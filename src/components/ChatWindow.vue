@@ -736,6 +736,29 @@ async function copyShotToClipboard(b64) {
 }
 
 onMounted(async () => {
+  // 先注册截图监听再等拖拽事件：onDragDropEvent 是 await 的，排在它后面的话
+  // 这段等待期间到达的截图触发会没人监听而丢掉
+  unlistenShot = await ipc.listenEvent(ipc.EVT.screenshotDone, async (p) => {
+    if (!store.activeKey) {
+      // 没有打开会话：剪贴板是唯一的去处，失败必须说出来，不能谎报「已复制」
+      try {
+        await copyShotToClipboard(p.b64)
+        toast(t('chat.shotNoChat'))
+      } catch (e) {
+        alert(t('chat.shotCopyFailed', { e }))
+      }
+      return
+    }
+    pushShotImage(p)
+    if (store.config?.shot_copy_clipboard !== false) {
+      try { await copyShotToClipboard(p.b64) } catch (e) { console.error('copy shot failed', e) }
+    }
+  })
+
+  unlistenShotCopy = await ipc.listenEvent(ipc.EVT.screenshotCopy, async (p) => {
+    try { await copyShotToClipboard(p.b64) } catch (e) { alert(t('chat.shotCopyFailed', { e })) }
+  })
+
   try {
     unlistenDrop = await getCurrentWindow().onDragDropEvent(async ({ payload }) => {
       if (payload.type === 'over') {
@@ -767,27 +790,6 @@ onMounted(async () => {
   } catch (e) {
     /* 拿不到窗口事件时静默降级：仍可用「发送文件」按钮 */
   }
-
-  unlistenShot = await ipc.listenEvent(ipc.EVT.screenshotDone, async (p) => {
-    if (!store.activeKey) {
-      // 没有打开会话：剪贴板是唯一的去处，失败必须说出来，不能谎报「已复制」
-      try {
-        await copyShotToClipboard(p.b64)
-        toast(t('chat.shotNoChat'))
-      } catch (e) {
-        alert(t('chat.shotCopyFailed', { e }))
-      }
-      return
-    }
-    pushShotImage(p)
-    if (store.config?.shot_copy_clipboard !== false) {
-      try { await copyShotToClipboard(p.b64) } catch (e) { console.error('copy shot failed', e) }
-    }
-  })
-
-  unlistenShotCopy = await ipc.listenEvent(ipc.EVT.screenshotCopy, async (p) => {
-    try { await copyShotToClipboard(p.b64) } catch (e) { alert(t('chat.shotCopyFailed', { e })) }
-  })
 })
 function onFindHotkey(e) {
   const k = e.key?.toLowerCase()
