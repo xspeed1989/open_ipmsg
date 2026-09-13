@@ -472,15 +472,21 @@ fn open_overlays(app: &tauri::AppHandle, cap: &ShotCapture) -> Result<(), ShotEr
                 .decorations(false)
                 .always_on_top(true)
                 .skip_taskbar(true)
-                .resizable(false)
                 .shadow(false)
                 .focused(true);
         if wayland {
-            // Wayland 不允许客户端定位窗口：先建小窗，再在 GTK 主线程上指定显示器全屏
+            // Wayland 不允许客户端定位窗口：先建小窗，再在 GTK 主线程上指定显示器全屏。
+            //
+            // **这里绝不能设 resizable(false)**：GDK 会把「不可缩放」翻译成
+            // xdg_toplevel 的 min/max 尺寸一起钉死（实测 set_min_size/set_max_size
+            // 都发 410×290，即当时的占位尺寸）。全屏请求虽然被 KWin 接受
+            // （configure(2048, 1152, [FULLSCREEN])），但 max_size 随后把窗口打回
+            // 410×290 —— 屏幕上只剩一块小方块。全屏窗口本来也不该让用户拖大小。
             builder = builder.inner_size(320.0, 200.0);
         } else {
             let bounds = virtual_bounds(&cap.monitors.iter().map(|m| m.logical).collect::<Vec<_>>());
             builder = builder
+                .resizable(false)
                 .position(bounds.x as f64, bounds.y as f64)
                 .inner_size(bounds.w.max(1) as f64, bounds.h.max(1) as f64);
         }
@@ -510,7 +516,12 @@ fn open_overlays(app: &tauri::AppHandle, cap: &ShotCapture) -> Result<(), ShotEr
     Ok(())
 }
 
-/// Wayland：请求在指定显示器上全屏（xdg-shell 的 set_fullscreen 支持 output）
+/// Wayland：请求在指定显示器上全屏（xdg-shell 的 set_fullscreen 支持 output）。
+///
+/// 时序：**先映射、后请求**。GDK 的 xdg_toplevel 是窗口映射时才建出来的，未映射
+/// 就 `fullscreen_on_monitor` 会被丢掉；而 `show_all()` 之后未必立刻映射，所以
+/// 已映射时走 idle、未映射时等 map 信号再进 idle —— 两条路都保证请求发生在
+/// 映射完成之后（也顺带排在 tao/wry 排队的尺寸请求之后）。
 #[cfg(target_os = "linux")]
 fn fullscreen_on_monitor(win: &tauri::WebviewWindow, index: usize) -> Result<(), ShotErr> {
     let w = win.clone();
@@ -519,26 +530,47 @@ fn fullscreen_on_monitor(win: &tauri::WebviewWindow, index: usize) -> Result<(),
         .run_on_main_thread(move || {
             use gtk::prelude::*;
             if let Ok(gw) = w.gtk_window() {
-                // GDK3 的签名是 `fullscreen_on_monitor(&Screen, monitor 序号)`，
-                // 屏幕取窗口自身所在的那块（取不到再退默认屏）；
-                // `screen` 在 GtkWindowExt 与 WidgetExt 上都有，必须写全路径
-                let screen = gtk::prelude::GtkWindowExt::screen(&gw)
-                    .or_else(gtk::gdk::Screen::default);
-                let exists = gtk::gdk::Display::default()
-                    .and_then(|d| d.monitor(index as i32))
-                    .is_some();
-                match (screen, exists) {
-                    (Some(s), true) => gw.fullscreen_on_monitor(&s, index as i32),
-                    // 取不到该显示器就退化为普通全屏（落在窗口当前所在屏）
-                    _ => gw.fullscreen(),
-                }
                 gw.show_all();
+                if gw.is_mapped() {
+                    let gw = gw.clone();
+                    gtk::glib::idle_add_local_once(move || request_fullscreen(&gw, index));
+                } else {
+                    gw.connect_map(move |gw| {
+                        let gw = gw.clone();
+                        gtk::glib::idle_add_local_once(move || request_fullscreen(&gw, index));
+                    });
+                }
             }
             let _ = tx.send(());
         })
         .map_err(|e| ShotErr::CaptureFailed(format!("请求全屏失败: {e}")))?;
     let _ = rx.recv_timeout(Duration::from_secs(3));
     Ok(())
+}
+
+/// 发出全屏请求。**只能在窗口映射之后调用**（见 `fullscreen_on_monitor` 的注释），
+/// 单独拆出来是为了能同时被「已映射」与「map 信号」两条路径复用。
+#[cfg(target_os = "linux")]
+fn request_fullscreen(gw: &gtk::ApplicationWindow, index: usize) {
+    use gtk::prelude::*;
+    // GDK3 的签名是 `fullscreen_on_monitor(&Screen, monitor 序号)`，
+    // 屏幕取窗口自身所在的那块（取不到再退默认屏）；
+    // `screen` 在 GtkWindowExt 与 WidgetExt 上都有，必须写全路径
+    let screen = gtk::prelude::GtkWindowExt::screen(gw).or_else(gtk::gdk::Screen::default);
+    let exists = gtk::gdk::Display::default()
+        .and_then(|d| d.monitor(index as i32))
+        .is_some();
+    match (screen, exists) {
+        (Some(s), true) => {
+            gw.fullscreen_on_monitor(&s, index as i32);
+            oim_log!("[shot] 遮罩已请求在 {index} 号屏全屏");
+        }
+        // 取不到该显示器就退化为普通全屏（落在窗口当前所在屏）
+        _ => {
+            gw.fullscreen();
+            oim_log!("[shot] 遮罩未找到 {index} 号屏，退化为普通全屏");
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
