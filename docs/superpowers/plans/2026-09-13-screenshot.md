@@ -2502,6 +2502,17 @@ function onPointerMove(ev) {
     }
 ```
 
+**F. (folded into the same round) Arrow keys still reached the window handler while typing.** With the text input focused, `←→↑↓` bubbled to `onKeydown` and nudged the selection instead of moving the caret — the same family as finding C. Guard the window handler instead of enumerating keys on the input:
+
+```js
+function onKeydown(ev) {
+  // 文字输入进行中：键盘归输入框（Enter/Esc 已 .stop，其余按键不应影响画布与选区）
+  if (textAt.value) return
+  if (ev.key === 'Escape') return cancel()
+  ...
+```
+
+
 ---
 
 ### Task 9: Confirm pipeline — composite, pending list, clipboard
