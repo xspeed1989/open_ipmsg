@@ -54,7 +54,12 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 install -Dm755 "$BIN" "$WORK/open-ipmsg"
-install -Dm644 "$ROOT/packaging/linux/open-ipmsg.desktop" "$WORK/open-ipmsg.desktop"
+# 桌面文件按 app id 命名（= tauri.conf.json 的 identifier）。安装名与文件名必须一致：
+# KDE 从 systemd scope（app-<appid>-<随机>.scope）反推 portal app id，而 scope 名来自
+# .desktop 的 basename；若仍用旧名（open-ipmsg）会被解析成 ipmsg，安装版的 Wayland
+# 全局热键就会被 portal 以 NotAllowed 拒绝并降级为禁用。详见 packaging/arch/PKGBUILD。
+install -Dm644 "$ROOT/packaging/linux/io.github.open-ipmsg.app.desktop" \
+  "$WORK/io.github.open-ipmsg.app.desktop"
 for s in 32x32 128x128; do
   install -Dm644 "$ROOT/src-tauri/icons/$s.png" "$WORK/icons/$s.png"
 done
@@ -80,7 +85,7 @@ options=('!strip' '!debug')
 # 没有 source 数组，因此用 startdir 而不是 srcdir
 package() {
   install -Dm755 "\$startdir/open-ipmsg" "\$pkgdir/usr/bin/open-ipmsg"
-  install -Dm644 "\$startdir/open-ipmsg.desktop" "\$pkgdir/usr/share/applications/open-ipmsg.desktop"
+  install -Dm644 "\$startdir/io.github.open-ipmsg.app.desktop" "\$pkgdir/usr/share/applications/io.github.open-ipmsg.app.desktop"
   for s in 32x32 128x128 512x512; do
     install -Dm644 "\$startdir/icons/\$s.png" \\
       "\$pkgdir/usr/share/icons/hicolor/\$s/apps/open-ipmsg.png"

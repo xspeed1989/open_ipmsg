@@ -32,8 +32,14 @@ check() {
 package() {
   cd "$srcdir/$pkgname"
   install -Dm755 src-tauri/target/release/open-ipmsg "$pkgdir/usr/bin/open-ipmsg"
-  install -Dm644 packaging/linux/open-ipmsg.desktop \
-    "$pkgdir/usr/share/applications/open-ipmsg.desktop"
+  # 桌面文件名必须等于 app id（tauri.conf.json 的 identifier）：KDE 用 systemd scope
+  # app-<appid>-<随机>.scope 反推 portal app id，而 scope 名来自 .desktop 的 basename。
+  # 若桌面文件仍用旧名（basename 为 open-ipmsg），portal 的正则会把 "open-" 当成
+  # 启动器前缀解析出 "ipmsg"，找不到 ipmsg 的桌面文件就没有 app id，
+  # GlobalShortcuts.CreateSession 直接 NotAllowed，安装版的 Wayland 全局热键
+  # 被降级为禁用（tauri dev 下反而正常）。
+  install -Dm644 packaging/linux/io.github.open-ipmsg.app.desktop \
+    "$pkgdir/usr/share/applications/io.github.open-ipmsg.app.desktop"
   install -Dm644 src-tauri/icons/32x32.png \
     "$pkgdir/usr/share/icons/hicolor/32x32/apps/open-ipmsg.png"
   install -Dm644 src-tauri/icons/128x128.png \
