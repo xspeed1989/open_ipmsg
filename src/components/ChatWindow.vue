@@ -694,12 +694,22 @@ function attachToPending(key, paths) {
 let unlistenShot = null
 let unlistenShotCopy = null
 
+/** 截图在途标记：双击或「热键 + 点击」不能连开两次抓屏 */
+const shotBusy = ref(false)
+
 /** 触发截图；后端抓屏并打开遮罩窗口 */
 async function startShot() {
+  if (shotBusy.value) return
+  shotBusy.value = true            // 同步置位：置位与 invoke 之间没有 await，连点第二下必然被挡
   try {
     await ipc.startScreenshot()
   } catch (e) {
-    alert(shotErrorText(e))
+    const msg = shotErrorText(e)
+    // 后端「正在截屏」= 另一次抓屏还在途（例如刚用热键触发过），它的遮罩马上就会出来；
+    // 这不是用户需要处理的错误，弹窗只会让人以为截图点坏了
+    if (!msg.includes('正在截屏')) alert(msg)
+  } finally {
+    shotBusy.value = false
   }
 }
 
@@ -1401,7 +1411,7 @@ watch(
               stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
           </svg>
         </button>
-        <button :title="t('chat.screenshot')" @click="startShot">
+        <button :title="t('chat.screenshot')" :class="{ disabled: shotBusy }" :disabled="shotBusy" @click="startShot">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
             <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"
               stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
