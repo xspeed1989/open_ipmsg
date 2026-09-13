@@ -18,7 +18,7 @@ Open IPMsg is a cross-platform LAN instant messenger compatible with [IP Messeng
 - **Clipboard paste image** — natively compatible with the official "paste image" feature (FILE_CLIPBOARD), both directions: send screenshots with Ctrl+V and preview images pasted by official clients inline
 - **Send screenshots** — trigger from the toolbar or the global hotkey (Alt+A by default), drag a selection on the dimmed full-screen overlay, annotate with six tools (rectangle / ellipse / arrow / pen / text / mosaic), then confirm into the pending attachment list with optional auto-copy to the clipboard
 - **Read receipts** — see when your messages are read, with per-bubble read/unread status
-- **Tray & notifications** — closing the window minimizes to the tray (WeChat-style); system notifications when messages arrive while unfocused
+- **Tray & notifications** — closing the window minimizes to the tray (WeChat-style); system notifications when messages arrive while unfocused; on Windows the **taskbar button** also flashes for new messages, stopping once the window is brought to the front
 - **Bilingual UI** — Simplified Chinese / English, switchable at runtime
 
 ---

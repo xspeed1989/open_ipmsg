@@ -919,6 +919,35 @@ async fn set_unread(app: tauri::AppHandle, total: u32) -> Result<(), String> {
         let _ = w.set_title(&tip);
     }
 
+    // Windows：收到消息时闪**任务栏按钮**（托盘图标闪烁之外的另一路提示）。
+    // 走 tauri 内置的 request_user_attention，不自己调 FlashWindowEx：
+    //   - Critical → Win32 `FlashWindowEx(FLASHW_ALL | FLASHW_TIMERNOFG, u32::MAX)`，
+    //     任务栏按钮持续闪、直到窗口被切到前台，由系统自动停（微信式）；
+    //   - FLASHW_ALL 虽含 caption 位，但主窗口 decorations=false，tao 建窗时已去掉
+    //     WS_CAPTION（window_state.rs），没有 caption 可闪 —— 闪的就是任务栏按钮。
+    // 必须回主线程调用：tao 判「窗口是否已在前台」用的是**调用线程**的
+    // GetActiveWindow()，而 set_unread 是 async 命令、跑在 tokio 线程上，那里它恒为
+    // NULL —— 守卫会静默失效，连用户正在看的窗口也照闪。回主线程后它拿到的才是真实
+    // 前台状态（理由与 set_tray_icon 回主线程改图标同源）。
+    // 未读归零要显式取消（FLASHW_STOP）：归零点不一定伴随窗口激活（如对端撤回了一条
+    // 未读消息），只靠「激活自动停」会留下一个再也停不下来的闪烁。
+    #[cfg(target_os = "windows")]
+    {
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            // 只能是 `tauri::UserAttentionType`。`tauri::window::UserAttentionType`
+            // 是私有导入（window/mod.rs 里没带 pub），按直觉写那里编译不过。
+            use tauri::UserAttentionType;
+            if let Some(w) = app2.get_webview_window("main") {
+                let _ = w.request_user_attention(if total > 0 {
+                    Some(UserAttentionType::Critical)
+                } else {
+                    None
+                });
+            }
+        });
+    }
+
     if total > 0 {
         // 已经在闪就不再起第二个任务
         if !FLASHING.swap(true, Ordering::SeqCst) {
