@@ -119,3 +119,11 @@ export function comboFromEvent(e) {
   if (!mods.length) return null
   return normalizeCombo([...mods, key].join('+'))
 }
+
+/**
+ * 粗判 Wayland 会话：WebKitGTK 在 XWayland 下 UA 也可能含 X11，故只认显式 Wayland。
+ * 设置页据此换用「由桌面环境绑定」的提示文案（Wayland 下全局热键走 portal）。
+ */
+export function isWaylandUA(ua = '') {
+  return /wayland/i.test(ua)
+}

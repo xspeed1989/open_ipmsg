@@ -18,3 +18,14 @@ test('协议扩展设置按纵向表单布局，不退化为 si-row 的横向挤
   assert.match(declarations('.adv-line'), /align-items\s*:\s*center\b/)
   assert.match(declarations('.adv-input'), /width\s*:\s*100%/)
 })
+
+test('截图设置分区包含热键录制与自动复制开关', () => {
+  assert.match(source, /shot_hotkey/, '设置页必须能改截图热键')
+  assert.match(source, /shot_copy_clipboard/, '设置页必须有「确认后复制到剪贴板」开关')
+})
+
+test('截图热键输入框是只读录制控件，不做自由文本输入', () => {
+  const css = source.match(/<style\b[^>]*>([\s\S]*?)<\/style>/)?.[1] || ''
+  assert.match(css, /\.hotkey-input/, '热键录制控件需要独立样式（避免与普通输入框混淆）')
+  assert.match(source, /readonly/, '热键框必须 readonly，值只能由按键录制写入')
+})

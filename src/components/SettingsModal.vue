@@ -4,6 +4,7 @@ import { reactive, watch, computed, ref } from 'vue'
 import { applyTheme, store, refreshConfig, refreshUsers, loadSessions } from '../store'
 import * as ipc from '../lib/ipc'
 import { t, SUPPORTED_LANGS, LANG_NAMES, setLocale, detectLocale } from '../lib/i18n'
+import { comboFromEvent, isValidCombo, isWaylandUA } from '../lib/hotkey'
 import { open as pickDialog } from '@tauri-apps/plugin-dialog'
 
 const form = reactive({
@@ -25,6 +26,9 @@ const form = reactive({
   ipdict_enabled: true,
   dir_mode: 'off',
   v6_mcast: true,
+  // 截图热键（规范形，空串 = 不注册全局热键）与「确认后复制到剪贴板」
+  shot_hotkey: '',
+  shot_copy_clipboard: true,
 })
 
 watch(
@@ -48,12 +52,38 @@ watch(
       form.ipdict_enabled = store.config.ipdict_enabled !== false
       form.dir_mode = store.config.dir_mode || 'off'
       form.v6_mcast = store.config.v6_mcast !== false
+      form.shot_hotkey = store.config.shot_hotkey || ''
+      form.shot_copy_clipboard = store.config.shot_copy_clipboard !== false
     }
   },
   { immediate: true }
 )
 
 const canClose = computed(() => !store.firstRun)
+
+const recording = ref(false)
+
+/** 录制：按下的组合键直接写进表单；Esc 清空（= 不注册全局热键） */
+function onHotkeyKeydown(e) {
+  // 裸 Tab 放行：否则 preventDefault 会把焦点困在录制框里（键盘用户出不去）；
+  // 带修饰键的 Ctrl/Alt+Tab 仍按普通组合键录制
+  if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) return
+  e.preventDefault()
+  if (e.key === 'Escape') {
+    form.shot_hotkey = ''
+    return
+  }
+  const combo = comboFromEvent(e)
+  if (combo) form.shot_hotkey = combo
+}
+
+/** 配置里可能存着一个不可用的值（手改配置 / 跨平台拷贝）—— 明确告诉用户它不会生效 */
+const hotkeyHint = computed(() => {
+  if (form.shot_hotkey && !isValidCombo(form.shot_hotkey)) return t('settings.shotHotkeyInvalid')
+  return isWaylandUA(navigator.userAgent)
+    ? t('settings.shotHotkeyWayland')
+    : t('settings.shotHotkeyHint')
+})
 
 // 点击指纹行 → 复制本机密钥指纹（复用 ipc.copyText 的原生剪贴板通道）
 const fpCopied = ref(false)
@@ -158,6 +188,8 @@ async function save() {
     ipdict_enabled: !!form.ipdict_enabled,
     dir_mode: form.dir_mode,
     v6_mcast: !!form.v6_mcast,
+    shot_hotkey: form.shot_hotkey,
+    shot_copy_clipboard: !!form.shot_copy_clipboard,
   }
   try {
     await ipc.saveConfig(patch)
@@ -308,6 +340,28 @@ async function save() {
             </label>
             <div class="import-hint">{{ t('settings.v6mcastHint') }}</div>
           </div>
+        </div>
+
+        <div class="selfinfo">
+          <div class="si-title">{{ t('settings.shot') }}</div>
+          <div class="si-row">
+            <label class="lab" for="shot-hotkey">{{ t('settings.shotHotkey') }}</label>
+            <input
+              id="shot-hotkey"
+              class="hotkey-input"
+              readonly
+              :value="form.shot_hotkey || ''"
+              :placeholder="t('settings.shotHotkeyPh')"
+              @keydown="onHotkeyKeydown"
+              @focus="recording = true"
+              @blur="recording = false"
+            />
+          </div>
+          <div class="si-row">
+            <label class="lab" for="shot-copy">{{ t('settings.shotCopy') }}</label>
+            <input id="shot-copy" type="checkbox" v-model="form.shot_copy_clipboard" />
+          </div>
+          <p class="import-hint">{{ hotkeyHint }}</p>
         </div>
 
         <div class="selfinfo">
@@ -585,6 +639,19 @@ select.adv-input option {
   color: var(--c-weak);
   line-height: 1.6;
   margin-top: 8px;
+}
+/* 截图热键录制框：只读，值只能由按键录制写入（区别于普通可输入框）。
+   变量名必须用本仓库 global.css 里真实存在的 --c-*（与 .dir-input 同款），
+   想当然写 --line/--bg-soft/--fg 会被整条丢弃 → 变成无边框透明框 */
+.hotkey-input {
+  width: 160px;
+  padding: 4px 8px;
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  background: var(--c-card-alt);
+  color: var(--c-text);
+  text-align: center;
+  cursor: pointer;
 }
 .note {
   font-size: 11.5px;

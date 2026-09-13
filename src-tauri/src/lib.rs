@@ -155,6 +155,12 @@ struct ConfigPatch {
     /// IPv6 组播成员发现（默认开；关闭即纯 IPv4）
     #[serde(default)]
     v6_mcast: Option<bool>,
+    /// 截图全局热键（规范形）；空串=不注册全局热键
+    #[serde(default)]
+    shot_hotkey: Option<String>,
+    /// 截图确认后自动复制到剪贴板
+    #[serde(default)]
+    shot_copy_clipboard: Option<bool>,
 }
 
 /// 配置 + 本机信息（前端设置页展示）
@@ -182,6 +188,9 @@ async fn get_config(st: State<'_, SharedState>) -> Result<Value, String> {
         "theme": cfg.theme,
         "lang": cfg.lang,
         "encrypt": cfg.encrypt,
+        // 截图设置：前端设置页回填 + 确认后是否自动复制（ChatWindow 直接读它）
+        "shot_hotkey": cfg.shot_hotkey,
+        "shot_copy_clipboard": cfg.shot_copy_clipboard,
         "hostname": hostname,
         "ips": ips,
         "version": env!("CARGO_PKG_VERSION"),
@@ -233,6 +242,9 @@ async fn save_config(
         ipdict_enabled: patch.ipdict_enabled.unwrap_or(prev.ipdict_enabled),
         dir_mode: patch.dir_mode.unwrap_or(prev.dir_mode),
         v6_mcast: patch.v6_mcast.unwrap_or(prev.v6_mcast),
+        // 截图热键：补丁未携带保留现值；空串视为「不注册全局热键」
+        shot_hotkey: patch.shot_hotkey.unwrap_or(prev.shot_hotkey),
+        shot_copy_clipboard: patch.shot_copy_clipboard.unwrap_or(prev.shot_copy_clipboard),
     };
     let absence_changed = cfg.absence_enabled != prev.absence_enabled;
     st.set_config(cfg.clone());

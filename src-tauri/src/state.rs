@@ -63,10 +63,20 @@ pub struct Config {
     /// 供与官方 Windows 客户端混合组网时排查「v4/v6 双条目」互通问题
     #[serde(default = "default_true")]
     pub v6_mcast: bool,
+    /// 截图全局热键（规范形，如 "Alt+A"）；Wayland 下作为 portal 的首选触发器
+    #[serde(default = "default_shot_hotkey")]
+    pub shot_hotkey: String,
+    /// 截图确认后是否自动复制到剪贴板（微信习惯：默认开）
+    #[serde(default = "default_true")]
+    pub shot_copy_clipboard: bool,
 }
 
 fn default_absence_text() -> String {
     "我现在不在，有事留言。".into()
+}
+
+fn default_shot_hotkey() -> String {
+    "Alt+A".into()
 }
 
 fn default_true() -> bool {
@@ -107,6 +117,8 @@ impl Default for Config {
             ipdict_enabled: default_true(),
             dir_mode: String::new(),
             v6_mcast: default_true(),
+            shot_hotkey: default_shot_hotkey(),
+            shot_copy_clipboard: default_true(),
         }
     }
 }
@@ -2313,6 +2325,13 @@ mod tests {
     }
 
     #[test]
+    fn config_defaults_keep_screenshot_settings() {
+        let c = crate::state::Config::default();
+        assert_eq!(c.shot_hotkey, "Alt+A");
+        assert!(c.shot_copy_clipboard);
+    }
+
+    #[test]
     fn config_persist_roundtrip() {
         let st = temp_state("config");
         std::fs::create_dir_all(&st.data_dir).unwrap();
@@ -2326,6 +2345,8 @@ mod tests {
         cfg.nickname = "测试昵称".into();
         cfg.group = "G1".into();
         cfg.lang = "en".into();
+        cfg.shot_hotkey = "Ctrl+Shift+X".into();
+        cfg.shot_copy_clipboard = false;
         st.set_config(cfg);
         st.persist_config().unwrap();
 
@@ -2334,16 +2355,37 @@ mod tests {
         assert_eq!(st2.config().nickname, "测试昵称");
         assert_eq!(st2.config().group, "G1");
         assert_eq!(st2.config().lang, "en", "界面语言持久化");
+        assert_eq!(st2.config().shot_hotkey, "Ctrl+Shift+X", "截图热键持久化");
+        assert!(!st2.config().shot_copy_clipboard, "截图自动复制开关持久化");
+
+        // 空串是「不注册全局热键」的有效值（设置页 Esc 清空）：原样落盘，
+        // 不能被 serde 默认值顶回 "Alt+A" —— Task 11 启动时按空串跳过注册
+        let mut cleared = st2.config();
+        cleared.shot_hotkey = String::new();
+        st2.set_config(cleared);
+        st2.persist_config().unwrap();
+        let st4 = AppState::new(st.data_dir.clone());
+        st4.load_config();
+        assert!(
+            st4.config().shot_hotkey.is_empty(),
+            "空热键原样持久化（= 不注册全局热键）"
+        );
 
         // 旧版配置文件没有 lang 字段：回落空串（前端按系统语言探测）
         let path = st.data_dir.join("config.json");
         let mut v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         v.as_object_mut().unwrap().remove("lang");
+        // 截图字段同理：老配置里没有它们，必须回落默认值（Alt+A / 开启自动复制），
+        // 而不是变成空串或关闭 —— 跨版本升级的行为契约
+        v.as_object_mut().unwrap().remove("shot_hotkey");
+        v.as_object_mut().unwrap().remove("shot_copy_clipboard");
         std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
         let st3 = AppState::new(st.data_dir.clone());
         st3.load_config();
         assert!(st3.config().lang.is_empty(), "缺失字段回落空串（跟随系统）");
+        assert_eq!(st3.config().shot_hotkey, "Alt+A", "缺失字段回落默认热键");
+        assert!(st3.config().shot_copy_clipboard, "缺失字段回落默认开启");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 

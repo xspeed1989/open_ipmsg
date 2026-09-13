@@ -62,3 +62,11 @@ test('规范名可往返：normalizeCombo 幂等', () => {
   assert.equal(isValidCombo('Alt+ArrowUp'), true)
   assert.equal(comboFromEvent({ key: 'ArrowUp', code: 'ArrowUp', altKey: true }), 'Alt+ArrowUp')
 })
+
+import { isWaylandUA } from '../src/lib/hotkey.js'
+
+test('Wayland 会话粗判只看显式 Wayland 标记', () => {
+  assert.equal(isWaylandUA('Mozilla/5.0 (X11; Linux x86_64)'), false)
+  assert.equal(isWaylandUA('Mozilla/5.0 (Wayland; Linux x86_64)'), true)
+  assert.equal(isWaylandUA(''), false)
+})
