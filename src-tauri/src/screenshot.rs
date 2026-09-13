@@ -335,6 +335,117 @@ mod platform {
     }
 }
 
+/// macOS：CoreGraphics 逐显示器抓图，再按各自的 bounds 拼成一张虚拟桌面图。
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::{Captured, ShotErr};
+    use core_graphics::display::CGDisplay;
+
+    /// 未授权时 CGDisplayCreateImage 会静默返回一张只有桌面壁纸的图 ——
+    /// 这是最难排查的失败形态，所以先做权限预检并给出明确文案。
+    pub fn capture() -> Result<Captured, ShotErr> {
+        if !has_permission() {
+            return Err(ShotErr::MacPermission);
+        }
+        let ids =
+            CGDisplay::active_displays().map_err(|e| ShotErr::CaptureFailed(format!("{e:?}")))?;
+        // 多屏按 bounds 的并集拼接：副屏排在主屏左侧/上方时原点为负
+        let mut shots = Vec::new();
+        let mut min_x = i64::MAX;
+        let mut min_y = i64::MAX;
+        let mut max_x = i64::MIN;
+        let mut max_y = i64::MIN;
+        for id in ids {
+            let display = CGDisplay::new(id);
+            let b = display.bounds();
+            min_x = min_x.min(b.origin.x as i64);
+            min_y = min_y.min(b.origin.y as i64);
+            max_x = max_x.max((b.origin.x + b.size.width) as i64);
+            max_y = max_y.max((b.origin.y + b.size.height) as i64);
+            let img = display
+                .image()
+                .ok_or_else(|| ShotErr::CaptureFailed(format!("抓取显示器 {id} 失败")))?;
+            shots.push((b, img));
+        }
+        if shots.is_empty() {
+            return Err(ShotErr::CaptureFailed("没有可用显示器".into()));
+        }
+        // bounds 是逻辑点、image 是物理像素，Retina 上差 2 倍。
+        //
+        // 简报这里写的是 `img.bounds()`，但 core-graphics 0.24.0 的 `CGImage`
+        // **没有** `bounds()` 方法（只有 `width()/height()`），照抄会直接编译不过。
+        // 而它想算的就是「一点等于几像素」—— 分母换成显示器自身的 bounds 既成立，
+        // 也才与下面的 ox/oy 同源。若沿用 img 自身的尺寸，比值恒为 1.0：
+        // Retina 上画布只有真实画面的 1/4，PNG 里只剩左上角那一块。
+        let scale = shots
+            .first()
+            .map(|(b, img)| img.width() as f64 / b.size.width.max(1.0))
+            .unwrap_or(1.0);
+        let w = ((max_x - min_x) as f64 * scale).round() as u32;
+        let h = ((max_y - min_y) as f64 * scale).round() as u32;
+        let mut canvas = image::RgbaImage::new(w, h);
+        for (b, img) in shots {
+            let sw = img.width();
+            let sh = img.height();
+            let mut data = vec![0u8; sw * sh * 4];
+            let ctx = core_graphics::context::CGContext::create_bitmap_context(
+                Some(data.as_mut_ptr() as *mut _),
+                sw,
+                sh,
+                8,
+                sw * 4,
+                &core_graphics::color_space::CGColorSpace::create_device_rgb(),
+                core_graphics::base::kCGImageAlphaPremultipliedLast,
+            );
+            ctx.draw_image(
+                core_graphics::geometry::CGRect::new(
+                    &core_graphics::geometry::CGPoint::new(0.0, 0.0),
+                    &core_graphics::geometry::CGSize::new(sw as f64, sh as f64),
+                ),
+                &img,
+            );
+            // 该屏在画布里的物理像素原点
+            let ox = ((b.origin.x as i64 - min_x) as f64 * scale).round() as i64;
+            let oy = ((b.origin.y as i64 - min_y) as f64 * scale).round() as i64;
+            for y in 0..sh {
+                for x in 0..sw {
+                    let si = (y * sw + x) * 4;
+                    let dx = ox + x as i64;
+                    let dy = oy + y as i64;
+                    if dx < 0 || dy < 0 || dx >= w as i64 || dy >= h as i64 {
+                        continue;
+                    }
+                    canvas.put_pixel(
+                        dx as u32,
+                        dy as u32,
+                        image::Rgba([data[si], data[si + 1], data[si + 2], data[si + 3]]),
+                    );
+                }
+            }
+        }
+        use image::ImageEncoder;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(canvas.as_raw(), w, h, image::ExtendedColorType::Rgba8)
+            .map_err(|e| ShotErr::CaptureFailed(format!("PNG 编码失败: {e}")))?;
+        Ok(Captured { png, width: w, height: h })
+    }
+
+    /// macOS 的 TCC 屏幕录制权限预检。
+    ///
+    /// 简报的写法是自己声明
+    /// `extern "C" { fn CGPreflightScreenCaptureAccess() -> bool; }`，
+    /// 理由是「core-graphics 0.24 不导出这个符号」。这句与 0.24.0 的实际源码不符：
+    /// `core_graphics::access::ScreenCaptureAccess::preflight()`（src/access.rs）
+    /// 正是它的安全封装，且该模块就挂在 `target_os = "macos"` 下，可直接用。
+    /// 另外该符号的 C 原型返回 `boolean_t`（c_uint，4 字节），而 Rust 的 `bool`
+    /// 只有 1 字节，手写 `-> bool` 是 ABI 不匹配（aarch64 上属未定义行为）。
+    /// 因此改为复用 crate 自带的封装，不再自行声明外部符号。
+    fn has_permission() -> bool {
+        core_graphics::access::ScreenCaptureAccess.preflight()
+    }
+}
+
 /// 单块显示器（index 是主键：Linux 上两块同型号屏的 name 会重名）
 #[derive(Clone, Debug, Serialize)]
 pub struct ShotMonitor {

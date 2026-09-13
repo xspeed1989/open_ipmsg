@@ -39,6 +39,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# macOS 下抓屏走 CoreGraphics（CGDisplayCreateImage 逐屏抓取后拼接）。
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+
 [dependencies]
 tauri = { version = "2.11", features = ["tray-icon", "image-png"] }
 tauri-plugin-dialog = "2.7"
