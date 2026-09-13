@@ -2645,6 +2645,20 @@ export const emitToMain = (event, payload) => emit(event, payload)
 
 with `import { emit } from '@tauri-apps/api/event'` at the top of `ipc.js`.
 
+**First, stop hardcoding the toolbar size.** Task 8's `barStyle` passes `{ w: 420, h: 40 }` to `toolbarPlacement`, but the real bar is ~435 px wide and 36 px high before this task's four action buttons — and this task makes it substantially wider, so the helper's right-edge clamp (and a selection near the top, where the bar flips above) would push the trailing buttons out of reach. Measure the element instead:
+
+```js
+const barRef = ref(null)
+const barStyle = computed(() => {
+  const el = barRef.value
+  const bar = { w: el?.offsetWidth || 560, h: el?.offsetHeight || 40 }
+  const p = toolbarPlacement(sel.value || { x: 0, y: 0, w: 0, h: 0 }, winRect.value, bar)
+  return { left: p.x + 'px', top: p.y + 'px' }
+})
+```
+
+and put `ref="barRef"` on the toolbar element. The fallback covers the first paint, before the element exists.
+
 Extend the overlay toolbar with the action group (right side of the same bar):
 
 ```html
