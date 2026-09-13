@@ -3423,6 +3423,75 @@ mod portal {
 
 The interface also offers `ConfigureShortcuts(session_handle, parent_window, options)`, which re-opens the desktop's shortcut configuration UI — it is intentionally **not** wired up in this task (the settings page tells the user to use their desktop's own shortcut settings instead); adding it later only affects the Wayland branch.
 
+**Review round 1 amendments (one Critical + two Important — apply all three):**
+
+**L (Critical) — the Activated listener must share the session's bus connection, and that connection must outlive `bind`.**
+
+The portal emits `Activated` as a **directed** signal to the unique name of the connection that created the session (`g_dbus_connection_emit_signal(connection, session->sender, …)` in xdg-desktop-portal's `src/global-shortcuts.c`), so a listener that opens its own `Connection::session()` can never receive it. Independently, the session belongs to the connection that created it: when `bind`'s local `conn` is dropped, the portal's `close_sessions_for_sender` tears the session — and the KDE/KGlobalAccel binding — down. The current shape therefore reports `Backend::Portal` while the hotkey is dead.
+
+Restructure `portal` so one connection does everything and the listening happens on it:
+
+```rust
+/// Wayland 绑定 + 监听（**不返回**，直到进程结束）。
+///
+/// 全程只用一条总线连接：portal 的 Activated 是「定向信号」，只发给创建 session
+/// 的那条连接（g_dbus_connection_emit_signal 的 destination 是 session->sender），
+/// 另开连接永远收不到；而且 session 属于创建它的连接 —— 连接一析构，portal 的
+/// close_sessions_for_sender 会把 session 连同 KDE 侧的快捷键绑定一起关掉。
+pub fn bind_and_listen(app: &tauri::AppHandle, combo: &str) {
+    let trigger = match super::to_portal_trigger(combo) {
+        Some(t) => t,
+        None => {
+            oim_log!("[shot] 非法快捷键：{combo}");
+            return;
+        }
+    };
+    match bind_inner(app, &trigger) {
+        Ok(conn) => {
+            oim_log!("[shot] 全局热键后端：Portal（{combo}）");
+            listen_activated(&conn, app);
+        }
+        Err(e) => oim_log!("[shot] Wayland 热键绑定失败：{e}（可用 --screenshot 自行绑定快捷键）"),
+    }
+}
+```
+
+`bind_inner` returns the `Connection` it used (so the session owner stays alive), keeps the subscribe-before-call ordering for both requests, and `listen_activated(&conn, app)` loops on that same connection's `Activated` signal forever. `register` then becomes:
+
+```rust
+pub fn register(app: &tauri::AppHandle, combo: &str) -> Backend {
+    if combo.trim().is_empty() {
+        return Backend::Disabled("未配置热键");
+    }
+    if crate::screenshot::is_wayland() {
+        // 注意：Wayland 分支不返回，内部进入监听循环 —— 调用方必须已经在自己线程里
+        portal::bind_and_listen(app, combo);
+        return Backend::Disabled("热键监听已结束");
+    }
+    match plugin::register(app, combo) { /* 不变 */ }
+}
+```
+
+**M (Important) — compare the returned request handle on both portal calls.** Both `CreateSession` and `BindShortcuts` currently discard the returned `o`. The portal can return a different path (it appends `/<random>` on a request-id collision), and then `next_response` waits forever on a path that never receives a `Response` — no backend log, no hotkey, no error. Mirror the working screenshot call (`src-tauri/src/screenshot.rs`, the returned-handle comparison plus re-subscribe).
+
+**N (Important) — make the Activated wire type a single shared definition, and pin it negatively.** Extract the body into one type used by both the listener and the test:
+
+```rust
+/// Activated 信号体：(session_handle o, shortcut_id s, timestamp t, options a{sv})。
+/// 第一个参数必须是 OwnedObjectPath —— portal 发的是 (osta{sv})，写成 String 会
+/// SignatureMismatch，而监听循环里的 `else { continue }` 会把它静默吞掉。
+type ActivatedBody = (
+    zbus::zvariant::OwnedObjectPath,
+    String,
+    u64,
+    HashMap<String, zbus::zvariant::OwnedValue>,
+);
+```
+
+and have the test assert **both** directions: the `(osta{sv})` message deserializes into `ActivatedBody`, and the same message **fails** to deserialize into `(String, String, u64, …)`. A test that redeclares its own tuple cannot fail when the listener regresses.
+
+Also, while touching this code (cheap, same functions): log before each `next_response` wait so an unanswered portal is diagnosable instead of silently hanging, log listener-setup failures instead of `return`ing silently, and mark `to_portal_trigger` with `#[cfg_attr(not(target_os = "linux"), allow(dead_code))]` so Tasks 12/13's builds stay warning-clean.
+
 - [ ] **Step 4: Wire it up**
 
 In `src-tauri/Cargo.toml`:
