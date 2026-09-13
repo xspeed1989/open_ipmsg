@@ -1516,6 +1516,14 @@ pub fn run() {
             if argv.iter().any(|a| a == "--log") {
                 state::set_log_enabled(true);
             }
+            // --screenshot：向已在运行的实例要一次截图。也是 Wayland 下没有全局
+            // 热键时的兜底入口（桌面环境里把这条命令绑成自定义快捷键即可）。
+            if argv.iter().any(|a| a == "--screenshot") {
+                if let Err(e) = screenshot::trigger(app) {
+                    oim_log!("[shot] 命令行触发失败：{}", e.message());
+                }
+                return;
+            }
             oim_log!("[single-instance] 已有实例在运行，唤起既有窗口");
             activate_from_tray(app);
         }))

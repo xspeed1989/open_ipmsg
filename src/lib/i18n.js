@@ -297,6 +297,9 @@ const zh = {
   'viewer.saveAs': '另存为…',
   'viewer.saved': '已保存',
   'viewer.saveFailed': '保存失败：{e}',
+  // ---- 截图遮罩 ----
+  'shot.tip': '拖拽选择截图区域，Enter 确认，Esc 取消',
+  'shot.todoConfirm': '确认链路将在下一步接通',
   // ---- 转发/引用（发送文本里的本地标记） ----
   'forward.noContent': '没有可转发的内容',
   'forward.notDownloaded': '「{name}」尚未下载，无法转发',
@@ -548,6 +551,9 @@ const en = {
   'viewer.saveAs': 'Save As…',
   'viewer.saved': 'Saved',
   'viewer.saveFailed': 'Failed to save: {e}',
+  // ---- 截图遮罩 ----
+  'shot.tip': 'Drag to select an area. Enter to confirm, Esc to cancel',
+  'shot.todoConfirm': 'Confirm pipeline lands in the next step',
   // ---- 转发/引用（发送文本里的本地标记） ----
   'forward.noContent': 'Nothing to forward',
   'forward.notDownloaded': '"{name}" hasn\'t been downloaded yet and can\'t be forwarded',

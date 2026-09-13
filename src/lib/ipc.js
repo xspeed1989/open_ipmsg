@@ -168,6 +168,23 @@ export const pickEmojiPack = () =>
 export const pickEmojiPackSavePath = (defaultPath) =>
   saveDialog({ defaultPath, filters: [{ name: 'Sticker pack', extensions: ['ipmojis'] }] })
 
+/* ---------------- 截图 ---------------- */
+
+/** 开始截图：后端抓屏并打开遮罩窗口，返回 { session, width, height, monitors } */
+export const startScreenshot = () => invoke('start_screenshot')
+
+/** 遮罩窗口取图：返回 { b64, mime, slice, scale, total } */
+export const shotImage = (session, index) => invoke('shot_image', { session, index })
+
+/** 关闭全部遮罩窗口并释放会话缓存（幂等） */
+export const closeShotOverlays = (session) => invoke('close_shot_overlays', { session })
+
+/** 把确认后的 PNG 另存为文件 */
+export const saveShotPng = (b64, path) => invoke('save_shot_png', { b64, path })
+
+/** 把 PNG 写进系统剪贴板（Linux 后端 GTK；其他平台返回 PLUGIN 由前端插件兜底） */
+export const copyShotImage = (b64) => invoke('copy_image_to_clipboard', { b64 })
+
 /** 事件常量 */
 export const EVT = {
   usersUpdated: 'users-updated',
@@ -184,4 +201,8 @@ export const EVT = {
   msgUnlocked: 'msg-unlocked',
   /** 对端不在通知文（GETABSENCEINFO 应答） */
   absenceInfo: 'absence-info',
+  /** 截图确认：遮罩窗口 → 主窗口，进入待发送列表 */
+  screenshotDone: 'screenshot-done',
+  /** 截图「复制」按钮：只写剪贴板、不进待发送列表 */
+  screenshotCopy: 'screenshot-copy',
 }

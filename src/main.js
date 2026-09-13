@@ -1,6 +1,7 @@
 import { createApp } from 'vue'
 import App from './App.vue'
 import ImageViewer from './components/ImageViewer.vue'
+import ScreenshotOverlay from './components/ScreenshotOverlay.vue'
 import { boot, refreshConfig } from './store'
 import './styles/global.css'
 
@@ -27,7 +28,15 @@ window.addEventListener('contextmenu', (e) => {
 const isViewer =
   new URLSearchParams(location.search).get('viewer') === 'image' || !!window.__OIM_VIEWER__
 
-if (isViewer) {
+// 截图遮罩是同一份前端的第三个入口（由 start_screenshot 打开的独立窗口）
+const isShot =
+  new URLSearchParams(location.search).get('viewer') === 'shot' || !!window.__OIM_SHOT__
+
+if (isShot) {
+  createApp(ScreenshotOverlay).mount('#app')
+  // 遮罩窗口也要有正确的主题变量，但不启动网络栈
+  refreshConfig().catch((e) => console.error('shot config failed', e))
+} else if (isViewer) {
   createApp(ImageViewer).mount('#app')
   // 独立图片窗口也要应用语言/主题：只拉配置，不启动网络栈
   refreshConfig().catch((e) => {

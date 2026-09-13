@@ -119,6 +119,7 @@ const FILES = [
   '../src/components/RecipientPicker.vue',
   '../src/components/Avatar.vue',
   '../src/components/ImageViewer.vue',
+  '../src/components/ScreenshotOverlay.vue',
 ]
 
 for (const f of FILES) {
