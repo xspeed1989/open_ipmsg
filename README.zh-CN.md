@@ -115,7 +115,7 @@ Windows/macOS/X11 由应用注册全局热键；Wayland 下改由桌面环境授
 桌面环境用「已安装桌面文件名」给应用分配 portal app id：KDE 从 systemd scope `app-<appid>-<随机>.scope` 反推，而 scope 名取自 `.desktop` 的 basename。旧包把桌面文件装成与应用同名的 `open-ipmsg`（加 `.desktop` 后缀），portal 会把 `open-` 当成启动器前缀、解析出 `ipmsg`，找不到对应桌面文件 → 没有 app id → `org.freedesktop.portal.GlobalShortcuts.CreateSession` 被拒（`NotAllowed: An app id is required`），热键降级为禁用；`tauri dev` 直接启动没有这个 scope，所以开发时反而正常。仓库已把桌面文件改名为 `io.github.open-ipmsg.app.desktop`（与 `src-tauri/tauri.conf.json` 的 `identifier` 一致），自行打包时请保持该文件名，否则仍可用 `open-ipmsg --screenshot` 兜底。
 
 **Q:截图有哪些已知限制?**
-混合 DPI 多屏（所有平台都是同一套换算逻辑，如一屏 100% + 一屏 200%）目前按整幅图使用同一个缩放比例，副屏可能错位；标注层按设备像素合成，撤销栈最多 20 步、每步约 12MB（k=1.25 时整栈约 247MB）。Windows 与 macOS 的抓屏/热键代码已实现，但从未在真机上运行过：Windows 分支能通过交叉类型检查（`cargo check --target x86_64-pc-windows-gnu`），macOS 分支只在隔离夹具里类型检查过——完整应用对 `aarch64-apple-darwin` 编译会卡在既有依赖 `objc2-exception-helper`（需要 macOS SDK），详见设计文档 §15.4。另外，设置页录制的 `CmdOrCtrl` 在 Wayland 映射为 Super，在 Windows/X11 映射为 Ctrl。
+混合 DPI 多屏（所有平台都是同一套换算逻辑，如一屏 100% + 一屏 200%）目前按整幅图使用同一个缩放比例，副屏可能错位；标注层按设备像素合成，撤销栈按 64MiB 字节预算封顶并保底 3 步（2560×1440 下 4 步 / 约 56MiB，4K 下 3 步 / 约 95MiB，8K 按保底约 398MiB）。Windows 与 macOS 的抓屏/热键代码已实现，但从未在真机上运行过：Windows 分支能通过交叉类型检查（`cargo check --target x86_64-pc-windows-gnu`），macOS 分支只在隔离夹具里类型检查过——完整应用对 `aarch64-apple-darwin` 编译会卡在既有依赖 `objc2-exception-helper`（需要 macOS SDK），详见设计文档 §15.4。另外，设置页录制的 `CmdOrCtrl` 在 Wayland 映射为 Super，在 Windows/X11 映射为 Ctrl。
 
 ---
 

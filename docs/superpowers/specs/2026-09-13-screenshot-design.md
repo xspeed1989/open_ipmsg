@@ -500,6 +500,10 @@ README.md / README.zh-CN.md            功能表与 Roadmap 勾选
 | §3 / §9 未涉及桌面安装包的 app id | 桌面文件改名为 `io.github.open-ipmsg.app.desktop`（`packaging/linux/`、`packaging/arch/PKGBUILD`、`scripts/build-arch.sh`），文件内容（`Exec=` / `Icon=` / `StartupWMClass=`）不变 | KDE 从 systemd scope（`app-<appid>-<随机>.scope`）反推 portal app id，scope 名取自已安装 `.desktop` 的 basename。旧名（`open-ipmsg` 加 `.desktop` 后缀）被 portal 的正则当成「启动器前缀 `open-` + id `ipmsg`」，找不到 `ipmsg` 的桌面文件 → 没有 app id → `org.freedesktop.portal.GlobalShortcuts.CreateSession` 返回 `NotAllowed: An app id is required` → **安装版**的 Wayland 热键降级为禁用（`tauri dev` 直接启动没有这个 scope，所以开发时反而正常） |
 | §10「Wayland 下显示 portal 绑定状态」 | **设计有、未实现**：设置页只在 UA 是 Wayland 时渲染一句静态提示（`settings.shotHotkeyWayland`），没有任何查询绑定状态的 IPC；`Backend`（Portal / Disabled / 插件）只在启动时写一行日志，前端拿不到 | 要显示真实状态（已绑定 / 被拒 / 具体原因）需要新增一个读后端状态的命令。当前只能给通用指引：本轮把该文案改成「首次启动会弹系统绑定确认，改完快捷键需重启应用才生效」——因为 `shortcut::register` 全项目只有一个调用点（`lib.rs` 的 `setup`），`save_config` 只存值、没有重新绑定的命令，原文案的「首次保存时弹确认」与事实不符 |
 | §11「`PORTAL_MISSING` → 设置页给安装提示」 | **设计有、未实现**：`PORTAL_MISSING` 只在**工具栏**路径以 `alert` 弹出（文案 `系统未提供截图服务（xdg-desktop-portal）：…`），设置页没有任何安装提示 | 设置页没有截图能力探测的数据来源；热键与 `--screenshot` 路径只在日志里记录（`[shot] 热键触发失败…` / `[shot] 命令行触发失败…`）。本轮把 README 与设置页文案按这个实际行为改准，没有新增探测命令 |
+| §5.4 macOS 权限只「查」不「申请」 | `preflight()` 失败后再调用 `ScreenCaptureAccess::request()`（同一个 crate 对 `CGRequestScreenCaptureAccess()` 的封装）：首次运行会把应用登记进「系统设置 → 屏幕录制」，仍未授权时照旧返回 `MAC_PERMISSION`，文案改为「勾选本应用后重启应用生效」 | 只 preflight 不 request 是死循环：系统设置里根本找不到这个应用，用户无从授权，而 preflight 又永远失败。来自最终整支评审的 I2（commit `2d6f981`）；macOS 运行时仍未实机验证（§15.4） |
+| §6.2 遮罩窗口 label `shot-overlay-<i>` | 改为 `shot-overlay-<会话号>-<显示器序号>`（`overlay_label()`） | 只按序号命名时，上一次截图残留的窗口会被新会话原样「复用」，而它的 URL 与 `window.__OIM_SHOT__` 绑的是旧会话 → 新图进不去、只能报「截图会话已失效」。`close_shot_overlays`、Destroyed 处理与 capabilities 的 `shot-overlay-*` 通配都按前缀工作，未受影响（commit `2d6f981`） |
+| §13 风险表「抓屏期间显示『正在截屏…』轻提示」 | **设计有、未实现**：抓屏那 1~15 秒里界面没有任何提示；只有后端在第二次触发时返回「正在截屏，请稍候」，前端把它当良性忽略（不再弹窗） | 轻提示需要前端在等待期有可渲染的状态，而触发是「后端先阻塞抓屏、再开遮罩」，前端在这段时间拿不到任何事件。最终整支评审的诚实性检查点出此项 |
+| §5.1「缓存超过 5 分钟即释放」 | **设计有、未实现**：`ShotState` 只有 `cache` 与 `capturing` 两个字段，没有时间戳也没有 TTL；`put` 直接替换 | 实际释放时机是「最后一个遮罩窗口销毁」（Destroyed 处理）或 `close_shot_overlays`；会话被新会话替换时旧缓存随之丢弃，所以没有 TTL 也不会读到陈旧图。最终整支评审的诚实性检查点出此项 |
 
 另有两处属于「实现期发现并修正的缺陷」，不改变设计：Windows BitBlt 的失败路径原先在位图仍被选进内存 DC 时删除它（每次失败泄漏一张全屏 HBITMAP），且 `GetDIBits` 也在位图仍被选中时调用（MSDN 明确禁止）——现已先选回旧对象、并给两个 GDI 句柄加空值检查；Windows/macOS 的剪贴板兜底原先把 `Image.fromBytes(...)` 的 Promise 直接传给 `writeImage`（必然 reject），Linux 走后端 GTK 路径所以本机看不见，已补 `await`。
 
@@ -509,19 +513,20 @@ README.md / README.zh-CN.md            功能表与 Roadmap 勾选
 | --- | --- |
 | 抓屏 | `--shot-test` / `--screenshot` 实测抓到 5120×1440 的整个工作区（两块 2560×1440 拼接），与 §2 一致；portal 非交互路径无授权弹窗。抓屏耗时沿用设计期实测（约 1s），本次未重新逐帧计时 |
 | 遮罩 | 两块屏各一个遮罩窗口，GTK 几何实测 `2048×1152`（= 该屏逻辑尺寸）；两屏变暗比例均 ≈0.55（mon0 117.8→64.8、mon1 34.0→18.8），整窗变暗 + box-shadow 挖洞生效 |
-| 会话 / 缓存 | 重复触发不叠第二层遮罩（复用现有 session）；关闭遮罩后两屏亮度比回到 1.000/1.001（无残留），再次触发是新 session |
+| 会话 / 缓存 | 重复触发不叠第二层遮罩：抓屏在途时第二次触发被直接拒绝（§15.6 的 I1），遮罩已存在时复用该 session 并聚焦；关闭遮罩后两屏亮度比回到 1.000/1.001（无残留），再次触发是新 session |
 | Wayland 热键 | KDE 首次弹绑定确认框，接受后日志 `Wayland 热键已绑定：Alt+A → ALT+a`，重启不再弹框；`dbus-monitor` 观察到 1 次 `Activated`，随后两块遮罩立即出现 |
 | 命令行诊断 | §9.3 的两个入口都可用：`open-ipmsg --screenshot` 走 single-instance 回调触发同一入口；`--shot-test` 打印 `抓屏成功: <宽>x<高> → /tmp/oim-shot-test.png` |
 | 工具栏 | 实测宽度 556px；切到马赛克（多三个按钮）后 624px，重新夹取后「确认/取消」仍在屏内 |
-| 撤销栈 | 每步快照实测 ≈12.4MB（k=1.25）；栈深上限 20 |
+| 撤销栈 | 64MiB **字节预算上限** + **至少保留 3 步**的下限（`UNDO_BYTES`，commit `a6d25a2`）。实测：2560×1440（14.06MiB/张）保留 4 步 = 56.25MiB（预算内）；4K 等效 3840×2160（31.64MiB/张）保留 3 步 = 94.92MiB（下限压过预算，是有意为之） |
 | 交互路径（Chromium 夹具） | drag → 标注 → ✓ → 待发送列表 → 剪贴板：在 Chromium 里用真实鼠标事件跑通（底图裁剪原点、标注 ±1px 对齐、✓ 只 emit 一次、无会话时只复制并提示），IPC 为桩 |
 | **本机端到端（本轮验收，提交后补测）** | 用 X11 后端（`GDK_BACKEND=x11`，让 XTEST 能驱动指针）在**真实 WebKitGTK 遮罩**上跑通：真实拖拽得到绿框选区、两屏变暗生效，`Enter` 确认，独立客户端从剪贴板读回 **750×400** 的 PNG（= CSS 600×320 选区 × k 1.25）；两个遮罩按屏几何出现（0,0 与 2560,0，各 2560×1440） |
-| 单元测试 | `pnpm test` 147/147；`cargo test` 224 passed / 1 ignored（共 225 项；比计划里写的 223 多 1 项，多出的是 Task 12 新增的 `bgra_to_rgba_handles_odd_width_rows`） |
+| 单元测试 | `pnpm test` 147/147；`cargo test` 226 passed / 1 ignored（共 227 项；比计划里写的 223 多 3 项：Task 12 的 `bgra_to_rgba_handles_odd_width_rows`，以及最终修复波的 `in_flight_capture_claim_refuses_second_trigger_and_releases`、`overlay_labels_are_session_scoped_but_keep_the_prefix`） |
+| 修复波实机复验（详见 §15.6） | `e2f1474` 后两屏遮罩 + 变暗 0.583/0.548、杀进程后屏幕干净；`2d6f981` 后两次触发相隔 46 ms 只建一组遮罩、无「会话已失效」；`--shot-test` 对只读目录如实报错并 exit 1 |
 
 ### 15.3 交付时已知的限制
 
 1. **混合 DPI / 混合缩放比的多屏共用一个全局比例 k**（§5.5、§13 已列为已知限制）。这是**全平台同一套逻辑**（Windows / macOS / Linux 都按整幅图的单一 k 换算），不是某个后端独有的毛病；本机两屏比例相同（都是 1.25），偏差没有暴露，而「Retina + 外接 1080p」这类混合缩放组合可能出现副屏黑边或错位。按屏精确换算要改抓屏拼接与遮罩裁剪模型，不在本次范围。
-2. **标注层按设备像素合成 → 撤销快照很大**：每步是一张整窗设备像素快照，实测 k=1.25 时 ≈12.4MB/步，20 步 ≈247MB（k=2 时整栈 ≈633MB）。当前上限是步数（`pushUndo` 的 `limit = 20`）；要收敛内存应改成按字节封顶或差分快照。
+2. **标注层按设备像素合成 → 撤销快照很大**：每步是一张整窗设备像素快照（2560×1440 约 14MiB，4K 约 31.6MiB，8K 约 132MiB）。栈按 **64MiB 字节预算**封顶，同时**保底 3 步**：实测常规屏 4 步 / 56.25MiB，4K 3 步 / 94.92MiB（下限压过预算，故意的——按 64MiB 硬切在 4K 上只剩 1 步，撤销等于没有），8K 按保底会到 ≈398MiB。要压这块内存，方向是给快照做降采样/压缩，而不是再调预算常量。
 3. （附）Wayland 协议不允许跨屏定位窗口，因此每屏一个遮罩、选区不能跨屏（§3 已记录，是协议限制而非实现取舍）。
 
 ### 15.4 本机无法执行 / 尚无现场证据的部分
@@ -533,7 +538,7 @@ README.md / README.zh-CN.md            功能表与 Roadmap 勾选
 - **原生 X11 会话**（计划里「整个虚拟桌面单窗遮罩 + 跨屏拖拽」那一项）没有现场记录：本轮的真实交互是在 Wayland 会话内用 `GDK_BACKEND=x11` 跑的（应用仍走 Wayland 的按屏遮罩分支，两个窗口），非 Wayland 的单窗路径证据仍是构建 + 分支推理 + 单元测试。
 - **发送到对端那一跳**：端到端只验证到「拖拽 → 确认 → 剪贴板」（独立客户端读回 750×400）；「图片进入待发送列表 → `Enter` 发送 → 对端收到同样的像素」没有在本机跑过。
 - **主窗口收进托盘后触发热键**（计划 Step 4 的第 5 项：事件不依赖主窗口可见）没有现场记录。
-- **通知回归**：zbus 特性变更后应用失焦时收到消息是否仍能弹系统通知并可点击，本轮没有现场验证。
+- **通知回归**：本轮没有现场验证；不过最终整支评审用依赖分析证明它在机制上不可能发生——`notify-rust` 的 zbus 依赖是 `default-features = false`，全仓库没有任何特性打开 `zbus/tokio`，所以我们新增的直连依赖只加了 `async-io` + `blocking-api`。剩下的只是一次「点一下确认」的现场动作。
 - **安装包内的热键**：本机只验证到「旧桌面文件名被 portal 拒绝 / 换成 app id 命名后可解析」这一层诊断；改名后的文件要重新打包安装才能确认端到端绑定。
 - **Tauri bundler 生成的 .deb / .rpm / AppImage 桌面文件名未核对**：本仓库 `packaging/linux/` 下的桌面文件只被 Arch 打包路径（`packaging/arch/PKGBUILD`、`scripts/build-arch.sh`）使用。
 
@@ -553,4 +558,27 @@ README.md / README.zh-CN.md            功能表与 Roadmap 勾选
 - [ ] 本机人工按键：按一次物理 `Alt+A`，确认 KGlobalAccel → portal `Activated` → 触发截图这一跳（§15.4）。
 - [ ] 打包安装后（Arch 包 / .deb / .rpm / AppImage）：Wayland 全局热键能绑定成功，不再出现 `NotAllowed: An app id is required`；并确认安装的桌面文件名是 `io.github.open-ipmsg.app.desktop`。
 - [ ] 真实 X11 会话：整个虚拟桌面用一个遮罩窗口、可跨屏拖拽（本轮的 X11 后端验证走的仍是 Wayland 分支）。
-- [ ] 通知回归：zbus 特性变更后在应用失焦时收到消息仍能弹系统通知且可点击（本次最需要防的回归）。
+- [ ] 通知回归：zbus 特性变更后在应用失焦时收到消息仍能弹系统通知且可点击（机制上已由依赖分析排除，这里只做一次现场确认）。
+
+**复评留下的已接受风险（PARKED，不阻塞交付，但维护者应知悉）**
+
+- [ ] 触发落在「认领已释放、遮罩尚未建好」的窗口期里时，第二次 `open_overlays` 可能撞上同 label 建窗失败（报「创建遮罩窗口失败: …」而不是静默忽略）。会话级 label 把这个窗口收窄了（不再复用旧会话窗口），但没有关闭；复现时重新触发即可。
+- [ ] 上一次会话残留的遮罩窗口若还在，它的 `Esc` 会按 `shot-overlay-` 前缀把**当前**会话的遮罩一起销毁（`close_shot_overlays` 是前缀级销毁）。重新触发即可恢复。
+- [ ] `ChatWindow.vue` 的监听器注册顺序调整后，若 `ipc.listenEvent` 抛错，拖放（drag-drop）注册也会被跳过——事件桥断掉时应用本身已降级，故未再调整顺序，仅记录。
+
+### 15.6 最终修复波（整支评审之后，2026-09-13）
+
+最终整支评审（`ea8e6d5..HEAD`）给出 1 Critical + 4 Important + ~14 Minor，修复波分四个提交落地：`e2f1474`（前端）、`a6d25a2`（撤销步数下限）、`2d6f981`（后端）、`3f3f152`（按钮重入守卫）。
+
+| 发现 | 性质 | 关闭方式与证据 |
+| --- | --- | --- |
+| C1 缩放的来源不唯一 | Critical | `compositeB64` 用取整后的 `k = r.w / sel.w`，而 `paintAnnoSize` / `applyMosaic` 用 `k0 = slice.w / winRect.w`，导出图里标注按 `sel.x × (k − k0)` 偏移（分数缩放下实测最大 ~50 设备像素，属静默错图）。修复后 `kWin` 是唯一缩放来源：评审复现用例的偏移 +4.17/+2.67 → +0.17/+0.67，第二个用例 −9.57/−3.07 → −0.57/−0.07；复评独立重算原始探针，残差 ≤0.5 设备像素（`Math.round` 过的裁剪原点带来的取整项，不再是比例误差） |
+| I1 连续触发的竞态 | Important | 抓屏那 1~15 秒里第二次触发会孤儿化会话（`capture_and_cache` 的 active_session 检查有 TOCTOU），而 `open_overlays` 会复用任意 `shot-overlay-*` 旧窗口。修复：`ShotState` 增加 `capturing` 认领（RAII guard，且**排在「已有会话就短路返回」之前**）+ 会话级 label（§15.1）+ 前端同步重入守卫（`shotBusy`、`finally` 复位、按钮置灰、把后端的「正在截屏，请稍候」当良性忽略）。实机：两次触发相隔 46 ms → 第二次被拒，遮罩只有一组（WebKitWebProcess = 3），无「会话已失效」，无残留窗口 |
+| I2 macOS 权限只查不申请 | Important | 见 §15.1 的 `ScreenCaptureAccess::request()` 一行 |
+| I3 撤销栈内存没有上限 | Important | 见 §15.2 / §15.3：64MiB 字节预算 + 保底 3 步 |
+| I4 文字工具不是所见即所得 | Important | 输入框字号与实际烧录公式统一（20 / 24 / 32px），只留一处 7px 垂直残差并已记录 |
+| ~14 Minor | Minor | 陈旧横幅清除、保存按钮 busy 守卫、标注层按选区裁剪、马赛克每次 move 只读一次底图（与旧算法逐像素等价）、拖拽的 pointercancel 恢复、监听器注册顺序、`.anno` 与 Tab 的注释、删除死键 `chat.screenshotSoon`、`--shot-test` 写盘失败如实报错并 exit 1、i18n 重启提示等 |
+
+复评结论：所有 finding ADDRESSED，无新增 Critical/Important。复评新提的三个 Minor 的裁决是：本文档陈旧（就是本节与 §15.1–§15.3 的更新）、`listenEvent` 失败会连带跳过拖放注册（PARKED，记入 §15.5）、旧会话残留遮罩的 `Esc` 会误销毁在用的遮罩（PARKED，记入 §15.5）。评审还用依赖分析关闭了「通知回归」的机制风险（§15.4）。
+
+详细证据在工作区的临时报告里（**未纳入 git**）：`.superpowers/sdd/2026-09-13-screenshot/final-fix-A-report.md`、`final-fix-B-report.md` 以及同目录的 `progress.md`。
