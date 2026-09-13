@@ -20,6 +20,7 @@ mod net;
 mod protocol;
 mod screenshot;
 mod selftest;
+mod shortcut;
 mod state;
 
 pub use state::{AppState, Config, PeerInfo};
@@ -1543,6 +1544,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // 全局热键（截图）：Windows/macOS/X11 由插件注册；Wayland 上插件无效，
+        // 注册与按键监听都在 shortcut.rs 里另走 portal（见该文件注释）
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             let handle = app.handle().clone();
             let data_dir = handle.path().app_data_dir()?;
@@ -1622,6 +1626,29 @@ pub fn run() {
             app.manage(ctx.clone());
             // 截图会话缓存（单槽：新截图立刻让旧遮罩失效）
             app.manage(screenshot::ShotState::default());
+
+            // 全局热键：Windows/macOS/X11 走插件，Wayland 走 portal（首次会弹系统确认）。
+            // 单独起线程：portal 的 CreateSession/BindShortcuts 要阻塞等用户点确认框，
+            // 而 setup 还在主线程上、事件循环尚未启动 —— 阻塞在这里窗口不会出现，
+            // 单实例回调（--screenshot 兜底入口）也永远排不上主线程。
+            let combo = app.state::<SharedState>().config().shot_hotkey.clone();
+            let hk_handle = handle.clone();
+            std::thread::spawn(move || {
+                let backend = shortcut::register(&hk_handle, &combo);
+                oim_log!("[shot] 全局热键后端：{backend:?}（{combo}）");
+            });
+
+            // 首次启动（没有别的实例在跑）时也要支持 --screenshot：等界面起来再抓屏，
+            // 否则遮罩窗口在事件循环启动前创建会卡住
+            if std::env::args().any(|a| a == "--screenshot") {
+                let h = handle.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1200));
+                    if let Err(e) = screenshot::trigger(&h) {
+                        oim_log!("[shot] 命令行触发失败：{}", e.message());
+                    }
+                });
+            }
 
             /* ---------- 系统托盘 ---------- */
             // Linux：先尝试自己注册 StatusNotifierItem（能拿到单击事件与悬停提示），
