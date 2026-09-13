@@ -1352,10 +1352,11 @@ fn logical_monitors(app: &tauri::AppHandle) -> Result<Vec<(String, Rect)>, ShotE
         use gtk::prelude::*;
         let list = gtk::gdk::Display::default()
             .map(|d| {
-                d.monitors()
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, m)| {
+                // GDK3（gtk 0.18）没有 `display.monitors()`：按序号逐个取，
+                // 这样 index 与 `fullscreen_on_monitor` 用的序号同源
+                (0..d.n_monitors())
+                    .filter_map(|i| {
+                        let m = d.monitor(i)?;
                         let g = m.geometry();
                         let name = m
                             .model()
@@ -1476,14 +1477,20 @@ fn fullscreen_on_monitor(win: &tauri::WebviewWindow, index: usize) -> Result<(),
         .run_on_main_thread(move || {
             use gtk::prelude::*;
             if let Ok(gw) = w.gtk_window() {
-                if let Some(display) = gtk::gdk::Display::default() {
-                    match display.monitor(index as i32) {
-                        Some(m) => gw.fullscreen_on_monitor(&m),
-                        // 取不到该显示器就退化为普通全屏（落在窗口当前所在屏）
-                        None => gw.fullscreen(),
-                    }
-                    gw.show_all();
+                // GDK3 的签名是 `fullscreen_on_monitor(&Screen, monitor 序号)`，
+                // 屏幕取窗口自身所在的那块（取不到再退默认屏）；
+                // `screen` 在 GtkWindowExt 与 WidgetExt 上都有，必须写全路径
+                let screen = gtk::prelude::GtkWindowExt::screen(&gw)
+                    .or_else(gtk::gdk::Screen::default);
+                let exists = gtk::gdk::Display::default()
+                    .and_then(|d| d.monitor(index as i32))
+                    .is_some();
+                match (screen, exists) {
+                    (Some(s), true) => gw.fullscreen_on_monitor(&s, index as i32),
+                    // 取不到该显示器就退化为普通全屏（落在窗口当前所在屏）
+                    _ => gw.fullscreen(),
                 }
+                gw.show_all();
             }
             let _ = tx.send(());
         })
