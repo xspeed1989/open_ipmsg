@@ -3081,6 +3081,10 @@ const recording = ref(false)
 /** 录制：按下的组合键直接写进表单；Esc 清空（= 不注册全局热键） */
 function onHotkeyKeydown(e) {
   e.preventDefault()
+  // 裸 Tab 必须放行：无条件 preventDefault 会让录制框变成键盘陷阱（WCAG 2.1.2），
+  // 而裸 Tab 本来就不是合法热键（comboFromEvent 要求至少一个修饰键）。
+  // Ctrl/Alt+Tab 仍按组合键录制。
+  if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) return
   if (e.key === 'Escape') {
     form.shot_hotkey = ''
     return
