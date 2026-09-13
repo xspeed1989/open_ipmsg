@@ -631,40 +631,33 @@ export function t(key, vars) {
   return s
 }
 
-/* ---------------- 日期与星期（消息流日期分隔标签用） ---------------- */
+/* ---------------- 日期（消息流日期分隔标签用） ---------------- */
 
-const WEEKDAYS = {
-  'zh-CN': ['周日', '周一', '周二', '周三', '周四', '周五', '周六'],
-  en: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
-}
 const MONTHS = {
   'zh-CN': ['1月', '2月', '3月', '4月', '5月', '6月', '7月', '8月', '9月', '10月', '11月', '12月'],
   en: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'],
 }
-
-const DAY_MS = 86400000
+const MS = 1000
 
 /**
  * 消息流中的日期分隔标签（按语言）。
- * 今天/昨天用相对词；一周内显示星期；更早显示月日（跨年带年份）。
+ * 今天用相对词「今天/Today」；今天以前一律显示日期（同年：月日；跨年：带年份）。
+ * 注意：ts 与 midnight 都是秒级，与 Date.getTime() 的毫秒相差 1000 倍。
  * @param {number} ts 秒级时间戳
  * @param {string} [lng] 语言，缺省用当前 locale
  */
 export function dayLabel(ts, lng = locale.value) {
   if (!ts) return ''
   const l = isSupported(lng) ? lng : 'zh-CN'
-  const d = new Date(ts * 1000)
+  const d = new Date(ts * MS)
   const now = new Date()
-  const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() / 1000
+  const midnight = Math.floor(new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() / MS)
   if (ts >= midnight) return l === 'en' ? 'Today' : '今天'
-  if (ts >= midnight - DAY_MS) return l === 'en' ? 'Yesterday' : '昨天'
-  const wd = WEEKDAYS[l][d.getDay()]
-  if (ts >= midnight - 6 * DAY_MS) return wd
   const sameYear = d.getFullYear() === now.getFullYear()
   if (l === 'en') {
     const md = `${MONTHS.en[d.getMonth()]} ${d.getDate()}`
     return sameYear ? md : `${md}, ${d.getFullYear()}`
   }
-  const zhM = `${d.getMonth() + 1}月${d.getDate()}日`
+  const zhM = `${MONTHS['zh-CN'][d.getMonth()]}${d.getDate()}日`
   return sameYear ? zhM : `${d.getFullYear()}年${zhM}`
 }

@@ -8,10 +8,12 @@ import {
 import { composeReplyBody, quotePreview } from '../src/lib/reply.js'
 import { forwardPayload, mergeForward } from '../src/lib/forward.js'
 
-const DAY = 86400000
+// dayLabel 的时间戳是「秒」，与 Date.getTime() 的「毫秒」相差 1000 倍
+const MS = 1000
+const DAY = 86400
 const todayMidnight = () => {
   const now = new Date()
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() / 1000
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() / MS
 }
 
 test('语言名用各自的语言书写', () => {
@@ -67,35 +69,63 @@ test('zh-CN 与 en 字典 key 完全一致（防漏翻）', () => {
   setLocale('zh-CN')
 })
 
-test('dayLabel：今天/昨天与星期（中英双语）', () => {
+test('dayLabel：今天显示「今天 / Today」', () => {
   const mid = todayMidnight()
   setLocale('zh-CN')
+  assert.equal(dayLabel(mid), '今天')
   assert.equal(dayLabel(mid + 10), '今天')
-  assert.equal(dayLabel(mid - DAY + 10), '昨天')
   setLocale('en')
+  assert.equal(dayLabel(mid), 'Today')
   assert.equal(dayLabel(mid + 10), 'Today')
-  assert.equal(dayLabel(mid - DAY + 10), 'Yesterday')
   setLocale('zh-CN')
 })
 
-test('dayLabel：一周内显示星期（按语言缩写）', () => {
+test('dayLabel：今天以前一律显示日期，不再误标昨天/星期', () => {
   const mid = todayMidnight()
-  setLocale('en')
-  // 3 天前：无论星期几，英文必然是 Sun..Sat 之一，且不含 Today/Yesterday
-  const label = dayLabel(mid - 3 * DAY + 100)
-  assert.match(label, /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)$/)
+  const zhDate = /^(\d{4}年)?\d{1,2}月\d{1,2}日$/
   setLocale('zh-CN')
-  const zl = dayLabel(mid - 3 * DAY + 100)
-  assert.match(zl, /^(周日|周一|周二|周三|周四|周五|周六)$/)
+  // 昨天 23:59:59（差一秒）/ 3 天前 / 30 天前 / 400 天前：都必须是日期
+  for (const ts of [mid - 1, mid - 3 * DAY + 100, mid - 30 * DAY, mid - 400 * DAY]) {
+    const label = dayLabel(ts)
+    assert.match(label, zhDate, `ts=${ts} 应显示日期，实际：${label}`)
+    assert.notEqual(label, '昨天')
+    assert.notEqual(label, '今天')
+  }
+  setLocale('en')
+  const enDate = /^[A-Z][a-z]{2} \d{1,2}(, \d{4})?$/
+  for (const ts of [mid - 1, mid - 3 * DAY + 100, mid - 30 * DAY, mid - 400 * DAY]) {
+    const label = dayLabel(ts)
+    assert.match(label, enDate, `ts=${ts} 应显示日期，实际：${label}`)
+    assert.notEqual(label, 'Yesterday')
+    assert.notEqual(label, 'Today')
+  }
+  setLocale('zh-CN')
 })
 
-test('dayLabel：更早的日期显示月日（跨年带年份）', () => {
-  const mid = todayMidnight()
-  setLocale('en')
-  const old = mid - 30 * DAY
-  assert.match(dayLabel(old), /^[A-Z][a-z]{2} \d{1,2}(, \d{4})?$/)
+test('dayLabel：同年显示月日，跨年带年份（中英）', () => {
+  const now = new Date()
+  const y = now.getFullYear()
+  const todayStart = new Date(y, now.getMonth(), now.getDate()).getTime()
+  // 同年：当年 1 月 15 日（今天若还没到 1/15 则跳过，避免把今天当过去）
+  const jan15 = new Date(y, 0, 15, 12)
+  if (jan15.getTime() < todayStart) {
+    setLocale('zh-CN')
+    assert.equal(dayLabel(jan15.getTime() / MS), '1月15日')
+    setLocale('en')
+    assert.equal(dayLabel(jan15.getTime() / MS), 'Jan 15')
+  }
+  // 跨年：去年 6 月 15 日
+  const prev = new Date(y - 1, 5, 15, 12)
   setLocale('zh-CN')
-  assert.match(dayLabel(old), /^(\d{4}年)?\d{1,2}月\d{1,2}日$/)
+  assert.equal(dayLabel(prev.getTime() / MS), `${y - 1}年6月15日`)
+  setLocale('en')
+  assert.equal(dayLabel(prev.getTime() / MS), `Jun 15, ${y - 1}`)
+  setLocale('zh-CN')
+})
+
+test('dayLabel：无时间戳返回空串', () => {
+  assert.equal(dayLabel(0), '')
+  assert.equal(dayLabel(undefined), '')
 })
 
 test('detectLocale：无 navigator 时回退英语；zh 前缀 → 简体中文', () => {
