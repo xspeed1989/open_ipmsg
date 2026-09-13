@@ -16,6 +16,7 @@ Open IPMsg is a cross-platform LAN instant messenger compatible with [IP Messeng
 - **End-to-end encryption** — RSA-2048 key exchange + AES-256-CBC message encryption + SHA-256 signing, plus AES-CTR encrypted TCP file streams; automatically falls back to plaintext for peers that don't support encryption
 - **Files & folders** — multi-file attachments, resumable TCP streaming with progress, and recursive folder transfer (both directions)
 - **Clipboard paste image** — natively compatible with the official "paste image" feature (FILE_CLIPBOARD), both directions: send screenshots with Ctrl+V and preview images pasted by official clients inline
+- **Send screenshots** — trigger from the toolbar or the global hotkey (Alt+A by default), drag a selection on the dimmed full-screen overlay, annotate with six tools (rectangle / ellipse / arrow / pen / text / mosaic), then confirm into the pending attachment list with optional auto-copy to the clipboard
 - **Read receipts** — see when your messages are read, with per-bubble read/unread status
 - **Tray & notifications** — closing the window minimizes to the tray (WeChat-style); system notifications when messages arrive while unfocused
 - **Bilingual UI** — Simplified Chinese / English, switchable at runtime
@@ -30,6 +31,7 @@ Open IPMsg is a cross-platform LAN instant messenger compatible with [IP Messeng
 | Messaging | Text messages, Unicode/emoji, message deduplication |
 | Files | Multi-file attachments, TCP streaming, progress, resume, folder transfer (both directions) |
 | Paste image | Send screenshots via Ctrl+V; inline preview of images pasted by official clients |
+| Screenshot sending | Toolbar button or global hotkey, drag a selection and annotate (rectangle / ellipse / arrow / pen / text / mosaic), then confirm into the pending attachment list |
 | Read receipts | READMSG-based receipts with read/unread bubbles |
 | Groups | Contact list grouped by broadcast group |
 | Away mode | "Away" broadcast with auto-reply, configurable away status text |
@@ -106,6 +108,15 @@ Both sides show a key fingerprint in Settings — compare them to confirm the sa
 **Q: Where are my chat records stored?**
 Chat history is stored in the app data directory, one file per conversation; recent records load automatically when you open a session.
 
+**Q: The screenshot hotkey does nothing.**
+On Windows/macOS/X11 the app registers the global hotkey itself; on Wayland the desktop environment owns the binding instead (the first save shows a confirmation dialog). If your desktop does not support it, bind the command `open-ipmsg --screenshot` as a custom shortcut in your system settings. On Linux the capture itself goes through xdg-desktop-portal; without that service the capture reports 系统未提供截图服务 ("no screenshot service provided by the system").
+
+**Q: On Wayland the hotkey shows up as unavailable (installed builds only).**
+The desktop derives a host app's portal app id from the installed desktop file's basename — on KDE that is the systemd scope `app-<appid>-<random>.scope`. Older packages installed it under the app's own name, `open-ipmsg` (plus a `.desktop` suffix), so the portal parsed `open-` as a launcher prefix and resolved `ipmsg`: no matching desktop file, no app id, and `org.freedesktop.portal.GlobalShortcuts.CreateSession` is refused with `NotAllowed: An app id is required`, which degrades the hotkey to disabled. (`tauri dev` has no such scope, which is why it works there.) The repo now ships the file as `io.github.open-ipmsg.app.desktop`, matching `identifier` in `src-tauri/tauri.conf.json`; keep that name when packaging, otherwise `open-ipmsg --screenshot` remains the fallback.
+
+**Q: What are the known limitations?**
+Mixed-DPI multi-monitor setups (say 100% + 200%) are converted with a single scale factor for the whole stitched image, so a secondary screen can be offset. The annotation layer is composited at device resolution, so the undo stack keeps up to 20 snapshots of roughly 12MB each (~247MB for the full stack at 1.25×). The Windows and macOS capture/hotkey code is implemented and cross-compile checked, but has never been executed on real hardware — see the acceptance checklist in `docs/superpowers/specs/2026-09-13-screenshot-design.md`. Also, a `CmdOrCtrl` recorded in Settings maps to Super on Wayland and to Ctrl on Windows/X11.
+
 ---
 
 ## Roadmap
@@ -113,7 +124,8 @@ Chat history is stored in the app data directory, one file per conversation; rec
 - [x] RSA-2048/AES key exchange and encrypted messaging + encrypted TCP file streams
 - [x] Recursive folder transfer (both directions)
 - [x] Broadcast mode (BROADCASTOPT)
-- [ ] Auto-start on boot, send screenshots
+- [x] Send screenshots
+- [ ] Auto-start on boot
 
 ---
 

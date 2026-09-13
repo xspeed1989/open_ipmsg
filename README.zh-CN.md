@@ -16,6 +16,7 @@ Open IPMsg 是基于 **Tauri v2** 的跨平台 [IP Messenger](https://ipmsg.org/
 - **端到端加密** — RSA-2048 密钥协商 + AES-256-CBC 消息加密 + SHA-256 签名,以及 AES-CTR 加密的 TCP 文件流;对端不支持时自动回退明文,互通零感知
 - **文件与文件夹传输** — 多文件附件、TCP 流式断点续传、传输进度、目录递归传输(收发双向)
 - **剪贴板贴图** — 与官方「粘贴图片」原生双向兼容:Ctrl+V 发送截图;官方客户端贴的图在聊天内自动内联预览
+- **截图发送** — 工具栏按钮或全局热键(默认 Alt+A)触发,全屏遮罩上拖拽选区 + 六种标注(矩形/椭圆/箭头/画笔/文字/马赛克),确认后进待发送列表并可自动复制到剪贴板
 - **已读回执** — 对方查看后显示「已读/未读」状态气泡
 - **托盘与通知** — 关闭窗口最小化到托盘(微信式);窗口未聚焦时来消息弹系统通知
 - **双语界面** — 简体中文 / English,运行时可随时切换
@@ -30,6 +31,7 @@ Open IPMsg 是基于 **Tauri v2** 的跨平台 [IP Messenger](https://ipmsg.org/
 | 即时消息 | 文本消息、Unicode/表情、消息去重 |
 | 文件传输 | 多文件附件、TCP 流式传输、进度、断点续传、文件夹双向传输 |
 | 粘贴图片 | Ctrl+V 发送截图;官方客户端粘贴的图片聊天内内联预览 |
+| 截图发送 | 工具栏按钮 / 全局热键触发，拖拽选区 + 标注（矩形/椭圆/箭头/画笔/文字/马赛克），确认后进待发送列表 |
 | 已读回执 | READMSG 回执,气泡显示已读/未读 |
 | 群组 | 联系人列表按广播群组分栏展示 |
 | 不在模式 | 「离开」状态广播、自动回复、可配置离开文案 |
@@ -106,6 +108,15 @@ sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
 **Q:聊天记录存在哪里?**
 聊天记录存放在应用数据目录,每个会话一个文件;打开会话时自动加载最近记录。
 
+**Q:截图热键按了没反应?**
+Windows/macOS/X11 由应用注册全局热键；Wayland 下改由桌面环境授权绑定（首次保存设置时会弹确认框），若你的桌面环境不支持，可在系统设置里把命令 `open-ipmsg --screenshot` 绑成自定义快捷键。抓屏本身在 Linux 走 xdg-desktop-portal；若系统没有该服务，截图会提示「系统未提供截图服务」。
+
+**Q:Wayland 下热键只在安装版里不可用?**
+桌面环境用「已安装桌面文件名」给应用分配 portal app id：KDE 从 systemd scope `app-<appid>-<随机>.scope` 反推，而 scope 名取自 `.desktop` 的 basename。旧包把桌面文件装成与应用同名的 `open-ipmsg`（加 `.desktop` 后缀），portal 会把 `open-` 当成启动器前缀、解析出 `ipmsg`，找不到对应桌面文件 → 没有 app id → `org.freedesktop.portal.GlobalShortcuts.CreateSession` 被拒（`NotAllowed: An app id is required`），热键降级为禁用；`tauri dev` 直接启动没有这个 scope，所以开发时反而正常。仓库已把桌面文件改名为 `io.github.open-ipmsg.app.desktop`（与 `src-tauri/tauri.conf.json` 的 `identifier` 一致），自行打包时请保持该文件名，否则仍可用 `open-ipmsg --screenshot` 兜底。
+
+**Q:截图有哪些已知限制?**
+混合 DPI 多屏（如一屏 100% + 一屏 200%）目前按整幅图使用同一个缩放比例换算，副屏可能错位；标注层按设备像素合成，撤销栈最多 20 步、每步约 12MB（k=1.25 时整栈约 247MB）。Windows 与 macOS 的抓屏/热键代码已实现并通过交叉编译检查，但未在真机上运行过，验收清单见 `docs/superpowers/specs/2026-09-13-screenshot-design.md`。另外，设置页录制的 `CmdOrCtrl` 在 Wayland 映射为 Super，在 Windows/X11 映射为 Ctrl。
+
 ---
 
 ## Roadmap
@@ -113,7 +124,8 @@ sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file \
 - [x] RSA-2048/AES 密钥协商与加密消息 + TCP 文件流加密
 - [x] 文件夹递归传输(收发双向)
 - [x] 广播群发模式(BROADCASTOPT)
-- [ ] 开机自启、截图发送
+- [x] 截图发送
+- [ ] 开机自启
 
 ---
 

@@ -1,7 +1,7 @@
 # 截图发送（截屏 → 标注 → 发送）设计
 
 **日期：** 2026-09-13
-**状态：** 设计已确认，待实现计划
+**状态：** 已实现（本机 KDE Wayland 实测；Windows/macOS 待真机验收——差异、限制与验收清单见 §15 实现记录）
 **范围：** 新增截图子系统（抓屏后端 / 遮罩窗口 / 标注 / 热键）。不改动 IPMsg 协议、不改动图片发送链路、不改动图片查看器。
 
 ## 1. 背景与目标
@@ -478,3 +478,71 @@ src/lib/i18n.js                        双语文案
 scripts/sfc-bindings.test.mjs          文件列表加入 ScreenshotOverlay.vue
 README.md / README.zh-CN.md            功能表与 Roadmap 勾选
 ```
+
+---
+
+## 15. 实现记录（as-built，2026-09-13）
+
+本节记录实现与本设计的差异、本机实测结论、交付时已知的限制，以及必须由维护者在真机上完成的验收清单。正文 §1–§14 保持设计原样，便于对照。
+
+### 15.1 与设计的偏离
+
+| 设计里的写法 | 实际实现 | 原因（含证据） |
+| --- | --- | --- |
+| §6.2 遮罩窗口 `resizable: false` | Wayland 分支**不再设** `resizable(false)`，改由 `request_fullscreen` 在窗口 map 之后（`connect_map` / `idle_add_local_once`）请求全屏；非 Wayland 的单窗路径仍保留 `resizable(false)` | Wayland 下 GDK 把「不可缩放」翻译成 xdg_toplevel 的 min = max = 当前占位尺寸，KWin 以 max_size 压过 fullscreen configure，遮罩只剩 410×290 的小窗。WAYLAND_DEBUG 显示 `set_fullscreen` 已下发且 `configure(2048,1152,[FULLSCREEN])` 已批准——即请求本身没问题，是 `resizable(false)` 把它按了回去 |
+| §4 / §6.3 遮罩窗口取「本屏切片」 | Wayland 仍按屏返回切片；**非 Wayland 改为返回整幅图**，`scale` 用各屏逻辑矩形并集的宽度 | 非 Wayland 只有一个覆盖整个虚拟桌面的窗口，只给 0 号屏切片会让双屏下窗口里只画出主屏内容（缺半屏 + 错位） |
+| §7.3 变暗由 `.dim` 的 `box-shadow` 挖洞实现 | 尚未选出选区时先铺一层整窗变暗层；选定后仍用 box-shadow 挖洞 | 无选区时没有任何变暗，截图模式与实时桌面在视觉上无法区分 |
+| §7.3 标注层 canvas（未规定后备分辨率） | 标注层按**设备像素**建后备存储 + `ctx.setTransform(k,0,0,k,0,0)`，绘制坐标仍是 CSS 像素 | 后备存储若按 CSS 尺寸，k=1.25 时笔画会被放大 1.25 倍、比底图糊；「确认后的图 = 所见」要求同分辨率合成。代价见 §15.3 |
+| §7.2 马赛克「对底图采样后回填」 | 采样与回填都吸附到设备像素（`round(css × k)`） | CSS 块网格在分数缩放下落在半像素上，相邻两块各盖一半 → 每道块缝漏出一条 25% 透光的原图细线（打码失效）。实测半透明像素 3890 → 0 |
+| §7.4 工具栏几何（未规定宽度来源） | 工具栏宽度运行时实测（`el.offsetWidth`），切换工具后再重量测 | 实测 556px，马赛克工具多三个按钮时 624px；按硬编码 420 估算会把「确认/取消」推出屏幕 |
+| §9.2 portal 三步流程 | `CreateSession` / `BindShortcuts` / `Activated` 监听复用**同一条长生命周期连接**；`Activated` 的第一个参数按 `OwnedObjectPath` 解析 | portal 把 `Activated` 定向发给 session 拥有者的唯一名，另开连接永远收不到；创建连接的局部变量析构会触发 `close_sessions_for_sender`，把 session 与 KDE 绑定一起拆掉 |
+| §5.4 macOS 未规定 `scale` 的分母 | 分母取该显示器自己的 `CGDisplay::bounds()` 逻辑宽；权限预检改用 `core_graphics::access::ScreenCaptureAccess::preflight()` | `core-graphics 0.24` 没有 `CGImage::bounds()`；若用图像自身尺寸，比值恒为 1.0 → 画布按点建、图是像素，Retina 上 PNG 只剩左上角 1/4。手写 `extern "C" ... -> bool` 与真实返回类型 `boolean_t`（`c_uint`）ABI 不符 |
+| §3 / §9 未涉及桌面安装包的 app id | 桌面文件改名为 `io.github.open-ipmsg.app.desktop`（`packaging/linux/`、`packaging/arch/PKGBUILD`、`scripts/build-arch.sh`），文件内容（`Exec=` / `Icon=` / `StartupWMClass=`）不变 | KDE 从 systemd scope（`app-<appid>-<随机>.scope`）反推 portal app id，scope 名取自已安装 `.desktop` 的 basename。旧名（`open-ipmsg` 加 `.desktop` 后缀）被 portal 的正则当成「启动器前缀 `open-` + id `ipmsg`」，找不到 `ipmsg` 的桌面文件 → 没有 app id → `org.freedesktop.portal.GlobalShortcuts.CreateSession` 返回 `NotAllowed: An app id is required` → **安装版**的 Wayland 热键降级为禁用（`tauri dev` 直接启动没有这个 scope，所以开发时反而正常） |
+
+另有两处属于「实现期发现并修正的缺陷」，不改变设计：Windows BitBlt 的失败路径原先在位图仍被选进内存 DC 时删除它（每次失败泄漏一张全屏 HBITMAP），且 `GetDIBits` 也在位图仍被选中时调用（MSDN 明确禁止）——现已先选回旧对象、并给两个 GDI 句柄加空值检查；Windows/macOS 的剪贴板兜底原先把 `Image.fromBytes(...)` 的 Promise 直接传给 `writeImage`（必然 reject），Linux 走后端 GTK 路径所以本机看不见，已补 `await`。
+
+### 15.2 本机实测（KDE Plasma 6 / Wayland，双 2K 屏，缩放 1.25）
+
+| 项目 | 结果 |
+| --- | --- |
+| 抓屏 | `--shot-test` / `--screenshot` 实测抓到 5120×1440 的整个工作区（两块 2560×1440 拼接），与 §2 一致；portal 非交互路径无授权弹窗。抓屏耗时沿用设计期实测（约 1s），本次未重新逐帧计时 |
+| 遮罩 | 两块屏各一个遮罩窗口，GTK 几何实测 `2048×1152`（= 该屏逻辑尺寸）；两屏变暗比例均 ≈0.55（mon0 117.8→64.8、mon1 34.0→18.8），整窗变暗 + box-shadow 挖洞生效 |
+| 会话 / 缓存 | 重复触发不叠第二层遮罩（复用现有 session）；关闭遮罩后两屏亮度比回到 1.000/1.001（无残留），再次触发是新 session |
+| Wayland 热键 | KDE 首次弹绑定确认框，接受后日志 `Wayland 热键已绑定：Alt+A → ALT+a`，重启不再弹框；`dbus-monitor` 观察到 1 次 `Activated`，随后两块遮罩立即出现 |
+| 命令行诊断 | §9.3 的两个入口都可用：`open-ipmsg --screenshot` 走 single-instance 回调触发同一入口；`--shot-test` 打印 `抓屏成功: <宽>x<高> → /tmp/oim-shot-test.png` |
+| 工具栏 | 实测宽度 556px；切到马赛克（多三个按钮）后 624px，重新夹取后「确认/取消」仍在屏内 |
+| 撤销栈 | 每步快照实测 ≈12.4MB（k=1.25）；栈深上限 20 |
+| 交互路径 | drag → 标注 → ✓ → 待发送列表 → 剪贴板：在 Chromium 里用真实鼠标事件跑通（底图裁剪原点、标注 ±1px 对齐、✓ 只 emit 一次、无会话时只复制并提示），IPC 为桩 |
+| 单元测试 | `pnpm test` 147/147；`cargo test` 224 passed / 1 ignored（共 225 项；比计划里写的 223 多 1 项，多出的是 Task 12 新增的 `bgra_to_rgba_handles_odd_width_rows`） |
+
+### 15.3 交付时已知的限制
+
+1. **混合 DPI / 混合缩放比的多屏共用一个全局比例 k**（§5.5、§13 已列为已知限制）。本机两屏比例相同（都是 1.25），偏差没有暴露；macOS 上「Retina + 外接 1080p」这类组合可能出现副屏黑边或错位。按屏精确换算要改抓屏拼接与遮罩裁剪模型，不在本次范围。
+2. **标注层按设备像素合成 → 撤销快照很大**：每步是一张整窗设备像素快照，实测 k=1.25 时 ≈12.4MB/步，20 步 ≈247MB（k=2 时整栈 ≈633MB）。当前上限是步数（`pushUndo` 的 `limit = 20`）；要收敛内存应改成按字节封顶或差分快照。
+3. （附）Wayland 协议不允许跨屏定位窗口，因此每屏一个遮罩、选区不能跨屏（§3 已记录，是协议限制而非实现取舍）。
+
+### 15.4 本机无法执行 / 尚无现场证据的部分
+
+以下项在本机无法执行，或截至本节写入时尚无现场证据（若后续在本机补齐，请直接更新本节与 §15.5）：
+- **Windows / macOS 运行时行为完全未在本机执行**（本机是 Linux）。代码状态：Windows 分支 `cargo check --target x86_64-pc-windows-gnu` 通过（exit 0）；macOS 分支的**整棵依赖树** `cargo check --target aarch64-apple-darwin` 会在无关依赖 `objc2-exception-helper`（需要 macOS SDK）处失败，因此只用「把该分支原样抽到独立夹具」的方式对真实 crate 做过类型检查——macOS arm 从未在完整应用里编译过，更没有运行过。
+- **Windows / macOS 剪贴板兜底**（前端 `writeImage(Image.fromBytes(...))`）只做过桩验证，未在真机粘贴过。
+- **物理按键 → 热键触发**：本机无法注入全局按键（KWin 未导出 FakeInput，XTEST 对 Wayland 客户端无效）。验证只做到 KGlobalAccel 的同源事件（`setForeignShortcut` + `Component.invokeShortcut`）与 `Activated` 已到达监听器；真人在键盘上按一次 Alt+A 这一跳留给维护者。
+- **真实 X11 会话**（计划里「单窗跨屏遮罩 + 跨屏拖拽」那一项）没有现场记录；非 Wayland 单窗路径的证据是构建 + 分支推理 + 单元测试。
+- **真机 WebKitGTK 遮罩里的交互路径**（拖拽/标注/确认/粘贴）没有现场证据：本机注入不了指针事件（`/dev/uinput` 模块未加载），现有证据是 Chromium + 真实鼠标事件。
+- **安装包内的热键**：本机只验证到「旧桌面文件名被 portal 拒绝 / 换成 app id 命名后可解析」这一层诊断；改名后的文件要重新打包安装才能确认端到端绑定。
+- **Tauri bundler 生成的 .deb / .rpm / AppImage 桌面文件名未核对**：本仓库 `packaging/linux/` 下的桌面文件只被 Arch 打包路径（`packaging/arch/PKGBUILD`、`scripts/build-arch.sh`）使用。
+
+### 15.5 维护者验收清单（需真机或人工按键）
+
+§12.4 是设计期的草稿清单，本节是交付时的正式清单（在其基础上补充了打包、物理按键与通知回归）。
+
+- [ ] Windows：抓屏在 100% / 125% / 150% 缩放下像素正确；双显示器（含跨屏拖拽选区）正常。
+- [ ] Windows：应用失焦时 `Alt+A` 生效；在设置页改键后重启应用生效。
+- [ ] macOS：首次抓屏弹出「屏幕录制」授权；拒绝后给出提示文案，而不是一张空白/只有壁纸的图。
+- [ ] macOS：多显示器拼接正确（Retina 缩放已处理；混合缩放比见 §15.3 限制 1）。
+- [ ] Windows / macOS：确认后的截图能在其他应用里粘贴。
+- [ ] Windows / macOS：混合 DPI 多屏下遮罩与图像对齐。
+- [ ] 本机人工按键：按一次物理 `Alt+A`，确认 KGlobalAccel → portal `Activated` → 触发截图这一跳（§15.4）。
+- [ ] 打包安装后（Arch 包 / .deb / .rpm / AppImage）：Wayland 全局热键能绑定成功，不再出现 `NotAllowed: An app id is required`；并确认安装的桌面文件名是 `io.github.open-ipmsg.app.desktop`。
+- [ ] 真实 X11 会话：整个虚拟桌面用一个遮罩窗口、可跨屏拖拽。
+- [ ] 通知回归：zbus 特性变更后在应用失焦时收到消息仍能弹系统通知且可点击（本次最需要防的回归）。
