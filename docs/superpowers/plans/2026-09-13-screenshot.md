@@ -2053,18 +2053,49 @@ In `scripts/sfc-bindings.test.mjs`, add to the explicit list:
   '../src/components/ScreenshotOverlay.vue',
 ```
 
-- [ ] **Step 6: Verify the overlay actually appears and selects**
+- [ ] **Step 6: Add the `--screenshot` command-line trigger (pulled forward from Task 11 for verifiability)**
 
-Run: `pnpm test` (expect PASS) and then `pnpm tauri dev`.
-In the running app, temporarily trigger a capture from the devtools console of the main window:
-`window.__TAURI__.core.invoke('start_screenshot')`.
-Expected: on this KDE Wayland dual-monitor machine **two** overlay windows appear, each fullscreen on one monitor, each showing that monitor's frozen content pixel-aligned; dragging draws a green-bordered selection with a live `W × H` label in physical pixels; `Esc` closes both overlays; a second trigger works again.
-Remove the temporary console trigger afterwards (no code change was made for it).
+Task 11 owns the global hotkey, but the command-line entry point belongs here: without it there is no way to trigger a capture from a script or a second process, so this task's overlay cannot be verified except by hand. It is the same `screenshot::trigger` call the hotkey will use.
 
-- [ ] **Step 7: Commit**
+In `src-tauri/src/lib.rs`, inside the existing `tauri_plugin_single_instance::init` closure, before the `activate_from_tray(app)` call:
+
+```rust
+            // --screenshot：向已在运行的实例要一次截图。也是 Wayland 下没有全局
+            // 热键时的兜底入口（桌面环境里把这条命令绑成自定义快捷键即可）。
+            if argv.iter().any(|a| a == "--screenshot") {
+                if let Err(e) = screenshot::trigger(app) {
+                    oim_log!("[shot] 命令行触发失败：{}", e.message());
+                }
+                return;
+            }
+```
+
+Then verify from a second terminal while the dev app is running:
 
 ```bash
-git add src/components/ScreenshotOverlay.vue src/main.js src/lib/ipc.js src/lib/i18n.js scripts/sfc-bindings.test.mjs
+./src-tauri/target/debug/open-ipmsg --screenshot    # 触发（走单实例回调）
+```
+
+- [ ] **Step 7: Verify the overlay actually appears and selects**
+
+Run: `pnpm test` (expect PASS), `pnpm build` (expect PASS), and then start the app with `pnpm tauri dev` **as a background job** — do not block on it.
+
+Trigger a capture from a second shell with `./src-tauri/target/debug/open-ipmsg --screenshot` (built by `cd src-tauri && cargo build`).
+
+Expected: on this KDE Wayland dual-monitor machine **two** overlay windows appear, each fullscreen on one monitor, each showing that monitor's frozen content pixel-aligned; dragging draws a green-bordered selection with a live `W × H` label in physical pixels; `Esc` closes both overlays; a second trigger works again.
+
+Since a headless agent cannot see the screen, capture the desktop while the overlays are up and inspect the PNG — that is both the check and a use of the feature:
+
+```bash
+cd src-tauri && ./target/debug/open-ipmsg --shot-test && cp /tmp/oim-shot-test.png /tmp/shot-verify-overlay.png
+```
+
+The resulting PNG must show the dimmed desktop with the overlay's green selection border (if you triggered a drag) or at least the dimmed full-screen overlay windows on both monitors. Report what the image shows, verbatim dimensions included. If the overlays do not appear, say so — do not report DONE on an unverified overlay.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/components/ScreenshotOverlay.vue src/main.js src/lib/ipc.js src/lib/i18n.js scripts/sfc-bindings.test.mjs src-tauri/src/lib.rs
 git commit -m "feat(shot): 遮罩窗口组件（取图/变暗挖洞/拖拽选区/微调/取消）"
 ```
 
@@ -3118,25 +3149,7 @@ In `src-tauri/src/lib.rs`:
 
 Note `st` is the `Arc<AppState>` created a few lines above in the same closure.
 
-4. In the single-instance callback, handle the CLI trigger:
-
-```rust
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            if argv.iter().any(|a| a == "--log") {
-                state::set_log_enabled(true);
-            }
-            // --screenshot：给没有全局热键的环境（如 GNOME < 48 的 Wayland）留的
-            // 命令行入口，用户可在桌面环境里把这条命令绑成自定义快捷键
-            if argv.iter().any(|a| a == "--screenshot") {
-                if let Err(e) = screenshot::trigger(app) {
-                    oim_log!("[shot] 命令行触发失败：{}", e.message());
-                }
-                return;
-            }
-            oim_log!("[single-instance] 已有实例在运行，唤起既有窗口");
-            activate_from_tray(app);
-        }))
-```
+4. The `--screenshot` branch in the single-instance callback already landed in Task 7 — do not add it again; just confirm it is still there.
 
 Also handle `--screenshot` when it is the **first** launch (no other instance): in `setup`, after the hotkey registration:
 
