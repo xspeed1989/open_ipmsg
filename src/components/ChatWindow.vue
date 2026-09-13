@@ -7,9 +7,11 @@ import {
   store, sendText, sendFiles, sendFilesTo, downloadFile, clearHistory,
   openChat, displayName, dayLabel, fmtTime, fmtSize, refreshUsers, splitDelayedNote,
   sendTextTo, recallMsg, unlockMsg, broadcastTo, loadEmojiIndex, sendEmojiTo,
+  isBroadcastKey, sessionName, msgSenderName, senderIpOf,
 } from '../store'
 import { parseFileUris, highlightParts } from '../lib/text'
 import { computePopupPosition } from '../lib/popup'
+import { isSealedEnvelope, isPasswordEnvelope, showsSealTag } from '../lib/secret'
 import { composeReplyBody, quotePreview } from '../lib/reply'
 import { recalledEditState } from '../lib/recall'
 import { forwardPayload, mergeForward } from '../lib/forward'
@@ -29,6 +31,21 @@ const activeUser = computed(
   () => store.userMap[store.activeKey] || store.peerMeta[store.activeKey] || null
 )
 const isOnline = computed(() => !!store.userMap[store.activeKey])
+/** 当前会话是不是「广播」信箱：名字固定、每条消息自带发送方、输入即广播 */
+const isBroadcast = computed(() => isBroadcastKey(store.activeKey))
+
+/** 某条消息的发送方名：广播信箱里按每条消息的快照取（该会话没有单一对端），
+ *  普通会话仍用会话名。 */
+const msgSender = (m) => (isBroadcast.value ? msgSenderName(m) : m?.dir === 'out' ? t('me') : displayName(store.activeKey))
+
+/** 头像标识：广播信箱用发送方 IP（同一个人头像稳定且互不相同） */
+const msgSeed = (m) => (isBroadcast.value ? m?.peer?.ip || m?.peer?.key || 'broadcast' : store.activeKey)
+
+/** 发送方完整显示名（气泡上方标签的悬浮提示用） */
+const msgSenderFull = (m) =>
+  m?.dir === 'out' ? store.config?.nickname || t('me') : m?.peer?.nickname || msgSender(m)
+
+
 const msgs = computed(() => store.chats[store.activeKey]?.msgs || [])
 
 /* ---------- 渲染列表：插入日期分隔 + 连续消息聚合 ---------- */
@@ -205,6 +222,14 @@ function openCtx(msg, e) {
 function closeCtx() {
   ctxMenu.value = null
 }
+/** 右键的是一条还没开封的封书/密码消息：菜单里只剩「打开（开封）」 */
+const ctxSealed = computed(() => isSealedEnvelope(ctxMenu.value?.msg))
+/** 信封上右键直接开封（菜单里就这一项，省得再瞄准气泡里的按钮） */
+function unlockFromCtx() {
+  const m = ctxMenu.value?.msg
+  closeCtx()
+  if (m) doUnlock(m)
+}
 function onCtxMouseDown(e) {
   const path = e.composedPath ? e.composedPath() : []
   if (path.includes(ctxMenuRef.value)) return
@@ -228,7 +253,7 @@ function startReply() {
   if (!m) return
   replyTarget.value = {
     preview: quotePreview(m),
-    nick: m.dir === 'out' ? t('me') : displayName(store.activeKey),
+    nick: msgSender(m),
   }
   closeCtx()
   nextTick(() => ta.value?.focus())
@@ -257,6 +282,12 @@ function startForward() {
 const secretOn = ref(false) // 封书（SECRETEXOPT）
 const pwdOn = ref(false) // 密码锁（PASSWORDOPT，仅密码功能开启时显示）
 
+/** 气泡里要渲染的附件：未开封的封书/密码消息连附件卡片一起遮住 ——
+ *  附件名、体积、下载入口同样是「信里」的内容，开封后才出现。 */
+function bubbleFiles(m) {
+  return isSealedEnvelope(m) ? [] : (m?.files || [])
+}
+
 /** 开封：封书直接开；密码锁需输入本机密码 */
 async function doUnlock(m) {
   if (!store.activeKey) return
@@ -276,18 +307,6 @@ async function doUnlock(m) {
   } catch (e) {
     alert(e)
   }
-}
-
-/* ---------- 广播（全网同报 BROADCASTOPT） ---------- */
-function startBroadcast() {
-  const text = draft.value.trim()
-  if (!text) {
-    alert(t('chat.alertFillContent'))
-    return
-  }
-  broadcastTo(text)
-    .then(() => alert(t('chat.broadcastSent')))
-    .catch((e) => alert(t('chat.alertSendFailed', { e })))
 }
 
 /* ---------- 撤回 ---------- */
@@ -374,7 +393,9 @@ function toggleSel(m) {
 
 function startMultiForward() {
   const peerNick = displayName(store.activeKey) || t('chat.peer')
-  const merged = mergeForward([...selected.value], (dir) => (dir === 'out' ? t('me') : peerNick))
+  const merged = mergeForward([...selected.value], (dir, m) =>
+    dir === 'out' ? t('me') : isBroadcast.value ? msgSender(m) : peerNick
+  )
   if (!merged) {
     alert(t('chat.alertNoForward'))
     return
@@ -440,6 +461,23 @@ async function doSend() {
   if (replyTarget.value) {
     text = composeReplyBody(replyTarget.value.preview, text)
     replyTarget.value = null
+  }
+  // 广播信箱：只发纯文本广播（记录与上屏由后端 msg-out 事件统一处理）。
+  // 加密/封书/附件对广播无意义，这里直接不发，避免静默降级成普通单聊。
+  if (isBroadcast.value) {
+    if (!text.trim()) return
+    if (pendingList.value.length) {
+      alert(t('broadcast.noFiles'))
+      return
+    }
+    try {
+      await broadcastTo(text)
+      draft.value = ''
+      autoBottom = true
+    } catch (e) {
+      alert(t('broadcast.failed', { e }))
+    }
+    return
   }
   try {
     const opts = { secret: secretOn.value, password: pwdOn.value }
@@ -687,6 +725,11 @@ function keyAtPoint(pos) {
 /** 把拖入的路径收进指定会话的待发送列表，等待用户按 Enter 发送 */
 function attachToPending(key, paths) {
   if (!key || !paths?.length) return
+  // 广播只承载纯文本：拖到广播条目上直接说明，别让附件静静躺在待发送区
+  if (isBroadcastKey(key)) {
+    alert(t('broadcast.noFiles'))
+    return
+  }
   pendingOf(key).push(...pendingFileItems(paths))
 }
 
@@ -1010,6 +1053,9 @@ const findHits = computed(() => {
   const q = findQuery.value.trim().toLowerCase()
   if (!q) return []
   return msgs.value.filter((m) => {
+    // 未开封的封书/密码消息不参与会话内查找：命中计数与跳转本身就会泄露
+    // 「这个词在这封还没拆的信里」，正文/附件名也一律不匹配
+    if (isSealedEnvelope(m)) return false
     if ((bodyOf(m) || '').toLowerCase().includes(q)) return true
     return (m.files || []).some((f) => (f.name || '').toLowerCase().includes(q))
   })
@@ -1155,7 +1201,15 @@ watch(
 
     <!-- 头部 -->
     <header v-if="activeUser" class="cw-head">
-      <div class="peer">
+      <!-- 广播信箱：不是某个对端，没有在线/离线之说，名字固定 -->
+      <div v-if="isBroadcast" class="peer">
+        <div class="name">{{ t('broadcast.name') }}</div>
+        <div class="sub">
+          <i class="stat on">📡 {{ t('broadcast.sub') }}</i>
+          <span class="bc-tip">{{ t('broadcast.tip') }}</span>
+        </div>
+      </div>
+      <div v-else class="peer">
         <div class="name">{{ displayName(store.activeKey) }}</div>
         <div class="sub">
           <i class="stat" :class="isOnline ? 'on' : 'off'">{{ isOnline ? '● ' + t('online') : '● ' + t('offline') }}</i>
@@ -1164,13 +1218,13 @@ watch(
         </div>
       </div>
       <div class="head-actions">
-        <button class="mini-btn" :title="t('chat.clearHistory')" @click="doClearHistory">
+        <button v-if="!isBroadcast" class="mini-btn" :title="t('chat.clearHistory')" @click="doClearHistory">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
             <path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13" stroke="currentColor" stroke-width="1.8"
               stroke-linecap="round" stroke-linejoin="round" />
           </svg>
         </button>
-        <button class="mini-btn" :title="t('chat.refreshUsers')" @click="refreshUsers">
+        <button v-if="!isBroadcast" class="mini-btn" :title="t('chat.refreshUsers')" @click="refreshUsers">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
             <path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
           </svg>
@@ -1229,15 +1283,25 @@ watch(
           :class="[v.m.dir === 'out' ? 'self' : 'peer', { merge: !v.firstOfCluster, selectable: selMode, picked: selected.has(v.m) }]"
           @click.stop="toggleSel(v.m)"
         >
-          <Avatar class="m-ava" :name="v.m.dir === 'out' ? store.config?.nickname : displayName(store.activeKey)"
-            :seed="v.m.dir === 'out' ? 'self' : store.activeKey" :size="34" />
+          <Avatar class="m-ava" :name="v.m.dir === 'out' ? store.config?.nickname : msgSender(v.m)"
+            :seed="v.m.dir === 'out' ? 'self' : msgSeed(v.m)" :size="34" />
           <div class="bubble-wrap">
-            <i v-if="selMode" class="sel-check" :class="{ on: selected.has(v.m) }" @click.stop="toggleSel(v.m)"></i>
+            <i v-if="selMode && !isSealedEnvelope(v.m)" class="sel-check"
+              :class="{ on: selected.has(v.m) }" @click.stop="toggleSel(v.m)"></i>
+            <!-- 广播信箱是一条会话里多个发送方（等同群聊）：头像不足以辨人，
+                 每条对端消息的簇首必须标出昵称。普通单聊只有一个对端，不标。 -->
+            <div v-if="isBroadcast && v.m.dir === 'in' && v.firstOfCluster" class="sender-line">
+              <span class="sender-name ellipsis" :title="msgSenderFull(v.m)">{{ msgSender(v.m) }}</span>
+              <span v-if="senderIpOf(v.m)" class="sender-ip">{{ senderIpOf(v.m) }}</span>
+            </div>
             <div class="bubble" :class="{ file: v.m.kind === 'file' }"
               @contextmenu.prevent="selMode ? null : openCtx(v.m, $event)">
-              <div v-if="(v.m.locked || (v.m.secret && !v.m.unlocked))" class="b-text locked">
+              <!-- 未开封的信封只可能是**收件人**看到的：自己发出的封书/密码消息
+                   正文就是我写的，显示信封既是错的文案（「对方发来的」），点开封
+                   还会因后端只查入站记录而报「找不到该消息」 -->
+              <div v-if="isSealedEnvelope(v.m)" class="b-text locked">
                 <span class="lock-ico">🔒</span>
-                <template v-if="v.m.locked && !v.m.unlocked">{{ t('chat.pwdLocked') }}</template>
+                <template v-if="isPasswordEnvelope(v.m)">{{ t('chat.pwdLocked') }}</template>
                 <template v-else>{{ t('chat.secretSealed') }}</template>
                 <button class="unlock-btn" @click.stop="doUnlock(v.m)">{{ t('chat.unlock') }}</button>
               </div>
@@ -1247,7 +1311,7 @@ watch(
                 </template>
                 <template v-else>{{ bodyOf(v.m) }}</template>
               </div>
-              <template v-for="f in v.m.files || []" :key="f.id">
+              <template v-for="f in bubbleFiles(v.m)" :key="f.id">
                 <!-- 图片：本地已有内容时直接内联预览，点击查看原图（多选模式下点击改为切换选中）；
                      自定义表情（命中表情库）按缩略尺寸渲染，不占满气泡 -->
                 <div v-if="isImg(f.name) && f.src" class="img-wrap" :class="{ 'sticker-wrap': isSticker(f) }">
@@ -1323,6 +1387,11 @@ watch(
               {{ t('chat.queuedNote') }}
             </div>
             <div class="m-time" :class="{ self: v.m.dir === 'out' }">
+              <!-- 封书标记：收发两端都标，不然封书和普通消息在流里长得一模一样
+                   （收发两端都是「这条按封书发的」，与开封与否无关） -->
+              <span v-if="showsSealTag(v.m)" class="seal-tag" :title="t('chat.secretSend')">
+                🔒 {{ t('chat.secretTag') }}
+              </span>
               <span v-if="v.m.dir === 'out' && v.m.rcpt && !v.m.queued" class="read-tag" :class="{ done: v.m.read }">
                 {{ v.m.read ? t('chat.read') : t('chat.unread') }}
               </span>
@@ -1340,15 +1409,22 @@ watch(
     <!-- 消息右键菜单 -->
     <div v-if="ctxMenu" ref="ctxMenuRef" class="ctx-menu"
       :style="{ position: 'fixed', left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }">
-      <button class="ctx-item" @click="copyMsg">{{ t('chat.copy') }}</button>
-      <button class="ctx-item" @click="startReply">{{ t('chat.reply') }}</button>
-      <button class="ctx-item" @click="startForward">{{ t('chat.forward') }}</button>
-      <button v-if="canAddToEmoji(ctxMenu.msg)" class="ctx-item" @click="addMsgToEmoji">
-        {{ t('emoji.addToEmoji') }}
-      </button>
-      <button v-if="ctxMenu.msg?.dir === 'out' && ctxMenu.msg?.kind === 'text' && !ctxMenu.msg?.recalled"
-        class="ctx-item danger" @click="startRecall">{{ t('chat.recall') }}</button>
-      <button class="ctx-item" @click="enterSelMode">{{ t('chat.multiSelect') }}</button>
+      <!-- 未开封的封书/密码消息：复制/回复/转发/加表情/多选都要把「信里」的内容
+           取出来用，开封前一律不提供，只留开封本身 -->
+      <template v-if="ctxSealed">
+        <button class="ctx-item" @click="unlockFromCtx">{{ t('chat.unlock') }}</button>
+      </template>
+      <template v-else>
+        <button class="ctx-item" @click="copyMsg">{{ t('chat.copy') }}</button>
+        <button class="ctx-item" @click="startReply">{{ t('chat.reply') }}</button>
+        <button class="ctx-item" @click="startForward">{{ t('chat.forward') }}</button>
+        <button v-if="canAddToEmoji(ctxMenu.msg)" class="ctx-item" @click="addMsgToEmoji">
+          {{ t('emoji.addToEmoji') }}
+        </button>
+        <button v-if="ctxMenu.msg?.dir === 'out' && ctxMenu.msg?.kind === 'text' && !ctxMenu.msg?.recalled"
+          class="ctx-item danger" @click="startRecall">{{ t('chat.recall') }}</button>
+        <button class="ctx-item" @click="enterSelMode">{{ t('chat.multiSelect') }}</button>
+      </template>
     </div>
 
     <!-- 转发（排除当前会话）/ 群发（默认含当前会话）的接收人选择 -->
@@ -1425,17 +1501,12 @@ watch(
             <circle cx="12" cy="15.5" r="1.2" fill="currentColor" />
           </svg>
         </button>
+        <!-- 封书：图标用信封，跟上面那把「密码锁」的锁形图标区分开 -->
         <button :class="{ on: secretOn }" :title="t('chat.secretSend')" @click="secretOn = !secretOn">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-            <rect x="4.5" y="10.5" width="15" height="9" rx="2" stroke="currentColor" stroke-width="1.6" />
-            <path d="M9 10.5V7.5a3 3 0 0 1 6 0v3" stroke="currentColor" stroke-width="1.6" />
-            <path d="M12 14v2.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
-          </svg>
-        </button>
-        <button :title="t('chat.broadcast')" @click="startBroadcast">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-            <circle cx="12" cy="12" r="2" fill="currentColor" />
-            <path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4M4.9 4.9a10 10 0 0 0 0 14.2M19.1 4.9a10 10 0 0 1 0 14.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+            <rect x="3" y="5.5" width="18" height="13" rx="2" stroke="currentColor" stroke-width="1.6" />
+            <path d="M4.2 7.2 12 12.8l7.8-5.6" stroke="currentColor" stroke-width="1.6"
+              stroke-linecap="round" stroke-linejoin="round" />
           </svg>
         </button>
       </div>
@@ -1477,7 +1548,7 @@ watch(
         ref="ta"
         v-model="draft"
         class="input-area"
-        :placeholder="t('chat.inputPh')"
+        :placeholder="isBroadcast ? t('broadcast.placeholder') : t('chat.inputPh')"
         spellcheck="false"
         @keydown="onKeydown"
       ></textarea>
@@ -1823,6 +1894,47 @@ watch(
 .read-tag {
   margin-right: 6px;
   color: var(--c-weak);
+}
+/* 封书标记：与只读的「未读/已读」同为时间行上的小徽标 */
+.seal-tag {
+  margin-right: 6px;
+  color: var(--c-accent);
+  cursor: help;
+}
+/* 信封占位里的「打开（开封）」：全局 button 重置（global.css 的
+   `button{border:none;background:none;color:inherit}`）会把它变成一段普通
+   文字，和前面的说明连成一句读，看不出哪截是按钮 —— 按气泡里内联动作链接
+   的样式给它上色（同 .fc-sub a） */
+.unlock-btn {
+  margin-left: 6px;
+  color: var(--c-link);
+}
+.unlock-btn:hover {
+  text-decoration: underline;
+}
+/* 广播信箱里的发送方标签（群聊式）：头像不足以辨人，簇首标昵称 + IP */
+.sender-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  max-width: 100%;
+  margin: 0 2px 2px;
+  font-size: 12px;
+  line-height: 16px;
+}
+.sender-name {
+  color: var(--c-text);
+  opacity: 0.9;
+  max-width: 220px;
+}
+.sender-ip {
+  color: var(--c-weak);
+  font-size: 11px;
+}
+/* 广播信箱头部：没有在线状态，用一行说明代替 */
+.bc-tip {
+  color: var(--c-weak);
+  margin-left: 6px;
 }
 .read-tag.done {
   color: var(--c-accent);

@@ -165,15 +165,23 @@ const zh = {
   'chat.recalledPeer': '对方撤回了一条消息',
   'chat.reedit': '重新编辑',
   'chat.secretSend': '封书（需对方点开查看）',
-  'chat.secretSealed': '封书：对方发来的保密消息，点击打开',
+  'chat.secretSealed': '封书：对方发来的保密消息',
+  // 时间行上的封书标记：收发两端都标（封书是这条消息本身的属性），
+  // 尤其让寄件人一眼看出「这条是按封书发出去的」
+  'chat.secretTag': '封书',
   'chat.pwdLock': '密码锁（对方需输入本机密码查看）',
   'chat.pwdLocked': '密码保护的消息',
   'chat.pwdPrompt': '请输入本机设置的密码以查看此消息：',
   'chat.unlock': '打开（开封）',
   'chat.unlockedOk': '已开封',
   'chat.unlockFail': '无法打开：{e}',
-  'chat.broadcast': '广播群发（全网络同报）',
-  'chat.broadcastSent': '已广播',
+  // 中栏常驻的「广播」信箱：收发的广播都在这里，会话名不随发送方变化
+  'broadcast.name': '广播',
+  'broadcast.sub': '全网同报',
+  'broadcast.placeholder': '发广播给全网…',
+  'broadcast.tip': '此处发出的每条消息都会广播给全网络所有客户端；其他人发来的广播也汇集在这里。',
+  'broadcast.noFiles': '广播不支持发送文件',
+  'broadcast.failed': '广播发送失败：{e}',
   'chat.leave': '离开',
   'chat.multiSelect': '多选',
   'chat.selected': '已选 {n} 条',
@@ -324,6 +332,8 @@ const zh = {
   // ---- 通知预览 / 日期 ----
   'preview.etc': ' 等{n}个',
   'preview.offline': '[离线留言]',
+  'preview.sealed': '[封书] 未开封',
+  'preview.locked': '[密码锁] 未开封',
 }
 
 const en = {
@@ -432,15 +442,20 @@ const en = {
   'chat.recalledPeer': 'The other party recalled a message',
   'chat.reedit': 'Re-edit',
   'chat.secretSend': 'Sealed message (receiver must open)',
-  'chat.secretSealed': 'Sealed message from peer, click to open',
+  'chat.secretSealed': 'Sealed message from peer',
+  'chat.secretTag': 'Sealed',
   'chat.pwdLock': 'Password lock (receiver needs local password)',
   'chat.pwdLocked': 'Password-protected message',
   'chat.pwdPrompt': 'Enter the local password to view this message:',
   'chat.unlock': 'Open (unseal)',
   'chat.unlockedOk': 'Unsealed',
   'chat.unlockFail': 'Cannot open: {e}',
-  'chat.broadcast': 'Broadcast to everyone',
-  'chat.broadcastSent': 'Broadcast sent',
+  'broadcast.name': 'Broadcast',
+  'broadcast.sub': 'to everyone',
+  'broadcast.placeholder': 'Broadcast to everyone…',
+  'broadcast.tip': 'Every message sent here is broadcast to all clients on the network; broadcasts from others land here too.',
+  'broadcast.noFiles': 'Broadcasts cannot carry files',
+  'broadcast.failed': 'Broadcast failed: {e}',
   'chat.leave': 'Away',
   'chat.multiSelect': 'Select',
   'chat.selected': '{n} selected',
@@ -591,6 +606,8 @@ const en = {
   // ---- 通知预览 / 日期 ----
   'preview.etc': ' and {n} more',
   'preview.offline': '[Offline message]',
+  'preview.sealed': '[Sealed message] unopened',
+  'preview.locked': '[Password lock] unopened',
 }
 
 const MESSAGES = { 'zh-CN': zh, en }

@@ -2317,8 +2317,9 @@ async fn extended_protocols() -> bool {
     let secret_sent = wait_for(2000, || ext.lock().unwrap().secret_flags.contains(&true)).await;
     log.check("E: 封书发出带 SECRETOPT", secret_sent);
 
-    // 对端发来无密码封书（SECRETEXOPT = SECRET|READCHECK）：正文自动展示但仍未读，
-    // 只有会话可见并走现有 mark-read 路径后才回 READMSG。
+    // 对端发来无密码封书（SECRETEXOPT = SECRET|READCHECK）：接收端保持**未开封** ——
+    // 正文此刻已在本地（载荷对收件人解封过），但不上屏，也不回 READMSG；
+    // 只有收件人显式「打开（开封）」之后正文才可见、回执才发。
     let secret_pkt = proto::next_packet_no();
     let mut s = proto::Packet::new(cmd::SENDMSG | opt::SECRETEXOPT).with_pkt_no(secret_pkt);
     s.extra = "请开封查看的封书".as_bytes().to_vec();
@@ -2333,21 +2334,31 @@ async fn extended_protocols() -> bool {
                 && v["msg"]["pkt"].as_u64() == Some(secret_pkt as u64)
                 && v["msg"]["secret"].as_bool() == Some(true)
                 && v["msg"]["locked"].as_bool() == Some(false)
-                && v["msg"]["unlocked"].as_bool() == Some(true)
+                && v["msg"]["unlocked"].as_bool() == Some(false)
                 && v["msg"]["read"].as_bool() == Some(false)
         })
     })
     .await;
-    log.check("E: 无密码封书入站自动展示但仍未读", secret_in);
+    log.check("E: 无密码封书入站保持未开封（信封占位）", secret_in);
     tokio::time::sleep(Duration::from_millis(300)).await;
     log.check(
-        "E: 无密码封书在显式标记前不发 READMSG",
+        "E: 未开封的封书不发 READMSG",
         !ext.lock().unwrap().receipts.contains(&secret_pkt),
     );
-    let sent1 = net::mark_read_and_receipt(&ctx, &peer_key, &[secret_pkt])
+    // 会话可见触发的「标记已读」不能替收件人拆信：门控在 pending_receipts 里
+    let sent_locked = net::mark_read_and_receipt(&ctx, &peer_key, &[secret_pkt])
         .await
-        .expect("mark secret");
-    log.check("E: 显式标记无密码封书后发送 READMSG", sent1 == 1);
+        .expect("mark sealed");
+    log.check("E: 未开封时标记已读仍不回 READMSG", sent_locked == 0);
+    log.check(
+        "E: 未开封时标记已读不改写 unlocked",
+        st.find_history_pkt(&peer_key, secret_pkt)
+            .map(|r| r["unlocked"].as_bool() == Some(false))
+            .unwrap_or(false),
+    );
+    net::unlock_message(&ctx, &peer_key, secret_pkt, None)
+        .await
+        .expect("unlock secret");
     let receipt_seen = wait_for(2000, || {
         ext.lock()
             .unwrap()
@@ -2358,11 +2369,11 @@ async fn extended_protocols() -> bool {
             == 1
     })
     .await;
-    log.check("E: 显式标记后恰好收到一条 READMSG", receipt_seen);
+    log.check("E: 开封后恰好收到一条 READMSG", receipt_seen);
     let sent_again = net::mark_read_and_receipt(&ctx, &peer_key, &[secret_pkt])
         .await
         .expect("mark secret again");
-    log.check("E: 重复标记无密码封书不重复发送回执", sent_again == 0);
+    log.check("E: 重复标记已开封的封书不重复发送回执", sent_again == 0);
     tokio::time::sleep(Duration::from_millis(300)).await;
     log.check(
         "E: 重复标记后仍只有一条 READMSG",
@@ -2375,7 +2386,7 @@ async fn extended_protocols() -> bool {
             == 1,
     );
     log.check(
-        "E: 无密码封书记录保持 unlocked",
+        "E: 开封后记录 unlocked 且已读",
         st.find_history_pkt(&peer_key, secret_pkt)
             .map(|r| {
                 r["secret"].as_bool() == Some(true)
@@ -2758,19 +2769,22 @@ async fn extended_protocols() -> bool {
                 event == "msg-in"
                     && value["msg"]["pkt"].as_u64() == Some(secret_pkt as u64)
                     && value["msg"]["secret"].as_bool() == Some(true)
-                    && value["msg"]["unlocked"].as_bool() == Some(true)
+                    && value["msg"]["unlocked"].as_bool() == Some(false)
                     && value["msg"]["sig_ok"].as_bool() == Some(true)
             })
         })
         .await;
-        log.check("E: EncIPDict 保留官方 SECRETOPT 封书语义", secret_emitted);
         log.check(
-            "E: EncIPDict 封书历史保留 secret=true 且自动解锁",
+            "E: EncIPDict 保留官方 SECRETOPT 封书语义（信封占位）",
+            secret_emitted,
+        );
+        log.check(
+            "E: EncIPDict 封书历史保留 secret=true 且未开封",
             st.read_history(&peer_key, 200).iter().any(|record| {
                 record["dir"] == "in"
                     && record["pkt"].as_u64() == Some(secret_pkt as u64)
                     && record["secret"].as_bool() == Some(true)
-                    && record["unlocked"].as_bool() == Some(true)
+                    && record["unlocked"].as_bool() == Some(false)
             }),
         );
     }

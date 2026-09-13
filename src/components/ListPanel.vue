@@ -2,7 +2,7 @@
 // 中栏：联系人列表（按群组分组，固定显示，未读角标提示新消息；右键可删除会话）
 import { computed, ref, watch } from 'vue'
 import { confirm as confirmDialog } from '@tauri-apps/plugin-dialog'
-import { store, openChat, onSearchInput, openHit, displayName, fmtTime, deleteContact, getAbsenceInfoFor } from '../store'
+import { store, openChat, onSearchInput, openHit, displayName, fmtTime, deleteContact, getAbsenceInfoFor, isBroadcastKey } from '../store'
 import { makeSnippet } from '../lib/text'
 import { t } from '../lib/i18n'
 import Avatar from './Avatar.vue'
@@ -58,6 +58,9 @@ const ctxMenu = ref(null)
 const ctxMenuRef = ref(null)
 
 function openContactCtx(u, e) {
+  // 广播信箱是常驻条目：既不能删（删了立刻回来），也没有别的会话操作，
+  // 索性不给菜单，避免"点了删除却没变化"的错觉
+  if (isBroadcastKey(u.key)) return
   ctxMenu.value = {
     x: Math.min(e.clientX, window.innerWidth - 140),
     y: Math.min(e.clientY, window.innerHeight - 72),
@@ -127,21 +130,24 @@ async function doDeleteContact() {
           :key="u.key"
           class="row contact"
           :data-user-key="u.key"
-          :class="{ active: store.activeKey === u.key, off: !u.online, 'drag-hover': store.dragHoverKey === u.key }"
+          :class="{ active: store.activeKey === u.key, off: !u.online && !isBroadcastKey(u.key), 'drag-hover': store.dragHoverKey === u.key }"
           @click="openContact(u)"
           @contextmenu.prevent="openContactCtx(u, $event)"
         >
           <div class="ava">
-            <Avatar :name="u.nickname || u.user || '?'" :seed="u.key" :size="36" />
-            <i class="status-dot" :class="u.online ? 'on' : 'off'" :title="u.online ? t('online') : t('offline')"></i>
+            <Avatar :name="isBroadcastKey(u.key) ? t('broadcast.name') : (u.nickname || u.user || '?')" :seed="u.key" :size="36" />
+            <!-- 广播信箱不是对端，没有在线/离线可言：用固定的 📡 取代状态点 -->
+            <i v-if="isBroadcastKey(u.key)" class="status-dot bc" :title="t('broadcast.sub')">📡</i>
+            <i v-else class="status-dot" :class="u.online ? 'on' : 'off'" :title="u.online ? t('online') : t('offline')"></i>
           </div>
           <div class="mid">
             <div class="r1 ellipsis">
-              {{ u.nickname || u.user || t('unknownUser') }}
+              {{ isBroadcastKey(u.key) ? t('broadcast.name') : (u.nickname || u.user || t('unknownUser')) }}
               <span v-if="u.online && u.absence" class="away-tag" :title="u.absence_text || t('chat.leave')"
   @click.stop="getAbsenceInfoFor(u.key).catch(() => {})">{{ t('chat.leave') }}</span>
             </div>
-            <div class="r2 ellipsis">{{ u.host || '' }}{{ u.ip ? ' · ' + u.ip : '' }}{{ u.group ? ' · ' + u.group : '' }}</div>
+            <div v-if="isBroadcastKey(u.key)" class="r2 ellipsis">{{ t('broadcast.tip') }}</div>
+            <div v-else class="r2 ellipsis">{{ u.host || '' }}{{ u.ip ? ' · ' + u.ip : '' }}{{ u.group ? ' · ' + u.group : '' }}</div>
           </div>
           <div class="right">
             <i v-if="store.unread[u.key]" class="badge">
@@ -185,6 +191,7 @@ async function doDeleteContact() {
       class="ctx-menu"
       :style="{ position: 'fixed', left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }"
     >
+      <!-- 广播信箱不对应任何对端，右键菜单在 openContactCtx 里直接不弹 -->
       <button class="ctx-item danger" @click="doDeleteContact">{{ t('list.deleteSession') }}</button>
     </div>
   </aside>
@@ -321,6 +328,19 @@ async function doDeleteContact() {
 /* 离线会话：灰点，整行弱化 */
 .status-dot.off {
   background: var(--c-weak);
+}
+/* 广播信箱：不是对端，用 📡 取代在线状态点（不参与在线/离线语义） */
+.status-dot.bc {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--c-accent);
+  font-size: 8px;
+  line-height: 1;
+  font-style: normal;
 }
 .row.contact.off .r1 {
   color: var(--c-sub);

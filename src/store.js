@@ -10,7 +10,11 @@ import { splitDelayedNote } from './lib/text'
 import { pickLatestUnread, pickLatestActive, applyUnreadFromSessions } from './lib/unread'
 import { unreadReceiptPkts } from './lib/receipts'
 import { mergeSessions } from './lib/sessions'
+import {
+  BROADCAST_SESSION_KEY, isBroadcastSession, senderOf, senderIp,
+} from './lib/sessions'
 import { normalizeEmojis } from './lib/emoji'
+import { sealedPreviewKey } from './lib/secret'
 import { applyTheme } from './lib/theme'
 import { t, setLocale, detectLocale, dayLabel as i18nDayLabel } from './lib/i18n'
 
@@ -74,6 +78,27 @@ export function fmtTime(ts) {
 /** 消息流中的日期分隔标签（文案按当前界面语言） */
 export const dayLabel = (ts) => i18nDayLabel(ts)
 
+/** 「广播」信箱的固定会话 key（与后端 state::BROADCAST_SESSION_KEY 一致）：
+ *  收发的广播都进这一个常驻条目，不按发送方拆成多个会话 */
+export const BROADCAST_KEY = BROADCAST_SESSION_KEY
+
+/** 会话是否就是「广播」信箱 */
+export const isBroadcastKey = isBroadcastSession
+
+/** 会话列表里显示的名字：广播信箱固定叫「广播」，不随最新发送方改名 */
+export function sessionName(key) {
+  if (isBroadcastKey(key)) return t('broadcast.name')
+  return displayName(key)
+}
+
+/** 广播信箱里每条消息的发送方名（纯函数，见 lib/sessions.js；文案在此注入） */
+export function msgSenderName(m) {
+  return senderOf(m, { me: t('me'), unknown: t('unknown') })
+}
+
+/** 发送方 IP：同一昵称可能有多台机器，气泡标签右侧给出 IP 便于区分 */
+export const senderIpOf = senderIp
+
 export function displayName(key) {
   const u = store.userMap[key]
   if (u && u.nickname) return u.nickname
@@ -136,6 +161,7 @@ export async function loadSessions() {
         store.peerMeta[s.key] = {
           nickname: clean(s.nickname) || clean(s.key),
           host: clean(s.host),
+          ip: clean(s.ip),
           group: clean(s.group),
         }
       }
@@ -316,6 +342,10 @@ async function notify(key, title, body) {
 export { splitDelayedNote }
 
 export function previewText(msg) {
+  // 未开封的封书/密码消息：通知正文里也不能带出「信里」的内容，否则气泡上
+  // 遮住了、系统通知却把正文弹在屏幕上（与信封占位是同一条规则）。
+  const sealedKey = sealedPreviewKey(msg)
+  if (sealedKey) return t(sealedKey)
   if (msg.kind === 'file') {
     const n = (msg.files || []).length
     const name = msg.files?.[0]?.name || ''
@@ -406,7 +436,8 @@ export function setAbsence(on, text) {
   return ipc.setAbsence(on, text)
 }
 
-/** 广播群发（BROADCASTOPT 同报；本地不留历史） */
+/** 广播群发（BROADCASTOPT 同报）。
+ *  历史由后端写入「广播」信箱并发 msg-out 事件，这里不重复上屏。 */
 export function broadcastTo(text) {
   return ipc.broadcastMessage(text)
 }
@@ -596,6 +627,13 @@ export async function boot() {
       notify(key, displayName(key), previewText(msg))
     }
   })
+  // 广播信箱里「自己发出的广播」：后端已落库，这里只上屏。
+  // 不算未读、不弹通知、不标已读 —— 是自己发的，不是对端消息。
+  await ipc.listenEvent(ipc.EVT.msgOut, async ({ key, msg }) => {
+    if (!key || !msg) return
+    await pushMsg(key, msg)
+  })
+
   // 托盘唤起主窗口：跳到最新未读会话（没有未读就跳到最近活动的会话）。
   // 切会话必须先做——show/setFocus 抛错不能挡住 openChat（Wayland 重映射后
   // 窗口操作偶发异常会吞掉后面的代码，open-chat 曾踩过同一个坑）。

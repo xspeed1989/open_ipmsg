@@ -138,15 +138,29 @@ pub struct PendingOut {
     /// 旧版队列 JSON 没有此字段，serde default 保证兼容加载。
     #[serde(default)]
     pub paths: Vec<String>,
+    /// 发送时生效的封书标志（SECRETEXOPT）：离线重投时必须原样带上，
+    /// 否则「对方不在线时发的封书」上线后会变成普通消息。
+    #[serde(default)]
+    pub secret: bool,
+    /// 发送时生效的密码锁标志（PASSWORDOPT）
+    #[serde(default)]
+    pub password: bool,
 }
 
 /// 历史会话摘要（中栏「离线会话」数据源）
 #[derive(Serialize, Clone, Debug)]
 pub struct SessionInfo {
     pub key: String,
+    /// 会话对端 IP。广播会话（key=255.255.255.255）靠记录内 peer.ip 快照回填，
+    /// 否则中栏只能显示主机名、看不出是哪台机器发的。
+    #[serde(default)]
+    pub ip: String,
     pub nickname: String,
     pub host: String,
     pub group: String,
+    /// 置顶常驻（广播信箱）：中栏永远显示在最前，不随时间沉底
+    #[serde(default)]
+    pub pinned: bool,
     /// 该会话最近一条消息的时间戳
     pub last_ts: u64,
     /// 未读入站消息数（read=false 的 in 记录）。
@@ -216,6 +230,11 @@ pub struct RetryOut {
     pub paths: Vec<String>,
     /// 首次登记的文件条目（ID 必须原样复用，重投公告与首投一致）
     pub entries: Vec<crate::protocol::FileEntry>,
+    /// 首投时生效的封书标志（SECRETEXOPT）——重发必须原样带上，
+    /// 否则对端会收到同包号的「普通消息」副本，封书被静默降级
+    pub secret: bool,
+    /// 首投时生效的密码锁标志（PASSWORDOPT，含本机密码开关的判定）
+    pub password: bool,
     pub ts: u64,
     pub attempts: u32,
 }
@@ -237,6 +256,13 @@ pub struct DirMember {
 
 /// 文件槽保留时长：对端可能延迟很久才来取，但也不能无限累积
 pub const OFFER_TTL_SECS: u64 = 24 * 3600;
+
+/// 「广播」会话的固定 key（历史遗留写法，沿用可免迁移）。
+///
+/// 它是一个**常驻信箱**而不是某个对端：收到的广播与本地发出的广播都落在这里，
+/// 中栏因此始终有一个可点进去发广播的条目。历史文件 `logs/255.255.255.255.jsonl`
+/// 继续有效；因为该 key 不是合法对端 IP，广播伪条目也不会和真实联系人撞身份。
+pub const BROADCAST_SESSION_KEY: &str = "255.255.255.255";
 
 type EventFn = Box<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 
@@ -1352,6 +1378,9 @@ impl AppState {
                 text: it.text.clone(),
                 ts: it.ts,
                 paths: it.paths.clone(),
+                // 转投递也要保住封书/密码锁：对方回来时收到的仍是原来的消息
+                secret: it.secret,
+                password: it.password,
             });
         }
         self.clear_retry(key);
@@ -1790,6 +1819,17 @@ impl AppState {
                             .collect()
                     })
                     .unwrap_or_default();
+                // 未开封的封书/密码消息：正文与附件名都还在「信里」，既不参与
+                // 匹配、也不回传给中栏命中行 —— 否则搜一下就把收件人还没开封的
+                // 内容印在了列表上（与气泡上的信封占位是同一条规则）。
+                // 开封后（unlocked=true）照常可搜。
+                let sealed = rec.get("dir").and_then(|v| v.as_str()) == Some("in")
+                    && rec.get("unlocked").and_then(|v| v.as_bool()) != Some(true)
+                    && (rec.get("secret").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || rec.get("locked").and_then(|v| v.as_bool()).unwrap_or(false));
+                if sealed {
+                    continue;
+                }
 
                 let in_text = text.to_lowercase().contains(&needle);
                 let in_files = file_names
@@ -1842,10 +1882,21 @@ impl AppState {
     /// 被用户删除（隐藏）的会话直接排除——文件虽已删除，仍防御性过滤。
     pub fn list_sessions(&self) -> Vec<SessionInfo> {
         let _g = self.hist_lock.lock().unwrap();
+        // 广播信箱是常驻条目，与 logs/ 是否存在无关（首启、清空历史后都要能发广播）
+        let mut out: Vec<SessionInfo> = vec![SessionInfo {
+            key: BROADCAST_SESSION_KEY.to_string(),
+            ip: String::new(),
+            nickname: String::new(),
+            host: String::new(),
+            group: String::new(),
+            pinned: true,
+            last_ts: 0,
+            unread: 0,
+            unread_ts: 0,
+        }];
         let Ok(rd) = std::fs::read_dir(&self.logs_dir) else {
-            return Vec::new();
+            return out;
         };
-        let mut out: Vec<SessionInfo> = Vec::new();
         for ent in rd.flatten() {
             let path = ent.path();
             if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
@@ -1867,6 +1918,7 @@ impl AppState {
             };
             let mut key = stem.clone();
             let (mut nickname, mut host, mut group) = (String::new(), String::new(), String::new());
+            let mut ip = String::new();
             let mut last_ts = 0u64;
             let mut unread = 0u32;
             let mut unread_ts = 0u64;
@@ -1905,6 +1957,13 @@ impl AppState {
                         nickname = n.to_string();
                     }
                 }
+                // 对端 IP：记录内快照优先（广播会话只有快照能给出真实发送方），
+                // 旧记录没有该字段时退化为会话 key（单播会话 key 即 IP）
+                if let Some(snapshot) = peer.get("ip").and_then(|v| v.as_str()) {
+                    if !snapshot.is_empty() {
+                        ip = snapshot.to_string();
+                    }
+                }
                 if let Some(h) = peer.get("host").and_then(|v| v.as_str()) {
                     if !h.is_empty() {
                         host = h.to_string();
@@ -1919,17 +1978,59 @@ impl AppState {
             if self.is_hidden(&key) {
                 continue;
             }
+            if ip.is_empty() && key.parse::<std::net::IpAddr>().is_ok() {
+                ip = key.clone();
+            }
+            let pinned = key == BROADCAST_SESSION_KEY;
+            if pinned {
+                // 广播信箱是「发给所有人」的公共频道，用某个发送方的昵称/主机
+                // 命名会让条目随最新一条广播改名换姓 —— 这里一律留空，界面统一
+                // 显示为「广播」，发送方身份由每条消息自己的快照承担。
+                nickname.clear();
+                host.clear();
+                group.clear();
+                ip.clear();
+                // 常驻条目已在 out 里，就地补上统计，避免出现两个「广播」
+                if let Some(entry) = out.iter_mut().find(|s| s.key == BROADCAST_SESSION_KEY) {
+                    entry.last_ts = last_ts;
+                    entry.unread = unread;
+                    entry.unread_ts = unread_ts;
+                }
+                continue;
+            }
             out.push(SessionInfo {
                 key,
+                ip,
                 nickname,
                 host,
                 group,
+                pinned,
                 last_ts,
                 unread,
                 unread_ts,
             });
         }
-        out.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+        // 广播信箱无历史（或文件被清空）时也要常驻，否则用户找不到发广播的入口；
+        // 文件存在时上面已按其记录补出条目，这里只做去重兜底。
+        if !out.iter().any(|s| s.key == BROADCAST_SESSION_KEY) {
+            out.push(SessionInfo {
+                key: BROADCAST_SESSION_KEY.to_string(),
+                ip: String::new(),
+                nickname: String::new(),
+                host: String::new(),
+                group: String::new(),
+                pinned: true,
+                last_ts: 0,
+                unread: 0,
+                unread_ts: 0,
+            });
+        }
+        // 置顶条目恒在最前，其余按最近消息倒序
+        out.sort_by(|a, b| {
+            b.pinned
+                .cmp(&a.pinned)
+                .then_with(|| b.last_ts.cmp(&a.last_ts))
+        });
         out
     }
 
@@ -2294,6 +2395,15 @@ mod tests {
         AppState::new(dir)
     }
 
+    /// 中栏可见的**对端**会话（滤掉常驻的广播信箱）——断言"某个会话在不在列表里"
+    /// 时用它，避免每个用例都要手动跳过置顶条目。
+    fn visible_sessions(st: &AppState) -> Vec<SessionInfo> {
+        st.list_sessions()
+            .into_iter()
+            .filter(|s| s.key != super::BROADCAST_SESSION_KEY)
+            .collect()
+    }
+
     /// 日志开关（--log 运行时参数）：
     /// - 默认关闭：diag() 不创建、不写入诊断文件
     /// - 打开后：diag() 写入 diag.log
@@ -2517,6 +2627,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
+    /// 未开封的封书/密码消息不参与检索：命中行会直接把「信里」的正文印在中栏上。
+    #[test]
+    fn search_history_hides_unopened_sealed_messages() {
+        let st = temp_state("search-sealed");
+        let a = "10.0.0.7:2425";
+        let peer = serde_json::json!({"key":a,"nickname":"老王"});
+        // 未开封封书（无密码）
+        st.log_record(
+            a,
+            &serde_json::json!({
+                "dir":"in","kind":"file","text":"未拆封的密信正文","pkt":1,"ts":100,
+                "secret":true,"locked":false,"unlocked":false,
+                "files":[{"id":1,"name":"密件.pdf","size":10}],
+                "peer":peer
+            }),
+        );
+        // 未开封密码锁
+        st.log_record(
+            a,
+            &serde_json::json!({
+                "dir":"in","kind":"text","text":"口令内容","pkt":2,"ts":200,
+                "secret":false,"locked":true,"unlocked":false,
+                "peer":peer
+            }),
+        );
+        // 已开封的封书：照常可搜
+        st.log_record(
+            a,
+            &serde_json::json!({
+                "dir":"in","kind":"text","text":"开封后的密信正文","pkt":3,"ts":300,
+                "secret":true,"locked":false,"unlocked":true,
+                "peer":peer
+            }),
+        );
+        // 自己发出的封书：正文本来就是自己写的
+        st.log_record(
+            a,
+            &serde_json::json!({
+                "dir":"out","kind":"text","text":"我发出去的封书","pkt":4,"ts":400,
+                "secret":true,
+                "peer":peer
+            }),
+        );
+
+        assert!(st.search_history("未拆封", None, 50).is_empty(), "未开封的正文不可搜");
+        assert!(st.search_history("密件", None, 50).is_empty(), "未开封的附件名也不可搜");
+        assert!(st.search_history("口令", None, 50).is_empty(), "未开封的密码消息不可搜");
+        let opened = st.search_history("开封后", None, 50);
+        assert_eq!(opened.len(), 1, "开封后照常可搜");
+        assert_eq!(opened[0]["pkt"], 3);
+        // 同一个词：只命中已开封的那条，未开封的仍然不出现
+        let sealed_word = st.search_history("密信", None, 50);
+        assert_eq!(sealed_word.len(), 1);
+        assert_eq!(sealed_word[0]["pkt"], 3);
+        assert_eq!(st.search_history("我发出去", None, 50).len(), 1, "出站封书不受影响");
+    }
+
     #[test]
     fn clear_history_removes_records() {
         let st = temp_state("clear");
@@ -2553,12 +2720,12 @@ mod tests {
             "10.0.0.9",
             &serde_json::json!({"dir":"out","pkt":2,"ts":2,"text":"b"}),
         );
-        assert_eq!(st.list_sessions().len(), 1);
+        assert_eq!(visible_sessions(&st).len(), 1);
         assert!(!st.is_hidden("10.0.0.9"));
 
         assert_eq!(st.delete_contact("10.0.0.9"), 2, "返回被删掉的记录条数");
         assert!(st.is_hidden("10.0.0.9"));
-        assert!(st.list_sessions().is_empty(), "删除后会话不再出现在列表");
+        assert!(visible_sessions(&st).is_empty(), "删除后会话不再出现在列表");
         assert!(st.read_history("10.0.0.9", 10).is_empty(), "记录文件已删除");
 
         // 对方重新发消息：历史重建，但列表仍隐藏（等待 unhide 恢复）
@@ -2566,13 +2733,13 @@ mod tests {
             "10.0.0.9",
             &serde_json::json!({"dir":"in","pkt":3,"ts":3,"text":"c"}),
         );
-        assert!(st.list_sessions().is_empty(), "恢复前仍隐藏");
+        assert!(visible_sessions(&st).is_empty(), "恢复前仍隐藏");
 
         // 收到对方消息（unhide_contact）后会话重新出现
         assert!(st.unhide_contact("10.0.0.9"));
         assert!(!st.unhide_contact("10.0.0.9"), "未隐藏的会话恢复是空操作");
         assert!(!st.is_hidden("10.0.0.9"));
-        assert_eq!(st.list_sessions().len(), 1, "恢复后重新出现在列表");
+        assert_eq!(visible_sessions(&st).len(), 1, "恢复后重新出现在列表");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -2592,7 +2759,7 @@ mod tests {
         // 重启：hidden_contacts.json 落盘，隐藏集合原样恢复
         let st2 = AppState::new(dir.clone());
         assert!(st2.is_hidden("192.168.1.5"));
-        assert!(st2.list_sessions().is_empty());
+        assert!(visible_sessions(&st2).is_empty());
         assert!(!st2.is_hidden("192.168.1.6"), "未删除的 key 不受影响");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2813,6 +2980,8 @@ mod tests {
             text: "等你上线".into(),
             ts: 100,
             paths: vec!["/tmp/a.zip".into(), "/tmp/docs".into()],
+            secret: true,
+            password: false,
         }));
         let list = st.pending_for("10.0.0.9");
         assert_eq!(list.len(), 1);
@@ -2831,6 +3000,7 @@ mod tests {
         assert_eq!(list2.len(), 1, "重启不丢待投递");
         assert_eq!(list2[0].text, "等你上线");
         assert_eq!(list2[0].paths.len(), 2, "重启后附件路径仍在");
+        assert!(list2[0].secret, "重启后封书标志仍在");
 
         // 收到 RECVMSG 确认后出队
         assert!(st2.ack_pending("10.0.0.9", 777));
@@ -2869,11 +3039,57 @@ mod tests {
                 text: "x".into(),
                 ts: 1,
                 paths: vec![],
+                secret: false,
+                password: false,
             });
         }
         let taken = st.take_pending("10.0.0.9");
         assert_eq!(taken.len(), 3);
         assert!(st.pending_for("10.0.0.9").is_empty(), "取出后即清空");
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn session_summary_keeps_broadcast_mailbox_identity_free() {
+        let st = temp_state("sessions-ip");
+        std::fs::create_dir_all(&st.logs_dir).unwrap();
+        // 广播伪会话：会话 key 是 255.255.255.255，真实发送方只能靠快照给
+        st.log_record(
+            "255.255.255.255",
+            &serde_json::json!({
+                "dir": "in", "pkt": 7, "ts": 200, "text": "Hello", "broadcast": true,
+                "peer": {"key": "255.255.255.255", "ip": "192.168.2.115",
+                         "nickname": "ubuntu", "host": "john-VMware-Virtual-Platform"}
+            }),
+        );
+        // 旧记录（本次修复前落库）没有 peer.ip：退化为会话 key，老会话不因此丢 IP
+        st.log_record(
+            "10.0.0.5",
+            &serde_json::json!({
+                "dir": "in", "pkt": 8, "ts": 100, "text": "old",
+                "peer": {"key": "10.0.0.5", "nickname": "小王", "host": "pc-wang"}
+            }),
+        );
+        let by_key: std::collections::HashMap<_, _> = st
+            .list_sessions()
+            .into_iter()
+            .map(|s| (s.key.clone(), s))
+            .collect();
+        // 广播信箱是全网络共用的一个条目：名字固定叫「广播」，不挂任何发送方身份
+        let broadcast = &by_key[super::BROADCAST_SESSION_KEY];
+        assert!(broadcast.pinned, "广播信箱置顶常驻");
+        assert_eq!(broadcast.nickname, "", "不随最新一条广播改名换姓");
+        assert_eq!(broadcast.host, "");
+        assert_eq!(broadcast.ip, "");
+        assert_eq!(broadcast.last_ts, 200, "但时间/未读仍随广播刷新");
+        // 发送方身份改由记录快照承担（界面按每条消息显示）
+        let rec = st
+            .find_history_pkt(super::BROADCAST_SESSION_KEY, 7)
+            .expect("广播记录");
+        assert_eq!(rec["peer"]["ip"].as_str(), Some("192.168.2.115"));
+        assert_eq!(rec["peer"]["nickname"].as_str(), Some("ubuntu"));
+        // 普通会话照旧带上自己的 IP（旧记录没有快照则退化为会话 key）
+        assert_eq!(by_key["10.0.0.5"].ip, "10.0.0.5");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -2898,7 +3114,9 @@ mod tests {
             }),
         );
         let list = st.list_sessions();
-        assert_eq!(list.len(), 2, "两个有历史的会话都列出");
+        // 广播信箱是常驻条目（pinned），不计入"有历史的会话"
+        let chats: Vec<_> = list.iter().filter(|s| !s.pinned).collect();
+        assert_eq!(chats.len(), 2, "两个有历史的会话都列出");
         let by_key: std::collections::HashMap<_, _> =
             list.iter().map(|s| (s.key.as_str(), s)).collect();
         assert_eq!(by_key[a].nickname, "小王");
@@ -2909,11 +3127,16 @@ mod tests {
             "无 peer 快照时按文件名校出 key，时间取最大"
         );
         assert_eq!(by_key[b].key, b);
-        // 按最近时间倒序
-        assert_eq!(list[0].key, b);
-        // 无历史时返回空
+        // 置顶的广播信箱在最前，其余按最近时间倒序
+        assert_eq!(list[0].key, super::BROADCAST_SESSION_KEY);
+        assert_eq!(chats[0].key, b);
+        // 无历史时也常驻广播信箱（否则没有发广播的入口），且再无别的会话
         let st2 = temp_state("sessions2");
-        assert!(st2.list_sessions().is_empty());
+        let list2 = st2.list_sessions();
+        assert_eq!(list2.len(), 1);
+        assert_eq!(list2[0].key, super::BROADCAST_SESSION_KEY);
+        assert!(list2[0].pinned, "广播信箱置顶");
+        assert_eq!(list2[0].last_ts, 0, "无历史时时间为 0，排在最前但不冒泡");
         let _ = std::fs::remove_dir_all(&st.data_dir);
         let _ = std::fs::remove_dir_all(&st2.data_dir);
     }
@@ -2924,7 +3147,9 @@ mod tests {
         std::fs::create_dir_all(&st.logs_dir).unwrap();
         // 迁移遗漏的旧命名文件（防御性跳过，不当作两个会话）
         std::fs::write(st.logs_dir.join("10.0.0.6_2425.jsonl"), "{}\n").unwrap();
-        assert!(st.list_sessions().is_empty());
+        let list = st.list_sessions();
+        assert_eq!(list.len(), 1, "旧命名文件不当会话，只剩常驻的广播信箱");
+        assert_eq!(list[0].key, super::BROADCAST_SESSION_KEY);
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 

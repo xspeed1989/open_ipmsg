@@ -164,6 +164,47 @@ struct ConfigPatch {
     shot_copy_clipboard: Option<bool>,
 }
 
+/// `get_config` 的配置视图（纯函数，便于回归测试）。
+///
+/// **这里是显式白名单，不是 `Config` 的序列化**：新增配置字段时必须在
+/// 这里补一行，否则前端设置页读不到它 —— 表现为「保存后再打开又变回默认值」，
+/// 而且更糟：设置页把读不到的字段按默认值回填，下一次保存会把磁盘上的
+/// 真实值**覆盖清空**（`test` 模块的 `config_view_round_trips_through_patch`
+/// 就是为守住这条契约而存在的）。
+fn config_view(cfg: Config, hostname: String, ips: Vec<String>, key_fp: String) -> Value {
+    json!({
+        "nickname": cfg.nickname,
+        "group": cfg.group,
+        "download_dir": cfg.download_dir,
+        "encoding": cfg.encoding,
+        "theme": cfg.theme,
+        "lang": cfg.lang,
+        "encrypt": cfg.encrypt,
+        // 截图设置：前端设置页回填 + 确认后是否自动复制（ChatWindow 直接读它）
+        "shot_hotkey": cfg.shot_hotkey,
+        "shot_copy_clipboard": cfg.shot_copy_clipboard,
+        // 不在模式：设置页回填「不在」开关与通知文
+        "absence_enabled": cfg.absence_enabled,
+        "absence_text": cfg.absence_text,
+        // 密码功能总开关与本机口令：设置页回填（ChatWindow 读 password_use
+        // 决定是否显示「密码锁」发送按钮）
+        "password_use": cfg.password_use,
+        "password": cfg.password,
+        // NAT 代理 / 成员主目录服务地址
+        "agent_addr": cfg.agent_addr,
+        "master_addr": cfg.master_addr,
+        "allow_send_list": cfg.allow_send_list,
+        "ipdict_enabled": cfg.ipdict_enabled,
+        "dir_mode": cfg.dir_mode,
+        "v6_mcast": cfg.v6_mcast,
+        "hostname": hostname,
+        "ips": ips,
+        "version": env!("CARGO_PKG_VERSION"),
+        // 本机公钥指纹：设置页与对端核对密钥用（首次调用会触发生成并落盘）
+        "key_fp": key_fp,
+    })
+}
+
 /// 配置 + 本机信息（前端设置页展示）
 #[tauri::command]
 async fn get_config(st: State<'_, SharedState>) -> Result<Value, String> {
@@ -181,36 +222,18 @@ async fn get_config(st: State<'_, SharedState>) -> Result<Value, String> {
             }
         }
     }
-    Ok(json!({
-        "nickname": cfg.nickname,
-        "group": cfg.group,
-        "download_dir": cfg.download_dir,
-        "encoding": cfg.encoding,
-        "theme": cfg.theme,
-        "lang": cfg.lang,
-        "encrypt": cfg.encrypt,
-        // 截图设置：前端设置页回填 + 确认后是否自动复制（ChatWindow 直接读它）
-        "shot_hotkey": cfg.shot_hotkey,
-        "shot_copy_clipboard": cfg.shot_copy_clipboard,
-        "hostname": hostname,
-        "ips": ips,
-        "version": env!("CARGO_PKG_VERSION"),
-        // 本机公钥指纹：设置页与对端核对密钥用（首次调用会触发生成并落盘）
-        "key_fp": st.fingerprint(),
-    }))
+    Ok(config_view(cfg, hostname, ips, st.fingerprint()))
 }
 
-#[tauri::command]
-async fn save_config(
-    patch: ConfigPatch,
-    st: State<'_, SharedState>,
-    ctx: State<'_, SharedCtx>,
-) -> Result<(), String> {
+/// 把前端补丁合并到已有配置上（纯函数，便于回归测试）。
+///
+/// 所有 `Option` 字段一律「未携带 = 保留现值」，只有 `ConfigPatch` 里
+/// 非 Option 的四项（昵称/群组/下载目录/编码）是必填。
+fn apply_config_patch(prev: Config, patch: ConfigPatch) -> Result<Config, String> {
     if patch.nickname.trim().is_empty() {
         return Err("昵称不能为空".into());
     }
-    let prev = st.config();
-    let cfg = Config {
+    Ok(Config {
         nickname: patch.nickname.trim().to_string(),
         group: patch.group.trim().to_string(),
         download_dir: patch.download_dir.trim().to_string(),
@@ -245,8 +268,20 @@ async fn save_config(
         v6_mcast: patch.v6_mcast.unwrap_or(prev.v6_mcast),
         // 截图热键：补丁未携带保留现值；空串视为「不注册全局热键」
         shot_hotkey: patch.shot_hotkey.unwrap_or(prev.shot_hotkey),
-        shot_copy_clipboard: patch.shot_copy_clipboard.unwrap_or(prev.shot_copy_clipboard),
-    };
+        shot_copy_clipboard: patch
+            .shot_copy_clipboard
+            .unwrap_or(prev.shot_copy_clipboard),
+    })
+}
+
+#[tauri::command]
+async fn save_config(
+    patch: ConfigPatch,
+    st: State<'_, SharedState>,
+    ctx: State<'_, SharedCtx>,
+) -> Result<(), String> {
+    let prev = st.config();
+    let cfg = apply_config_patch(prev.clone(), patch)?;
     let absence_changed = cfg.absence_enabled != prev.absence_enabled;
     st.set_config(cfg.clone());
     st.persist_config().map_err(|e| e.to_string())?;
@@ -1266,6 +1301,94 @@ mod tests {
         // 中文与 ?# 等会破坏查询串的字符必须转义
         assert_eq!(urlencode("图"), "%E5%9B%BE");
         assert!(!urlencode("x?y#z&w=1").contains(['?', '#', '&', '=']));
+    }
+
+    /// `get_config` 的视图必须覆盖 `save_config` 能写的**全部**配置项。
+    ///
+    /// 这是前端设置页的唯一数据源：读不到的字段，表单只能按默认值回填，
+    /// 于是「保存 → 再打开」看起来没存上，而且下一次保存会把磁盘上的真实值
+    /// 覆盖清空。
+    #[test]
+    fn config_view_round_trips_through_patch() {
+        use super::{apply_config_patch, config_view, Config, ConfigPatch};
+
+        // 每个字段都取「非默认值」：视图漏了哪个字段，下面就会指出哪个
+        let saved = Config {
+            nickname: "测昵称".into(),
+            group: "研发组".into(),
+            download_dir: "/tmp/dl".into(),
+            encoding: "gbk".into(),
+            theme: "dark".into(),
+            lang: "en".into(),
+            encrypt: false,
+            absence_enabled: true,
+            absence_text: "外出中".into(),
+            password_use: true,
+            password: "opensesame".into(),
+            agent_addr: "10.0.0.9:2425".into(),
+            master_addr: "10.0.0.1:2425".into(),
+            allow_send_list: false,
+            ipdict_enabled: false,
+            dir_mode: "user".into(),
+            v6_mcast: false,
+            shot_hotkey: "Ctrl+Shift+A".into(),
+            shot_copy_clipboard: false,
+        };
+        let view = config_view(
+            saved.clone(),
+            "host".into(),
+            vec!["10.0.0.2".into()],
+            "fp".into(),
+        );
+        // 设置页把这坨 JSON 回填进表单，保存时按同名同形的补丁回传
+        let patch: ConfigPatch = serde_json::from_value(view)
+            .expect("get_config 的视图必须能当作 save_config 的补丁解析");
+        // 底值取默认（与 saved 处处不同）：只有补丁真的带了该字段才会还原成 saved
+        let round_tripped = apply_config_patch(Config::default(), patch).expect("保存应当成功");
+
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&round_tripped).unwrap(),
+            "get_config 漏字段：设置页「保存后再打开」这些项会退回默认值"
+        );
+    }
+
+    /// 用户报的那个场景：勾上密码功能、填口令、保存 → 再打开 → 再保存。
+    #[test]
+    fn password_settings_survive_reopen_and_resave() {
+        use super::{apply_config_patch, config_view, Config, ConfigPatch};
+
+        // 1) 打开设置：勾上密码功能并填口令，点「保存」
+        let patch: ConfigPatch = serde_json::from_value(serde_json::json!({
+            "nickname": "daye",
+            "group": "",
+            "download_dir": "/tmp/dl",
+            "encoding": "utf8",
+            "password_use": true,
+            "password": "hunter2",
+        }))
+        .unwrap();
+        let cfg = apply_config_patch(Config::default(), patch).unwrap();
+        assert!(cfg.password_use, "第一次保存就该存下密码开关");
+
+        // 2) 再次打开设置页：表单从 get_config 回填（此处即 config_view）
+        let reopened = config_view(cfg.clone(), String::new(), Vec::new(), String::new());
+        assert_eq!(
+            reopened["password_use"],
+            serde_json::json!(true),
+            "重新打开设置页时密码开关必须还是「开」"
+        );
+        assert_eq!(
+            reopened["password"],
+            serde_json::json!("hunter2"),
+            "重新打开设置页时口令必须已回填"
+        );
+
+        // 3) 原样再保存一次：口令不能被清空（旧 bug 就是在这里把磁盘值冲掉的）
+        let patch2: ConfigPatch = serde_json::from_value(reopened).unwrap();
+        let cfg2 = apply_config_patch(cfg, patch2).unwrap();
+        assert!(cfg2.password_use, "重新保存后密码功能开关被关掉了");
+        assert_eq!(cfg2.password, "hunter2", "重新保存后口令被清空了");
     }
 
     /// 托盘两态 PNG 资产回归测试：

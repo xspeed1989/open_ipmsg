@@ -3,6 +3,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { forwardPayload } from '../src/lib/forward.js'
 import { mergeSessions } from '../src/lib/sessions.js'
+import {
+  BROADCAST_SESSION_KEY, isBroadcastSession, senderOf, senderIp,
+} from '../src/lib/sessions.js'
 
 /* ---------------- forwardPayload ---------------- */
 
@@ -74,6 +77,66 @@ test('参数缺省安全', () => {
   assert.deepEqual(mergeSessions(undefined, undefined), [])
   assert.deepEqual(mergeSessions(online, undefined).length, 2)
 })
+
+/* ---------------- 广播信箱（pinned 常驻条目） ---------------- */
+
+test('广播信箱：置顶条目排在普通会话之前', () => {
+  const list = mergeSessions(online, [
+    { key: '10.0.0.9', nickname: '离线赵', last_ts: 900 },
+    { key: '255.255.255.255', nickname: '', pinned: true, last_ts: 100 },
+  ])
+  assert.equal(list[0].key, '255.255.255.255', '置顶条目不管时间多旧都在最前')
+  assert.equal(list[0].online, false, '广播信箱不是在线对端，不参与在线语义')
+  assert.equal(list[1].key, '10.0.0.1', '在线用户紧随其后')
+})
+
+test('广播信箱：只有它自己时列表也不为空（可直接点进去发广播）', () => {
+  const list = mergeSessions([], [{ key: '255.255.255.255', pinned: true, last_ts: 0 }])
+  assert.equal(list.length, 1)
+  assert.equal(list[0].key, '255.255.255.255')
+})
+
+/* ---------------- 广播信箱里的发送方归属 ---------------- */
+
+const T = { me: '我', unknown: '未知' }
+
+test('发送方：自己发的算「我」，不借用对端身份', () => {
+  assert.equal(senderOf({ dir: 'out', peer: { nickname: 'ubuntu' } }, T), '我')
+})
+
+test('发送方：别人发的用它自己的昵称快照，而不是会话名', () => {
+  const m = { dir: 'in', peer: { nickname: 'ubuntu', ip: '192.168.2.115' } }
+  assert.equal(senderOf(m, T), 'ubuntu')
+  assert.equal(senderIp(m), '192.168.2.115', '同一昵称多台机器时用 IP 区分')
+})
+
+test('发送方：昵称为空退化为用户名，再退化为 IP', () => {
+  assert.equal(senderOf({ dir: 'in', peer: { user: 'win7', ip: '10.0.0.7' } }, T), 'win7')
+  assert.equal(senderOf({ dir: 'in', peer: { ip: '10.0.0.7' } }, T), '10.0.0.7')
+})
+
+test('发送方：旧记录没有快照时给「未知」，不把伪造的广播地址当 IP 显示', () => {
+  const legacy = { dir: 'in', peer: { key: '255.255.255.255', nickname: '' } }
+  assert.equal(senderOf(legacy, T), '未知')
+  assert.equal(senderIp(legacy), '', 'peer.key 是广播地址，不能当发送方 IP')
+})
+
+test('发送方：缺消息/缺 peer 都安全', () => {
+  assert.equal(senderOf(undefined, T), '')
+  assert.equal(senderOf({ dir: 'in' }, T), '未知')
+  assert.equal(senderIp({}), '')
+})
+
+test('发送方：昵称里的控制字符被清掉，不污染界面', () => {
+  assert.equal(senderOf({ dir: 'in', peer: { nickname: 'ub\u0000un\u001ftu' } }, T), 'ubuntu')
+})
+
+test('会话 key 判定：只有广播地址算广播信箱', () => {
+  assert.equal(isBroadcastSession(BROADCAST_SESSION_KEY), true)
+  assert.equal(isBroadcastSession('192.168.2.115'), false)
+  assert.equal(isBroadcastSession(''), false)
+})
+
 /* ---------------- mergeForward（多选合并转发） ---------------- */
 
 import { mergeForward } from '../src/lib/forward.js'

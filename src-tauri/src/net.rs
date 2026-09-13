@@ -575,6 +575,9 @@ async fn retry_pending_for(ctx: Arc<NetCtx>, key: &str) {
             } else {
                 0
             }
+            // 封书/密码锁：重发与首投同标志（否则几秒后对端收到的是普通消息）
+            | if item.secret { opt::SECRETEXOPT } else { 0 }
+            | if item.password { opt::PASSWORDOPT } else { 0 }
             | if enc { opt::ENCRYPTOPT } else { 0 };
         let mut pkt = proto::Packet::new(command).with_pkt_no(item.pkt);
         pkt.extra = wire_extra;
@@ -697,6 +700,9 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
             | if utf8 { opt::UTF8OPT } else { 0 }
             // 加密附件公告需带 ENCEXTMSGOPT，与直发保持一致
             | if enc && !entries.is_empty() { opt::ENCEXTMSGOPT } else { 0 }
+            // 封书/密码锁：离线重投与首投同标志（否则上线后收到的是普通消息）
+            | if item.secret { opt::SECRETEXOPT } else { 0 }
+            | if item.password { opt::PASSWORDOPT } else { 0 }
             | if enc { opt::ENCRYPTOPT } else { 0 };
         let pkt = proto::Packet::new(command).with_pkt_no(item.pkt);
         let pkt = proto::Packet {
@@ -1893,7 +1899,13 @@ async fn handle_sendmsg(
         .as_ref()
         .and_then(|record| record.get("unlocked").and_then(Value::as_bool))
         .unwrap_or(false);
-    let unlocked = prior_unlocked || (secret && !password_protected);
+    // 入站封书/密码锁一律保持**未开封**：正文此刻确实已在本地（载荷对收件人解封过），
+    // 但「开封」是收件人的动作 —— 开封前不上屏、不回 READMSG。曾经对无密码封书
+    // 自动置 unlocked（`secret && !password_protected`），结果是「封书（需对方点开
+    // 查看）」在接收端退化成普通消息，正文直接显示、回执也在收到时就发了，与
+    // pending_receipts 的门控和官方 recvdlg「开封才回 READMSG」的语义都矛盾。
+    // 同一 payload 的重投沿用既有开封状态（用户开过的信不必再开一次）。
+    let unlocked = prior_unlocked;
 
     let existing_peer = if is_broadcast {
         None
@@ -1932,7 +1944,10 @@ async fn handle_sendmsg(
         "files": file_jsons,
         "ts": now_secs(),
         "pkt": pkt.pkt_no,
-        "peer": {"key": session_key, "nickname": display, "host": pkt.host, "group": group},
+        // ip = 本次报文的真实来源地址。单播时会话 key 就等于它，冗余但无害；
+        // 广播会话（key=255.255.255.255）没有它就只能显示昵称/主机 —— 界面上
+        // 就成了「一个没有 IP 的离线联系人」，而这台机器其实是活的。
+        "peer": {"key": session_key, "ip": from.ip().to_string(), "nickname": display, "host": pkt.host, "group": group},
         "need_read": pkt.command & opt::READCHECKOPT != 0,
         "read": already_read,
         "enc": enc_meta.is_some(),
@@ -2314,6 +2329,7 @@ fn offline_enqueue_record(
     ts: u64,
     text: &str,
     paths: &[String],
+    flags: MsgFlags,
 ) -> Result<serde_json::Value, String> {
     let mut entries = Vec::new();
     if !paths.is_empty() {
@@ -2329,6 +2345,8 @@ fn offline_enqueue_record(
         text: text.to_string(),
         ts,
         paths: paths.to_vec(),
+        secret: flags.secret,
+        password: flags.password,
     }) {
         ctx.st.diag(&format!(
             "-> {key} 离线消息入队 pkt={pkt_no}（附件 {} 项）",
@@ -2353,6 +2371,9 @@ fn offline_enqueue_record(
         "queued": true,
         // 入队时必然明文暂存；实际是否加密由重投时的 flush_pending_for 决定
         "enc": false, "sig_ok": true,
+        // 封书/密码锁语义随消息一起等待重投（否则界面上也看不出是封书）
+        "secret": flags.secret,
+        "locked": flags.password,
     });
     ctx.st.log_record(key, &rec);
     Ok(rec)
@@ -2456,6 +2477,17 @@ pub struct MsgSendOpts {
     pub clip_pos: Option<u32>,
 }
 
+/// 一条出站消息**实际生效**的机密标志（含「本机密码功能是否开启」的判定）。
+///
+/// 与 [`MsgSendOpts`] 的区别：那是前端按钮的瞬时状态，这里是「这条消息究竟
+/// 以什么身份发出去了」。送达重发与离线重投必须原样复用，否则封书会在几秒
+/// 后（或对方上线后）被静默降级成普通消息，密码锁更是直接失效。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MsgFlags {
+    pub secret: bool,
+    pub password: bool,
+}
+
 /// 发送文本/文件消息。paths 为空则纯文本。
 pub async fn send_message(
     ctx: &NetCtx,
@@ -2476,13 +2508,18 @@ pub async fn send_message_opts(
     let cfg = ctx.st.config();
     let pkt_no = proto::next_packet_no();
     let ts = now_secs();
+    // 本次实际生效的机密标志：密码锁还要看本机密码功能是否开启
+    let flags = MsgFlags {
+        secret: opts.secret,
+        password: opts.password && cfg.password_use,
+    };
 
     let peer = ctx.st.peers.lock().unwrap().get(key).cloned();
     let Some(peer) = peer else {
         // 对方不在线：文本与附件都进待投递队列（官方 IPMsg 语义，上线后自动
         // 重投，以原包号发送并带延迟尾注）。队列只存本地路径，文件槽与公告
         // ID 在重投时重新校验并登记（flush_pending_for）。
-        return offline_enqueue_record(ctx, key, pkt_no, ts, text, &paths);
+        return offline_enqueue_record(ctx, key, pkt_no, ts, text, &paths, flags);
     };
     let target = peer_addr(&peer).ok_or("无效的对方地址")?;
 
@@ -2567,8 +2604,8 @@ pub async fn send_message_opts(
         | if entries.is_empty() { 0 } else { opt::FILEATTACHOPT }
         | if utf8 { opt::UTF8OPT } else { 0 }
         // 封书 = SECRET|READCHECK（官方 SECRETEXOPT）；密码锁 = PASSWORDOPT
-        | if opts.secret { opt::SECRETEXOPT } else { 0 }
-        | if opts.password && cfg.password_use { opt::PASSWORDOPT } else { 0 }
+        | if flags.secret { opt::SECRETEXOPT } else { 0 }
+        | if flags.password { opt::PASSWORDOPT } else { 0 }
         // 加密公告必须带 ENCEXTMSGOPT：官方解密后只在此位下拆分附件段（spec §5），
         // 缺位则对面只见文字、文件条目丢失（2026-08-26 官方客户端实测）
         | if enc && !entries.is_empty() { opt::ENCEXTMSGOPT } else { 0 }
@@ -2638,8 +2675,8 @@ pub async fn send_message_opts(
         "read": false,
         // 本次实际是否加密发出；我方发出的消息签名恒可核验
         "enc": enc, "sig_ok": true,
-        "secret": opts.secret,
-        "locked": opts.password && cfg.password_use,
+        "secret": flags.secret,
+        "locked": flags.password,
     });
     ctx.st.log_record(key, &rec);
 
@@ -2652,6 +2689,8 @@ pub async fn send_message_opts(
             text: text.to_string(),
             paths,
             entries,
+            secret: flags.secret,
+            password: flags.password,
             ts,
             attempts: 0,
         });
@@ -2747,8 +2786,11 @@ pub async fn recall_message(ctx: &NetCtx, key: &str, pkt: u32) -> Result<(), Str
 
 /// 广播群发（BROADCASTOPT 同报）：发给广播地址与所有在线成员，
 /// 不回执、不触发对方不在自动应答（官方 MsgSendMsg 门控一致）。
-/// 我方自己不落历史（官方 NOLOG 语义：广播不鼓励留痕）；
-/// 对端收到进入其「广播」会话。
+///
+/// 收发都进同一间「广播」信箱（`BROADCAST_SESSION_KEY`）：自己发的也落一条
+/// `dir:"out"`，中栏那个常驻条目里就能看到完整的广播往来；因为发送方身份由
+/// 每条记录的快照承担，落库不发 `msg-in`（那是入站事件），改发 `msg-out`，
+/// 否则前端会把广播气泡当对端消息渲染。
 pub async fn broadcast_message(ctx: &NetCtx, text: &str) -> Result<(), String> {
     let cfg = ctx.st.config();
     let utf8 = proto::is_utf8_mode(&cfg.encoding);
@@ -2770,11 +2812,43 @@ pub async fn broadcast_message(ctx: &NetCtx, text: &str) -> Result<(), String> {
             sent += 1;
         }
     }
+    // 落库：广播信箱里每条消息自带发送方快照（对端侧同名收件箱所见一致）
+    let record = json!({
+        "dir": "out",
+        "kind": "text",
+        "text": text,
+        "files": [],
+        "ts": now_secs(),
+        "pkt": pkt.pkt_no,
+        "peer": {"key": crate::state::BROADCAST_SESSION_KEY, "nickname": cfg.nickname.clone(),
+                 "host": my_host(), "group": cfg.group.clone()},
+        "need_read": false,
+        "read": false,
+        "enc": false,
+        "sig_ok": true,
+        "secret": false,
+        "locked": false,
+        "unlocked": false,
+        "broadcast": true,
+        "broadcast_targets": sent,
+    });
+    if let Err(error) = ctx
+        .st
+        .log_record_fallible(crate::state::BROADCAST_SESSION_KEY, &record)
+    {
+        // 发包已经成功：落库失败只影响本机留痕，不能让整个发送报错
+        ctx.st
+            .diag(&format!("-> 广播群发已发出，但本地留痕失败：{error}"));
+    } else {
+        ctx.st.emit(
+            "msg-out",
+            json!({"key": crate::state::BROADCAST_SESSION_KEY, "msg": record}),
+        );
+    }
     ctx.st
         .diag(&format!("-> 广播群发「{}」到 {} 个目标", text.trim(), sent));
     Ok(())
 }
-
 /// 封书/密码锁开封：校验密码（密码锁场景）后把记录标记 unlocked，
 /// 并补发已读回执（官方 recvdlg 开封即回 READMSG）。
 /// 返回是否成功开封（密码错/不满足条件返回 Err）。
@@ -2784,7 +2858,15 @@ pub async fn unlock_message(
     pkt: u32,
     password: Option<String>,
 ) -> Result<(), String> {
-    let rec = ctx.st.find_history_pkt(key, pkt).ok_or("找不到该消息")?;
+    let Some(rec) = ctx.st.find_history_pkt(key, pkt) else {
+        // 只有入站消息才有「开封」一说：自己的记录没有 unlocked 字段，
+        // 旧版前端把出站封书也画成信封并来点这里 —— 记录明明在本地，
+        // 却回「找不到该消息」是误导。出站直接当已开封（正文本来就是我写的）。
+        return match ctx.st.find_history_any(key, pkt) {
+            Some(rec) if rec.get("dir").and_then(|v| v.as_str()) == Some("out") => Ok(()),
+            _ => Err("找不到该消息".into()),
+        };
+    };
     let is_locked = rec.get("locked").and_then(|v| v.as_bool()).unwrap_or(false);
     let is_secret = rec.get("secret").and_then(|v| v.as_bool()).unwrap_or(false);
     if !is_locked && !is_secret {
@@ -4807,6 +4889,405 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
+    /// 端到端回归：A 用「封书」按钮发一条加密消息（SENDMSG|SECRETEXOPT|ENCRYPTOPT），
+    /// B（另一个实例）必须真的收到、落库并经 msg-in 上屏，且**保持未开封**：
+    /// 收件人看到的是信封占位，正文要等「打开（开封）」才可见。
+    ///
+    /// 这条路径此前没有任何测试覆盖：既有用例要么只断言「发出的报文带 SECRETOPT」
+    /// （假对端），要么只用手工明文报文构造入站封书，两边都不碰真实密封载荷。
+    /// 已读回执同样以开封为界：未开封时 A 只该收到送达确认（RECVMSG），
+    /// 开封后才补 READMSG。
+    #[tokio::test]
+    async fn sealed_message_reaches_a_second_instance_end_to_end() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir_a = test_data_dir("seal-e2e-a");
+        let dir_b = test_data_dir("seal-e2e-b");
+        let st_a = Arc::new(AppState::new(dir_a.clone()));
+        let st_b = Arc::new(AppState::new(dir_b.clone()));
+        let sock_a = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let port_a = sock_a.local_addr().unwrap().port();
+        let port_b = sock_b.local_addr().unwrap().port();
+
+        let mut cfg = Config::default();
+        cfg.encrypt = true;
+        st_a.set_config(cfg.clone());
+        st_b.set_config(cfg);
+
+        let ctx_a = NetCtx {
+            st: st_a.clone(),
+            // A 的套接字留一份给测试自己收包：开封后要断言 A 收到的确实是 READMSG
+            sock: sock_a.clone(),
+            v6_sock: tokio::sync::Mutex::new(None),
+            port: port_a,
+        };
+        let ctx_b = NetCtx {
+            st: st_b.clone(),
+            sock: sock_b.clone(),
+            v6_sock: tokio::sync::Mutex::new(None),
+            port: port_b,
+        };
+
+        // 两台机器都绑定回环：会话 key 就是来源 IP，注册时给真实端口
+        let key = "127.0.0.1";
+        for (st, port) in [(&st_a, port_b), (&st_b, port_a)] {
+            st.upsert_peer(PeerInfo {
+                key: key.into(),
+                ip: key.into(),
+                port,
+                nickname: "peer".into(),
+                group: String::new(),
+                host: "peer-host".into(),
+                user: "peer".into(),
+                last_seen: now_secs(),
+                absence: false,
+                absence_text: None,
+                vs: None,
+            });
+        }
+        // 等价于双方已完成 GETPUBKEY/ANSPUBKEY：各自缓存对方公钥
+        st_a.remember_peer_key(key, crate::crypto::CAPA_OUR_SEND, &st_b.own_keypair().public_key())
+            .unwrap();
+        st_b.remember_peer_key(key, crate::crypto::CAPA_OUR_SEND, &st_a.own_keypair().public_key())
+            .unwrap();
+
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let emitted_b = emitted.clone();
+        st_b.set_event(Box::new(move |event, _| {
+            if event == "msg-in" {
+                emitted_b.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        let records = super::send_message_multi_opts(
+            &ctx_a,
+            key,
+            "封书正文",
+            vec![],
+            MsgSendOpts {
+                secret: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("发送封书");
+        let pkt_no = records[0]["pkt"].as_u64().unwrap() as u32;
+        assert_eq!(records[0]["secret"], true);
+
+        let mut buf = [0u8; 8192];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), sock_b.recv_from(&mut buf))
+            .await
+            .expect("B 必须收到封书报文")
+            .unwrap();
+        super::handle_datagram(&ctx_b, &buf[..n], from).await;
+
+        let rec = st_b
+            .find_in_record(key, pkt_no)
+            .expect("B 应把封书落库（这正是「对方没收到」会失败的地方）");
+        assert_eq!(rec["text"], "封书正文");
+        assert_eq!(rec["secret"], true);
+        assert_eq!(rec["locked"], false);
+        assert_eq!(
+            rec["unlocked"], false,
+            "无密码封书入站保持未开封：接收端渲染信封占位而不是正文"
+        );
+        assert_eq!(rec["read"], false);
+        assert_eq!(emitted.load(Ordering::SeqCst), 1, "B 应上屏一条 msg-in");
+
+        // 未开封期间 A 只该收到 SENDCHECK 的送达确认，不能收到已读回执：
+        // 官方 recvdlg 也是「开封才回 READMSG」，否则寄件人会看到「已读」，
+        // 而对方其实只是收到了一封还没拆的信。
+        let mut buf = [0u8; 8192];
+        while let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(300), sock_a.recv_from(&mut buf)).await
+        {
+            let packet = crate::protocol::parse(&buf[..n]).expect("A 收到的报文应可解析");
+            assert_ne!(
+                packet.command & 0xff,
+                crate::protocol::cmd::READMSG,
+                "未开封的封书不得回 READMSG"
+            );
+        }
+
+        // 收件人点「打开（开封）」：正文可见，且到这时才补发这一条 READMSG
+        super::unlock_message(&ctx_b, key, pkt_no, None)
+            .await
+            .expect("无密码封书应可直接开封");
+        let rec = st_b.find_in_record(key, pkt_no).expect("开封后记录仍在");
+        assert_eq!(rec["unlocked"], true, "开封后正文可见");
+        assert_eq!(rec["read"], true, "开封即视为已读");
+
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), sock_a.recv_from(&mut buf))
+            .await
+            .expect("开封后 A 应收到 READMSG")
+            .unwrap();
+        let packet = crate::protocol::parse(&buf[..n]).expect("READMSG 应可解析");
+        assert_eq!(
+            packet.command & 0xff,
+            crate::protocol::cmd::READMSG,
+            "开封后补发的必须是这一条已读回执"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&packet.extra),
+            pkt_no.to_string(),
+            "READMSG 的附加数据是原 SENDMSG 包编号"
+        );
+
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// 「密码锁」在**本应用的收发两端**是一条真实生效的契约：A 勾选密码锁直发，
+    /// 线上报文带 PASSWORDOPT，B 落库时 `locked=true` / `unlocked=false`，
+    /// 于是 B 的前端渲染成未开封信封，必须输入口令才能看。
+    ///
+    /// 注意这条契约的边界：`locked` 只是**收件人客户端**的展示门控，正文本身
+    /// 仍是明文（既在线上，也在 B 的 history/*.jsonl 里）。对不认这个标志的
+    /// 客户端（官方 IPMsg 在 v3.x 之后移除了 Lock UI、飞秋等）就是直接可见。
+    #[tokio::test]
+    async fn password_locked_message_arrives_locked_e2e() {
+        let dir_a = test_data_dir("pwd-e2e-a");
+        let dir_b = test_data_dir("pwd-e2e-b");
+        let st_a = Arc::new(AppState::new(dir_a.clone()));
+        let st_b = Arc::new(AppState::new(dir_b.clone()));
+        let sock_a = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let port_a = sock_a.local_addr().unwrap().port();
+        let port_b = sock_b.local_addr().unwrap().port();
+
+        // A 打开密码功能并设了口令；B 也设了同一口令（双方约定同一口令）
+        let mut cfg = Config::default();
+        cfg.password_use = true;
+        cfg.password = "opensesame".into();
+        st_a.set_config(cfg.clone());
+        st_b.set_config(cfg);
+
+        let ctx_a = NetCtx {
+            st: st_a.clone(),
+            sock: sock_a,
+            v6_sock: tokio::sync::Mutex::new(None),
+            port: port_a,
+        };
+        let ctx_b = NetCtx {
+            st: st_b.clone(),
+            sock: sock_b.clone(),
+            v6_sock: tokio::sync::Mutex::new(None),
+            port: port_b,
+        };
+
+        let key = "127.0.0.1";
+        for (st, port) in [(&st_a, port_b), (&st_b, port_a)] {
+            st.upsert_peer(PeerInfo {
+                key: key.into(),
+                ip: key.into(),
+                port,
+                nickname: "peer".into(),
+                group: String::new(),
+                host: "peer-host".into(),
+                user: "peer".into(),
+                last_seen: now_secs(),
+                absence: false,
+                absence_text: None,
+                vs: None,
+            });
+        }
+        // 等价于双方已完成 GETPUBKEY/ANSPUBKEY（加密路径下标志位同样要保住）
+        st_a.remember_peer_key(
+            key,
+            crate::crypto::CAPA_OUR_SEND,
+            &st_b.own_keypair().public_key(),
+        )
+        .unwrap();
+        st_b.remember_peer_key(
+            key,
+            crate::crypto::CAPA_OUR_SEND,
+            &st_a.own_keypair().public_key(),
+        )
+        .unwrap();
+
+        let records = super::send_message_multi_opts(
+            &ctx_a,
+            key,
+            "机密正文",
+            vec![],
+            MsgSendOpts {
+                password: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("发送密码锁消息");
+        let pkt_no = records[0]["pkt"].as_u64().unwrap() as u32;
+
+        let mut buf = [0u8; 8192];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), sock_b.recv_from(&mut buf))
+            .await
+            .expect("B 必须收到密码锁报文")
+            .unwrap();
+        let wire = crate::protocol::parse(&buf[..n]).expect("报文可解析");
+        assert_ne!(
+            wire.command & crate::protocol::opt::PASSWORDOPT,
+            0,
+            "密码锁必须真的写到线上报文里"
+        );
+        super::handle_datagram(&ctx_b, &buf[..n], from).await;
+
+        let rec = st_b.find_in_record(key, pkt_no).expect("B 应落库");
+        assert_eq!(
+            rec["locked"], true,
+            "密码锁消息在收件人侧必须是未开封状态，否则对方直接能看"
+        );
+        assert_eq!(rec["unlocked"], false);
+
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// 登记一台回环上的「在线对端」，直发路径才会走网络而不是离线队列。
+    fn register_loopback_peer(st: &AppState, port: u16) {
+        st.upsert_peer(PeerInfo {
+            key: "127.0.0.1".into(),
+            ip: "127.0.0.1".into(),
+            port,
+            nickname: "peer".into(),
+            group: String::new(),
+            host: "peer-host".into(),
+            user: "peer".into(),
+            last_seen: now_secs(),
+            absence: false,
+            absence_text: None,
+            vs: None,
+        });
+    }
+
+    fn sent_sendmsg(peer: &std::net::UdpSocket) -> Vec<crate::protocol::Packet> {
+        recv_test_packets(peer)
+            .into_iter()
+            .filter(|p| p.command & 0xff == crate::protocol::cmd::SENDMSG)
+            .collect()
+    }
+
+    /// 自己的封书消息不该被当成「对端发来的信封」：点开封必须成功（空操作），
+    /// 而不是报「找不到该消息」——出站记录只有 secret、没有 unlocked，
+    /// 而 unlock_message 过去只查入站记录。
+    #[tokio::test]
+    async fn unlock_on_own_sealed_message_is_not_an_error() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("unlock-own-secret").await;
+        register_loopback_peer(&st, peer.local_addr().unwrap().port());
+        let records = super::send_message_multi_opts(
+            &ctx,
+            "127.0.0.1",
+            "自己发出的封书",
+            vec![],
+            MsgSendOpts {
+                secret: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("发送封书");
+        let pkt = records[0]["pkt"].as_u64().unwrap() as u32;
+        assert_eq!(records[0]["secret"], true);
+        assert!(
+            st.find_history_any("127.0.0.1", pkt).is_some(),
+            "记录确实在本地历史里"
+        );
+
+        super::unlock_message(&ctx, "127.0.0.1", pkt, None)
+            .await
+            .expect("自己的封书记录不该报「找不到该消息」");
+        // 真的不存在的包号仍然要报错，别把「找不到」一并吞掉
+        assert!(super::unlock_message(&ctx, "127.0.0.1", pkt.wrapping_add(12345), None)
+            .await
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    /// 送达重发（SENDCHECKOPT 未确认，每 4s 一次）必须原样保留封书标志：
+    /// 否则对端会在几秒后收到同包号的「普通消息」副本，封书语义被静默降级。
+    #[tokio::test]
+    async fn retry_resends_sealed_message_with_secretopt() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("retry-secret").await;
+        register_loopback_peer(&st, peer.local_addr().unwrap().port());
+        let records = super::send_message_multi_opts(
+            &ctx,
+            "127.0.0.1",
+            "重发也要是封书",
+            vec![],
+            MsgSendOpts {
+                secret: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("发送封书");
+        let pkt = records[0]["pkt"].as_u64().unwrap() as u32;
+        let first = sent_sendmsg(&peer);
+        assert_eq!(first.len(), 1, "首投只有一条 SENDMSG");
+        assert_ne!(first[0].command & crate::protocol::opt::SECRETOPT, 0);
+
+        // 队列里登记的重发项必须记住封书标志，并且到期重发仍带 SECRETEXOPT
+        let mut item = st
+            .retry_for("127.0.0.1")
+            .into_iter()
+            .find(|i| i.pkt == pkt)
+            .expect("纯文本消息应登记送达重发");
+        assert!(item.secret, "重发项必须记住封书标志");
+        item.ts = item.ts.saturating_sub(super::RETRY_INTERVAL_SECS + 1);
+        st.enqueue_retry(item);
+        super::retry_pending_for(Arc::new(ctx), "127.0.0.1").await;
+
+        let resent = sent_sendmsg(&peer);
+        assert_eq!(resent.len(), 1, "应重发一条 SENDMSG");
+        assert_eq!(resent[0].pkt_no, pkt, "重发沿用原包号");
+        assert_ne!(
+            resent[0].command & crate::protocol::opt::SECRETOPT,
+            0,
+            "重发不能把封书降级成普通消息"
+        );
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    /// 对方离线时入队、上线后重投的封书消息同样要保持封书语义
+    /// （本地留痕 + 线上标志都不能降级）。
+    #[tokio::test]
+    async fn offline_sealed_message_keeps_secret_when_flushed() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("offline-secret").await;
+        // 对端尚不在线：走待投递队列
+        let records = super::send_message_multi_opts(
+            &ctx,
+            "127.0.0.1",
+            "离线封书",
+            vec![],
+            MsgSendOpts {
+                secret: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("离线入队");
+        let pkt = records[0]["pkt"].as_u64().unwrap() as u32;
+        assert_eq!(records[0]["queued"], true);
+        assert_eq!(records[0]["secret"], true, "离线留痕也要保住封书语义");
+
+        register_loopback_peer(&st, peer.local_addr().unwrap().port());
+        super::flush_pending_for(&ctx, "127.0.0.1").await;
+
+        let flushed = sent_sendmsg(&peer);
+        assert_eq!(flushed.len(), 1, "应重投一条 SENDMSG");
+        assert_eq!(flushed[0].pkt_no, pkt);
+        assert_ne!(
+            flushed[0].command & crate::protocol::opt::SECRETOPT,
+            0,
+            "离线重投不能把封书降级成普通消息"
+        );
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
     #[tokio::test]
     async fn classic_passwordopt_identity_conflict_resets_read_unlock_and_file_state() {
         let (ctx, st, peer, data_dir) = encipdict_test_ctx("classic-password-conflict").await;
@@ -4830,6 +5311,11 @@ mod tests {
             file["path"] = "/tmp/old-report.txt".into();
             file["error"] = "old runtime error".into();
         });
+        // 显式开封：无密码封书入站后不再自动解锁（正文要等收件人点开封），
+        // 这里先把记录造成「已读 + 已开封」，下面才验证身份冲突会把它重置回去
+        super::unlock_message(&ctx, &key, pkt_no, None)
+            .await
+            .unwrap();
         assert_eq!(st.find_in_record(&key, pkt_no).unwrap()["unlocked"], true);
 
         let mut replacement = first.clone();
@@ -4856,6 +5342,116 @@ mod tests {
         assert_eq!(record["files"][0]["state"], "pending");
         assert!(record["files"][0].get("path").is_none());
         assert!(record["files"][0].get("error").is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn broadcast_message_lands_in_the_mailbox_as_sent() {
+        let (ctx, st, _peer, data_dir) = encipdict_test_ctx("broadcast-out").await;
+        // 广播只发往广播地址与在线成员：这里登记一个本机 UDP 接收端当成员，
+        // 才能既验证真发出去了、又不依赖真实网卡
+        let listener = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        st.upsert_peer(PeerInfo {
+            key: "127.0.0.1".into(),
+            ip: "127.0.0.1".into(),
+            port: listen_addr.port(),
+            nickname: "peer".into(),
+            group: String::new(),
+            host: "peer-host".into(),
+            user: "peer".into(),
+            last_seen: now_secs(),
+            absence: false,
+            absence_text: None,
+            vs: None,
+        });
+        let mut cfg = crate::state::Config::default();
+        cfg.nickname = "daye".into();
+        st.set_config(cfg);
+
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emitted_out = emitted.clone();
+        st.set_event(Box::new(move |event, value| {
+            if event == "msg-out" {
+                emitted_out.lock().unwrap().push(value);
+            }
+        }));
+
+        super::broadcast_message(&ctx, "全体注意").await.unwrap();
+
+        // 真的发出去了
+        let mut buf = [0u8; 1024];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut buf))
+            .await
+            .expect("广播应到达在线成员")
+            .unwrap();
+        let pkt = crate::protocol::parse(&buf[..n]).expect("可解析的 IPMsg 报文");
+        assert_ne!(pkt.command & crate::protocol::opt::BROADCASTOPT, 0);
+
+        // 且落进「广播」信箱，方向是 out、带着自己的身份，界面才能显示在右侧
+        let record = st
+            .find_history_any(crate::state::BROADCAST_SESSION_KEY, pkt.pkt_no)
+            .expect("自己发的广播也要留在广播信箱里");
+        assert_eq!(record["dir"].as_str(), Some("out"));
+        assert_eq!(record["broadcast"].as_bool(), Some(true));
+        assert_eq!(record["text"].as_str(), Some("全体注意"));
+        assert_eq!(record["peer"]["nickname"].as_str(), Some("daye"));
+        // 走 msg-out 而不是 msg-in：否则前端会把广播气泡当对端消息渲染
+        let events = emitted.lock().unwrap();
+        assert_eq!(events.len(), 1, "应发出一条出站事件");
+        assert_eq!(events[0]["key"].as_str(), Some(crate::state::BROADCAST_SESSION_KEY));
+        let session = st
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.key == crate::state::BROADCAST_SESSION_KEY)
+            .expect("广播信箱常驻");
+        assert!(session.pinned);
+        assert!(session.last_ts > 0, "发完广播，信箱时间要刷新");
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn broadcast_sendmsg_keeps_sender_identity_in_the_mailbox() {
+        let (ctx, st, _peer, data_dir) = encipdict_test_ctx("broadcast-sender-ip").await;
+        let pkt_no = 771001;
+        let mut packet = crate::protocol::Packet::new(
+            crate::protocol::cmd::SENDMSG | crate::protocol::opt::BROADCASTOPT,
+        )
+        .with_pkt_no(pkt_no);
+        packet.user = "ubuntu".into();
+        packet.host = "john-VMware-Virtual-Platform".into();
+        packet.extra = b"Hello".to_vec();
+        let from: std::net::SocketAddr = "192.168.2.115:2425".parse().unwrap();
+        let key = from.ip().to_string();
+
+        let identity = super::classic_payload_identity(&packet);
+        super::handle_sendmsg(&ctx, from, &packet, &key, None, &identity, false, None)
+            .await
+            .unwrap();
+
+        // 进「广播」信箱，但记录里留着真实发送方，气泡才显示得出是谁发的
+        let record = st
+            .find_history_pkt(crate::state::BROADCAST_SESSION_KEY, pkt_no)
+            .expect("广播记录应落在广播信箱");
+        assert_eq!(record["broadcast"].as_bool(), Some(true));
+        assert_eq!(record["peer"]["ip"].as_str(), Some("192.168.2.115"));
+        assert_eq!(record["peer"]["nickname"].as_str(), Some("ubuntu"));
+        // 广播发送方不因此进入在线名单（存在性只由上线类报文维护）
+        assert!(st.peers.lock().unwrap().get(&key).is_none());
+
+        // 中栏：广播信箱常驻且置顶，但条目本身不挂发送方身份（固定显示「广播」）
+        let session = st
+            .list_sessions()
+            .into_iter()
+            .find(|s| s.key == crate::state::BROADCAST_SESSION_KEY)
+            .expect("广播信箱常驻");
+        assert!(session.pinned, "置顶常驻");
+        assert_eq!(session.nickname, "", "不随发送方改名");
+        assert_eq!(session.last_ts, record["ts"].as_u64().unwrap());
+
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

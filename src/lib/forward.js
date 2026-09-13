@@ -41,7 +41,8 @@ export function forwardPayload(msg) {
  * 由调用方提示「没有可转发的内容」。
  *
  * @param {{dir?:string, ts?:number, text?:string, files?:{name?:string}[]}[]} msgs
- * @param {(dir?: string) => string} nickOf 由方向取显示昵称（'我' / 对方昵称）
+ * @param {(dir?: string, msg?: object) => string} nickOf 由方向/消息取显示昵称
+ *        （'我' / 对方昵称；广播会话里每条消息的发送方各不相同，故回传整条消息）
  * @returns {string|null}
  */
 export function mergeForward(msgs, nickOf) {
@@ -55,7 +56,7 @@ export function mergeForward(msgs, nickOf) {
       .join(', ')
     const content = body + (att ? (body ? ' ' : '') + `${t('attach.tag')} ` + att : '')
     if (!content) continue
-    lines.push(`${t('merge.qOpen')}${nickOf(m.dir)}${t('merge.qClose')}${content}`)
+    lines.push(`${t('merge.qOpen')}${nickOf(m.dir, m)}${t('merge.qClose')}${content}`)
   }
   return lines.length ? lines.join('\n') : null
 }

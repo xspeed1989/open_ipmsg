@@ -196,6 +196,8 @@ export const copyShotImage = (b64) => invoke('copy_image_to_clipboard', { b64 })
 export const EVT = {
   usersUpdated: 'users-updated',
   msgIn: 'msg-in',
+  /** 广播信箱里本地发出的广播（只有广播走这个事件：正文与记录同源） */
+  msgOut: 'msg-out',
   fileProgress: 'file-progress',
   /** 从托盘唤起主窗口：跳到最新的未读会话 */
   openUnread: 'open-unread',
