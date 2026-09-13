@@ -183,28 +183,35 @@ function drawShape(ctx, d) {
 /** 马赛克：读底图对应区域的像素，按块平均后回填。
  *
  *  坐标系：标注层与选区是 CSS 像素，而 base 画布的后备像素是图像物理像素
- *  （k = slice.w / 窗口 CSS 宽，本机 1.25）。采样必须乘 k，回填仍用 CSS 坐标，
+ *  （k = slice.w / 窗口 CSS 宽，本机 1.25）。采样必须乘 k；回填也走设备像素，
  *  否则每个块都取到图上别处的像素，块网格也会与拖拽范围错位。 */
 function applyMosaic(ctx, cssRect) {
   const base = baseCanvas.value
   if (!base) return
   const bctx = base.getContext('2d')
   const k = base.width / Math.max(1, winRect.value.w)
+  // 回填也走设备像素：CSS 块网格在分数缩放下会落在半像素上，
+  // 相邻两块各盖一半 → 每个块缝漏出一条 25% 透光的原图细线（打码就白打了）
+  ctx.save()
+  ctx.setTransform(1, 0, 0, 1, 0, 0)
   for (const b of mosaicBlocks(cssRect, blockSize.value)) {
-    const sx = Math.max(0, Math.round(b.x * k))
-    const sy = Math.max(0, Math.round(b.y * k))
-    if (sx >= base.width || sy >= base.height) continue
-    const sw = Math.max(1, Math.min(Math.round(b.w * k), base.width - sx))
-    const sh = Math.max(1, Math.min(Math.round(b.h * k), base.height - sy))
-    const data = bctx.getImageData(sx, sy, sw, sh).data
+    const dx = Math.round(b.x * k)
+    const dy = Math.round(b.y * k)
+    const dw = Math.max(1, Math.round((b.x + b.w) * k) - dx)
+    const dh = Math.max(1, Math.round((b.y + b.h) * k) - dy)
+    if (dx >= base.width || dy >= base.height) continue
+    const sw = Math.max(1, Math.min(dw, base.width - dx))
+    const sh = Math.max(1, Math.min(dh, base.height - dy))
+    const data = bctx.getImageData(dx, dy, sw, sh).data
     let r = 0, g = 0, bl = 0, n = 0
     for (let i = 0; i < data.length; i += 4) {
       r += data[i]; g += data[i + 1]; bl += data[i + 2]; n++
     }
     if (!n) continue
     ctx.fillStyle = `rgb(${Math.round(r / n)},${Math.round(g / n)},${Math.round(bl / n)})`
-    ctx.fillRect(b.x, b.y, b.w, b.h)
+    ctx.fillRect(dx, dy, dw, dh)
   }
+  ctx.restore()
 }
 
 /** 文字工具：Enter / 失焦把输入框里的字烧进标注层，空串直接丢弃 */
