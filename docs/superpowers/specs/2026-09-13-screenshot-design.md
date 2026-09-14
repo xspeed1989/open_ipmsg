@@ -238,7 +238,12 @@ selected ──选择工具后按下──→ annotating（选区冻结）
 - 最小选区 3×3 物理像素；小于该值松开视为「清除选区」回到 idle
 - `selected` 后方向键微调 1px，`Shift+方向键` 10px
 - 快捷键：`Esc` 取消、`Enter` 确认、`Ctrl+Z` 撤销、右键取消
-- 光标：十字准星（idle/dragging）、移动（选区内部）、对应方向箭头（手柄）
+- 光标：十字准星（idle/dragging）、移动（**仅 `move` 工具**的选区内部）、对应方向箭头（手柄）。
+  选区内部的光标必须跟着当前工具走：`move` 工具是移动光标；画笔是**笔形图片**
+  （`src/lib/shotCursor.js`，CSS 没有「笔」这个关键字，只能内嵌 32×32 PNG，热点在笔尖 (3,3)，
+  末尾 `crosshair` 兜底）；文字是 I 形；箭头/矩形/椭圆/马赛克是十字准星（对位要准，笔形挡视线）。
+  以前这里是写死的 `inside → 'move'`，于是「框选 → 选箭头/画笔」后指针一进选区就是移动光标，
+  看起来还在拖选区（KDE Breeze 主题把 CSS `move` 画成一只手，用户直接读成「手形光标」）
 
 ### 7.2 工具与行为
 
@@ -284,7 +289,11 @@ mosaicBlocks(rect, block)             // 马赛克分块矩形
 arrowHead(from, to, size)             // 箭头几何
 pushUndo(stack, snapshot, limit)      // 撤销栈
 toolbarPlacement(selRect, winRect)    // 工具栏贴合与越界翻转
+cursorFor(tool, hover, hasSel)        // 命中区域 + 当前工具 → 光标（见 §7.1）
 ```
+
+光标图片是**生成文件**：`scripts/gen_shot_cursor.py`（纯标准库，8 倍超采样描线 + 盒式降采样）
+→ `src/lib/shotCursor.js`。改图形重跑脚本，不要手改 base64。
 
 ## 8. 发送与剪贴板
 

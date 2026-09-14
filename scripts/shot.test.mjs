@@ -65,7 +65,7 @@ test('移动与方向键微调都夹在窗口内', () => {
 })
 
 import {
-  cssRectToImageRect, mosaicBlocks, arrowHead, pushUndo, toolbarPlacement,
+  cssRectToImageRect, mosaicBlocks, arrowHead, pushUndo, toolbarPlacement, cursorFor,
 } from '../src/lib/shot.js'
 
 test('CSS 选区换算成整幅图里的物理像素矩形', () => {
@@ -131,6 +131,71 @@ test('工具栏优先贴选区下方，越界翻到上方，再越界贴进窗�
  * 用户看到的就是「桌面忽然暗一下 / 白闪」——而构建、既有测试、肉眼 dev 全都不报错。
  */
 const overlaySrc = readFileSync(new URL('../src/components/ScreenshotOverlay.vue', import.meta.url), 'utf8')
+
+/* ---------------- 遮罩光标 ----------------
+ *
+ * 回归背景：光标曾经只按命中区域算（inside → 'move'），不认当前工具。KDE Breeze
+ * 主题把 CSS `move` 画成**一只手**（已比对 xcursor-breeze/cursors/move），于是
+ * 「框选完 → 选箭头/画笔」之后指针一进选区就变成手，看起来还在拖选区，画不了。
+ */
+test('除画笔外的标注工具在选区内部是十字，不是移动光标', () => {
+  for (const tl of ['rect', 'ellipse', 'arrow', 'mosaic']) {
+    assert.equal(cursorFor(tl, 'inside', true), 'crosshair', `${tl} 工具在选区内应显示十字`)
+  }
+})
+
+test('画笔工具在选区内是笔形光标：自带图片 + 热点 + 十字兜底', () => {
+  const c = cursorFor('pen', 'inside', true)
+  // 热点必须落在笔尖（3,3）；末尾的 crosshair 是兜底 —— 图片没加载出来也不能变成默认箭头
+  assert.match(c, /^url\("data:image\/png;base64,[A-Za-z0-9+/=]+"\) 3 3, crosshair$/,
+    '笔形光标必须是「内嵌图片 + 热点 + crosshair 兜底」')
+  // 只有画笔画布才给笔形：手柄、选区外、没框选时都不该是笔
+  assert.equal(cursorFor('pen', 'nw', true), 'nwse-resize')
+  assert.equal(cursorFor('pen', 'outside', true), 'crosshair')
+  assert.equal(cursorFor('pen', '', false), 'crosshair')
+})
+
+test('笔形光标的图片是 32×32 的合法 PNG（三种内核都要能解）', () => {
+  const m = cursorFor('pen', 'inside', true).match(/base64,([A-Za-z0-9+/=]+)"/)
+  assert.ok(m, '光标里必须内嵌 base64 图片')
+  const buf = Buffer.from(m[1], 'base64')
+  assert.equal(buf.subarray(0, 8).toString('hex'), '89504e470d0a1a0a', 'PNG 魔数不对')
+  // IHDR 的宽高：8 字节魔数 + 4 字节块长 + 4 字节块类型之后
+  assert.equal(buf.readUInt32BE(16), 32, '宽度必须是 32（Windows 自定义光标上限）')
+  assert.equal(buf.readUInt32BE(20), 32, '高度必须是 32')
+  assert.equal(buf.subarray(12, 16).toString('ascii'), 'IHDR')
+})
+
+test('只有移动工具在选区内部是移动光标，文字工具是 I 形光标', () => {
+  assert.equal(cursorFor('move', 'inside', true), 'move')
+  assert.equal(cursorFor('text', 'inside', true), 'text')
+})
+
+test('手柄缩放光标与工具无关；选区外/未框选一律十字', () => {
+  const handle = {
+    nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize',
+    n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize',
+  }
+  for (const [h, want] of Object.entries(handle)) {
+    for (const tl of ['move', 'arrow', 'text']) {
+      assert.equal(cursorFor(tl, h, true), want, `${tl} 工具下手柄 ${h} 仍应是缩放光标`)
+    }
+  }
+  assert.equal(cursorFor('move', 'outside', true), 'crosshair')
+  assert.equal(cursorFor('arrow', 'outside', true), 'crosshair')
+  assert.equal(cursorFor('move', '', false), 'crosshair')
+  // 没有选区时工具再花哨也是十字：这一笔要么新建选区、要么画不了
+  assert.equal(cursorFor('arrow', 'inside', false), 'crosshair')
+})
+
+test('遮罩组件的光标全部来自 cursorFor，不再自己写一套映射', () => {
+  assert.match(overlaySrc, /import \{[^}]*cursorFor[^}]*\} from '\.\.\/lib\/shot'/,
+    'ScreenshotOverlay 必须从 lib/shot 引入 cursorFor')
+  assert.match(overlaySrc, /const cursor = computed\(\(\) => cursorFor\(/,
+    'cursor 必须由 cursorFor 统一决定')
+  assert.doesNotMatch(overlaySrc, /inside:\s*'move'/,
+    'inside → move 的硬编码会绕开工具判断（手形光标回归）')
+})
 
 test('底图落地前不画任何不透明层：压暗层/提示都挂在 painted 上', () => {
   // 两个不透明层必须带 painted 条件

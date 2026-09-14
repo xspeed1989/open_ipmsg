@@ -2,6 +2,7 @@
  * 截图遮罩的几何纯函数（无 DOM、无 Tauri 依赖，node --test 直接跑）。
  * 坐标系：一律 CSS 像素；与整幅抓屏图像的换算只发生在 cssRectToImageRect。
  */
+import { PEN_CURSOR } from './shotCursor.js'
 
 /** 拖拽两点 → 归一化矩形，并夹取到 bounds 内 */
 export function rectFromDrag(a, b, bounds) {
@@ -57,6 +58,32 @@ export function hitTestHandle(r, pt, tol = 6) {
   if (spanX && nearB) return 's'
   if (pt.x > r.x && pt.x < r.x + r.w && pt.y > r.y && pt.y < r.y + r.h) return 'inside'
   return 'outside'
+}
+
+/** 手柄命中区域 → 缩放光标 */
+const HANDLE_CURSORS = {
+  nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize',
+  n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize',
+}
+
+/**
+ * 遮罩上的光标：手柄 > 选区内部 > 其余一律十字。
+ *
+ * 选区内部**必须看当前工具**：只有 move 工具是在拖选区，标注工具（箭头/画笔/矩形…）
+ * 在选区里就是画布。以前这里写死了 inside → 'move'，而 KDE Breeze 主题把 `move`
+ * 画成**一只手**，于是「框选 → 选箭头/画笔」之后指针一进选区就变成手，看起来还在
+ * 拖选区、画不下去。
+ *
+ * 各工具：move → 移动光标；pen → 笔形图片（PEN_CURSOR）；text → I 形；
+ * 箭头/矩形/椭圆/马赛克 → 十字准星（对位要准，笔形反而挡视线）。
+ */
+export function cursorFor(tool, hover, hasSel) {
+  if (!hasSel) return 'crosshair'
+  if (HANDLE_CURSORS[hover]) return HANDLE_CURSORS[hover]
+  if (hover !== 'inside') return 'crosshair'
+  if (tool === 'move') return 'move'
+  if (tool === 'pen') return PEN_CURSOR
+  return tool === 'text' ? 'text' : 'crosshair'
 }
 
 /** 拖动某个手柄：被拖的边跟随指针，其余边不动 */

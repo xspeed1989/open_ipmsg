@@ -5,7 +5,7 @@ import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import * as ipc from '../lib/ipc'
 import {
   rectFromDrag, clampRect, canConfirm, hitTestHandle, resizeRect, moveRect, nudgeRect,
-  cssRectToImageRect, toolbarPlacement, mosaicBlocks, arrowHead, pushUndo,
+  cssRectToImageRect, toolbarPlacement, mosaicBlocks, arrowHead, pushUndo, cursorFor,
 } from '../lib/shot'
 import { t } from '../lib/i18n'
 import { save as saveDialog } from '@tauri-apps/plugin-dialog'
@@ -57,15 +57,6 @@ const sizeLabel = computed(() => {
 })
 
 const hover = ref('')
-const cursor = computed(() => {
-  if (!sel.value) return 'crosshair'
-  const map = {
-    nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize',
-    n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize',
-    inside: 'move', outside: 'crosshair',
-  }
-  return map[hover.value] || 'crosshair'
-})
 
 const canOk = computed(() => canConfirm(sel.value))
 
@@ -84,6 +75,11 @@ const TOOLS = ['move', 'rect', 'ellipse', 'arrow', 'pen', 'text', 'mosaic']
 const COLORS = ['#e64340', '#ff8c00', '#ffd400', '#1aad19', '#1e6fff', '#000000']
 const WIDTHS = [2, 3, 5]
 const BLOCKS = [6, 10, 16]
+
+/** 光标 = 命中区域 + 当前工具（映射规则在 lib/shot.cursorFor，有单测）。
+ *  写在工具声明之后：虽然 computed 是惰性求值、放前面也不会踩 TDZ，
+ *  但顺序理顺后，以后有人在 setup 里同步读 cursor 也不会炸。 */
+const cursor = computed(() => cursorFor(tool.value, hover.value, !!sel.value))
 
 /** 工具栏贴合：优先选区下方，放不下翻到上方，最后夹进窗口。
  *  尺寸必须实测：工具栏加了确认组之后更宽，写死的宽度会让右端的按钮被夹出窗口；

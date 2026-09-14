@@ -3996,3 +3996,22 @@ git commit -m "docs(shot): 截图功能说明、FAQ 与实现记录"
 - `pnpm test`（147）、`cargo test`（226 passed / 1 ignored）、`pnpm build`、`cargo check --target x86_64-pc-windows-gnu`。
 - 本机真触发：日志出现 `[shot] 遮罩已就绪并显示`；遮罩仍正确铺满两块屏（≈0.55 压暗）；用 `GDK_BACKEND=x11` + XTEST 重跑一次"拖拽→标注→回车→剪贴板 750×400"的端到端，确认透明窗没有破坏合成（画布必须不透明地盖住整个窗口）。
 - Windows/macOS：透明窗行为需维护者真机确认（清单 §15.5）。
+
+---
+
+### Task 16: 选区内的光标跟随工具（后续修复，用户实测反馈）
+
+**背景（用户实测）**：「框选之后选择画线或者箭头的时候鼠标不应该是手的形状」。`ScreenshotOverlay.vue` 的 `cursor` computed 只按 `hitTestHandle` 的命中区域查表，**没有看当前工具**：`inside → 'move'` 是写死的，于是只要指针落在选区里（选了箭头、画笔、马赛克都一样）光标都是 `move`。本机 KDE Breeze 主题的 `move` 光标恰好画成**一只手**（把 `xcursor-breeze/cursors/move` 的 Xcursor 帧解出来渲染确认过），用户看到的就是「手形光标」，看起来还在拖选区、画不下去。
+
+**修复**：把映射抽成纯函数 `cursorFor(tool, hover, hasSel)`（`src/lib/shot.js`）——手柄优先（缩放箭头）> 选区内部看工具 > 其余一律 `crosshair`。组件里换成 `const cursor = computed(() => cursorFor(tool.value, hover.value, !!sel.value))`（该 computed 移到工具声明之后，免得以后有人在 setup 里同步读 `cursor` 踩 TDZ）。
+
+**后续（同一轮反馈的追加要求）**：用户追问「不能改成笔的形状吗？」。裁决：**只有画笔工具用笔形**，箭头/矩形/椭圆/马赛克仍用十字准星，文字仍是 I 形。CSS 没有「笔」这个关键字，只能自带图片 —— 新增生成脚本 `scripts/gen_shot_cursor.py`（纯标准库，8 倍超采样 + 盒式降采样）产出 `src/lib/shotCursor.js`（32×32 PNG，热点在笔尖 (3,3)，末尾 `crosshair` 兜底）。选 PNG 而非 SVG：遮罩跑在 WebKitGTK/WebView2/WKWebView 三种内核上，WebKitGTK 的光标图走 gdk-pixbuf，不保证带 SVG loader；32×32 是 Windows `cursor: url()` 的上限。
+
+**Files:**
+- Modify: `src/lib/shot.js`, `src/components/ScreenshotOverlay.vue`, `scripts/shot.test.mjs`
+- Add: `scripts/gen_shot_cursor.py`, `src/lib/shotCursor.js`（生成文件）
+
+**验证**
+- `pnpm test`（173 passed）、`pnpm build`（vite 产物正常）。
+- 无 Tauri 也能验：临时夹具把**真实** `ScreenshotOverlay.vue` 挂进普通浏览器（`window.__TAURI_INTERNALS__.invoke` 打桩，`shot_image` 返回一张假底图），用真实指针事件逐工具读 `getComputedStyle(.shot-root).cursor`。修复前：7 个工具的选区内部**全是 `move`**；修复后：`move` → `move`、画笔 → `url("data:image/png;base64,…") 3 3, crosshair`、文字 → `text`、箭头/矩形/椭圆/马赛克 → `crosshair`；手柄仍是 `nwse-resize`/`ew-resize`、选区外仍是 `crosshair`。行为未回归：画笔照旧画得出来（标注层不透明像素 0 → 1970）、`move` 工具拖选区与手柄缩放结果不变、文字工具点击仍弹出输入框。
+- 光标图片本身：单测里解码 base64 校验 PNG 魔数与 IHDR 32×32；浏览器里 `new Image()` 真解码 32×32；Linux 侧再用 gdk-pixbuf（WebKitGTK 载入光标图的通道）载入一次确认 32×32 带 alpha。高 DPI 下由合成器按系统光标尺寸缩放，可能轻微软化，可接受。
