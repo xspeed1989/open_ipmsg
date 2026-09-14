@@ -2021,6 +2021,9 @@ async fn extended_protocols() -> bool {
     cfg.encoding = "utf8".into();
     cfg.password_use = true;
     cfg.password = "secret123".into();
+    // E4 守的是「信封占位 + 手动开封 + 开封才回执」这条路径，所以这里显式关掉
+    // 默认开启的「自动打开封书」；开启后的行为在同段末尾单独断言。
+    cfg.auto_open_secret = false;
     st.set_config(cfg.clone());
     let ctx = net::start_network_quiet(st.clone(), port_app)
         .await
@@ -2317,9 +2320,9 @@ async fn extended_protocols() -> bool {
     let secret_sent = wait_for(2000, || ext.lock().unwrap().secret_flags.contains(&true)).await;
     log.check("E: 封书发出带 SECRETOPT", secret_sent);
 
-    // 对端发来无密码封书（SECRETEXOPT = SECRET|READCHECK）：接收端保持**未开封** ——
-    // 正文此刻已在本地（载荷对收件人解封过），但不上屏，也不回 READMSG；
-    // 只有收件人显式「打开（开封）」之后正文才可见、回执才发。
+    // 对端发来无密码封书（SECRETEXOPT = SECRET|READCHECK）：关掉「自动打开封书」时
+    // 接收端保持**未开封** —— 正文此刻已在本地（载荷对收件人解封过），但不上屏，
+    // 也不回 READMSG；只有收件人显式「打开（开封）」之后正文才可见、回执才发。
     let secret_pkt = proto::next_packet_no();
     let mut s = proto::Packet::new(cmd::SENDMSG | opt::SECRETEXOPT).with_pkt_no(secret_pkt);
     s.extra = "请开封查看的封书".as_bytes().to_vec();
@@ -2396,6 +2399,44 @@ async fn extended_protocols() -> bool {
             })
             .unwrap_or(false),
     );
+
+    // 打开「自动打开封书」后再来一封同样的无密码封书：入站即已开封 —— 正文直接
+    // 上屏，标记已读也就能回执（上面关掉开关时这两件事都被门控挡住）。
+    {
+        let mut cfg_auto = st.config();
+        cfg_auto.auto_open_secret = true;
+        st.set_config(cfg_auto);
+    }
+    let auto_pkt = proto::next_packet_no();
+    let mut s_auto = proto::Packet::new(cmd::SENDMSG | opt::SECRETEXOPT).with_pkt_no(auto_pkt);
+    s_auto.extra = "自动打开的封书".as_bytes().to_vec();
+    let _ = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+        .await
+        .unwrap()
+        .send_to(&s_auto.encode("扩展假对端", "fake-ext"), target_app)
+        .await;
+    let auto_opened = wait_for(2000, || {
+        events.lock().unwrap().iter().any(|(e, v)| {
+            e == "msg-in"
+                && v["msg"]["pkt"].as_u64() == Some(auto_pkt as u64)
+                && v["msg"]["secret"].as_bool() == Some(true)
+                && v["msg"]["locked"].as_bool() == Some(false)
+                && v["msg"]["unlocked"].as_bool() == Some(true)
+        })
+    })
+    .await;
+    log.check("E: 开启自动打开封书后入站即已开封", auto_opened);
+    let auto_receipt = net::mark_read_and_receipt(&ctx, &peer_key, &[auto_pkt])
+        .await
+        .expect("mark auto-opened secret");
+    log.check("E: 自动开封的封书照常回一条 READMSG", auto_receipt == 1);
+    // 本场景后续（EncIPDict 封书等）仍按「关掉自动打开」的状态断言信封占位与
+    // 回执门控，这里把开关拨回去，避免上一条检查的副作用改变后面用例的前提
+    {
+        let mut cfg_restore = st.config();
+        cfg_restore.auto_open_secret = false;
+        st.set_config(cfg_restore);
+    }
 
     /* ---- E5. 密码锁（PASSWORDOPT） ---- */
     let pass_pkt = proto::next_packet_no();

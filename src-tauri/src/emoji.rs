@@ -559,7 +559,7 @@ pub fn inspect_pack(data_dir: &Path, src: &Path) -> Result<PackInspect, String> 
             problem: None,
         };
         if !safe_entry_name(&it.file) {
-            item.problem = Some("包内路径不合法".into());
+            item.problem = Some("E_PACK_BAD_PATH|包内路径不合法".into());
             items.push(item);
             continue;
         }
@@ -573,13 +573,13 @@ pub fn inspect_pack(data_dir: &Path, src: &Path) -> Result<PackInspect, String> 
                     .take(MAX_EMOJI_BYTES + 1)
                     .read_to_end(&mut bytes)
                 {
-                    item.problem = Some(format!("读取失败：{e}"));
+                    item.problem = Some(format!("E_READ_FAILED|{e}"));
                     items.push(item);
                     continue;
                 }
             }
             Err(_) => {
-                item.problem = Some("包内缺少该文件".into());
+                item.problem = Some("E_PACK_FILE_MISSING|包内缺少该文件".into());
                 items.push(item);
                 continue;
             }
@@ -588,25 +588,25 @@ pub fn inspect_pack(data_dir: &Path, src: &Path) -> Result<PackInspect, String> 
         match detect_image_kind(&bytes) {
             Some(kind) => item.kind = Some(kind.to_string()),
             None => {
-                item.problem = Some("不是支持的图片格式".into());
+                item.problem = Some("E_PACK_BAD_FORMAT|不是支持的图片格式".into());
                 items.push(item);
                 continue;
             }
         }
         if bytes.len() as u64 > MAX_EMOJI_BYTES {
-            item.problem = Some(format!("超过 {}MB 上限", MAX_EMOJI_BYTES / 1024 / 1024));
+            item.problem = Some(format!("E_PACK_TOO_BIG|{}", MAX_EMOJI_BYTES / 1024 / 1024));
             items.push(item);
             continue;
         }
         total_bytes += bytes.len() as u64;
         if total_bytes > MAX_PACK_TOTAL_BYTES {
-            item.problem = Some("包内图片总大小超限".into());
+            item.problem = Some("E_PACK_TOTAL_TOO_BIG|包内图片总大小超限".into());
             items.push(item);
             continue;
         }
         if local.contains(&content_sha(&bytes)) {
             item.duplicate = true;
-            item.problem = Some("表情库里已有相同图片".into());
+            item.problem = Some("E_PACK_DUPLICATE|表情库里已有相同图片".into());
         }
         items.push(item);
     }

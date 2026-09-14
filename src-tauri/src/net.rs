@@ -1899,13 +1899,17 @@ async fn handle_sendmsg(
         .as_ref()
         .and_then(|record| record.get("unlocked").and_then(Value::as_bool))
         .unwrap_or(false);
-    // 入站封书/密码锁一律保持**未开封**：正文此刻确实已在本地（载荷对收件人解封过），
-    // 但「开封」是收件人的动作 —— 开封前不上屏、不回 READMSG。曾经对无密码封书
-    // 自动置 unlocked（`secret && !password_protected`），结果是「封书（需对方点开
-    // 查看）」在接收端退化成普通消息，正文直接显示、回执也在收到时就发了，与
-    // pending_receipts 的门控和官方 recvdlg「开封才回 READMSG」的语义都矛盾。
+    // 入站封书/密码锁的「未开封」状态：
+    // - 密码锁（PASSWORDOPT）一律保持未开封 —— 必须收件人输口令才能看，
+    //   自动打开也不能绕过这道门；
+    // - 无密码封书按设置项 `auto_open_secret`（默认开）处理：开启时等价于
+    //   收件人一收到就点了「开封」，正文直接上屏、回执随之走常规已读流程；
+    //   关闭时保持信封占位、不回 READMSG，由收件人手动开封。
+    //   曾经这里写死「一律未开封」，理由是无条件自动开封会让封书在接收端
+    //   退化成普通消息；现在这是用户可选的开关，关掉即回到那个语义。
     // 同一 payload 的重投沿用既有开封状态（用户开过的信不必再开一次）。
-    let unlocked = prior_unlocked;
+    let auto_open = secret && !password_protected && ctx.st.config().auto_open_secret;
+    let unlocked = prior_unlocked || auto_open;
 
     let existing_peer = if is_broadcast {
         None
@@ -1966,7 +1970,7 @@ async fn handle_sendmsg(
     let outcome = ctx
         .st
         .upsert_in_record_fallible(session_key, &record)
-        .map_err(|error| format!("聊天记录持久化失败：{error}"))?;
+        .map_err(|error| format!("E_PERSIST_FAILED|{error}"))?;
     if outcome == InRecordOutcome::Duplicate {
         return Ok(outcome);
     }
@@ -2110,7 +2114,7 @@ pub fn stage_clipboard_image(
         "image/gif" => "gif",
         "image/bmp" => "bmp",
         "image/webp" => "webp",
-        other => return Err(format!("不支持的图片类型：{other}")),
+        other => return Err(format!("E_IMAGE_UNSUPPORTED|{other}")),
     };
     let id = FILE_ID_SEQ.fetch_add(1, Ordering::Relaxed).max(1);
     stage_blob(
@@ -2754,14 +2758,14 @@ pub async fn recall_message(ctx: &NetCtx, key: &str, pkt: u32) -> Result<(), Str
     // 只允许撤回我方发出的文本消息（附件消息撤回后对端无法再取，禁止）
     let rec = ctx.st.find_history_any(key, pkt);
     let Some(rec) = rec else {
-        return Err("找不到该消息".into());
+        return Err("E_RECALL_NOT_FOUND|找不到该消息".into());
     };
     if rec.get("dir").and_then(|v| v.as_str()) != Some("out") {
-        return Err("只能撤回自己发出的消息".into());
+        return Err("E_RECALL_NOT_MINE|只能撤回自己发出的消息".into());
     }
     let kind = rec.get("kind").and_then(|v| v.as_str()).unwrap_or("text");
     if kind != "text" {
-        return Err("附件消息不支持撤回（对方可能已开始下载）".into());
+        return Err("E_RECALL_HAS_FILES|附件消息不支持撤回（对方可能已开始下载）".into());
     }
     let peer = ctx.st.peers.lock().unwrap().get(key).cloned();
     if let Some(peer) = peer {
@@ -2864,7 +2868,7 @@ pub async fn unlock_message(
         // 却回「找不到该消息」是误导。出站直接当已开封（正文本来就是我写的）。
         return match ctx.st.find_history_any(key, pkt) {
             Some(rec) if rec.get("dir").and_then(|v| v.as_str()) == Some("out") => Ok(()),
-            _ => Err("找不到该消息".into()),
+            _ => Err("E_UNLOCK_NOT_FOUND|找不到该消息".into()),
         };
     };
     let is_locked = rec.get("locked").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -2875,11 +2879,11 @@ pub async fn unlock_message(
     if is_locked {
         let cfg = ctx.st.config();
         if !cfg.password_use || cfg.password.is_empty() {
-            return Err("本机未启用密码验证，无法解锁密码消息".into());
+            return Err("E_UNLOCK_DISABLED|本机未启用密码验证，无法解锁密码消息".into());
         }
         let pw = password.unwrap_or_default();
         if !pw.eq(&cfg.password) {
-            return Err("密码错误".into());
+            return Err("E_UNLOCK_BAD_PASSWORD|密码错误".into());
         }
     }
     ctx.st.update_history_pkt(key, pkt, |r| {
@@ -4890,8 +4894,10 @@ mod tests {
     }
 
     /// 端到端回归：A 用「封书」按钮发一条加密消息（SENDMSG|SECRETEXOPT|ENCRYPTOPT），
-    /// B（另一个实例）必须真的收到、落库并经 msg-in 上屏，且**保持未开封**：
-    /// 收件人看到的是信封占位，正文要等「打开（开封）」才可见。
+    /// B（另一个实例）必须真的收到、落库并经 msg-in 上屏；在**关掉「自动打开封书」**
+    /// 的设置下**保持未开封**：收件人看到的是信封占位，正文要等「打开（开封）」才可见。
+    ///（默认开启时入站即已开封，那条路径由
+    /// `inbound_sealed_message_is_unsealed_on_arrival_by_default` 覆盖。）
     ///
     /// 这条路径此前没有任何测试覆盖：既有用例要么只断言「发出的报文带 SECRETOPT」
     /// （假对端），要么只用手工明文报文构造入站封书，两边都不碰真实密封载荷。
@@ -4912,6 +4918,10 @@ mod tests {
 
         let mut cfg = Config::default();
         cfg.encrypt = true;
+        // 这条用例守的是「信封占位 + 手动开封」那条路径，所以显式关掉
+        // 默认开启的「自动打开封书」（开关默认值由
+        // `auto_open_secret_survives_reopen_and_resave` 与入站用例各自守住）
+        cfg.auto_open_secret = false;
         st_a.set_config(cfg.clone());
         st_b.set_config(cfg);
 
@@ -4990,7 +5000,7 @@ mod tests {
         assert_eq!(rec["locked"], false);
         assert_eq!(
             rec["unlocked"], false,
-            "无密码封书入站保持未开封：接收端渲染信封占位而不是正文"
+            "关掉「自动打开封书」后无密码封书保持未开封：接收端渲染信封占位而不是正文"
         );
         assert_eq!(rec["read"], false);
         assert_eq!(emitted.load(Ordering::SeqCst), 1, "B 应上屏一条 msg-in");
@@ -5036,6 +5046,43 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir_a);
         let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// 「自动打开封书」（设置项，默认开）：无密码的封书一到就按已开封落库 ——
+    /// 收件人不点「开封」也能直接看到正文；`secret` 仍是 true，时间行照旧标
+    /// 「封书」，不会退化成一条看不出是封书的普通消息。
+    #[tokio::test]
+    async fn inbound_sealed_message_is_unsealed_on_arrival_by_default() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("auto-open-secret").await;
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        let pkt_no = 665510;
+        let mut packet = classic_identity_packet(
+            "自动打开的封书".as_bytes(),
+            crate::protocol::cmd::SENDMSG
+                | crate::protocol::opt::SECRETOPT
+                | crate::protocol::opt::READCHECKOPT
+                | crate::protocol::opt::UTF8OPT,
+        );
+        packet.pkt_no = pkt_no;
+        let identity = super::classic_payload_identity(&packet);
+
+        super::handle_sendmsg(&ctx, from, &packet, &key, None, &identity, false, None)
+            .await
+            .unwrap();
+
+        let record = st.find_in_record(&key, pkt_no).expect("封书应落库");
+        assert_eq!(
+            record["unlocked"], true,
+            "默认开启自动打开：入站封书落库时就该是已开封"
+        );
+        assert_eq!(record["locked"], false);
+        assert_eq!(
+            record["secret"], true,
+            "自动打开不改变「这条是封书」的属性（时间行仍要标出来）"
+        );
+        assert_eq!(record["text"].as_str(), Some("自动打开的封书"));
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     /// 「密码锁」在**本应用的收发两端**是一条真实生效的契约：A 勾选密码锁直发，

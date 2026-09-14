@@ -9,6 +9,7 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { t } from '../lib/i18n'
 import * as ipc from '../lib/ipc'
+import { confirm } from '../lib/dialog'
 import { store } from '../store'
 import {
   normalizeEmojis, importSummary, packSummary, packItemState, defaultPackSelection,
@@ -106,7 +107,7 @@ async function loadThumb(e) {
 async function loadList() {
   try {
     const r = await ipc.listEmojis()
-    emojis.value = normalizeEmojis(r)
+    emojis.value = normalizeEmojis(r, t('emoji.untitled'))
     store.emojiFiles = emojis.value.map((e) => e.file)
     store.emojiCacheFiles = emojis.value.map((e) => e.cacheFile).filter(Boolean)
     for (const e of emojis.value) loadThumb(e)
@@ -141,7 +142,7 @@ async function importImages() {
     }
     busy.value = true
     const r = await ipc.importEmoji(paths)
-    const added = normalizeEmojis({ emojis: r?.imported || [] })
+    const added = normalizeEmojis({ emojis: r?.imported || [] }, t('emoji.untitled'))
     // 直接增量更新，少一次全量拉取；顺序与后端一致（新导入排最后）
     if (added.length) {
       emojis.value = emojis.value.concat(added)
@@ -416,7 +417,7 @@ async function menuDelete() {
   const entry = menu.value?.entry
   closeMenu()
   if (!entry) return
-  if (!window.confirm(t('emoji.deleteConfirm', { n: 1 }))) return
+  if (!(await confirm(t('emoji.deleteConfirm', { n: 1 }), { danger: true }))) return
   await deleteSticker(entry)
 }
 

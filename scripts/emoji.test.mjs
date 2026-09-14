@@ -100,8 +100,8 @@ const INSPECT = {
   name: '朋友的包',
   items: [
     { file: 'images/001_a.png', name: 'a', kind: 'png', duplicate: false, problem: null },
-    { file: 'images/002_b.gif', name: 'b', kind: 'gif', duplicate: true, problem: '表情库里已有相同图片' },
-    { file: '../evil.png', name: 'evil', kind: null, duplicate: false, problem: '包内路径不合法' },
+    { file: 'images/002_b.gif', name: 'b', kind: 'gif', duplicate: true, problem: 'E_PACK_DUPLICATE|表情库里已有相同图片' },
+    { file: '../evil.png', name: 'evil', kind: null, duplicate: false, problem: 'E_PACK_BAD_PATH|包内路径不合法' },
   ],
 }
 

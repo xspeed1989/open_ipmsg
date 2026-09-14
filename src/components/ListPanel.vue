@@ -1,10 +1,10 @@
 <script setup>
 // 中栏：联系人列表（按群组分组，固定显示，未读角标提示新消息；右键可删除会话）
 import { computed, ref, watch } from 'vue'
-import { confirm as confirmDialog } from '@tauri-apps/plugin-dialog'
 import { store, openChat, onSearchInput, openHit, displayName, fmtTime, deleteContact, getAbsenceInfoFor, isBroadcastKey } from '../store'
 import { makeSnippet } from '../lib/text'
 import { t } from '../lib/i18n'
+import { confirm } from '../lib/dialog'
 import Avatar from './Avatar.vue'
 
 const q = computed(() => store.search.trim())
@@ -93,10 +93,11 @@ async function doDeleteContact() {
   if (!key) return
   closeCtx()
   const who = displayName(key)
-  const ok = await confirmDialog(
-    t('list.deleteConfirm', { who }),
-    { title: t('list.deleteTitle'), kind: 'warning', okLabel: t('list.deleteOk'), cancelLabel: t('cancel') }
-  )
+  const ok = await confirm(t('list.deleteConfirm', { who }), {
+    okLabel: t('list.deleteOk'),
+    cancelLabel: t('cancel'),
+    danger: true,
+  })
   if (ok) await deleteContact(key)
 }
 </script>

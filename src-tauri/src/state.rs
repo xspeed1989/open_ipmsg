@@ -69,6 +69,11 @@ pub struct Config {
     /// 截图确认后是否自动复制到剪贴板（微信习惯：默认开）
     #[serde(default = "default_true")]
     pub shot_copy_clipboard: bool,
+    /// 自动打开封书：收到的**无密码**封书（SECRETOPT）直接按已开封上屏，
+    /// 不必再点「开封」。默认开；关闭后恢复「信封占位 + 手动开封」。
+    /// 只影响新到的消息，密码锁（PASSWORDOPT）永远要输密码，不受此项影响。
+    #[serde(default = "default_true")]
+    pub auto_open_secret: bool,
 }
 
 fn default_absence_text() -> String {
@@ -119,6 +124,7 @@ impl Default for Config {
             v6_mcast: default_true(),
             shot_hotkey: default_shot_hotkey(),
             shot_copy_clipboard: default_true(),
+            auto_open_secret: default_true(),
         }
     }
 }

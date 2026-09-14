@@ -1,6 +1,6 @@
 <script setup>
 // 右侧聊天窗口：头部 / 消息流（日期分隔+气泡）/ 工具栏 / 输入区
-import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted, inject } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import * as ipc from '../lib/ipc'
 import {
@@ -20,7 +20,9 @@ import { copyTextOf } from '../lib/copymsg'
 import { pendingImgFromB64, b64ToBytes } from '../lib/clipimg'
 import { addToEmojiPlan, attachPath, importSummary, isStickerFile } from '../lib/emoji'
 import { t } from '../lib/i18n'
-import { open as openFileDialog, confirm as confirmDialog } from '@tauri-apps/plugin-dialog'
+import { toast, confirm, prompt as promptDialog } from '../lib/dialog'
+import { describeError, errorCode } from '../lib/errors'
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog'
 import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import Avatar from './Avatar.vue'
@@ -90,22 +92,22 @@ watch(() => store.activeKey, () => {
 })
 watch(() => msgs.value.length, () => scrollBottom(true))
 
+/* ---------- toast 落点 ---------- */
+// App 提供的共享 ref：绑到头部下方那个零高锚点上，DialogHost 用 Teleport 把
+// 轻提示挂进来，落点由布局决定。注意只能 inject —— ChatWindow 与 DialogHost
+// 是兄弟节点，在这里 provide 传不过去
+const toastAnchor = inject('toastAnchor', null)
+// 必须用脚本侧的 setter 绑定：把 ref 对象直接写进模板（:ref="toastAnchor"）会被
+// setupState 的 proxyRefs 解包成 null，锚点永远绑不上（实测 A/B 对比确认）
+const setToastAnchor = (el) => {
+  if (toastAnchor) toastAnchor.value = el
+}
+
 /* ---------- 发送 ---------- */
 const draft = ref('')
 const ta = ref(null)
 
 /* ---------- 自定义表情 ---------- */
-
-/** 顶部轻提示（表情收纳等轻量反馈；3 秒后自动消失） */
-const toastMsg = ref('')
-let toastTimer = null
-function toast(text) {
-  toastMsg.value = String(text || '')
-  clearTimeout(toastTimer)
-  toastTimer = setTimeout(() => {
-    toastMsg.value = ''
-  }, 3000)
-}
 
 /**
  * 等待某个附件下载完成，返回最终落盘路径（失败/超时返回 ''）。
@@ -153,7 +155,7 @@ async function sendSticker(entry) {
   try {
     await sendEmojiTo(key, entry.id)
   } catch (e) {
-    alert(t('emoji.sendFailed', { e: String(e?.message || e) }))
+    toast(describeError(e, 'emoji.sendFailed'), { kind: 'error' })
   }
 }
 
@@ -271,7 +273,7 @@ function startForward() {
   const payload = forwardPayload(m)
   closeCtx()
   if (!payload.ok) {
-    alert(payload.reason)
+    toast(payload.reason, { kind: 'error' })
     return
   }
   picker.value = { mode: 'forward', payload }
@@ -292,20 +294,21 @@ function bubbleFiles(m) {
 async function doUnlock(m) {
   if (!store.activeKey) return
   if (m.locked) {
-    const pw = window.prompt ? window.prompt(t('chat.pwdPrompt')) : ''
+    // 输入框掩码显示：原生 prompt 是明文的
+    const pw = await promptDialog(t('chat.pwdPrompt'), { password: true })
     if (pw === null) return
     try {
       await unlockMsg(store.activeKey, m.pkt, pw || null)
-      alert(t('chat.unlockedOk'))
+      toast(t('chat.unlockedOk'))
     } catch (e) {
-      alert(t('chat.unlockFail', { e }))
+      toast(describeError(e, 'chat.unlockFail'), { kind: 'error' })
     }
     return
   }
   try {
     await unlockMsg(store.activeKey, m.pkt, null)
   } catch (e) {
-    alert(e)
+    toast(describeError(e), { kind: 'error' })
   }
 }
 
@@ -314,7 +317,7 @@ function startRecall() {
   const m = ctxMenu.value?.msg
   if (!m || !store.activeKey) return
   closeCtx()
-  recallMsg(store.activeKey, m.pkt).catch((e) => alert(e))
+  recallMsg(store.activeKey, m.pkt).catch((e) => toast(describeError(e), { kind: 'error' }))
 }
 
 function reeditRecalled(m) {
@@ -332,12 +335,12 @@ function reeditRecalled(m) {
 
 function startBatch() {
   if (!store.activeKey) {
-    alert(t('chat.alertSelectSession'))
+    toast(t('chat.alertSelectSession'))
     return
   }
   // 输入框为空时不再静默禁用按钮，点击给出明确引导
   if (!canSend.value) {
-    alert(t('chat.alertFillContent'))
+    toast(t('chat.alertFillContent'))
     nextTick(() => ta.value?.focus())
     return
   }
@@ -356,7 +359,7 @@ function copyMsg() {
   const selText = sel && !sel.isCollapsed ? sel.toString() : ''
   if (selText.trim()) {
     closeCtx()
-    ipc.copyText(selText).catch((e) => alert(t('chat.alertCopyFailed', { e })))
+    ipc.copyText(selText).catch((e) => toast(describeError(e, 'chat.alertCopyFailed'), { kind: 'error' }))
     return
   }
   const m = ctxMenu.value?.msg
@@ -364,10 +367,10 @@ function copyMsg() {
   if (!m) return
   const ct = copyTextOf(m)
   if (!ct) {
-    alert(t('chat.alertNoCopy'))
+    toast(t('chat.alertNoCopy'))
     return
   }
-  ipc.copyText(ct).catch((e) => alert(t('chat.alertCopyFailed', { e })))
+  ipc.copyText(ct).catch((e) => toast(describeError(e, 'chat.alertCopyFailed'), { kind: 'error' }))
 }
 
 function enterSelMode() {
@@ -397,7 +400,7 @@ function startMultiForward() {
     dir === 'out' ? t('me') : isBroadcast.value ? msgSender(m) : peerNick
   )
   if (!merged) {
-    alert(t('chat.alertNoForward'))
+    toast(t('chat.alertNoForward'))
     return
   }
   exitSel()
@@ -426,7 +429,7 @@ async function onPickerConfirm(keys) {
     try {
       paths = await pendingToPaths(pendingList.value)
     } catch (e) {
-      alert(t('chat.alertStageFailed', { e }))
+      toast(describeError(e, 'chat.alertStageFailed'), { kind: 'error' })
       return
     }
   }
@@ -444,8 +447,8 @@ async function onPickerConfirm(keys) {
 /** 群发/转发的统一结果提示：全成功报「已发送给 N 人」，有失败报「成功 N 人；失败 M 人」 */
 function reportSendResult(ok, fails, keys) {
   const names = keys.map((k) => displayName(k) || k).join(t('sep.list'))
-  if (!fails.length) alert(t('chat.alertSentTo', { n: ok, names }))
-  else alert(t('chat.alertPartial', { ok, fail: fails.length, names }))
+  if (!fails.length) toast(t('chat.alertSentTo', { n: ok, names }))
+  else toast(t('chat.alertPartial', { ok, fail: fails.length, names }))
 }
 
 watch(() => store.activeKey, () => nextTick(() => ta.value?.focus()))
@@ -467,7 +470,7 @@ async function doSend() {
   if (isBroadcast.value) {
     if (!text.trim()) return
     if (pendingList.value.length) {
-      alert(t('broadcast.noFiles'))
+      toast(t('broadcast.noFiles'))
       return
     }
     try {
@@ -475,7 +478,7 @@ async function doSend() {
       draft.value = ''
       autoBottom = true
     } catch (e) {
-      alert(t('broadcast.failed', { e }))
+      toast(describeError(e, 'broadcast.failed'), { kind: 'error' })
     }
     return
   }
@@ -494,7 +497,7 @@ async function doSend() {
     draft.value = ''
     autoBottom = true
   } catch (e) {
-    alert(t('chat.alertSendFailed', { e }))
+    toast(describeError(e, 'chat.alertSendFailed'), { kind: 'error' })
   }
 }
 
@@ -575,7 +578,7 @@ function bytesToB64(bytes) {
 async function takeImageFile(file) {
   if (!file) return false
   if (file.size > 32 * 1024 * 1024) {
-    alert(t('chat.alertImgTooBig'))
+    toast(t('chat.alertImgTooBig'), { kind: 'error' })
     return false
   }
   const buf = new Uint8Array(await file.arrayBuffer())
@@ -648,7 +651,7 @@ async function onPaste(e) {
     }
     nextTick(() => ta.value?.focus())
   } catch (err) {
-    alert(t('chat.alertPasteFailed', { e: err }))
+    toast(describeError(err, 'chat.alertPasteFailed'), { kind: 'error' })
   }
 }
 
@@ -727,7 +730,7 @@ function attachToPending(key, paths) {
   if (!key || !paths?.length) return
   // 广播只承载纯文本：拖到广播条目上直接说明，别让附件静静躺在待发送区
   if (isBroadcastKey(key)) {
-    alert(t('broadcast.noFiles'))
+    toast(t('broadcast.noFiles'))
     return
   }
   pendingOf(key).push(...pendingFileItems(paths))
@@ -747,20 +750,13 @@ async function startShot() {
   try {
     await ipc.startScreenshot()
   } catch (e) {
-    const msg = shotErrorText(e)
-    // 后端「正在截屏」= 另一次抓屏还在途（例如刚用热键触发过），它的遮罩马上就会出来；
-    // 这不是用户需要处理的错误，弹窗只会让人以为截图点坏了
-    if (!msg.includes('正在截屏')) alert(msg)
+    // 后端 CAPTURE_BUSY = 另一次抓屏还在途（例如刚用热键触发过），它的遮罩马上就
+    // 会出来；这不是用户需要处理的错误，提示只会让人以为截图点坏了。
+    // 按错误码分流，不比对文案：文案改了这里会静默失效
+    if (errorCode(e) !== 'CAPTURE_BUSY') toast(describeError(e), { kind: 'error' })
   } finally {
     shotBusy.value = false
   }
-}
-
-/** 后端错误串形如 "ERROR_CODE|文案"；有文案就直接给用户看 */
-function shotErrorText(e) {
-  const s = String(e?.message || e)
-  const i = s.indexOf('|')
-  return i > 0 ? s.slice(i + 1) : s
 }
 
 /** 把截图按「粘贴图片」的同一形状放进待发送列表 */
@@ -798,7 +794,7 @@ onMounted(async () => {
         await copyShotToClipboard(p.b64)
         toast(t('chat.shotNoChat'))
       } catch (e) {
-        alert(t('chat.shotCopyFailed', { e }))
+        toast(describeError(e, 'chat.shotCopyFailed'), { kind: 'error' })
       }
       return
     }
@@ -809,7 +805,7 @@ onMounted(async () => {
   })
 
   unlistenShotCopy = await ipc.listenEvent(ipc.EVT.screenshotCopy, async (p) => {
-    try { await copyShotToClipboard(p.b64) } catch (e) { alert(t('chat.shotCopyFailed', { e })) }
+    try { await copyShotToClipboard(p.b64) } catch (e) { toast(describeError(e, 'chat.shotCopyFailed'), { kind: 'error' }) }
   })
 
   try {
@@ -833,7 +829,7 @@ onMounted(async () => {
       // 落点在联系人上 → 打开对应会话再附加；其余位置 → 当前会话的待发送列表
       const key = hoverKey || store.activeKey
       if (!key) {
-        alert(t('chat.alertPickContact'))
+        toast(t('chat.alertPickContact'))
         return
       }
       if (hoverKey && hoverKey !== store.activeKey) await openChat(hoverKey)
@@ -896,7 +892,7 @@ async function pickFiles() {
     await sendFiles(Array.isArray(sel) ? sel : [sel])
     autoBottom = true
   } catch (e) {
-    alert(t('chat.alertSendFailed', { e }))
+    toast(describeError(e, 'chat.alertSendFailed'), { kind: 'error' })
   }
 }
 
@@ -908,7 +904,7 @@ async function pickFolder() {
     await sendFiles(Array.isArray(sel) ? sel : [sel])
     autoBottom = true
   } catch (e) {
-    alert(t('chat.alertSendFailed', { e }))
+    toast(describeError(e, 'chat.alertSendFailed'), { kind: 'error' })
   }
 }
 
@@ -1028,14 +1024,14 @@ async function viewImage(f) {
   try {
     await ipc.openImageViewer(f.path, f.name)
   } catch (e) {
-    alert(t('chat.alertOpenImg', { e }))
+    toast(describeError(e, 'chat.alertOpenImg'), { kind: 'error' })
   }
 }
 async function openFile(path) {
-  try { await openPath(path) } catch (e) { alert(t('chat.alertOpen', { e })) }
+  try { await openPath(path) } catch (e) { toast(describeError(e, 'chat.alertOpen'), { kind: 'error' }) }
 }
 async function revealFile(path) {
-  try { await revealItemInDir(path) } catch (e) { alert(t('chat.alertReveal', { e })) }
+  try { await revealItemInDir(path) } catch (e) { toast(describeError(e, 'chat.alertReveal'), { kind: 'error' }) }
 }
 
 /* ---------- 会话内查找（Ctrl+F）与搜索结果定位 ---------- */
@@ -1147,15 +1143,16 @@ async function doClearHistory() {
   const key = store.activeKey
   if (!key) return
   const who = displayName(key)
-  const ok = await confirmDialog(
-    t('chat.clearConfirm', { who }),
-    { title: t('chat.clearTitle'), kind: 'warning', okLabel: t('chat.clearOk'), cancelLabel: t('cancel') }
-  )
+  const ok = await confirm(t('chat.clearConfirm', { who }), {
+    okLabel: t('chat.clearOk'),
+    cancelLabel: t('cancel'),
+    danger: true,
+  })
   if (!ok) return
   try {
     await clearHistory(key)
   } catch (e) {
-    alert(t('chat.alertClear', { e }))
+    toast(describeError(e, 'chat.alertClear'), { kind: 'error' })
   }
 }
 
@@ -1196,8 +1193,6 @@ watch(
 
 <template>
   <section class="chat-window">
-    <!-- 轻提示（表情收纳结果等）：不打断操作，自动消失 -->
-    <div v-if="toastMsg" class="cw-toast">{{ toastMsg }}</div>
 
     <!-- 头部 -->
     <header v-if="activeUser" class="cw-head">
@@ -1263,6 +1258,10 @@ watch(
       <button :title="t('chat.findNext')" :disabled="!findHits.length" @click="stepFind(1)">∨</button>
       <button :title="t('chat.findClose')" @click="closeFind">✕</button>
     </div>
+
+    <!-- toast 锚点：零高度、紧贴在头部（含查找栏）之下。DialogHost 把轻提示
+         teleport 到这里，落点交给布局决定 —— 别再拿窗口坐标去减标题栏/头部高度 -->
+    <div :ref="setToastAnchor" class="toast-anchor"></div>
 
     <!-- 消息区 -->
     <div v-if="activeUser" ref="scroller" class="msgs" @scroll="onScroll">
@@ -1736,6 +1735,13 @@ watch(
   background: var(--c-chat);
   position: relative;
 }
+/* toast 锚点：不占高度，只当定位上下文 —— 轻提示贴在它下面（= 消息列表顶端），
+   这样标题栏/头部高度怎么变都不用改 toast 的位置 */
+.toast-anchor {
+  position: relative;
+  height: 0;
+  flex: none;
+}
 .cw-head {
   flex: none;
   height: 52px;
@@ -1978,22 +1984,6 @@ watch(
   border-radius: 6px;
 }
 
-/* 轻提示 */
-.cw-toast {
-  position: absolute;
-  top: 12px;
-  left: 50%;
-  transform: translateX(-50%);
-  padding: 6px 12px;
-  font-size: 12px;
-  line-height: 18px;
-  color: var(--c-card);
-  background: var(--c-shadow);
-  border-radius: 6px;
-  z-index: 50;
-  max-width: 80%;
-  word-break: break-all;
-}
 
 /* 文件卡片 */
 .file-card {

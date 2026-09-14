@@ -103,7 +103,7 @@ fn fnames_by_msg(conn: &Connection, table: &str) -> HashMap<i64, Vec<String>> {
 /// 导入一个官方 ipmsg 日志库到本应用的聊天记录。
 pub fn import_ipmsg_db(st: &AppState, path: &Path) -> Result<ImportReport, String> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| format!("无法打开 {}：{e}", path.display()))?;
+        .map_err(|e| format!("E_IMPORT_OPEN_FAILED|{}：{e}", path.display()))?;
 
     // 结构校验：官方日志库必有 msg_tbl，否则给出能引导用户的错误
     let has_msg_tbl: i64 = conn
@@ -112,10 +112,10 @@ pub fn import_ipmsg_db(st: &AppState, path: &Path) -> Result<ImportReport, Strin
             [],
             |r| r.get(0),
         )
-        .map_err(|e| format!("读取失败：{e}"))?;
+        .map_err(|e| format!("E_READ_FAILED|{e}"))?;
     if has_msg_tbl == 0 {
         return Err(format!(
-            "{} 不是官方 IP Messenger 的日志库（找不到 msg_tbl 表）",
+            "E_IMPORT_NOT_IPMSG|{}",
             path.display()
         ));
     }
@@ -129,7 +129,7 @@ pub fn import_ipmsg_db(st: &AppState, path: &Path) -> Result<ImportReport, Strin
              join host_tbl h on h.host_id = mg.host_id
              order by m.msg_id asc",
         )
-        .map_err(|e| format!("读取消息失败：{e}"))?;
+        .map_err(|e| format!("E_IMPORT_READ_FAILED|{e}"))?;
     let peers: Vec<(i64, i64, String, String, String, String, String, String)> = stmt
         .query_map([], |r| {
             Ok((
@@ -143,9 +143,9 @@ pub fn import_ipmsg_db(st: &AppState, path: &Path) -> Result<ImportReport, Strin
                 r.get::<_, Option<String>>(7)?.unwrap_or_default(),
             ))
         })
-        .map_err(|e| format!("读取消息失败：{e}"))?
+        .map_err(|e| format!("E_IMPORT_READ_FAILED|{e}"))?
         .collect::<Result<_, _>>()
-        .map_err(|e| format!("读取消息失败：{e}"))?;
+        .map_err(|e| format!("E_IMPORT_READ_FAILED|{e}"))?;
     drop(stmt);
 
     // 自己发出的群发消息的其余收件人（idx > 0），逐会话落一份副本
@@ -831,7 +831,13 @@ mod tests {
         let conn = Connection::open(&db).unwrap();
         conn.execute("create table t(x)", []).unwrap();
         let err = import_ipmsg_db(&st, &db).unwrap_err();
-        assert!(err.contains("官方"), "错误信息要能引导用户：{err}");
+        // 用户看到的引导文案在前端 i18n（err.E_IMPORT_NOT_IPMSG）；这里守的是
+        // 「错误码对得上 + 带上是哪个文件」——码写错的话英文界面只会剩兜底句
+        assert!(
+            err.starts_with("E_IMPORT_NOT_IPMSG|"),
+            "应带 E_IMPORT_NOT_IPMSG 错误码：{err}"
+        );
+        assert!(err.contains("other.db"), "错误信息要指明是哪个文件：{err}");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 

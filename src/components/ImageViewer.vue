@@ -10,6 +10,9 @@ import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { save as saveDialog } from '@tauri-apps/plugin-dialog'
 import { copyFileAs } from '../lib/ipc'
 import { t } from '../lib/i18n'
+import { toast } from '../lib/dialog'
+import { describeError } from '../lib/errors'
+import DialogHost from './DialogHost.vue'
 
 const appWindow = getCurrentWindow()
 // 参数优先取窗口创建时注入的对象，其次回退查询串
@@ -184,7 +187,7 @@ async function saveAs() {
     }, 900)
   } catch (e) {
     closeCtx()
-    alert(t('viewer.saveFailed', { e }))
+    toast(describeError(e, 'viewer.saveFailed'), { kind: 'error' })
   } finally {
     saving.value = false
   }
@@ -239,6 +242,8 @@ function revealInMenu() {
       </button>
       <button class="ctx-item" @click="revealInMenu">{{ t('viewer.reveal') }}</button>
     </div>
+    <!-- 弹窗宿主：独立窗口也要有自己的（保存失败提示等） -->
+    <DialogHost />
   </div>
 </template>
 

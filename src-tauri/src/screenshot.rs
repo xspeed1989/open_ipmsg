@@ -86,6 +86,8 @@ pub enum ShotErr {
     MacPermission,
     /// 平台抓屏 API 失败
     CaptureFailed(String),
+    /// 已有一次抓屏在途，这次直接拒绝（用户不需要处理，前端据码静默）
+    Busy,
 }
 
 impl ShotErr {
@@ -97,6 +99,7 @@ impl ShotErr {
             ShotErr::Decode(_) => "DECODE_FAILED",
             ShotErr::MacPermission => "MAC_PERMISSION",
             ShotErr::CaptureFailed(_) => "CAPTURE_FAILED",
+            ShotErr::Busy => "CAPTURE_BUSY",
         }
     }
 
@@ -114,6 +117,7 @@ impl ShotErr {
                     .into()
             }
             ShotErr::CaptureFailed(e) => format!("抓屏失败：{e}"),
+            ShotErr::Busy => "正在截屏，请稍候".into(),
         }
     }
 }
@@ -552,9 +556,9 @@ impl ShotState {
         }
     }
 
-    /// 「正在截屏」拒绝文案只此一处，测试与调用点共用
+    /// 「正在截屏」拒绝只此一处，测试与调用点共用（码独立，前端据此静默）
     fn busy_err() -> ShotErr {
-        ShotErr::CaptureFailed("正在截屏，请稍候".into())
+        ShotErr::Busy
     }
 
     pub fn put(&self, shot: CachedShot) {
@@ -1167,7 +1171,7 @@ pub async fn save_shot_png(b64: String, path: String) -> Result<(), String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
         .map_err(|e| format!("图片数据非法: {e}"))?;
-    std::fs::write(&path, bytes).map_err(|e| format!("保存失败: {e}"))
+    std::fs::write(&path, bytes).map_err(|e| format!("E_SAVE_FAILED|{e}"))
 }
 
 /// 把 PNG 写进系统剪贴板（Linux 走 GTK：与现有 clipboard_image 读路径对称）
@@ -1364,7 +1368,7 @@ mod tests {
         // 抓屏在途（1~15 秒）时的第二次触发：立刻被拒，绝不能放第二个抓屏进去
         assert!(state.claim().is_none());
         let e = ShotState::busy_err();
-        assert_eq!(e.code(), "CAPTURE_FAILED");
+        assert_eq!(e.code(), "CAPTURE_BUSY");
         assert!(e.message().contains("正在截屏"));
         // 释放后可以再次截屏（RAII：任何返回路径都会走到这一步）
         drop(claim);

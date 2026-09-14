@@ -1,12 +1,19 @@
 // node --test scripts/ —— i18n 纯函数单测（不依赖 Tauri 运行时）
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync, readdirSync } from 'node:fs'
 import {
   locale, setLocale, t, dayLabel, detectLocale, isSupported,
   SUPPORTED_LANGS, LANG_NAMES,
 } from '../src/lib/i18n.js'
 import { composeReplyBody, quotePreview } from '../src/lib/reply.js'
 import { forwardPayload, mergeForward } from '../src/lib/forward.js'
+
+const settingsSource = readFileSync(
+  new URL('../src/components/SettingsModal.vue', import.meta.url),
+  'utf8'
+)
+const i18nSource = readFileSync(new URL('../src/lib/i18n.js', import.meta.url), 'utf8')
 
 // dayLabel 的时间戳是「秒」，与 Date.getTime() 的「毫秒」相差 1000 倍
 const MS = 1000
@@ -53,20 +60,104 @@ test('t 未知 key 原样返回（便于发现漏翻）', () => {
 })
 
 test('zh-CN 与 en 字典 key 完全一致（防漏翻）', () => {
-  // 通过 setLocale 无法直接拿到字典，用 t 的行为差异推断：
-  // 若某 key 只在 zh 里有，切到 en 后会回退 zh 文案而非 key 本身，
-  // 这里无法枚举内部表，因此直接覆盖常用路径并断言结构
+  // 通过 setLocale 拿不到内部表，但源码就摆在旁边：直接解析两个字典字面量，
+  // 全量比对 key 集合。曾经 18 个协议扩展项的英文被中文覆盖而 en 又没有定义，
+  // 英文界面于是静默显示中文（不是显示 key，肉眼极难发现）。
+  const keysOf = (name) => {
+    const body = i18nSource.match(new RegExp(`const ${name} = \\{([\\s\\S]*?)\\n\\}`))?.[1]
+    assert.ok(body, `应从源码里解析出 ${name} 字典`)
+    return new Set([...body.matchAll(/^\s*'([^']+)':/gm)].map((m) => m[1]))
+  }
+  const zhKeys = keysOf('zh')
+  const enKeys = keysOf('en')
+  assert.ok(zhKeys.size > 200, `zh 字典 key 数量异常：${zhKeys.size}`)
+  assert.deepEqual(
+    [...zhKeys].filter((k) => !enKeys.has(k)).sort(),
+    [],
+    'en 字典缺这些 key：英文界面会回退成中文'
+  )
+  assert.deepEqual(
+    [...enKeys].filter((k) => !zhKeys.has(k)).sort(),
+    [],
+    'zh 字典缺这些 key：中文界面会回退成英文或显示 key 本身'
+  )
+})
+
+test('「自动打开封书」开关的文案中英都有，不漏翻', () => {
+  setLocale('zh-CN')
+  assert.equal(t('settings.autoOpenSecret'), '自动打开封书')
+  assert.notEqual(
+    t('settings.autoOpenSecretHint'),
+    'settings.autoOpenSecretHint',
+    'zh 字典缺少说明文案'
+  )
   setLocale('en')
-  const sample = [
-    'me', 'online', 'offline', 'unknownUser', 'ungrouped', 'cancel',
-    'titlebar.min', 'sidebar.settings', 'list.searchPh', 'settings.title',
-    'settings.language', 'picker.empty', 'chat.send', 'chat.read',
-    'chat.clearConfirm', 'viewer.loading', 'forward.noContent', 'preview.offline',
+  // 这里必须断言具体英文文案：t() 在 en 缺 key 时会回退到 zh 字典，
+  // 只断言「不等于 key 本身」会把「英文界面显示中文」当成通过
+  assert.equal(t('settings.autoOpenSecret'), 'Open sealed messages automatically')
+  assert.match(
+    t('settings.autoOpenSecretHint'),
+    /^Show incoming sealed messages/,
+    'en 字典缺说明文案（否则英文界面会回退成中文）'
+  )
+  setLocale('zh-CN')
+})
+
+test('设置页用到的每个 settings.* key 在英文下都不是中文（t() 缺 key 会回退 zh）', () => {
+  // t() 的回退链是 dict[key] ?? zh[key] ?? key：en 缺 key 时英文界面会静默显示
+  // 中文（不是显示 key 本身，肉眼很难发现）。这里把设置页用到的 key 全量枚举出来，
+  // 逐个断言英文侧真的有译文 —— 曾经 18 个协议扩展项就是这样漏掉的。
+  const keys = [
+    ...new Set(
+      [...settingsSource.matchAll(/t\(\s*'(settings\.[A-Za-z0-9_]+)'/g)].map((m) => m[1])
+    ),
   ]
-  for (const k of sample) {
-    assert.notEqual(t(k), k, `en 字典缺少 key: ${k}`)
+  assert.ok(keys.length >= 60, `应从设置页提取到全部文案 key，实际只拿到 ${keys.length} 个`)
+
+  const CJK = /[\u4e00-\u9fff]/
+  const leaks = []
+  for (const key of keys) {
+    setLocale('zh-CN')
+    const zhText = t(key)
+    if (zhText === key) leaks.push(`${key}: zh 缺 key`)
+    setLocale('en')
+    const enText = t(key)
+    if (enText === key) leaks.push(`${key}: en 缺 key（界面会显示 key 本身）`)
+    else if (CJK.test(enText)) leaks.push(`${key}: en 回退成中文「${enText.slice(0, 20)}…」`)
   }
   setLocale('zh-CN')
+  assert.deepEqual(leaks, [], `设置页英文文案漏翻：\n  ${leaks.join('\n  ')}`)
+})
+
+test('界面文案必须走 t()：模板里不得硬编码中文', () => {
+  // 硬编码的中文既不进字典、也不受语言切换控制 —— 英文界面就会直接露出中文。
+  // 设置页的「IPMsg 协议扩展」标题与 agent 地址的「留空关闭」占位符就是这么漏的：
+  // 它们没有 t() 调用，所以「按 key 查译文」的测试永远看不到它们。
+  const files = [
+    new URL('../src/App.vue', import.meta.url),
+    ...readdirSync(new URL('../src/components/', import.meta.url))
+      .filter((f) => f.endsWith('.vue'))
+      .map((f) => new URL(`../src/components/${f}`, import.meta.url)),
+  ]
+  const CJK = /[\u4e00-\u9fff]/
+  const leaks = []
+  for (const url of files) {
+    const body = readFileSync(url, 'utf8').match(/<template>([\s\S]*?)\n<\/template>/)?.[1]
+    if (!body) continue
+    const rendered = body
+      .replace(/<!--[\s\S]*?-->/g, '') // 注释不渲染
+      .replace(/\{\{[^}]*\}\}/g, '') // 插值里是 t(...) 调用
+    for (const line of rendered.split('\n')) {
+      if (CJK.test(line)) {
+        leaks.push(`${url.pathname.split('/src/')[1]}: ${line.trim().slice(0, 70)}`)
+      }
+    }
+  }
+  assert.deepEqual(
+    leaks,
+    [],
+    `模板里的硬编码中文（英文界面会露出中文，请改用 t()）:\n  ${leaks.join('\n  ')}`
+  )
 })
 
 test('dayLabel：今天显示「今天 / Today」', () => {

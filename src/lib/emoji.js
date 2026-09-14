@@ -5,6 +5,7 @@
  * 待发送附件与表情条目的匹配、导出文件名生成等，便于用 node --test 直接测。
  * 真正的读盘、校验、落盘都在后端 emoji.rs（见 src/lib/ipc.js 的命令封装）。
  */
+import { describeError, errorCode } from './errors.js'
 
 /** 单张表情上限，与后端 emoji.rs 的 MAX_EMOJI_BYTES 保持一致（16MB） */
 export const MAX_EMOJI_BYTES = 16 * 1024 * 1024
@@ -35,7 +36,7 @@ function validId(id) {
  * @param {any} raw 后端 list_emojis 的返回（`{ emojis: [...] }` 或直接数组）
  * @returns {Array<{id:string,name:string,file:string,abs:string,cacheFile:string,size:number,addedAt:number}>}
  */
-export function normalizeEmojis(raw) {
+export function normalizeEmojis(raw, fallbackName = '表情') {
   const list = Array.isArray(raw) ? raw : raw?.emojis
   if (!Array.isArray(list)) return []
   const seen = new Set()
@@ -48,7 +49,7 @@ export function normalizeEmojis(raw) {
     seen.add(id)
     out.push({
       id,
-      name: String(it.name ?? '').trim() || '表情',
+      name: String(it.name ?? '').trim() || fallbackName,
       file,
       abs: String(it.abs ?? ''),
       cacheFile: String(it.cache_file ?? ''),
@@ -82,10 +83,12 @@ export function importSummary(res, t) {
 /** 包预览的一行状态文案（不可导入时给出原因） */
 export function packItemState(item, t) {
   if (!item || typeof item !== 'object') return { kind: 'bad', text: '' }
-  if (item.problem === '表情库里已有相同图片' || item.duplicate) {
+  // 判重按**错误码**分流，不比中文文案：文案一改这里就静默失效
+  if (item.duplicate || errorCode(item.problem) === 'E_PACK_DUPLICATE') {
     return { kind: 'dup', text: t('emoji.packDup') }
   }
-  if (item.problem) return { kind: 'bad', text: String(item.problem) }
+  // 其余原因交给统一的错误本地化层：后端给的是中文原文，英文界面不该透出来
+  if (item.problem) return { kind: 'bad', text: describeError(item.problem) }
   return { kind: 'ok', text: '' }
 }
 

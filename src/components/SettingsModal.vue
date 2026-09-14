@@ -5,6 +5,8 @@ import { applyTheme, store, refreshConfig, refreshUsers, loadSessions } from '..
 import * as ipc from '../lib/ipc'
 import { t, SUPPORTED_LANGS, LANG_NAMES, setLocale, detectLocale } from '../lib/i18n'
 import { comboFromEvent, isValidCombo, isWaylandUA } from '../lib/hotkey'
+import { toast, alert as showAlert } from '../lib/dialog'
+import { describeError } from '../lib/errors'
 import { open as pickDialog } from '@tauri-apps/plugin-dialog'
 
 const form = reactive({
@@ -29,6 +31,8 @@ const form = reactive({
   // 截图热键（规范形，空串 = 不注册全局热键）与「确认后复制到剪贴板」
   shot_hotkey: '',
   shot_copy_clipboard: true,
+  // 自动打开封书：收到的无密码封书直接显示正文（默认选中，与后端默认一致）
+  auto_open_secret: true,
 })
 
 watch(
@@ -54,6 +58,7 @@ watch(
       form.v6_mcast = store.config.v6_mcast !== false
       form.shot_hotkey = store.config.shot_hotkey || ''
       form.shot_copy_clipboard = store.config.shot_copy_clipboard !== false
+      form.auto_open_secret = store.config.auto_open_secret !== false
     }
   },
   { immediate: true }
@@ -138,7 +143,7 @@ async function importIpmsg() {
     const lines = r.files.map((f) =>
       f.ok
         ? `${t('settings.importLineOk', { name: f.path.split(/[\\/]/).pop(), n: f.imported })}`
-        : `✘ ${f.path}\n  ${f.error}`
+        : `✘ ${f.path}\n  ${describeError(f.error)}`
     )
     let msg =
       r.failed > 0
@@ -148,9 +153,10 @@ async function importIpmsg() {
           (r.sessionsNew ? t('settings.importNewSessions', { n: r.sessionsNew }) : '') +
           (r.mergedSessions ? t('settings.importMerged', { n: r.mergedSessions }) : '')
     if (!r.total && !r.failed) msg += t('settings.importNoNew')
-    alert(msg)
+    // 多行导入汇总：留着模态（要读完逐文件结果），不走会自动消失的 toast
+    await showAlert(msg)
   } catch (e) {
-    alert(t('settings.alertImportFailed', { e }))
+    toast(describeError(e, 'settings.alertImportFailed'), { kind: 'error' })
   } finally {
     importing.value = false
   }
@@ -165,7 +171,7 @@ function close() {
 
 async function save() {
   if (!form.nickname.trim()) {
-    alert(t('settings.alertNickname'))
+    toast(t('settings.alertNickname'), { kind: 'error' })
     return
   }
   const patch = {
@@ -188,6 +194,7 @@ async function save() {
     v6_mcast: !!form.v6_mcast,
     shot_hotkey: form.shot_hotkey,
     shot_copy_clipboard: !!form.shot_copy_clipboard,
+    auto_open_secret: !!form.auto_open_secret,
   }
   try {
     await ipc.saveConfig(patch)
@@ -196,7 +203,7 @@ async function save() {
     store.firstRun = false
     store.settingsOpen = false
   } catch (e) {
-    alert(t('settings.alertSaveFailed', { e }))
+    toast(describeError(e, 'settings.alertSaveFailed'), { kind: 'error' })
   }
 }
 </script>
@@ -247,7 +254,7 @@ async function save() {
           </select>
         </label>
 
-        <div class="field">
+        <div class="field enc-field">
           <span class="lab">{{ t('settings.encrypt') }}</span>
           <div class="enc-col">
             <div class="enc-line">
@@ -269,7 +276,7 @@ async function save() {
         </div>
 
         <div class="selfinfo">
-          <div class="si-title">IPMsg 协议扩展</div>
+          <div class="si-title">{{ t('settings.extTitle') }}</div>
           <div class="si-row adv-col">
             <label class="adv-line">
               <button type="button" class="switch" :class="{ on: form.absence_enabled }" role="switch"
@@ -294,9 +301,20 @@ async function save() {
               :placeholder="t('settings.password')" maxlength="64" spellcheck="false" />
             <div class="import-hint">{{ t('settings.passwordHint') }}</div>
           </div>
+          <!-- 封书展示：开着的时候收到的封书直接展开，关掉就回到「信封占位 + 点开封」 -->
+          <div class="si-row adv-col">
+            <label class="adv-line">
+              <button type="button" class="switch" :class="{ on: form.auto_open_secret }" role="switch"
+                :aria-checked="form.auto_open_secret ? 'true' : 'false'" @click="form.auto_open_secret = !form.auto_open_secret">
+                <i class="knob"></i>
+              </button>
+              <span class="lab">{{ t('settings.autoOpenSecret') }}</span>
+            </label>
+            <div class="import-hint">{{ t('settings.autoOpenSecretHint') }}</div>
+          </div>
           <div class="si-row adv-col">
             <span class="lab">{{ t('settings.agentAddr') }}</span>
-            <input v-model="form.agent_addr" class="adv-input" placeholder="ip:2425（留空关闭）" spellcheck="false" />
+            <input v-model="form.agent_addr" class="adv-input" :placeholder="t('settings.agentAddrPh')" spellcheck="false" />
             <div class="import-hint">{{ t('settings.agentHint') }}</div>
           </div>
           <div class="si-row adv-col">
@@ -452,6 +470,13 @@ header {
   color: var(--c-text);
   padding-right: 10px;
 }
+/* 表单行的标签列必须定宽：列宽跟着文案长度走的话，同一屏里各行的控件左边缘
+   就对不齐 —— 英文标签比中文宽近一倍，加密行的开关会整体右移 60px。
+   88px 需放得下最长的英文标签（Nickname / Encoding / Encryption）；将来文案
+   变长时这里会退化成「那一行不齐」，而不是把标签挤到折行。 */
+.field .lab {
+  min-width: 88px;
+}
 .field input,
 .field select,
 .adv-input {
@@ -503,6 +528,16 @@ select.adv-input option {
 .enc-col {
   flex: 1;
   min-width: 0;
+}
+/* 这一行是「标签 + 三行内容」的复合行：默认的 align-items:center 会把标签
+   对齐到内容块的垂直中点（也就是说明那一行），看着像标签配错了行 ——
+   中文下同样错位。改成与内容列顶边对齐，再让标签行高等于开关高度，
+   标签就和开关落在同一视觉行。 */
+.field.enc-field {
+  align-items: flex-start;
+}
+.field.enc-field .lab {
+  line-height: 21px;
 }
 .enc-line {
   display: flex;

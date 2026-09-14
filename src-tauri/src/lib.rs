@@ -162,6 +162,9 @@ struct ConfigPatch {
     /// 截图确认后自动复制到剪贴板
     #[serde(default)]
     shot_copy_clipboard: Option<bool>,
+    /// 自动打开封书（收到的无密码 SECRETOPT）；省略保留现值
+    #[serde(default)]
+    auto_open_secret: Option<bool>,
 }
 
 /// `get_config` 的配置视图（纯函数，便于回归测试）。
@@ -197,6 +200,9 @@ fn config_view(cfg: Config, hostname: String, ips: Vec<String>, key_fp: String) 
         "ipdict_enabled": cfg.ipdict_enabled,
         "dir_mode": cfg.dir_mode,
         "v6_mcast": cfg.v6_mcast,
+        // 封书展示：设置页回填「自动打开封书」开关（后端入站落库时读它
+        // 决定无密码封书是否直接算已开封）
+        "auto_open_secret": cfg.auto_open_secret,
         "hostname": hostname,
         "ips": ips,
         "version": env!("CARGO_PKG_VERSION"),
@@ -231,7 +237,7 @@ async fn get_config(st: State<'_, SharedState>) -> Result<Value, String> {
 /// 非 Option 的四项（昵称/群组/下载目录/编码）是必填。
 fn apply_config_patch(prev: Config, patch: ConfigPatch) -> Result<Config, String> {
     if patch.nickname.trim().is_empty() {
-        return Err("昵称不能为空".into());
+        return Err("E_NICKNAME_REQUIRED|昵称不能为空".into());
     }
     Ok(Config {
         nickname: patch.nickname.trim().to_string(),
@@ -271,6 +277,8 @@ fn apply_config_patch(prev: Config, patch: ConfigPatch) -> Result<Config, String
         shot_copy_clipboard: patch
             .shot_copy_clipboard
             .unwrap_or(prev.shot_copy_clipboard),
+        // 自动打开封书：补丁未携带保留现值（旧前端兼容）
+        auto_open_secret: patch.auto_open_secret.unwrap_or(prev.auto_open_secret),
     })
 }
 
@@ -284,7 +292,7 @@ async fn save_config(
     let cfg = apply_config_patch(prev.clone(), patch)?;
     let absence_changed = cfg.absence_enabled != prev.absence_enabled;
     st.set_config(cfg.clone());
-    st.persist_config().map_err(|e| e.to_string())?;
+    st.persist_config().map_err(|e| format!("E_SAVE_FAILED|{e}"))?;
     let _ = std::fs::create_dir_all(&cfg.download_dir);
     // 身份变化，立即重新广播
     net::announce(&ctx).await;
@@ -349,7 +357,7 @@ async fn recall_message(ctx: State<'_, SharedCtx>, key: String, pkt: u32) -> Res
 async fn broadcast_message(ctx: State<'_, SharedCtx>, text: String) -> Result<(), String> {
     let text = text.trim().to_string();
     if text.is_empty() {
-        return Err("不能发送空消息".into());
+        return Err("E_SEND_EMPTY|不能发送空消息".into());
     }
     net::broadcast_message(&ctx, &text).await
 }
@@ -550,17 +558,17 @@ async fn read_image_data(path: String) -> Result<Value, String> {
         "gif" => "image/gif",
         "bmp" => "image/bmp",
         "webp" => "image/webp",
-        _ => return Err("不支持的图片类型".into()),
+        _ => return Err("E_IMAGE_UNSUPPORTED|不支持的图片类型".into()),
     };
     let meta = tokio::fs::metadata(&path)
         .await
-        .map_err(|e| format!("读取失败: {e}"))?;
+        .map_err(|e| format!("E_READ_FAILED|{e}"))?;
     if meta.len() > 32 * 1024 * 1024 {
-        return Err("图片过大，不做内联预览".into());
+        return Err("E_IMAGE_TOO_BIG|图片过大，不做内联预览".into());
     }
     let bytes = tokio::fs::read(&path)
         .await
-        .map_err(|e| format!("读取失败: {e}"))?;
+        .map_err(|e| format!("E_READ_FAILED|{e}"))?;
     use base64::Engine as _;
     Ok(json!({
         "mime": mime,
@@ -583,14 +591,14 @@ async fn copy_file_as(source: String, dest: String) -> Result<(), String> {
         ext.as_str(),
         "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp"
     ) {
-        return Err("不支持的图片类型".into());
+        return Err("E_IMAGE_UNSUPPORTED|不支持的图片类型".into());
     }
     if !src.is_file() {
-        return Err("图片文件不存在（可能已被移动或删除）".into());
+        return Err("E_FILE_MISSING|图片文件不存在（可能已被移动或删除）".into());
     }
     tokio::fs::copy(src, &dest)
         .await
-        .map_err(|e| format!("保存失败: {e}"))?;
+        .map_err(|e| format!("E_SAVE_FAILED|{e}"))?;
     Ok(())
 }
 
@@ -1078,10 +1086,10 @@ async fn clipboard_image(app: tauri::AppHandle) -> Result<Option<Value>, String>
                 .and_then(|pix| pix.save_to_bufferv("png", &[]).ok());
             let _ = tx.send(png);
         })
-        .map_err(|e| format!("读取剪贴板失败: {e}"))?;
+        .map_err(|e| format!("E_CLIPBOARD_FAILED|{e}"))?;
         let png = rx
             .recv_timeout(std::time::Duration::from_secs(3))
-            .map_err(|e| format!("读取剪贴板超时: {e}"))?;
+            .map_err(|e| format!("E_CLIPBOARD_TIMEOUT|{e}"))?;
         Ok(png.map(|bytes| {
             json!({
                 "mime": "image/png",
@@ -1118,10 +1126,10 @@ async fn clipboard_file_paths(app: tauri::AppHandle) -> Result<Vec<String>, Stri
                 .collect::<Vec<String>>();
             let _ = tx.send(uris);
         })
-        .map_err(|e| format!("读取剪贴板失败: {e}"))?;
+        .map_err(|e| format!("E_CLIPBOARD_FAILED|{e}"))?;
         let uris = rx
             .recv_timeout(std::time::Duration::from_secs(3))
-            .map_err(|e| format!("读取剪贴板超时: {e}"))?;
+            .map_err(|e| format!("E_CLIPBOARD_TIMEOUT|{e}"))?;
         Ok(uris
             .iter()
             .filter_map(|u| file_uri_to_path(u))
@@ -1204,10 +1212,10 @@ async fn open_image_viewer(
         ext.as_str(),
         "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp"
     ) {
-        return Err("不支持的图片类型".into());
+        return Err("E_IMAGE_UNSUPPORTED|不支持的图片类型".into());
     }
     if !p.is_file() {
-        return Err("图片文件不存在（可能已被移动或删除）".into());
+        return Err("E_FILE_MISSING|图片文件不存在（可能已被移动或删除）".into());
     }
     // 同一张图已经开着就直接聚焦，不重复开窗
     let label_key: String = path
@@ -1247,7 +1255,7 @@ async fn open_image_viewer(
         .resizable(true)
         .decorations(false)
         .build()
-        .map_err(|e| format!("打开图片窗口失败: {e}"))?;
+        .map_err(|e| format!("E_VIEWER_OPEN_FAILED|{e}"))?;
     Ok(())
 }
 
@@ -1333,6 +1341,7 @@ mod tests {
             v6_mcast: false,
             shot_hotkey: "Ctrl+Shift+A".into(),
             shot_copy_clipboard: false,
+            auto_open_secret: false,
         };
         let view = config_view(
             saved.clone(),
@@ -1389,6 +1398,45 @@ mod tests {
         let cfg2 = apply_config_patch(cfg, patch2).unwrap();
         assert!(cfg2.password_use, "重新保存后密码功能开关被关掉了");
         assert_eq!(cfg2.password, "hunter2", "重新保存后口令被清空了");
+    }
+
+    /// 「自动打开封书」开关的持久化契约：关掉它（默认是开的）保存后，
+    /// 重新打开设置页必须还是关着的 —— 用户关它就是为了保留信封语义，
+    /// 被默认值静默冲回「开」等于这个开关白给。
+    #[test]
+    fn auto_open_secret_survives_reopen_and_resave() {
+        use super::{apply_config_patch, config_view, Config, ConfigPatch};
+
+        // 0) 「默认选中」是需求本身：默认必须是开
+        assert!(
+            Config::default().auto_open_secret,
+            "自动打开封书默认必须是选中状态"
+        );
+
+        // 1) 打开设置、关掉开关、保存
+        let patch: ConfigPatch = serde_json::from_value(serde_json::json!({
+            "nickname": "daye",
+            "group": "",
+            "download_dir": "/tmp/dl",
+            "encoding": "utf8",
+            "auto_open_secret": false,
+        }))
+        .unwrap();
+        let cfg = apply_config_patch(Config::default(), patch).unwrap();
+        assert!(!cfg.auto_open_secret, "保存时没把关闭状态存下来");
+
+        // 2) 再次打开设置页：表单从 get_config 回填
+        let reopened = config_view(cfg.clone(), String::new(), Vec::new(), String::new());
+        assert_eq!(
+            reopened["auto_open_secret"],
+            serde_json::json!(false),
+            "重新打开设置页时开关必须还是关着的（config_view 漏了这个字段）"
+        );
+
+        // 3) 原样再保存一次：不能被默认值冲回「开」
+        let patch2: ConfigPatch = serde_json::from_value(reopened).unwrap();
+        let cfg2 = apply_config_patch(cfg, patch2).unwrap();
+        assert!(!cfg2.auto_open_secret, "重新保存后开关被默认值冲开了");
     }
 
     /// 托盘两态 PNG 资产回归测试：
@@ -1492,7 +1540,7 @@ async fn import_ipmsg_log(st: State<'_, SharedState>, paths: Vec<String>) -> Res
         }))
     })
     .await
-    .map_err(|e| format!("导入任务失败：{e}"))?
+    .map_err(|e| format!("E_IMPORT_FAILED|{e}"))?
 }
 
 /* ================= 启动 ================= */
