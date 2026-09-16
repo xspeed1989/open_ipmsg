@@ -36,6 +36,8 @@ export const ERROR_CODES = [
   'E_IMPORT_NOT_IPMSG',
   'E_IMPORT_READ_FAILED',
   'E_PERSIST_FAILED',
+  // 开机启动（autostart.rs：注册表 / LaunchAgent / .desktop 写入失败）
+  'E_AUTOSTART_FAILED',
   // 表情包导入预检（emoji.rs 逐条给出不可导入的原因）
   'E_PACK_BAD_PATH',
   'E_PACK_FILE_MISSING',

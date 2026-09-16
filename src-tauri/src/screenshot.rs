@@ -53,7 +53,14 @@ pub fn slice_for_monitor(logical: Rect, bounds: Rect, k: f64) -> Rect {
     Rect { x, y, w, h }
 }
 
-/// Windows BitBlt 的 32 位 BGRA 缓冲 → RGBA（stride 可能大于行宽）
+/// Windows BitBlt 的 32 位 BGRA 缓冲 → RGBA（stride 可能大于行宽）。
+///
+/// 唯一调用方是 `#[cfg(windows)] mod platform`，所以 Linux/macOS 构建下它是死代码 ——
+/// 但它是**没有平台依赖的纯函数**，留在公共位置才能在本机（Linux）跑单测：
+/// 行 stride 对齐、通道顺序这些坑（下面 `bgra_to_rgba_*` 那几条用例）正是靠本地
+/// 测试守住的。为消一条 dead_code 告警把它塞进 Windows 模块，等于把这些验证挪到
+/// 本机跑不到的目标上，不划算。
+#[allow(dead_code)]
 pub fn bgra_to_rgba(src: &[u8], w: u32, h: u32, stride: usize) -> Vec<u8> {
     let mut out = vec![0u8; (w * h * 4) as usize];
     for y in 0..h as usize {
@@ -71,18 +78,29 @@ pub fn bgra_to_rgba(src: &[u8], w: u32, h: u32, stride: usize) -> Vec<u8> {
     out
 }
 
-/// 抓屏失败分类：错误码给前端做分支，文案给用户看
+/// 抓屏失败分类：错误码给前端做分支，文案给用户看。
+///
+/// 变体按**构造它的平台**加 cfg：交叉编译 Windows 时（`cargo build --target
+/// x86_64-pc-windows-gnu`）portal 与 macOS 权限这两个分支根本不参与编译，
+/// 不加标注就会刷一串 `variants ... are never constructed`，把真正的告警淹掉。
+/// 前端 `ERROR_CODES` 里保留全部错误码：它们描述的是「可能的失败」，不是本机能力。
 #[derive(Debug)]
 pub enum ShotErr {
     /// 系统没有可用的截图服务（未安装/未运行 xdg-desktop-portal）
+    #[cfg(target_os = "linux")]
     PortalMissing(String),
     /// portal 返回了非 0 响应码（用户拒绝 / 后端出错）
+    #[cfg(target_os = "linux")]
     PortalDenied(u32),
-    /// portal 在规定时间内没有回响应
+    /// portal 在规定时间内没有回响应（`capture_png` 的通道超时，各平台共用）
     Timeout,
-    /// 图像解码失败
+    /// 图像解码失败：只有 Linux 的 portal 需要解 PNG 读尺寸
+    /// （Windows 走 GDI + encode_png，macOS 用 ImageEncoder 直接编码，
+    /// 两者都不解码现成的 PNG 字节）
+    #[cfg(target_os = "linux")]
     Decode(String),
     /// macOS 未授予「屏幕录制」权限
+    #[cfg(target_os = "macos")]
     MacPermission,
     /// 平台抓屏 API 失败
     CaptureFailed(String),
@@ -93,10 +111,14 @@ pub enum ShotErr {
 impl ShotErr {
     pub fn code(&self) -> &'static str {
         match self {
+            #[cfg(target_os = "linux")]
             ShotErr::PortalMissing(_) => "PORTAL_MISSING",
+            #[cfg(target_os = "linux")]
             ShotErr::PortalDenied(_) => "PORTAL_DENIED",
             ShotErr::Timeout => "PORTAL_TIMEOUT",
+            #[cfg(target_os = "linux")]
             ShotErr::Decode(_) => "DECODE_FAILED",
+            #[cfg(target_os = "macos")]
             ShotErr::MacPermission => "MAC_PERMISSION",
             ShotErr::CaptureFailed(_) => "CAPTURE_FAILED",
             ShotErr::Busy => "CAPTURE_BUSY",
@@ -105,10 +127,14 @@ impl ShotErr {
 
     pub fn message(&self) -> String {
         match self {
+            #[cfg(target_os = "linux")]
             ShotErr::PortalMissing(e) => format!("系统未提供截图服务（xdg-desktop-portal）：{e}"),
+            #[cfg(target_os = "linux")]
             ShotErr::PortalDenied(c) => format!("截图请求被系统拒绝（响应码 {c}）"),
             ShotErr::Timeout => "截图超时：系统未在 15 秒内响应".into(),
+            #[cfg(target_os = "linux")]
             ShotErr::Decode(e) => format!("截图数据解码失败：{e}"),
+            #[cfg(target_os = "macos")]
             ShotErr::MacPermission => {
                 // 「必须重启」不是客套：TCC 的屏幕录制授权对已运行的进程不生效，
                 // 不重启的话用户授了权也还是抓不到图（见 platform::has_permission）
@@ -129,7 +155,10 @@ pub struct Captured {
     pub height: u32,
 }
 
-/// PNG 字节 → 尺寸（Linux 下 portal 直接给 PNG，无需再编码）
+/// PNG 字节 → 尺寸。只有 Linux 的 portal 直接给整张 PNG，需要从这里读尺寸；
+/// Windows（GDI + encode_png）与 macOS（ImageEncoder + put_pixel 拼图）都是
+/// 自己编码出 PNG，不经过本函数。
+#[cfg(target_os = "linux")]
 pub fn decode_captured(png: Vec<u8>) -> Result<Captured, ShotErr> {
     let img = image::load_from_memory(&png).map_err(|e| ShotErr::Decode(e.to_string()))?;
     let (width, height) = (img.width(), img.height());
@@ -1301,23 +1330,38 @@ mod tests {
     #[test]
     fn error_codes_and_messages_are_stable() {
         assert_eq!(ShotErr::Timeout.code(), "PORTAL_TIMEOUT");
-        assert_eq!(ShotErr::PortalDenied(2).code(), "PORTAL_DENIED");
+        // 平台专有的变体只在对应平台上存在（见 ShotErr 的 cfg 说明），
+        // 断言也跟着加同样的 cfg，否则交叉编译这个测试模块会编译不过
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(ShotErr::PortalDenied(2).code(), "PORTAL_DENIED");
+            assert!(ShotErr::PortalDenied(2).message().contains('2'));
+        }
+        #[cfg(target_os = "macos")]
         assert_eq!(ShotErr::MacPermission.code(), "MAC_PERMISSION");
-        assert!(ShotErr::PortalDenied(2).message().contains('2'));
+
         // 错误码是给前端做分支判断用的，必须是稳定的大写常量
-        for e in [
-            ShotErr::PortalMissing("x".into()),
-            ShotErr::PortalDenied(1),
+        #[allow(unused_mut)]
+        let mut errors = vec![
             ShotErr::Timeout,
-            ShotErr::Decode("x".into()),
-            ShotErr::MacPermission,
             ShotErr::CaptureFailed("x".into()),
-        ] {
+        ];
+        #[cfg(target_os = "linux")]
+        {
+            errors.push(ShotErr::PortalMissing("x".into()));
+            errors.push(ShotErr::PortalDenied(1));
+        }
+        #[cfg(target_os = "linux")]
+        errors.push(ShotErr::Decode("x".into()));
+        #[cfg(target_os = "macos")]
+        errors.push(ShotErr::MacPermission);
+        for e in errors {
             assert!(e.code().chars().all(|c| c.is_ascii_uppercase() || c == '_'));
         }
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn png_dimensions_are_read_without_decoding_failure() {
         // 用 image 现场编码一张 1×1 再解回来：不依赖手写 PNG 字节常量
         // （手写常量一旦 IDAT 长度写错，测试失败会指向错误的方向）

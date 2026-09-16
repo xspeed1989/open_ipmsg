@@ -12,6 +12,7 @@ macro_rules! oim_log {
     };
 }
 
+mod autostart;
 mod crypto;
 mod emoji;
 mod ipdict;
@@ -165,6 +166,9 @@ struct ConfigPatch {
     /// 自动打开封书（收到的无密码 SECRETOPT）；省略保留现值
     #[serde(default)]
     auto_open_secret: Option<bool>,
+    /// 开机启动（写系统自启条目）；省略保留现值
+    #[serde(default)]
+    autostart: Option<bool>,
 }
 
 /// `get_config` 的配置视图（纯函数，便于回归测试）。
@@ -203,6 +207,8 @@ fn config_view(cfg: Config, hostname: String, ips: Vec<String>, key_fp: String) 
         // 封书展示：设置页回填「自动打开封书」开关（后端入站落库时读它
         // 决定无密码封书是否直接算已开封）
         "auto_open_secret": cfg.auto_open_secret,
+        // 开机启动：设置页回填开关（真正的系统登记由 set_autostart 负责）
+        "autostart": cfg.autostart,
         "hostname": hostname,
         "ips": ips,
         "version": env!("CARGO_PKG_VERSION"),
@@ -279,6 +285,8 @@ fn apply_config_patch(prev: Config, patch: ConfigPatch) -> Result<Config, String
             .unwrap_or(prev.shot_copy_clipboard),
         // 自动打开封书：补丁未携带保留现值（旧前端兼容）
         auto_open_secret: patch.auto_open_secret.unwrap_or(prev.auto_open_secret),
+        // 开机启动：补丁未携带保留现值（系统条目的写入由 set_autostart 做）
+        autostart: patch.autostart.unwrap_or(prev.autostart),
     })
 }
 
@@ -301,6 +309,22 @@ async fn save_config(
         net::announce_absence(&ctx).await;
     }
     Ok(())
+}
+
+/// 开机启动：登记/取消系统的登录自启条目（Windows 注册表 Run / macOS LaunchAgent /
+/// Linux ~/.config/autostart）。
+///
+/// 与 `save_config` 分开是因为**副作用发生在应用之外**：设置页保存时先调本命令，
+/// 平台写入失败就不落盘配置，避免出现「界面显示已开、系统里其实没有」。
+/// 它**不碰 config**：用户的选择由紧随其后的 `save_config` 落盘（单一写入者），
+/// 启动对齐（`autostart::apply_choice`）再按 config 把系统条目修正回来。
+#[tauri::command]
+async fn set_autostart(on: bool) -> Result<(), String> {
+    if on {
+        autostart::enable(&autostart::current_exe()?)
+    } else {
+        autostart::disable()
+    }
 }
 
 #[tauri::command]
@@ -1342,6 +1366,7 @@ mod tests {
             shot_hotkey: "Ctrl+Shift+A".into(),
             shot_copy_clipboard: false,
             auto_open_secret: false,
+            autostart: true,
         };
         let view = config_view(
             saved.clone(),
@@ -1783,6 +1808,21 @@ pub fn run() {
             }
             let _ = std::fs::create_dir_all(st.config().download_dir);
 
+            // 开机启动：按 config.autostart 对齐系统条目 —— 配置说开而条目缺失/指向
+            // 别处时补写，配置说关而条目还指着当前 exe（上次「登记成功但配置没落盘」
+            // 的残留）时清掉。失败只记日志：自启没对齐不该挡启动；debug 构建的策略
+            // 见 autostart::apply_choice。
+            match autostart::current_exe()
+                .and_then(|exe| autostart::apply_choice(st.config().autostart, &exe).map(|_| exe))
+            {
+                Ok(exe) => st.diag(&format!(
+                    "autostart 对齐（autostart={}）：{}",
+                    st.config().autostart,
+                    exe.display()
+                )),
+                Err(e) => st.diag(&format!("autostart 对齐失败：{e}")),
+            }
+
             // Rust → 前端 事件桥
             {
                 let h = handle.clone();
@@ -1984,6 +2024,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_config,
             save_config,
+            set_autostart,
             get_users,
             refresh_users,
             get_history,

@@ -94,3 +94,48 @@ test('协议扩展区有「自动打开封书」开关：默认选中、可回�
     '开关需要一行说明文案（否则用户不知道它管的是「收到的封书」）'
   )
 })
+
+test('常规区有「开机启动」开关：默认不勾、可回填、保存时先改系统再落盘', () => {
+  // 默认不勾：往系统里写自启条目必须是用户的显式选择
+  assert.match(source, /autostart:\s*false/, '「开机启动」默认必须不勾选')
+  // 回填：config.autostart 是唯一数据源（读不到就按关闭处理）
+  assert.match(
+    source,
+    /form\.autostart\s*=\s*!!store\.config\.autostart/,
+    '设置页回填漏了该字段：打开一次再保存就会把用户的开关写回默认值'
+  )
+  // 真正的系统登记走 set_autostart，而不是只改 config.json
+  assert.match(
+    source,
+    /await ipc\.setAutostart\(/,
+    '保存时必须调用 ipc.setAutostart 去写系统自启条目'
+  )
+  // 顺序：系统写入失败就整体不落盘 —— 否则会留下「界面显示已开、系统里没有」的假象
+  const saveFn = source.match(/async function save\(\)[\s\S]*?\n\}/)?.[0] || ''
+  const callAt = saveFn.indexOf('ipc.setAutostart')
+  const saveCfgAt = saveFn.indexOf('await ipc.saveConfig(')
+  const patchAt = saveFn.indexOf('const patch = {')
+  assert.ok(callAt > -1 && patchAt > -1 && callAt < patchAt, 'setAutostart 必须在 saveConfig 之前调用')
+  // 配置落盘失败要回滚系统条目：否则系统里留着「开机自己起来」而设置里显示关着
+  assert.ok(
+    saveFn.indexOf('ipc.setAutostart(prevAutostart)') > saveCfgAt,
+    'saveConfig 失败时必须回滚系统自启条目'
+  )
+  // 失败要提示用户，且用带错误码的译文（E_AUTOSTART_FAILED）
+  assert.match(
+    source,
+    /describeError\(e, 'settings\.alertAutostartFailed'\)/,
+    '开机启动写入失败必须给出可读提示'
+  )
+  // 开关控件与说明
+  assert.match(source, /:class="\{ on: form\.autostart \}"/, '缺少绑定该字段的开关')
+  assert.match(
+    source,
+    /@click="form\.autostart = !form\.autostart"/,
+    '开关必须能切换该字段'
+  )
+  assert.match(source, /t\('settings\.autostartHint'\)/, '开关需要说明文案（生效时机/写到哪里）')
+  // 保存补丁里也要记录这次选择（后端 apply_config_patch 按 Option 合并）
+  assert.match(source, /autostart:\s*!!form\.autostart/, '保存补丁漏了该字段')
+})
+

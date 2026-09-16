@@ -1,5 +1,5 @@
 <script setup>
-// 设置弹窗：昵称 / 群组 / 下载目录 / 语言 / 主题 / 发送编码 / 消息加密 + 本机信息
+// 设置弹窗：昵称 / 群组 / 下载目录 / 语言 / 主题 / 开机启动 / 发送编码 / 消息加密 + 本机信息
 import { reactive, watch, computed, ref } from 'vue'
 import { applyTheme, store, refreshConfig, refreshUsers, loadSessions } from '../store'
 import * as ipc from '../lib/ipc'
@@ -33,6 +33,8 @@ const form = reactive({
   shot_copy_clipboard: true,
   // 自动打开封书：收到的无密码封书直接显示正文（默认选中，与后端默认一致）
   auto_open_secret: true,
+  // 开机启动（系统登录自启条目；默认不勾，由用户显式选择）
+  autostart: false,
 })
 
 watch(
@@ -59,6 +61,7 @@ watch(
       form.shot_hotkey = store.config.shot_hotkey || ''
       form.shot_copy_clipboard = store.config.shot_copy_clipboard !== false
       form.auto_open_secret = store.config.auto_open_secret !== false
+      form.autostart = !!store.config.autostart
     }
   },
   { immediate: true }
@@ -174,6 +177,19 @@ async function save() {
     toast(t('settings.alertNickname'), { kind: 'error' })
     return
   }
+  // 开机启动是唯一会写到应用之外的开关（注册表 / LaunchAgent / autostart 条目）：
+  // 先改系统、成功后再落盘配置 —— 平台写入失败时这一次保存整体不生效，
+  // 不会出现「设置里显示已开、系统里其实没有」的假象。
+  const prevAutostart = !!store.config?.autostart
+  const autostartChanged = !!form.autostart !== prevAutostart
+  if (autostartChanged) {
+    try {
+      await ipc.setAutostart(!!form.autostart)
+    } catch (e) {
+      toast(describeError(e, 'settings.alertAutostartFailed'), { kind: 'error' })
+      return
+    }
+  }
   const patch = {
     nickname: form.nickname.trim(),
     group: form.group.trim(),
@@ -195,16 +211,28 @@ async function save() {
     shot_hotkey: form.shot_hotkey,
     shot_copy_clipboard: !!form.shot_copy_clipboard,
     auto_open_secret: !!form.auto_open_secret,
+    // 用户的选择：系统条目已在上面的 ipc.setAutostart 里改好，这里只落盘偏好
+    autostart: !!form.autostart,
   }
   try {
     await ipc.saveConfig(patch)
-    await refreshConfig()
-    await refreshUsers()
-    store.firstRun = false
-    store.settingsOpen = false
   } catch (e) {
+    // 系统条目已经改了、配置却没落盘 —— 回滚系统，别给用户留下一个
+    // 「设置里显示关着、开机却自己起来」的条目（应用下次启动也会按配置清理它）
+    if (autostartChanged) {
+      try {
+        await ipc.setAutostart(prevAutostart)
+      } catch {
+        // 回滚也失败：下次启动时后端按 config 对齐兜底，这里不叠加报错
+      }
+    }
     toast(describeError(e, 'settings.alertSaveFailed'), { kind: 'error' })
+    return
   }
+  await refreshConfig()
+  await refreshUsers()
+  store.firstRun = false
+  store.settingsOpen = false
 }
 </script>
 
@@ -253,6 +281,22 @@ async function save() {
             <option value="gbk">{{ t('settings.encodingGbk') }}</option>
           </select>
         </label>
+
+        <!-- 开机启动：沿用加密行那种「标签 + 开关」的单行布局，说明文字另起一行 -->
+        <div class="field enc-field">
+          <span class="lab">{{ t('settings.autostart') }}</span>
+          <div class="enc-col">
+            <div class="enc-line">
+              <button type="button" class="switch" :class="{ on: form.autostart }" role="switch"
+                :aria-checked="form.autostart ? 'true' : 'false'" :title="t('settings.autostart')"
+                @click="form.autostart = !form.autostart">
+                <i class="knob"></i>
+              </button>
+              <span class="enc-state">{{ form.autostart ? t('settings.autostartOn') : t('settings.autostartOff') }}</span>
+            </div>
+            <div class="enc-hint">{{ t('settings.autostartHint') }}</div>
+          </div>
+        </div>
 
         <div class="field enc-field">
           <span class="lab">{{ t('settings.encrypt') }}</span>

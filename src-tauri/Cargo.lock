@@ -2943,6 +2943,7 @@ dependencies = [
  "cbc",
  "core-graphics 0.24.0",
  "ctr",
+ "dirs",
  "encoding_rs",
  "gdk",
  "gtk",

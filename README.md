@@ -42,6 +42,7 @@ Open IPMsg is a cross-platform LAN instant messenger compatible with [IP Messeng
 | IPv6 | Group-multicast member discovery (`ff15::979` / `ff02::1`), auto-falls back to IPv4 |
 | Encoding | Send in UTF-8 or GBK (for older Chinese clients); auto-detect on receive |
 | Privacy & crypto | E2E message and file encryption with visible key fingerprints |
+| Launch at login | One switch in Settings: start in the tray after you log in (Windows per-user registry Run entry / macOS `~/Library/LaunchAgents` / Linux `~/.config/autostart`) |
 | More | Emoji panel, unread badges, search, custom download directory, open-in-file-manager |
 
 ---
@@ -117,6 +118,9 @@ The desktop derives a host app's portal app id from the installed desktop file's
 **Q: What are the known limitations?**
 Mixed-DPI multi-monitor setups (the same conversion logic on every platform — say 100% + 200%) are converted with a single scale factor for the whole stitched image, so a secondary screen can be offset. The annotation layer is composited at device resolution, so the undo stack is capped by a 64MiB byte budget with a floor of 3 retained steps (4 steps / ~56MiB at 2560×1440, 3 steps / ~95MiB at 4K, ~398MiB at 8K when the floor wins). The Windows and macOS capture/hotkey code is implemented, but has never been executed on real hardware: the Windows arm passes a cross-target type check (`cargo check --target x86_64-pc-windows-gnu`), while the macOS arm was only type-checked in an isolated fixture — the full app does not compile for `aarch64-apple-darwin` because a pre-existing dependency (`objc2-exception-helper`) needs the macOS SDK (design doc §15.4). Also, a `CmdOrCtrl` recorded in Settings maps to Super on Wayland and to Ctrl on Windows/X11.
 
+**Q: I turned on "Launch at login" but the app does not start after I log in.**
+The switch registers the path of the current executable with the system: on Windows the `OpenIPMsg` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, on macOS `~/Library/LaunchAgents/io.github.open-ipmsg.app.plist`, on Linux `$XDG_CONFIG_HOME/autostart/open-ipmsg.desktop` (`~/.config/autostart/` by default). The entry takes effect at your **next login** and records the path as it was when you enabled it — move the app or swap the AppImage and the entry points at a file that no longer exists. At startup the app rewrites the entry when it is missing, points elsewhere, or is **malformed** (the registry value should look like `"C:\...\open-ipmsg.exe"`; an early build wrote Windows verbatim paths such as `//?/C:/...`, which never start). Under a Wayland session the autostarted instance does not register global shortcuts (the portal app id needs a systemd scope that login autostart does not get); use an X11 session or your own systemd user service if you need the hotkey. A `tauri dev` build lives in `target/debug` and is never auto-registered — use an installed build. For diagnostics, start with `--log`: `diag.log` in the app data directory records `autostart 对齐(autostart=true/false): <path>`.
+
 ---
 
 ## Roadmap
@@ -125,7 +129,7 @@ Mixed-DPI multi-monitor setups (the same conversion logic on every platform — 
 - [x] Recursive folder transfer (both directions)
 - [x] Broadcast mode (BROADCASTOPT)
 - [x] Send screenshots
-- [ ] Auto-start on boot
+- [x] Auto-start on boot
 
 ---
 

@@ -28,7 +28,10 @@ ksni = { version = "0.3.6", default-features = false, features = ["async-io"] }
 notify-rust = "4.18"
 
 # Windows 下枚举 IPv6 网卡及接口索引，用于逐接口加入/发送 IPMsg 组播；
-# 截图抓屏走 GDI BitBlt（Graphics_Gdi + UI_WindowsAndMessaging 取虚拟桌面尺寸）。
+# 截图抓屏走 GDI BitBlt（Graphics_Gdi + UI_WindowsAndMessaging 取虚拟桌面尺寸）；
+# 开机启动写 HKCU\...\Run 用 Win32_System_Registry 里的 RegSetValueExW /
+# RegQueryValueExW / RegDeleteValueW（RegCreateKeyExW 因 0.61.2 尚缺
+# Win32_System_Security 特性，在 autostart.rs 里就地声明）。
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -36,6 +39,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_Graphics_Gdi",
+    "Win32_System_Registry",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
@@ -56,6 +60,10 @@ tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+# 开机启动条目要落在「用户主目录」（macOS 的 ~/Library/LaunchAgents、Linux 的
+# ~/.config/autostart）—— dirs 本就躺在依赖树里（tauri 的传递依赖），这里提升为
+# 直接依赖，只借它算标准目录，不引入新的第三方代码
+dirs = "6"
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
 # 官方 IPMsg v4.5+ 的聊天记录是 SQLite 库（ipmsg.db），导入用；

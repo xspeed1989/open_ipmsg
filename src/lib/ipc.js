@@ -17,6 +17,10 @@ export const getConfig = () => invoke('get_config')
 /** 保存配置，patch: { nickname, group, download_dir, encoding, theme, lang, encrypt } */
 export const saveConfig = (patch) => invoke('save_config', { patch })
 
+/** 开机启动：登记/取消系统登录自启条目（Windows 注册表 / macOS LaunchAgent /
+ *  Linux ~/.config/autostart）。失败抛 E_AUTOSTART_FAILED|…，此时不要把配置落盘 */
+export const setAutostart = (on) => invoke('set_autostart', { on })
+
 /** 在线用户列表 */
 export const getUsers = () => invoke('get_users')
 

@@ -86,6 +86,7 @@ const zh = {
   'err.E_IMPORT_NOT_IPMSG': '{e} 不是官方 IP Messenger 的日志库（找不到 msg_tbl 表）',
   'err.E_IMPORT_READ_FAILED': '读取消息失败：{e}',
   'err.E_PERSIST_FAILED': '聊天记录保存失败：{e}',
+  'err.E_AUTOSTART_FAILED': '开机启动条目写入失败：{e}',
   // 表情包导入预检
   'err.E_PACK_BAD_PATH': '包内路径不合法',
   'err.E_PACK_FILE_MISSING': '包内缺少该文件',
@@ -121,6 +122,10 @@ const zh = {
   'settings.encryptOn': '已开启',
   'settings.encryptOff': '已关闭',
   'settings.encryptHint': '关闭后与所有联系人使用明文通讯',
+  'settings.autostart': '开机启动',
+  'settings.autostartOn': '已开启',
+  'settings.autostartOff': '已关闭',
+  'settings.autostartHint': '登录系统后自动运行本程序并常驻托盘（下次登录生效）。Windows 写当前用户的注册表启动项，macOS 写 ~/Library/LaunchAgents，Linux 写 ~/.config/autostart。Wayland 会话下自启的实例不注册全局热键，建议改用 X11 会话或自建 systemd 用户服务。',
 
   'settings.extTitle': 'IPMsg 协议扩展',
   'settings.absence': '不在模式',
@@ -167,6 +172,7 @@ const zh = {
   'settings.save': '保存',
   'settings.alertNickname': '请填写昵称',
   'settings.alertSaveFailed': '保存失败：{e}',
+  'settings.alertAutostartFailed': '开机启动设置失败：{e}',
   'settings.pickDirTitle': '选择接收文件的保存目录',
   'settings.pickDbTitle': '选择官方 IP Messenger 的日志数据库',
   'settings.dbFilter': 'IPMsg 日志库（ipmsg.db）',
@@ -430,6 +436,7 @@ const en = {
   'err.E_IMPORT_NOT_IPMSG': '{e} is not an official IP Messenger log database (no msg_tbl table)',
   'err.E_IMPORT_READ_FAILED': 'Failed to read messages: {e}',
   'err.E_PERSIST_FAILED': 'Failed to save chat history: {e}',
+  'err.E_AUTOSTART_FAILED': 'Failed to write the launch-at-login entry: {e}',
   // Sticker pack pre-check
   'err.E_PACK_BAD_PATH': 'Invalid path inside the pack',
   'err.E_PACK_FILE_MISSING': 'File is missing from the pack',
@@ -465,6 +472,10 @@ const en = {
   'settings.encryptOn': 'On',
   'settings.encryptOff': 'Off',
   'settings.encryptHint': 'All chats use plaintext when this is off',
+  'settings.autostart': 'Launch at login',
+  'settings.autostartOn': 'On',
+  'settings.autostartOff': 'Off',
+  'settings.autostartHint': 'Start the app in the tray automatically after you log in (takes effect at the next login). Windows writes a per-user registry Run entry, macOS a LaunchAgent under ~/Library/LaunchAgents, Linux ~/.config/autostart. Under a Wayland session the autostarted instance does not register global shortcuts — use an X11 session or your own systemd user service instead.',
   // 协议扩展区（不在/密码/自动打开封书/代理/成员主/IPDict/IPv6 组播）：
   // 这些译文曾经误放在 zh 字典里又被紧随其后的中文覆盖，en 缺 key 时
   // t() 回退 zh，英文界面就一直显示中文 —— 英文文案必须定义在 en 这里
@@ -512,6 +523,7 @@ const en = {
   'settings.save': 'Save',
   'settings.alertNickname': 'Please enter a nickname',
   'settings.alertSaveFailed': 'Failed to save: {e}',
+  'settings.alertAutostartFailed': 'Failed to change the launch-at-login setting: {e}',
   'settings.pickDirTitle': 'Choose the folder for received files',
   'settings.pickDbTitle': 'Select the official IP Messenger log database',
   'settings.dbFilter': 'IPMsg log database (ipmsg.db)',

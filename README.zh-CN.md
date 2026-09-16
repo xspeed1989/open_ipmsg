@@ -42,6 +42,7 @@ Open IPMsg 是基于 **Tauri v2** 的跨平台 [IP Messenger](https://ipmsg.org/
 | IPv6 | 组播成员发现(`ff15::979` / `ff02::1`),无 IPv6 环境自动降级 IPv4 |
 | 编码 | 发送可选 UTF-8 / GBK(兼容老版中文飞鸽);接收自动识别 |
 | 隐私与加密 | 消息与文件端到端加密,可查看本机密钥指纹 |
+| 开机启动 | 设置里一个开关:登录系统后自动运行并常驻托盘(Windows 写当前用户注册表 Run 项 / macOS 写 `~/Library/LaunchAgents` / Linux 写 `~/.config/autostart`) |
 | 其他 | 表情面板、未读角标、搜索、自定义接收目录、文件管理器定位 |
 
 ---
@@ -117,6 +118,9 @@ Windows/macOS/X11 由应用注册全局热键；Wayland 下改由桌面环境授
 **Q:截图有哪些已知限制?**
 混合 DPI 多屏（所有平台都是同一套换算逻辑，如一屏 100% + 一屏 200%）目前按整幅图使用同一个缩放比例，副屏可能错位；标注层按设备像素合成，撤销栈按 64MiB 字节预算封顶并保底 3 步（2560×1440 下 4 步 / 约 56MiB，4K 下 3 步 / 约 95MiB，8K 按保底约 398MiB）。Windows 与 macOS 的抓屏/热键代码已实现，但从未在真机上运行过：Windows 分支能通过交叉类型检查（`cargo check --target x86_64-pc-windows-gnu`），macOS 分支只在隔离夹具里类型检查过——完整应用对 `aarch64-apple-darwin` 编译会卡在既有依赖 `objc2-exception-helper`（需要 macOS SDK），详见设计文档 §15.4。另外，设置页录制的 `CmdOrCtrl` 在 Wayland 映射为 Super，在 Windows/X11 映射为 Ctrl。
 
+**Q:开了「开机启动」但登录后没起来?**
+设置里的开关只负责把当前可执行文件的路径登记到系统:Windows 是当前用户注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `OpenIPMsg`,macOS 是 `~/Library/LaunchAgents/io.github.open-ipmsg.app.plist`,Linux 是 `$XDG_CONFIG_HOME/autostart/open-ipmsg.desktop`(默认 `~/.config/autostart/`)。条目登记后**下次登录**才生效,且记录的是开启那一刻的路径——把程序挪了位置、AppImage 换了个文件,条目就指向不存在的文件;启动时若发现条目缺失、指向别处或**格式不对**都会按当前路径重写一遍(注册表里应是 `"C:\...\open-ipmsg.exe"` 这种普通路径;早期版本曾把 Windows 的 verbatim 路径 `//?/C:/...` 写进去,那种值开机起不来)。Linux 的 Wayland 会话下自启实例不注册全局热键(portal 的 app id 依赖 systemd scope,登录自启拿不到),需要热键就改用 X11 会话或自建 systemd 用户服务;开发构建(`tauri dev`)的可执行文件在 `target/debug` 下,不会自动补登记,请用安装版。排查用带 `--log` 启动,数据目录的 `diag.log` 里会记 `autostart 对齐(autostart=true/false): <路径>`。
+
 ---
 
 ## Roadmap
@@ -125,7 +129,7 @@ Windows/macOS/X11 由应用注册全局热键；Wayland 下改由桌面环境授
 - [x] 文件夹递归传输(收发双向)
 - [x] 广播群发模式(BROADCASTOPT)
 - [x] 截图发送
-- [ ] 开机自启
+- [x] 开机自启
 
 ---
 

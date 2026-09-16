@@ -74,6 +74,11 @@ pub struct Config {
     /// 只影响新到的消息，密码锁（PASSWORDOPT）永远要输密码，不受此项影响。
     #[serde(default = "default_true")]
     pub auto_open_secret: bool,
+    /// 开机启动：在系统里登记「登录时自动运行本程序」。
+    /// 默认关（不自作主张往系统里写自启条目）；真正的登记/取消由
+    /// `set_autostart` 命令完成，本字段只保存用户的选择。
+    #[serde(default)]
+    pub autostart: bool,
 }
 
 fn default_absence_text() -> String {
@@ -125,6 +130,7 @@ impl Default for Config {
             shot_hotkey: default_shot_hotkey(),
             shot_copy_clipboard: default_true(),
             auto_open_secret: default_true(),
+            autostart: false,
         }
     }
 }
