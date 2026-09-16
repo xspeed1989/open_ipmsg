@@ -4,7 +4,7 @@
 // 里的运行时错误。真踩过一次 —— defineProps 没接返回值就裸用 prop 名，
 // 构建照过，浏览器里一渲染整个宿主组件空白。这里把 SFC 编译出来渲染一遍，
 // 让这类错误在 `pnpm test` 里就暴露。
-import { readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createSSRApp } from 'vue'
@@ -66,5 +66,45 @@ test('DialogHost 真渲染：toast 与模态都能出来（setup/render 无运�
   } finally {
     resetDialogs()
     rmSync(OUT, { force: true })
+  }
+})
+
+/**
+ * 轻提示的层叠契约：toast 会被 teleport 进聊天区的锚点里，锚点链上任何一层只要
+ * 自己成了层叠上下文（z-index 不是 auto），toast 就被关在那一层里 —— 那时把
+ * .toasts 的 z-index 调到多大都没用。这条测试同时锁住「值够大」和「没被关起来」。
+ */
+test('轻提示压在所有浮层之上（z-index 阶梯 + 锚点链不能形成层叠上下文）', () => {
+  const host = readFileSync(SFC, 'utf8')
+  const hostCss = host.match(/<style[^>]*>([\s\S]*?)<\/style>/)?.[1] || ''
+  const toastsZ = Number(hostCss.match(/\.toasts\s*\{[^}]*z-index:\s*(-?\d+)/)?.[1])
+  assert.ok(Number.isFinite(toastsZ), '.toasts 必须显式声明 z-index，否则会被任何浮层盖住')
+
+  // 扫全应用的 z-index，toast 必须比它们都高
+  const root = new URL('../src/', import.meta.url)
+  const files = readdirSync(root, { recursive: true, encoding: 'utf8' })
+    .filter((f) => f.endsWith('.vue') || f.endsWith('.css'))
+  const others = []
+  for (const rel of files) {
+    const src = readFileSync(new URL(rel.replaceAll('\\', '/'), root), 'utf8')
+    for (const m of src.matchAll(/z-index:\s*(-?\d+)/g)) others.push([rel, Number(m[1])])
+  }
+  const maxOther = Math.max(...others.filter(([f]) => !f.endsWith('DialogHost.vue')).map(([, n]) => n))
+  assert.ok(
+    toastsZ > maxOther,
+    `toast 的 z-index(${toastsZ}) 必须高于其他浮层的最大值(${maxOther})；` +
+      `最高的那几个：${others.sort((a, b) => b[1] - a[1]).slice(0, 3).map(([f, n]) => `${f}:${n}`).join(', ')}`
+  )
+
+  // 锚点链：ChatWindow 的 .chat-window > .toast-anchor 都不能有 z-index
+  const chat = readFileSync(new URL('../src/components/ChatWindow.vue', import.meta.url), 'utf8')
+  for (const sel of ['.chat-window', '.toast-anchor']) {
+    const escaped = sel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const decl = chat.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`))?.[1] || ''
+    assert.doesNotMatch(
+      decl,
+      /z-index/,
+      `${sel} 一旦有 z-index 就成了层叠上下文，toast 会被关在里面（调高 .toasts 也没用）`
+    )
   }
 })

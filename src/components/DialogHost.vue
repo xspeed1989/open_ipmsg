@@ -139,6 +139,14 @@ const isMultiline = (text) => String(text ?? '').includes('\n')
   top: 12px;
   left: 0;
   right: 0;
+  /* 轻提示必须压在所有浮层之上。toast 会被 teleport 进聊天区的锚点里，这里
+     不给 z-index 的话它是 z-index:auto，会被表情面板(30)、右键菜单(40/45)、
+     选人弹窗(60)、设置弹窗(100)、模态遮罩(200) 依次盖住 —— 设置页里保存后
+     「已保存」看不见、表情面板开着时提示被压住，都是这么来的。
+     z-index 阶梯（全应用一份，改动请同步 scripts/dialog-host.test.mjs）：
+       30 表情面板 / 聊天右键菜单 · 40 列表与查看器菜单 · 45 表情悬停预览
+       60 转发/群发选人 · 100 设置弹窗 · 200 应用内模态 · 300 轻提示 */
+  z-index: 300;
   display: flex;
   flex-direction: column;
   align-items: center;
