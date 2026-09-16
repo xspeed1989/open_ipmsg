@@ -181,6 +181,8 @@ async function addMsgToEmoji() {
   try {
     let src = await resolveLocalImage(attachPath(f), f.name)
     if (!src) {
+      // 自己发出的附件没有「向对端下载」这一说：本地找不到就只能如实说明
+      if (m.dir === 'out') throw new Error(t('emoji.srcGone'))
       if (m.pkt == null || f.id == null) throw new Error(t('emoji.srcUnavailable'))
       toast(t('emoji.addNeedDownload'))
       const wait = waitFileDownload(key, m.pkt, f.id)

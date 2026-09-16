@@ -124,13 +124,18 @@ export function looksLikeImage(name) {
 }
 
 /**
- * 待发送附件里能直接入库的本地路径。
- * 剪贴板图片只有 base64（后端未落盘）时返回空串 —— 此时不能入库。
- * @param {{kind?:string,path?:string}} item
+ * 消息附件 / 待发送附件里能直接入库的本地路径。
+ *
+ * ⚠️ 不能用 `kind` 判断：`kind: 'img'` 只是草稿框里剪贴板图片的标记，**消息里的
+ * 附件根本没有这个字段**（出站 `{id,name,size,path,state}`、入站 `{id,rid,name,…}`），
+ * 按 kind 过滤会把它们的 path 一律丢掉 —— 后果是自己刚发出的那张图（文件在
+ * 「剪贴板图片」目录而不是下载目录）永远找不到本地文件，右键「添加到表情」必失败。
+ *
+ * 剪贴板图片只有 base64（后端未落盘）时没有 path，返回空串 —— 此时不能入库。
+ * @param {{path?:string}} item
  */
 export function attachPath(item) {
-  if (!item || item.kind !== 'img') return ''
-  return typeof item.path === 'string' ? item.path : ''
+  return typeof item?.path === 'string' ? item.path : ''
 }
 
 /**

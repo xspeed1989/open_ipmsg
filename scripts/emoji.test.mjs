@@ -145,10 +145,16 @@ test('looksLikeImage 只看扩展名，大小写不敏感', () => {
   assert.ok(!looksLikeImage(''))
 })
 
-test('attachPath 只认已落盘的图片', () => {
+test('attachPath 认消息附件的本地路径（消息附件没有 kind 字段）', () => {
+  // 出站附件就是 {id,name,size,path,state}，入站是 {id,rid,name,…,path?}：
+  // 旧实现按 `kind === 'img'` 过滤，把消息附件的 path 一律丢掉，于是自己发出的
+  // 那张图（文件在「剪贴板图片」而不是下载目录）永远找不到 —— 右键加表情必失败
+  const out = { id: 268435457, name: 'ipmsgclip_s_268435456_0(3).png', size: 16152, path: '/clip/a.png', state: 'sent' }
+  assert.equal(attachPath(out), '/clip/a.png', '自己发出的图要能拿到记录里的路径')
+  assert.equal(attachPath({ id: 1, name: 'b.png', path: '/dl/b.png', state: 'done' }), '/dl/b.png')
   assert.equal(attachPath({ kind: 'img', path: '/cache/a.png' }), '/cache/a.png')
   assert.equal(attachPath({ kind: 'img' }), '', '只有 base64 的剪贴板图不能入库')
-  assert.equal(attachPath({ kind: 'file', path: '/tmp/a.png' }), '')
+  assert.equal(attachPath({ path: '' }), '')
   assert.equal(attachPath(null), '')
 })
 

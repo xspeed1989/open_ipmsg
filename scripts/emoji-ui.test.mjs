@@ -205,6 +205,8 @@ test('收纳前先按文件系统实际情况判断，不信任消息上的 stat
   assert.match(chat, /return r\?\.ok && r\.path \? r\.path : ''/)
   // 下载失败的真实原因要透给用户，不能统一糊成「尚未下载」
   assert.match(chat, /throw new Error\(f\.error \|\| t\('emoji\.srcUnavailable'\)\)/)
+  // 自己发出的附件不能再去「向对端下载」：找不到本地文件就如实说明
+  assert.match(chat, /if \(m\.dir === 'out'\) throw new Error\(t\('emoji\.srcGone'\)\)/)
   const ipcSrc = readFileSync(new URL('../src/lib/ipc.js', import.meta.url), 'utf8')
   assert.match(ipcSrc, /invoke\('emoji_src_available', \{ path, name \}\)/)
   const lib = readFileSync(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8')

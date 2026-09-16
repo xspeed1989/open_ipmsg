@@ -822,14 +822,23 @@ fn src_available_payload(path: &str, name: Option<&str>, data_dir: &Path) -> ser
             return hit(p);
         }
     }
-    // 记录里的路径不可用 → 按文件名到下载目录再找一个（用户改过下载目录、
-    // 或记录里的路径是历史遗留的别处路径时都能救回来）
+    // 记录里的路径不可用 → 按文件名再找一遍（用户改过下载目录、把原图挪走、
+    // 或记录里的路径是历史遗留的别处路径时都能救回来）：
+    //   下载目录   —— 收到的附件都在这里
+    //   剪贴板缓存 —— 自己发出的「粘贴图片/粘贴文件」先落盘到这里，
+    //                 少了这一处，自己发出的图右键「添加到表情」必失败
     if let Some(n) = name {
         let base = n.rsplit(['/', '\\']).next().unwrap_or("").trim();
         if !base.is_empty() && base != "." && base != ".." {
-            let candidate = download_dir(data_dir).join(base);
-            if candidate.is_file() {
-                return hit(&candidate);
+            for dir in [
+                download_dir(data_dir),
+                data_dir.join("剪贴板图片"),
+                data_dir.join("剪贴板文件"),
+            ] {
+                let candidate = dir.join(base);
+                if candidate.is_file() {
+                    return hit(&candidate);
+                }
             }
         }
     }
@@ -1478,14 +1487,28 @@ mod tests {
         let stale = src_available_payload("/nonexistent/x.png", Some("a.png"), &dir);
         assert_eq!(stale["ok"], serde_json::json!(true), "陈旧路径也要能兜底");
 
-        // 3) 没有 config.json → 回落 <data_dir>/接收文件
+        // 3) 自己发出的「粘贴图片」：记录路径失效后，按文件名到剪贴板缓存目录兜底
+        //    （这张图不在下载目录里，少这一处就永远找不到 —— 右键加表情必失败）
+        let clip = dir.join("剪贴板图片");
+        std::fs::create_dir_all(&clip).unwrap();
+        let sent = clip.join("ipmsgclip_s_7_0(1).png");
+        std::fs::write(&sent, png_bytes()).unwrap();
+        let sent_hit = src_available_payload(
+            "/tmp/moved-away.png",
+            Some("ipmsgclip_s_7_0(1).png"),
+            &dir,
+        );
+        assert_eq!(sent_hit["ok"], serde_json::json!(true), "发出的粘贴图片要能找回来");
+        assert_eq!(sent_hit["path"], serde_json::json!(sent.to_string_lossy()));
+
+        // 4) 没有 config.json → 回落 <data_dir>/接收文件
         let dir2 = tmp_data("srcavail2");
         std::fs::create_dir_all(dir2.join("接收文件")).unwrap();
         std::fs::write(dir2.join("接收文件/b.png"), png_bytes()).unwrap();
         let dflt = src_available_payload("", Some("b.png"), &dir2);
         assert_eq!(dflt["ok"], serde_json::json!(true));
 
-        // 4) 目录不算、路径穿越被挡住、确实没有则 ok=false
+        // 5) 目录不算、路径穿越被挡住、确实没有则 ok=false
         assert_eq!(
             src_available_payload(&dir.to_string_lossy(), None, &dir)["ok"],
             serde_json::json!(false)
