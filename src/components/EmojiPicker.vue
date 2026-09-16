@@ -13,7 +13,7 @@ import { confirm } from '../lib/dialog'
 import { store } from '../store'
 import {
   normalizeEmojis, importSummary, packSummary, packItemState, defaultPackSelection,
-  packFileName, MAX_IMPORT_BATCH,
+  packFileName,
 } from '../lib/emoji'
 
 const emit = defineEmits(['pick', 'pickSticker', 'need-layout'])
@@ -93,6 +93,34 @@ function fail(e) {
 
 /* ---------------- 表情库 ---------------- */
 
+/** 单元格滚到可见才去取图：库里可能存着上千张，一打开面板就逐张 read_image_data
+ *  会把内存（每张都是一个 base64 字符串）和 IPC 同时打满。
+ *  用视口做观察根即可 —— 网格自身 overflow 的裁剪会让滚出面板的格子判为不可见。 */
+let thumbObserver = null
+
+function observerForThumbs() {
+  if (typeof IntersectionObserver === 'undefined') return null // 老 WebView：退回立即加载
+  if (!thumbObserver) {
+    thumbObserver = new IntersectionObserver((entries) => {
+      for (const en of entries) {
+        if (!en.isIntersecting) continue
+        thumbObserver.unobserve(en.target)
+        const entry = entryById.value.get(en.target.dataset.eid)
+        if (entry) loadThumb(entry)
+      }
+    }, { rootMargin: '150px 0px' })
+  }
+  return thumbObserver
+}
+
+/** 网格格子的 :ref 回调：只登记，加载时机交给观察器 */
+function watchCell(el, entry) {
+  if (!el) return
+  const obs = observerForThumbs()
+  if (obs) obs.observe(el)
+  else loadThumb(entry)
+}
+
 async function loadThumb(e) {
   if (thumbs.value[e.id] || !e.abs) return
   thumbs.value[e.id] = 'loading'
@@ -108,9 +136,8 @@ async function loadList() {
   try {
     const r = await ipc.listEmojis()
     emojis.value = normalizeEmojis(r, t('emoji.untitled'))
-    store.emojiFiles = emojis.value.map((e) => e.file)
-    store.emojiCacheFiles = emojis.value.map((e) => e.cacheFile).filter(Boolean)
-    for (const e of emojis.value) loadThumb(e)
+    // 缩略图不在这里预取：渲染出的格子会各自登记给观察器，滚到跟前才加载
+    syncStore()
   } catch (e) {
     fail(t('emoji.loadFailed', { e: String(e?.message || e) }))
   }
@@ -121,6 +148,9 @@ function syncStore() {
   store.emojiCacheFiles = emojis.value.map((e) => e.cacheFile).filter(Boolean)
 }
 
+/** id → 条目：观察器回调里按 data-eid 找条目，避免每次线性扫描整库 */
+const entryById = computed(() => new Map(emojis.value.map((e) => [e.id, e])))
+
 onMounted(() => {
   loadList()
   // 面板高度已固定，这里只需在挂载后报一次实测高度给父组件摆位
@@ -129,6 +159,7 @@ onMounted(() => {
 
 /* ---------------- 导入本地图片 ---------------- */
 
+/** 选多少张都收：读盘/校验全在后端按批进行（内存有界），前端不再设批次上限 */
 async function importImages() {
   if (busy.value) return
   try {
@@ -136,18 +167,14 @@ async function importImages() {
     if (!sel) return
     const paths = (Array.isArray(sel) ? sel : [sel]).filter(Boolean)
     if (!paths.length) return
-    if (paths.length > MAX_IMPORT_BATCH) {
-      flash(t('emoji.tooMany', { n: MAX_IMPORT_BATCH }))
-      return
-    }
     busy.value = true
     const r = await ipc.importEmoji(paths)
     const added = normalizeEmojis({ emojis: r?.imported || [] }, t('emoji.untitled'))
     // 直接增量更新，少一次全量拉取；顺序与后端一致（新导入排最后）
+    // 缩略图同样交给观察器：新格子挂上去后由可见性决定何时取图
     if (added.length) {
       emojis.value = emojis.value.concat(added)
       syncStore()
-      for (const e of added) loadThumb(e)
     }
     const sum = importSummary(r, t)
     if (sum.level === 'warn') err.value = sum.text
@@ -316,6 +343,7 @@ const PREVIEW_SIZE = 200
 
 function hoverAt(ev, entry) {
   if (view.value !== 'stickers' || !entry) return
+  loadThumb(entry) // 鼠标已经在格子上：即使观察器还没轮到它，也先把图取来
   const host = panelRef.value?.getBoundingClientRect?.()
   const box = ev.currentTarget?.getBoundingClientRect?.()
   if (!host || !box) return
@@ -361,6 +389,8 @@ watch(menu, (open) => {
 onUnmounted(() => {
   document.removeEventListener('mousedown', onDocMouseDown, true)
   document.removeEventListener('keydown', onDocKeyDown)
+  thumbObserver?.disconnect()
+  thumbObserver = null
 })
 
 /** 空白处右键：只出「导入 / 导出」（没有表情时唯一能用右键的地方） */
@@ -484,6 +514,8 @@ defineExpose({ showCustom, reload: loadList })
           <div
             v-for="e in emojis"
             :key="e.id"
+            :ref="(el) => watchCell(el, e)"
+            :data-eid="e.id"
             class="cell"
             :class="{ dragging: dragId === e.id }"
             draggable="true"
@@ -527,6 +559,8 @@ defineExpose({ showCustom, reload: loadList })
           <div
             v-for="e in emojis"
             :key="e.id"
+            :ref="(el) => watchCell(el, e)"
+            :data-eid="e.id"
             class="cell"
             :class="{ dragging: dragId === e.id }"
             draggable="true"

@@ -143,10 +143,24 @@ test('滚动发生在固定内容区内，面板本身不会被内容撑高', ()
   assert.match(declarations(css, '.pack-list'), /overflow-y\s*:\s*auto/)
 })
 
-test('缩略图按需加载（懒加载 data URL），失败留占位不再重试', () => {
+test('缩略图滚动到可见才加载（懒加载 data URL），失败留占位不再重试', () => {
   assert.match(picker, /async function loadThumb/)
   assert.match(picker, /thumbs\.value\[e\.id\] = 'loading'/)
   assert.match(picker, /读取失败|catch \{[\s\S]{0,80}thumbs\.value\[e\.id\] = ''/)
+  // 库里可能有上千张：打开面板不能逐张 read_image_data，交给 IntersectionObserver
+  assert.match(picker, /new IntersectionObserver/)
+  assert.match(picker, /function watchCell/)
+  assert.match(picker, /:ref="\(el\) => watchCell\(el, e\)"/)
+  assert.doesNotMatch(
+    picker,
+    /for \(const e of emojis\.value\) loadThumb\(e\)/,
+    '不允许在 loadList 里全量预取缩略图',
+  )
+})
+
+test('导入数量不设上限：前端不再有批次拦截，文案也一并清掉', () => {
+  assert.doesNotMatch(picker, /MAX_IMPORT_BATCH/)
+  assert.doesNotMatch(picker, /emoji\.tooMany/)
 })
 
 test('拖拽排序仍然写回后端顺序', () => {

@@ -40,10 +40,11 @@ const DIR_NAME: &str = "emojis";
 pub const MAX_EMOJI_BYTES: u64 = 16 * 1024 * 1024;
 /// 一个表情包内所有图片累计上限
 pub const MAX_PACK_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
-/// 一个表情包内的条目上限
-pub const MAX_PACK_ENTRIES: usize = 500;
-/// 表情库容量上限（防止无限增长）
-pub const MAX_EMOJIS: usize = 2000;
+/// 一次读盘入库的批量。
+///
+/// 这是**内存**上限，不是导入数量上限：同一时刻内存里只放这么几张图，
+/// 选多少张都会全部入库（多出来的顺延到下一批）。表情库本身不设容量上限。
+const IMPORT_CHUNK: usize = 64;
 /// 名字长度上限（字符数）
 const MAX_NAME_CHARS: usize = 32;
 /// 包内清单名与图片目录名
@@ -248,62 +249,77 @@ fn load_emojis(data_dir: &Path) -> Result<Vec<EmojiEntry>, String> {
 /// 导入结果：成功入库的条目 + 跳过项（名字，原因）
 type ImportOutcome = (Vec<EmojiEntry>, Vec<(String, String)>);
 
-/// 把一批源文件导入表情库，返回 (成功列表, 跳过原因列表)。
+/// 把一批已读进内存的源文件拷进表情库，返回这一批成功入库的条目。
 ///
-/// 校验：存在且是普通文件、≤16MB、魔数判定为图片、指纹去重、库容量上限。
+/// 校验：≤16MB、魔数判定为图片、指纹去重。**不限制表情库总量** —— 用户存多少张
+/// 就存多少张，占用是用户自己的磁盘，不再用一个人为的数字把新表情挡在门外。
+///
+/// 调用方必须持有 REGISTRY_LOCK，并在最后 write_registry：这样「分批读盘导入」
+/// 也只需要读/写一次索引（见 import_emoji 命令）。
+fn import_sources(
+    dir: &Path,
+    reg: &mut EmojiRegistry,
+    sources: &[(String, Vec<u8>)],
+    skipped: &mut Vec<(String, String)>,
+) -> Result<Vec<EmojiEntry>, String> {
+    let mut known: HashSet<String> = reg.emojis.iter().map(|e| e.sha.clone()).collect();
+    let mut added: Vec<EmojiEntry> = Vec::new();
+
+    for (label, bytes) in sources {
+        if bytes.len() as u64 > MAX_EMOJI_BYTES {
+            skipped.push((
+                label.clone(),
+                format!("超过 {}MB 上限", MAX_EMOJI_BYTES / 1024 / 1024),
+            ));
+            continue;
+        }
+        let Some(kind) = detect_image_kind(bytes) else {
+            skipped.push((label.clone(), "不是支持的图片格式".to_string()));
+            continue;
+        };
+        let sha = content_sha(bytes);
+        if known.contains(&sha) {
+            skipped.push((label.clone(), "表情库里已有相同图片".to_string()));
+            continue;
+        }
+        let id = next_id();
+        let file = format!("{id}.{kind}");
+        std::fs::write(dir.join(&file), bytes).map_err(|e| format!("写入表情失败：{e}"))?;
+        known.insert(sha.clone());
+        let entry = EmojiEntry {
+            id,
+            name: name_from_path(label),
+            file,
+            size: bytes.len() as u64,
+            sha,
+            added_at: now_secs(),
+            cache_file: String::new(),
+        };
+        // 立刻进内存态：同一批里的重复项、后续批次的去重都靠它
+        reg.emojis.push(entry.clone());
+        added.push(entry);
+    }
+
+    Ok(added)
+}
+
+/// 把一批源文件导入表情库，返回 (成功列表, 跳过原因列表)。
 fn import_files(data_dir: &Path, sources: &[(String, Vec<u8>)]) -> Result<ImportOutcome, String> {
     let dir = emoji_dir(data_dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建表情目录失败：{e}"))?;
-    let mut imported: Vec<EmojiEntry> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
 
-    {
+    let imported = {
         let _guard = REGISTRY_LOCK.lock().map_err(|_| "表情库锁异常")?;
         let mut reg = read_registry(data_dir);
         prune_missing(data_dir, &mut reg);
-        let mut known: HashSet<String> = reg.emojis.iter().map(|e| e.sha.clone()).collect();
-
-        for (label, bytes) in sources {
-            if bytes.len() as u64 > MAX_EMOJI_BYTES {
-                skipped.push((
-                    label.clone(),
-                    format!("超过 {}MB 上限", MAX_EMOJI_BYTES / 1024 / 1024),
-                ));
-                continue;
-            }
-            let Some(kind) = detect_image_kind(bytes) else {
-                skipped.push((label.clone(), "不是支持的图片格式".to_string()));
-                continue;
-            };
-            let sha = content_sha(bytes);
-            if known.contains(&sha) {
-                skipped.push((label.clone(), "表情库里已有相同图片".to_string()));
-                continue;
-            }
-            if reg.emojis.len() + imported.len() >= MAX_EMOJIS {
-                skipped.push((label.clone(), "表情库数量已达上限".to_string()));
-                continue;
-            }
-            let id = next_id();
-            let file = format!("{id}.{kind}");
-            std::fs::write(dir.join(&file), bytes).map_err(|e| format!("写入表情失败：{e}"))?;
-            known.insert(sha.clone());
-            imported.push(EmojiEntry {
-                id,
-                name: name_from_path(label),
-                file,
-                size: bytes.len() as u64,
-                sha,
-                added_at: now_secs(),
-                cache_file: String::new(),
-            });
-        }
-
-        if !imported.is_empty() {
-            reg.emojis.extend(imported.iter().cloned());
+        let before = reg.emojis.len();
+        let added = import_sources(&dir, &mut reg, sources, &mut skipped)?;
+        if reg.emojis.len() != before {
             write_registry(data_dir, &reg)?;
         }
-    }
+        added
+    };
 
     Ok((imported, skipped))
 }
@@ -542,8 +558,12 @@ pub fn inspect_pack(data_dir: &Path, src: &Path) -> Result<PackInspect, String> 
 
     let mut items: Vec<PackInspectItem> = Vec::new();
     let mut total_bytes: u64 = 0;
-    for (i, it) in manifest.emojis.iter().enumerate() {
-        if i >= MAX_PACK_ENTRIES {
+    // 不按「条数」截断（那样 500 张以上的包会被静默丢掉一部分）：改成按已读取
+    // 字节数封顶。合法包（图片总体积本来就 ≤ MAX_PACK_TOTAL_BYTES）永远走不到
+    // 这条线；伪造的巨型条目 / zip bomb 读到预算就见底，后面的条目本来也进不了库。
+    let mut scanned_bytes: u64 = 0;
+    for it in manifest.emojis.iter() {
+        if scanned_bytes >= MAX_PACK_TOTAL_BYTES {
             break;
         }
         let mut item = PackInspectItem {
@@ -566,23 +586,23 @@ pub fn inspect_pack(data_dir: &Path, src: &Path) -> Result<PackInspect, String> 
         // 以实际解出的长度为准（清单里的 size 只是提示，可被伪造）；
         // take(上限+1) 防止伪造的巨型条目把内存吃光
         let mut bytes: Vec<u8> = Vec::new();
-        match za.by_name(&it.file) {
-            Ok(mut entry) => {
-                if let Err(e) = entry
-                    .by_ref()
-                    .take(MAX_EMOJI_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                {
-                    item.problem = Some(format!("E_READ_FAILED|{e}"));
-                    items.push(item);
-                    continue;
-                }
-            }
+        let read = match za.by_name(&it.file) {
+            Ok(mut entry) => entry
+                .by_ref()
+                .take(MAX_EMOJI_BYTES + 1)
+                .read_to_end(&mut bytes),
             Err(_) => {
                 item.problem = Some("E_PACK_FILE_MISSING|包内缺少该文件".into());
                 items.push(item);
                 continue;
             }
+        };
+        // 读出来的字节不管合不合法都计入预算：预算只认「读了多少」，不认「有几条」
+        scanned_bytes += bytes.len() as u64;
+        if let Err(e) = read {
+            item.problem = Some(format!("E_READ_FAILED|{e}"));
+            items.push(item);
+            continue;
         }
         item.size = bytes.len() as u64;
         match detect_image_kind(&bytes) {
@@ -648,10 +668,11 @@ pub fn import_pack(
     let mut picked: Vec<(String, Vec<u8>)> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut total_bytes: u64 = 0;
-    for (i, it) in manifest.emojis.iter().enumerate() {
-        if i >= MAX_PACK_ENTRIES {
-            skipped.push((it.file.clone(), "超出包内条目上限".to_string()));
-            continue;
+    let mut scanned_bytes: u64 = 0;
+    for it in manifest.emojis.iter() {
+        // 与 inspect_pack 同一口径：按已读字节数封顶，不按条数（见那里的说明）
+        if scanned_bytes >= MAX_PACK_TOTAL_BYTES {
+            break;
         }
         if let Some(w) = &want {
             if !w.contains(it.file.as_str()) {
@@ -668,21 +689,20 @@ pub fn import_pack(
             continue;
         }
         let mut bytes = Vec::new();
-        match za.by_name(&it.file) {
-            Ok(mut entry) => {
-                if let Err(e) = entry
-                    .by_ref()
-                    .take(MAX_EMOJI_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                {
-                    skipped.push((label, format!("读取失败：{e}")));
-                    continue;
-                }
-            }
+        let read = match za.by_name(&it.file) {
+            Ok(mut entry) => entry
+                .by_ref()
+                .take(MAX_EMOJI_BYTES + 1)
+                .read_to_end(&mut bytes),
             Err(_) => {
                 skipped.push((label, "包内缺少该文件".to_string()));
                 continue;
             }
+        };
+        scanned_bytes += bytes.len() as u64;
+        if let Err(e) = read {
+            skipped.push((label, format!("读取失败：{e}")));
+            continue;
         }
         if bytes.len() as u64 > MAX_EMOJI_BYTES {
             skipped.push((label, format!("超过 {}MB 上限", MAX_EMOJI_BYTES / 1024 / 1024)));
@@ -855,41 +875,65 @@ fn entries_json(data_dir: &Path, list: Vec<EmojiEntry>) -> Vec<serde_json::Value
         .collect()
 }
 
-/// 从本地文件导入表情（前端只传路径，读盘/校验都在后端做，大图不经 IPC）
+/// 从本地文件导入表情（前端只传路径，读盘/校验都在后端做，大图不经 IPC）。
+///
+/// 选多少张都收：读盘按 IMPORT_CHUNK 分批，内存里最多只有一个批次；
+/// 索引只读一次、只写一次（整批导入是一个整体，中途不会让别的命令看到半截状态）。
 #[tauri::command]
 pub async fn import_emoji(
     paths: Vec<String>,
     st: State<'_, SharedState>,
 ) -> Result<serde_json::Value, String> {
-    let mut sources: Vec<(String, Vec<u8>)> = Vec::new();
+    let dir = emoji_dir(&st.data_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建表情目录失败：{e}"))?;
+    let mut imported: Vec<EmojiEntry> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
-    for p in &paths {
-        let path = Path::new(p);
-        if !path.is_file() {
-            skipped.push((p.clone(), "文件不存在".to_string()));
-            continue;
-        }
-        match std::fs::metadata(path) {
-            Ok(m) if m.len() > MAX_EMOJI_BYTES => {
-                skipped.push((
-                    p.clone(),
-                    format!("超过 {}MB 上限", MAX_EMOJI_BYTES / 1024 / 1024),
-                ));
+
+    {
+        let _guard = REGISTRY_LOCK.lock().map_err(|_| "表情库锁异常")?;
+        let mut reg = read_registry(&st.data_dir);
+        prune_missing(&st.data_dir, &mut reg);
+        let before = reg.emojis.len();
+        let mut batch: Vec<(String, Vec<u8>)> = Vec::with_capacity(IMPORT_CHUNK);
+
+        for p in &paths {
+            let path = Path::new(p);
+            if !path.is_file() {
+                skipped.push((p.clone(), "文件不存在".to_string()));
                 continue;
             }
-            Ok(_) => {}
-            Err(e) => {
-                skipped.push((p.clone(), format!("读取失败：{e}")));
-                continue;
+            match std::fs::metadata(path) {
+                Ok(m) if m.len() > MAX_EMOJI_BYTES => {
+                    skipped.push((
+                        p.clone(),
+                        format!("超过 {}MB 上限", MAX_EMOJI_BYTES / 1024 / 1024),
+                    ));
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    skipped.push((p.clone(), format!("读取失败：{e}")));
+                    continue;
+                }
+            }
+            match std::fs::read(path) {
+                Ok(bytes) => batch.push((name_from_path(p), bytes)),
+                Err(e) => skipped.push((p.clone(), format!("读取失败：{e}"))),
+            }
+            if batch.len() >= IMPORT_CHUNK {
+                imported.extend(import_sources(&dir, &mut reg, &batch, &mut skipped)?);
+                batch.clear();
             }
         }
-        match std::fs::read(path) {
-            Ok(bytes) => sources.push((name_from_path(p), bytes)),
-            Err(e) => skipped.push((p.clone(), format!("读取失败：{e}"))),
+        if !batch.is_empty() {
+            imported.extend(import_sources(&dir, &mut reg, &batch, &mut skipped)?);
+        }
+
+        if reg.emojis.len() != before {
+            write_registry(&st.data_dir, &reg)?;
         }
     }
-    let (imported, mut more) = import_files(&st.data_dir, &sources)?;
-    skipped.append(&mut more);
+
     Ok(serde_json::json!({
         "imported": entries_json(&st.data_dir, imported),
         "skipped": skipped.into_iter().map(|(n, r)| serde_json::json!({ "name": n, "reason": r })).collect::<Vec<_>>(),
@@ -1057,6 +1101,13 @@ mod tests {
         v
     }
 
+    /// 一张内容互不相同的合法 PNG（去重按内容指纹算，批量用例必须张张不同）
+    fn unique_png(seed: usize) -> Vec<u8> {
+        let mut v = png_bytes();
+        v.extend_from_slice(format!("-{seed}").as_bytes());
+        v
+    }
+
     #[test]
     fn every_supported_kind_maps_to_a_stageable_mime() {
         // 五种魔数都要有 MIME，且必须是 net::stage_clipboard_image 认的那几种
@@ -1170,6 +1221,26 @@ mod tests {
     }
 
     #[test]
+    fn library_has_no_entry_cap() {
+        // 旧实现卡在 MAX_EMOJIS = 2000：第 2001 张会被判「数量已达上限」丢掉。
+        // 数量上限已解除，这里锁死「全收，一条都不跳过」，且存量不封顶。
+        let dir = tmp_data("nocap");
+        let sources: Vec<(String, Vec<u8>)> = (0..2001)
+            .map(|i| (format!("{i}.png"), unique_png(i)))
+            .collect();
+        let (ok, skipped) = import_files(&dir, &sources).unwrap();
+        assert_eq!(ok.len(), 2001);
+        assert!(skipped.is_empty(), "不该有跳过项：{skipped:?}");
+        assert_eq!(load_emojis(&dir).unwrap().len(), 2001);
+        // 库已经「满了」的旧实现会在这里开始拒收
+        let (more, more_skipped) =
+            import_files(&dir, &[("x.png".to_string(), unique_png(9999))]).unwrap();
+        assert_eq!(more.len(), 1);
+        assert!(more_skipped.is_empty(), "不该有跳过项：{more_skipped:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn prune_drops_entries_whose_file_is_gone() {
         let dir = tmp_data("prune");
         let (ok, _) = import_files(&dir, &[("a.png".to_string(), png_bytes())]).unwrap();
@@ -1231,6 +1302,51 @@ mod tests {
             std::fs::read(emoji_dir(&dir).join(&gif_entry.file)).unwrap(),
             gif_bytes()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pack_with_more_entries_than_the_old_cap_imports_whole() {
+        // 旧实现按条数截断（MAX_PACK_ENTRIES = 500）：第 501 张起在预览里看不到、
+        // 导入时被静默丢掉。现在只按字节预算封顶，600 张小图必须一张不少。
+        let dir = tmp_data("bigpack");
+        std::fs::create_dir_all(emoji_dir(&dir)).unwrap();
+        let pack_path = dir.join("big.ipmojis");
+        const N: usize = 600;
+        let images: Vec<(String, Vec<u8>)> = (0..N)
+            .map(|i| (format!("images/{i:04}.png"), unique_png(i)))
+            .collect();
+        {
+            let f = std::fs::File::create(&pack_path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            let manifest = serde_json::json!({
+                "format": PACK_FORMAT,
+                "version": 1,
+                "name": "big",
+                "emojis": images
+                    .iter()
+                    .map(|(file, bytes)| serde_json::json!({
+                        "name": "", "file": file, "size": bytes.len(),
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+            zw.start_file(PACK_MANIFEST, opts).unwrap();
+            zw.write_all(manifest.to_string().as_bytes()).unwrap();
+            for (file, bytes) in &images {
+                zw.start_file(file, opts).unwrap();
+                zw.write_all(bytes).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+
+        let ins = inspect_pack(&dir, &pack_path).unwrap();
+        assert_eq!(ins.total, N, "预览不能按条数截断");
+        assert_eq!(ins.importable, N);
+        let (imported, skipped) = import_pack(&dir, &pack_path, &[]).unwrap();
+        assert_eq!(imported, N, "整包都要入库");
+        assert!(skipped.is_empty(), "不该有跳过项：{skipped:?}");
+        assert_eq!(load_emojis(&dir).unwrap().len(), N);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

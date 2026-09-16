@@ -10,9 +10,6 @@ import { describeError, errorCode } from './errors.js'
 /** 单张表情上限，与后端 emoji.rs 的 MAX_EMOJI_BYTES 保持一致（16MB） */
 export const MAX_EMOJI_BYTES = 16 * 1024 * 1024
 
-/** 一次「导入图片」最多选多少个文件（后端逐个校验，这里只做交互层兜底） */
-export const MAX_IMPORT_BATCH = 500
-
 /** 支持导入的图片扩展名（真正的判定在后端按文件头魔数做） */
 export const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']
 
