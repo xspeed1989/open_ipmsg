@@ -60,7 +60,7 @@ const viewList = computed(() => {
     }
     const dayInserted = out.length && out[out.length - 1].kind === 'day'
     const merged =
-      prev && !dayInserted &&
+      !isBroadcast.value && prev && !dayInserted &&
       prev.dir === m.dir && prev.kind === m.kind && m.ts - prev.ts < 180
     out.push({ kind: 'msg', id: 'm-' + m.pkt + '-' + out.length, m, firstOfCluster: !merged })
     prev = m
@@ -1290,8 +1290,8 @@ watch(
             <i v-if="selMode && !isSealedEnvelope(v.m)" class="sel-check"
               :class="{ on: selected.has(v.m) }" @click.stop="toggleSel(v.m)"></i>
             <!-- 广播信箱是一条会话里多个发送方（等同群聊）：头像不足以辨人，
-                 每条对端消息的簇首必须标出昵称。普通单聊只有一个对端，不标。 -->
-            <div v-if="isBroadcast && v.m.dir === 'in' && v.firstOfCluster" class="sender-line">
+                 每条对端消息都必须标出昵称。普通单聊只有一个对端，不标。 -->
+            <div v-if="isBroadcast && v.m.dir === 'in'" class="sender-line">
               <span class="sender-name ellipsis" :title="msgSenderFull(v.m)">{{ msgSender(v.m) }}</span>
               <span v-if="senderIpOf(v.m)" class="sender-ip">{{ senderIpOf(v.m) }}</span>
             </div>

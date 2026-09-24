@@ -1911,11 +1911,8 @@ async fn handle_sendmsg(
     let auto_open = secret && !password_protected && ctx.st.config().auto_open_secret;
     let unlocked = prior_unlocked || auto_open;
 
-    let existing_peer = if is_broadcast {
-        None
-    } else {
-        ctx.st.peers.lock().unwrap().get(key).cloned()
-    };
+    // key 是真实发送方 IP，不是广播信箱 key；广播同样复用已知昵称。
+    let existing_peer = ctx.st.peers.lock().unwrap().get(key).cloned();
     let metadata_nickname = peer_metadata
         .and_then(|metadata| metadata.nickname.as_deref())
         .filter(|nickname| !nickname.is_empty());
@@ -5499,6 +5496,41 @@ mod tests {
         assert_eq!(session.nickname, "", "不随发送方改名");
         assert_eq!(session.last_ts, record["ts"].as_u64().unwrap());
 
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn broadcast_sendmsg_uses_known_sender_nickname() {
+        let (ctx, st, _peer, data_dir) = encipdict_test_ctx("broadcast-known-name").await;
+        let from: std::net::SocketAddr = "192.168.2.115:2425".parse().unwrap();
+        let key = from.ip().to_string();
+        st.peers.lock().unwrap().insert(key.clone(), crate::state::PeerInfo {
+            key: key.clone(),
+            ip: key.clone(),
+            port: from.port(),
+            nickname: "张三".into(),
+            group: "开发".into(),
+            host: "workstation".into(),
+            user: "ubuntu".into(),
+            last_seen: 1,
+            absence: false,
+            absence_text: None,
+            vs: None,
+        });
+        let mut packet = crate::protocol::Packet::new(
+            crate::protocol::cmd::SENDMSG | crate::protocol::opt::BROADCASTOPT,
+        ).with_pkt_no(771002);
+        packet.user = "ubuntu".into();
+        packet.extra = b"Hello".to_vec();
+        let identity = super::classic_payload_identity(&packet);
+        super::handle_sendmsg(&ctx, from, &packet, &key, None, &identity, false, None)
+            .await
+            .unwrap();
+        let record = st.find_history_pkt(crate::state::BROADCAST_SESSION_KEY, 771002)
+            .expect("广播记录应落在广播信箱");
+        assert_eq!(record["peer"]["nickname"].as_str(), Some("张三"));
+        assert_eq!(record["peer"]["ip"].as_str(), Some(key.as_str()));
+        assert_eq!(st.peers.lock().unwrap().get(&key).unwrap().last_seen, 1);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
