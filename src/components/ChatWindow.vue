@@ -86,11 +86,19 @@ function scrollBottom(smooth = false) {
     el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
   })
 }
-watch(() => store.activeKey, () => {
+watch(() => [store.activeKey, store.chatOpenVersion], () => {
   autoBottom = true
   scrollBottom()
 })
 watch(() => msgs.value.length, () => scrollBottom(true))
+
+// 隐藏/最小化时布局可能尚未恢复，容器重新获得尺寸后补做定位。
+watch(scroller, (el, _previous, onCleanup) => {
+  if (!el) return
+  const observer = new ResizeObserver(() => scrollBottom())
+  observer.observe(el)
+  onCleanup(() => observer.disconnect())
+}, { flush: 'post' })
 
 /* ---------- toast 落点 ---------- */
 // App 提供的共享 ref：绑到头部下方那个零高锚点上，DialogHost 用 Teleport 把

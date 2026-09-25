@@ -40,6 +40,7 @@ export const store = reactive({
   peerMeta: {}, // key -> { nickname, host, group } 快照（离线也能显示）
 
   activeKey: null,
+  chatOpenVersion: 0, // 同一会话再次打开也要触发最新消息定位
   unread: {}, // key -> 未读数
   unreadTs: {}, // key -> 最近一条未读消息的时间戳（决定托盘唤起时跳到哪个会话）
   searchHits: [], // 中栏搜索命中的聊天记录
@@ -279,6 +280,7 @@ export async function deleteContact(key) {
 export async function openChat(key) {
   await ensureChat(key)
   store.activeKey = key
+  store.chatOpenVersion += 1
   await markReadFor(key)
 }
 
