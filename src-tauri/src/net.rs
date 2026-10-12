@@ -7,6 +7,7 @@ use crate::crypto;
 use crate::ipdict::{self as ipd};
 use crate::protocol::{self as proto, cmd, fileattr, opt};
 use crate::wire;
+use crate::dirwire::{self, attr as dirattr};
 use crate::state::{
     now_secs, AppState, Config, DirMember, InRecordOutcome, OfferedFile, PeerInfo, PendingOut,
     RetryOut, VerifiedPeerKeyDecision,
@@ -6637,22 +6638,6 @@ mod tests {
     }
 
     #[test]
-    fn dir_header_length_is_self_inclusive() {
-        let h = dir_header("a.txt", 0x1234, dirattr::REGULAR);
-        assert_eq!(h, b"0012:a.txt:1234:1:".to_vec());
-        assert_eq!(
-            usize::from_str_radix(std::str::from_utf8(&h[..4]).unwrap(), 16).unwrap(),
-            h.len()
-        );
-        // 超长名字导致长度字段扩位时仍自洽
-        let long = "x".repeat(0x10000);
-        let h = dir_header(&long, 0, dirattr::ENTER);
-        let colon = h.iter().position(|&b| b == b':').unwrap();
-        let n = usize::from_str_radix(std::str::from_utf8(&h[..colon]).unwrap(), 16).unwrap();
-        assert_eq!(n, h.len());
-    }
-
-    #[test]
     fn safe_component_blocks_traversal() {
         assert_eq!(safe_component("../../etc/passwd"), ".._.._etc_passwd");
         assert_eq!(safe_component(".."), "unnamed");
@@ -7019,20 +7004,6 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
 （此时名称固定为 "."，无内容）。目录树按深度优先展开。 */
 
 /// 目录流内的条目属性
-mod dirattr {
-    #![allow(dead_code)]
-    pub const REGULAR: u32 = 1;
-    pub const ENTER: u32 = 2;
-    pub const RETPARENT: u32 = 3;
-    // 官方 ipmsg.h 还定义了这些类型；我们不落盘，但必须把内容读掉，
-    // 否则流会错位，后面的条目全部解析失败
-    pub const SYMLINK: u32 = 4;
-    pub const CDEV: u32 = 5;
-    pub const BDEV: u32 = 6;
-    pub const FIFO: u32 = 7;
-    pub const RESFORK: u32 = 0x10;
-}
-
 /// 一次目录传输最多接收的条目数，防御异常/恶意对端把磁盘写满
 const DIR_MAX_ENTRIES: usize = 50_000;
 
@@ -7105,28 +7076,6 @@ fn collect_dir_ops(root: &std::path::Path, root_name: &str) -> Vec<DirOp> {
     out
 }
 
-/// 组装目录流头部（长度字段自身也计入总长）
-fn dir_header(name: &str, size: u64, attr: u32) -> Vec<u8> {
-    let cleaned: String = name
-        .chars()
-        .map(|c| match c {
-            ':' | '/' | '\\' | '\0' | '\r' | '\n' => '_',
-            _ => c,
-        })
-        .collect();
-    let body = format!(":{cleaned}:{size:x}:{attr:x}:");
-    // 官方用 4 位十六进制；超长文件名时自然扩展位数并迭代收敛
-    let mut width = 4usize;
-    loop {
-        let total = width + body.len();
-        let head = format!("{:0width$x}", total, width = width);
-        if head.len() == width {
-            return format!("{head}{body}").into_bytes();
-        }
-        width = head.len();
-    }
-}
-
 /// 服务端：把目录树按流发给对端，返回发出的内容字节数。
 /// writer 用泛型抽象：明文传 TcpStream，加密时传 EncStream<TcpStream>，
 /// 整条流（头部+内容）无差别过密钥流。
@@ -7140,7 +7089,7 @@ async fn serve_dir_stream<W: AsyncWrite + Unpin>(
     for op in collect_dir_ops(root, root_name) {
         match op {
             DirOp::Enter(name) => {
-                if w.write_all(&dir_header(&name, 0, dirattr::ENTER))
+                if w.write_all(&dirwire::header(&name, 0, dirattr::ENTER))
                     .await
                     .is_err()
                 {
@@ -7148,7 +7097,7 @@ async fn serve_dir_stream<W: AsyncWrite + Unpin>(
                 }
             }
             DirOp::Ret => {
-                if w.write_all(&dir_header(".", 0, dirattr::RETPARENT))
+                if w.write_all(&dirwire::header(".", 0, dirattr::RETPARENT))
                     .await
                     .is_err()
                 {
@@ -7157,7 +7106,7 @@ async fn serve_dir_stream<W: AsyncWrite + Unpin>(
             }
             DirOp::File(path, name, size) => {
                 // 以登记时的大小为准：发送期间文件被改写也要保证头部与内容一致
-                if w.write_all(&dir_header(&name, size, dirattr::REGULAR))
+                if w.write_all(&dirwire::header(&name, size, dirattr::REGULAR))
                     .await
                     .is_err()
                 {
@@ -7775,24 +7724,10 @@ impl StreamReader {
         }
         let head = self.buf[self.pos..self.pos + head_len].to_vec();
         self.pos += head_len;
-
-        // 名称之后的字段固定为 大小:属性[:扩展]，从右往左定位，容忍名称里的冒号
-        let body = &head[len_str.len() + 1..];
-        let body = body.strip_suffix(b":").unwrap_or(body);
-        let mut fields: Vec<&[u8]> = body.split(|&b| b == b':').collect();
-        if fields.len() < 3 {
-            return Err("目录流头部字段不足".into());
-        }
-        // 扩展属性（key=value）在尾部，剥掉后剩下 名称/大小/属性
-        while fields.len() > 3 && fields.last().map(|f| f.contains(&b'=')).unwrap_or(false) {
-            fields.pop();
-        }
-        let attr = num_flex_hex(&String::from_utf8_lossy(fields[fields.len() - 1]))
-            .ok_or("目录流属性字段无法解析")? as u32;
-        let size = num_flex_hex(&String::from_utf8_lossy(fields[fields.len() - 2]))
-            .ok_or("目录流大小字段无法解析")?;
-        let name = proto::decode_bytes(&fields[..fields.len() - 2].join(&b':'));
-        Ok(Some((proto::strip_control(&name), size, attr)))
+        // 解析规则与写端/假对端同源（dirwire::parse_header）：名称里的冒号、扩展段都在这边处理
+        dirwire::parse_header(&head)
+            .map(Some)
+            .ok_or_else(|| "目录流头部字段不足或无法解析".into())
     }
 
     /// 丢弃接下来的 want 字节（用于跳过不落盘的条目），返回实际跳过量
@@ -7834,14 +7769,6 @@ impl StreamReader {
         }
         Ok(want - left)
     }
-}
-
-fn num_flex_hex(t: &str) -> Option<u64> {
-    let t = t.trim();
-    if t.is_empty() {
-        return None;
-    }
-    u64::from_str_radix(t.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()
 }
 
 /* ---------- 取文件请求的方言 ----------
@@ -7990,10 +7917,7 @@ pub(crate) async fn open_transfer(
             req.push('\n');
         }
         None => {
-            req.push_str(&pkt_field);
-            req.push(':');
-            req.push_str(&id_field);
-            req.push_str(":0");
+            req.push_str(&dirwire::request_line(&pkt_field, &id_field, 0));
             if d.newline {
                 req.push('\n');
             }

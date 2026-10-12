@@ -14,6 +14,7 @@ macro_rules! oim_log {
 
 mod autostart;
 mod crypto;
+mod dirwire;
 mod emoji;
 mod ipdict;
 mod ipmsg_import;

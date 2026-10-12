@@ -1851,12 +1851,6 @@ fn spawn_fake_peer(
 
 /* ---------------- 目录流工具（自检内独立实现，与被测代码不共享逻辑） ---------------- */
 
-fn dir_head(name: &str, size: u64, attr: u32) -> Vec<u8> {
-    let body = format!(":{name}:{size:x}:{attr:x}:");
-    let total = 4 + body.len();
-    format!("{total:04x}{body}").into_bytes()
-}
-
 /// 假对端提供的目录树：dirA/{hello.txt, sub/{data.bin}}
 fn fake_dir_files() -> Vec<(&'static str, Vec<u8>)> {
     vec![
@@ -1870,27 +1864,27 @@ fn fake_dir_files() -> Vec<(&'static str, Vec<u8>)> {
 
 fn fake_dir_stream() -> Vec<u8> {
     let files = fake_dir_files();
-    let mut out = dir_head("假对端目录", 0, 2);
+    let mut out = crate::dirwire::header("假对端目录", 0, 2);
     let (_, ref f0) = files[0];
-    out.extend_from_slice(&dir_head("hello.txt", f0.len() as u64, 1));
+    out.extend_from_slice(&crate::dirwire::header("hello.txt", f0.len() as u64, 1));
     out.extend_from_slice(f0);
 
     // 符号链接条目（官方类型 4）：不该落盘，但其内容必须被跳过，
     // 否则后面的条目会全部错位
     let link_target = b"/etc/passwd";
-    out.extend_from_slice(&dir_head("链接", link_target.len() as u64, 4));
+    out.extend_from_slice(&crate::dirwire::header("链接", link_target.len() as u64, 4));
     out.extend_from_slice(link_target);
 
     // 空子目录：进入后立刻返回，接收端也应该把它建出来
-    out.extend_from_slice(&dir_head("空目录", 0, 2));
-    out.extend_from_slice(&dir_head(".", 0, 3));
+    out.extend_from_slice(&crate::dirwire::header("空目录", 0, 2));
+    out.extend_from_slice(&crate::dirwire::header(".", 0, 3));
 
-    out.extend_from_slice(&dir_head("sub", 0, 2));
+    out.extend_from_slice(&crate::dirwire::header("sub", 0, 2));
     let (_, ref f1) = files[1];
-    out.extend_from_slice(&dir_head("data.bin", f1.len() as u64, 1));
+    out.extend_from_slice(&crate::dirwire::header("data.bin", f1.len() as u64, 1));
     out.extend_from_slice(f1);
-    out.extend_from_slice(&dir_head(".", 0, 3)); // 退出 sub
-    out.extend_from_slice(&dir_head(".", 0, 3)); // 退出根
+    out.extend_from_slice(&crate::dirwire::header(".", 0, 3)); // 退出 sub
+    out.extend_from_slice(&crate::dirwire::header(".", 0, 3)); // 退出根
     out
 }
 
@@ -1908,11 +1902,10 @@ async fn fetch_dir(
     .map_err(|_| "连接超时".to_string())?
     .map_err(|e| format!("connect: {e}"))?;
     let req = format!(
-        "1:{}:fake:fake-host:{}:{}:{}:0\n",
+        "1:{}:fake:fake-host:{}:{}\n",
         proto::next_packet_no(),
         cmd::GETDIRFILES,
-        pkt_no,
-        file_id
+        crate::dirwire::request_line(&pkt_no.to_string(), &file_id.to_string(), 0)
     );
     stream
         .write_all(req.as_bytes())
@@ -1938,15 +1931,13 @@ async fn fetch_dir(
         if i + head_len > raw.len() {
             return Err("头部越界".into());
         }
-        let head = String::from_utf8_lossy(&raw[i..i + head_len]).into_owned();
+        let head = &raw[i..i + head_len];
         i += head_len;
-        let fields: Vec<&str> = head.trim_end_matches(':').split(':').collect();
-        if fields.len() < 4 {
-            return Err(format!("头部字段不足: {head:?}"));
-        }
-        let name = fields[1].to_string();
-        let size = u64::from_str_radix(fields[2], 16).map_err(|e| e.to_string())? as usize;
-        let attr = u32::from_str_radix(fields[3], 16).map_err(|e| e.to_string())?;
+        // 与写端同源（dirwire::parse_header）：夹具不再自己切字段
+        let Some((name, size, attr)) = crate::dirwire::parse_header(head) else {
+            return Err(format!("头部无法解析: {:?}", String::from_utf8_lossy(head)));
+        };
+        let size = size as usize;
         match attr {
             2 => {
                 stack.push(name);
@@ -2022,11 +2013,10 @@ async fn fetch_file(port_app: u16, pkt_no: u32, file_id: u32) -> Result<Vec<u8>,
     .map_err(|_| "连接超时".to_string())?
     .map_err(|e| format!("connect: {e}"))?;
     let req = format!(
-        "1:{}:fake:fake-host:{}:{}:{}:0\n",
+        "1:{}:fake:fake-host:{}:{}\n",
         proto::next_packet_no(),
         cmd::GETFILEDATA,
-        pkt_no,
-        file_id
+        crate::dirwire::request_line(&pkt_no.to_string(), &file_id.to_string(), 0)
     );
     stream
         .write_all(req.as_bytes())
