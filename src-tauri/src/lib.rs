@@ -334,11 +334,9 @@ async fn get_users(st: State<'_, SharedState>) -> Result<Vec<PeerInfo>, String> 
     // 排除被用户删除（隐藏）的联系人：对方的在线广播也不在列表里出现
     let mut users: Vec<PeerInfo> = st
         .peers
-        .lock()
-        .unwrap()
-        .values()
+        .snapshot()
+        .into_iter()
         .filter(|p| !st.is_hidden(&p.key))
-        .cloned()
         .collect();
     users.sort_by(|a, b| {
         a.group
@@ -1756,7 +1754,7 @@ pub fn run() {
                 protocol::DEFAULT_PORT
             );
             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-            let mut users: Vec<PeerInfo> = st.peers.lock().unwrap().values().cloned().collect();
+            let mut users: Vec<PeerInfo> = st.peers.snapshot();
             users.sort_by(|a, b| a.key.cmp(&b.key));
             println!("{}", serde_json::to_string_pretty(&users).unwrap());
         });

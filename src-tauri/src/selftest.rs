@@ -156,15 +156,13 @@ async fn async_run() -> bool {
     let peer_key = "127.0.0.1".to_string();
 
     /* ---- 1. 发现 ---- */
-    let discovered = wait_for(2500, || st.peers.lock().unwrap().contains_key(&peer_key)).await;
+    let discovered = wait_for(2500, || st.peers.contains(&peer_key)).await;
     log.check("发现假对端（BR_ENTRY→ANSENTRY 注册）", discovered);
     if !discovered {
         return finish(log, peer_tasks, &data_dir);
     }
     let info_ok = wait_for(2500, || {
         st.peers
-            .lock()
-            .unwrap()
             .get(&peer_key)
             .map(|p| p.nickname == "假对端" && p.group == "测试组")
             .unwrap_or(false)
@@ -882,7 +880,7 @@ async fn crypto_roundtrip() -> bool {
     let addr_b: SocketAddr = format!("{key_b}:{port_b}").parse().unwrap();
     net::announce_unicast(&ctx_a, &[addr_b]).await;
 
-    let discovered = wait_for(2500, || st_a.peers.lock().unwrap().contains_key(key_b)).await;
+    let discovered = wait_for(2500, || st_a.peers.contains(key_b)).await;
     log.check("发现实例 B（BR_ENTRY→ANSENTRY 注册）", discovered);
     // B 缓存了 A 的公钥 = B 侧预握手已完成（peer_keys.json 非空且含回环键）
     let b_cached_a = wait_for(5000, || peer_keys_cached(&dir_b, key)).await;
@@ -2217,7 +2215,7 @@ async fn extended_protocols() -> bool {
     let peer_key = "127.0.0.1".to_string();
     let mut log = Log(vec![]);
 
-    let discovered = wait_for(2500, || st.peers.lock().unwrap().contains_key(&peer_key)).await;
+    let discovered = wait_for(2500, || st.peers.contains(&peer_key)).await;
     log.check("E: 扩展假对端发现", discovered);
     if !discovered {
         // 收尾：杀任务
@@ -2582,7 +2580,7 @@ async fn extended_protocols() -> bool {
         .sock
         .send_to(&probe.encode(&cfg_now.nickname, "ext-self"), peer_addr)
         .await;
-    let third = wait_for(3000, || st.peers.lock().unwrap().contains_key("127.0.0.9")).await;
+    let third = wait_for(3000, || st.peers.contains("127.0.0.9")).await;
     log.check("E: ANSLIST 第三方主机并入用户表", third);
 
     /* ---- E8. 成员主目录服务（DIR_MASTER 三实例：主/成员/普通） ---- */
@@ -2621,7 +2619,7 @@ async fn extended_protocols() -> bool {
     .await;
     log.check("E: 成员主登记 POLL 成员", member_reg);
     let got_packet = wait_for(5000, || {
-        st_u.peers.lock().unwrap().contains_key("127.0.0.7")
+        st_u.peers.contains("127.0.0.7")
     })
     .await;
     log.check("E: 成员收到 DIR_PACKET 全网列表", got_packet);
@@ -2684,24 +2682,20 @@ async fn extended_protocols() -> bool {
     }
     // X 的会话表里手工登记 Y（回环下没有广播发现）
     {
-        let mut peers = st_x.peers.lock().unwrap();
-        peers.insert(
-            "127.0.0.6".into(),
-            crate::state::PeerInfo {
-                key: "127.0.0.6".into(),
-                ip: "127.0.0.6".into(),
-                port: port_y,
-                nickname: "中继Y".into(),
-                group: String::new(),
-                host: "y-host".into(),
-                user: "中继Y".into(),
-                last_seen: crate::state::now_secs(),
-                absence: false,
-                absence_text: None,
-                vs: None,
-                encrypt_announced: false,
-},
-        );
+        st_x.peers.upsert_peer(crate::state::PeerInfo {
+            key: "127.0.0.6".into(),
+            ip: "127.0.0.6".into(),
+            port: port_y,
+            nickname: "中继Y".into(),
+            group: String::new(),
+            host: "y-host".into(),
+            user: "中继Y".into(),
+            last_seen: crate::state::now_secs(),
+            absence: false,
+            absence_text: None,
+            vs: None,
+            encrypt_announced: false,
+        });
     }
     let rec_x = net::send_message(&ctx_x, "127.0.0.6", "经代理的消息", vec![])
         .await

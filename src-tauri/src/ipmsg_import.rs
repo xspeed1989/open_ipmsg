@@ -207,7 +207,7 @@ pub fn import_ipmsg_db(st: &AppState, path: &Path) -> Result<ImportReport, Strin
     seeds.sort_by_key(|(_, _, live)| !*live); // live=true 优先
     let mut ident_map: HashMap<(String, String), String> = HashMap::new();
     // 在线用户优先：正在对话的人，历史应落在他的当前会话里
-    for p in st.peers.lock().unwrap().values() {
+    for p in st.peers.snapshot().iter() {
         if let Some(id) = ident_key(&p.nickname, &p.host) {
             ident_map.entry(id).or_insert(p.key.clone());
         }

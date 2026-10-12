@@ -428,9 +428,9 @@ pub(crate) async fn handshake_sweep(ctx: &NetCtx) -> usize {
         return 0;
     }
     let pending: Vec<(String, SocketAddr)> = {
-        let peers = ctx.st.peers.lock().unwrap();
+        let peers = ctx.st.peers.snapshot();
         peers
-            .values()
+            .iter()
             .filter(|p| p.encrypt_announced)
             .filter(|p| ctx.st.trust.peer_pubkey(&p.key).is_none())
             .filter(|p| !ctx.st.trust.peer_marked_plain(&p.key))
@@ -497,13 +497,12 @@ fn spawn_ticker(ctx: Arc<NetCtx>) {
             // 离线消息复查：对方在线就重投（送达以 RECVMSG 确认为准，
             // 这里只负责「还在线就再发一遍」，失败消息由对端按包号去重）
             let keys: Vec<String> = {
-                let peers = ctx.st.peers.lock().unwrap();
-                peers.keys().cloned().collect()
+                ctx.st.peers.keys()
             };
             for k in keys {
                 flush_pending_for(&ctx, &k).await;
             }
-            let stale = ctx.st.prune_stale_peers(30 * 60);
+            let stale = ctx.st.peers.prune_stale_peers(30 * 60);
             if !stale.is_empty() {
                 ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
             }
@@ -546,7 +545,7 @@ async fn retry_pending_for(ctx: Arc<NetCtx>, key: &str) {
             continue;
         }
         // 对方离线：整体转入待投递队列（对方回来时补投）
-        let peer = ctx.st.peers.lock().unwrap().get(key).cloned();
+        let peer = ctx.st.peers.get(key);
         let Some(peer) = peer else {
             ctx.st.outbox.demote_retry_to_pending(key);
             return;
@@ -692,9 +691,8 @@ fn plain_payload(extra: &[u8]) -> Vec<u8> {
 async fn flush_pending_for(ctx: &NetCtx, key: &str) {
     // 守卫只在块内存活，绝不跨 await
     let peer = {
-        let peers = ctx.st.peers.lock().unwrap();
-        match peers.get(key) {
-            Some(p) => p.clone(),
+        match ctx.st.peers.get(key) {
+            Some(p) => p,
             None => return,
         }
     };
@@ -867,8 +865,8 @@ pub async fn announce_absence(ctx: &NetCtx) {
         .map(|ip| SocketAddr::from((ip, ctx.port)))
         .collect();
     {
-        let peers = ctx.st.peers.lock().unwrap();
-        targets.extend(peers.values().filter_map(peer_addr));
+        let peers = ctx.st.peers.snapshot();
+        targets.extend(peers.iter().filter_map(peer_addr));
     } // 守卫在此释放，之后才 await
     for t in targets {
         let _ = ctx.sock.send_to(&bytes, t).await;
@@ -889,11 +887,8 @@ pub fn announce_exit_blocking(st: &AppState, port: u16) {
         for ip in broadcast_targets() {
             let _ = sock.send_to(&bytes, SocketAddr::from((ip, port)));
         }
-        let targets: Vec<SocketAddr> = st
-            .peers
-            .lock()
-            .map(|p| p.values().filter_map(peer_addr).collect())
-            .unwrap_or_default();
+        let targets: Vec<SocketAddr> =
+            st.peers.snapshot().iter().filter_map(peer_addr).collect();
         for addr in targets {
             let _ = sock.send_to(&bytes, addr);
         }
@@ -944,9 +939,9 @@ fn maybe_withdraw_peer_key(
 ) {
     if cfg.encrypt && pkt.command & opt::ENCRYPTOPT == 0 && ctx.st.trust.peer_pubkey(key).is_some() {
         // 对端这轮不再声明加密：连「宣告过」的标志一起撤，预握手重试不再盯它
-        if let Some(p) = ctx.st.peers.lock().unwrap().get_mut(key) {
-            p.encrypt_announced = false;
-        }
+        ctx.st
+            .peers
+            .with_peer(key, |p| p.encrypt_announced = false);
         match ctx.st.trust.forget_peer_key(key) {
             Ok(()) => ctx.st.diag(&format!(
                 "<- {from} 上线通告未声明 ENCRYPTOPT，撤回该对端公钥缓存"
@@ -1219,7 +1214,7 @@ mod inbound {
             // dispatcher 里算好的 base（pkt 已被解析过）
             let base = pkt.command & 0xFF;
             let info = proto::parse_entry_extra(&pkt.extra, pkt.command);
-            let added = ctx.st.upsert_peer(PeerInfo {
+            let added = ctx.st.peers.upsert_peer(PeerInfo {
                 key: key.to_string(),
                 ip: from.ip().to_string(),
                 port: from.port(),
@@ -1273,7 +1268,7 @@ mod inbound {
             let base = pkt.command & 0xFF;
             let info = proto::parse_entry_extra(&pkt.extra, pkt.command);
             let absence = pkt.command & opt::ABSENCEOPT != 0;
-            ctx.st.upsert_peer(PeerInfo {
+            ctx.st.peers.upsert_peer(PeerInfo {
                 key: key.to_string(),
                 ip: from.ip().to_string(),
                 port: from.port(),
@@ -1290,7 +1285,7 @@ mod inbound {
             ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
             // 不在模式通告（BR_ABSENCE）说明对方状态切换：旧缓存的不在通知文作废
             if base == cmd::BR_ABSENCE {
-                ctx.st.clear_peer_absence(&key);
+                ctx.st.peers.clear_peer_absence(&key);
             }
             // 对端应答里若声明加密能力，同样触发预握手（对方可能没收到我们的 BR_ENTRY）
             let cfg = ctx.st.config();
@@ -1317,17 +1312,19 @@ mod inbound {
             // 因此按 IP 清理该主机的所有会话条目，而不是只按 ip:port 精确匹配
             let ip = from.ip().to_string();
             let removed: Vec<String> = {
-                let mut peers = ctx.st.peers.lock().unwrap();
-                let hit: Vec<String> = peers
-                    .values()
+                let hit: Vec<String> = ctx
+                    .st
+                    .peers
+                    .snapshot()
+                    .iter()
                     .filter(|p| p.ip == ip)
                     .map(|p| p.key.to_string())
                     .collect();
                 for k in &hit {
-                    peers.remove(k);
+                    ctx.st.peers.remove_peer(k);
                     // 未确认的在线消息转入待投递（对方回来补投）
                     ctx.st.outbox.demote_retry_to_pending(k);
-                    ctx.st.clear_peer_absence(k);
+                    ctx.st.peers.clear_peer_absence(k);
                 }
                 hit
             };
@@ -1454,7 +1451,7 @@ mod inbound {
         pub(crate) async fn send_absence_info(ctx: &NetCtx, _from: SocketAddr, pkt: &proto::Packet, key: &str) {
             // 对端的不在通知文：缓存到会话，供前端展示
             let text = proto::text_of(&pkt);
-            ctx.st.set_peer_absence(&key, &text);
+            ctx.st.peers.set_peer_absence(&key, &text);
             ctx.st
                 .emit(wire::evt::ABSENCE_INFO, json!({"key": key, "text": text}));
         }
@@ -1497,7 +1494,7 @@ mod inbound {
             let reachable = targ
                 .parse::<IpAddr>()
                 .map(|ip| {
-                    ctx.st.peers.lock().unwrap().contains_key(&ip.to_string())
+                    ctx.st.peers.contains(&ip.to_string())
                         || local_ip_set().contains(&ip)
                 })
                 .unwrap_or(false);
@@ -1785,7 +1782,7 @@ mod inbound {
             let unlocked = prior_unlocked || auto_open;
 
             // key 是真实发送方 IP，不是广播信箱 key；广播同样复用已知昵称。
-            let existing_peer = ctx.st.peers.lock().unwrap().get(key).cloned();
+            let existing_peer = ctx.st.peers.get(key);
             let metadata_nickname = peer_metadata
                 .and_then(|metadata| metadata.nickname.as_deref())
                 .filter(|nickname| !nickname.is_empty());
@@ -1860,38 +1857,35 @@ mod inbound {
                     let absence = peer_metadata
                         .and_then(|metadata| metadata.status)
                         .map(|status| status & opt::ABSENCEOPT != 0);
-                    let mut peers = ctx.st.peers.lock().unwrap();
-                    match peers.get_mut(key) {
-                        Some(existing) => {
-                            existing.last_seen = now_secs();
-                            let mut changed = false;
-                            if peer_metadata.is_some() {
-                                existing.host = pkt.host.clone();
-                                existing.user = pkt.user.clone();
-                                if let Some(nickname) = nickname {
-                                    changed |= existing.nickname != nickname;
-                                    existing.nickname = nickname;
-                                }
-                                if let Some(group) = group {
-                                    changed |= existing.group != group;
-                                    existing.group = group;
-                                }
-                                if let Some(version) = version {
-                                    changed |= existing.vs.as_deref() != Some(version.as_str());
-                                    existing.vs = Some(version);
-                                }
-                                if let Some(absence) = absence {
-                                    changed |= existing.absence != absence;
-                                    existing.absence = absence;
-                                }
+                    ctx.st.peers.with_peer(key, |existing| {
+                        existing.last_seen = now_secs();
+                        let mut changed = false;
+                        if peer_metadata.is_some() {
+                            existing.host = pkt.host.clone();
+                            existing.user = pkt.user.clone();
+                            if let Some(nickname) = nickname {
+                                changed |= existing.nickname != nickname;
+                                existing.nickname = nickname;
                             }
-                            changed
+                            if let Some(group) = group {
+                                changed |= existing.group != group;
+                                existing.group = group;
+                            }
+                            if let Some(version) = version {
+                                changed |= existing.vs.as_deref() != Some(version.as_str());
+                                existing.vs = Some(version);
+                            }
+                            if let Some(absence) = absence {
+                                changed |= existing.absence != absence;
+                                existing.absence = absence;
+                            }
                         }
-                        None => false,
-                    }
+                        changed
+                    })
+                    .unwrap_or(false)
                 } else if !no_add_list {
                     let metadata = peer_metadata.cloned().unwrap_or_default();
-                    let added = ctx.st.upsert_peer(PeerInfo {
+                    let added = ctx.st.peers.upsert_peer(PeerInfo {
                         key: key.to_string(),
                         ip: from.ip().to_string(),
                         port: from.port(),
@@ -1982,9 +1976,9 @@ mod inbound {
                 .parse::<usize>()
                 .unwrap_or(0);
             let hosts: Vec<proto::HostListEntry> = {
-                let peers = ctx.st.peers.lock().unwrap();
+                let peers = ctx.st.peers.snapshot();
                 peers
-                    .values()
+                    .iter()
                     .map(|p| proto::HostListEntry {
                         user: p.user.clone(),
                         host: p.host.clone(),
@@ -2016,13 +2010,12 @@ mod inbound {
                     Err(_) => continue,
                 };
                 if h.status & 0xFF == cmd::BR_EXIT {
-                    let mut peers = ctx.st.peers.lock().unwrap();
-                    if peers.remove(ip.to_string().as_str()).is_some() {
+                    if ctx.st.peers.remove_peer(ip.to_string().as_str()).is_some() {
                         changed = true;
                     }
                     continue;
                 }
-                let add = ctx.st.upsert_peer(PeerInfo {
+                let add = ctx.st.peers.upsert_peer(PeerInfo {
                     key: ip.to_string(),
                     ip: ip.to_string(),
                     port: if h.port == 0 { 2425 } else { h.port },
@@ -2690,7 +2683,7 @@ pub async fn send_message_opts(
         password: opts.password && cfg.password_use,
     };
 
-    let peer = ctx.st.peers.lock().unwrap().get(key).cloned();
+    let peer = ctx.st.peers.get(key);
     let Some(peer) = peer else {
         // 对方不在线：文本与附件都进待投递队列（官方 IPMsg 语义，上线后自动
         // 重投，以原包号发送并带延迟尾注）。队列只存本地路径，文件槽与公告
@@ -2887,7 +2880,7 @@ pub async fn send_message_opts(
 /// 解析 READMSG 来源对应的会话 key：会话身份即 IP，在线表里查得到就返回
 fn resolve_session_key(ctx: &NetCtx, ip: IpAddr) -> Option<String> {
     let key = ip.to_string();
-    if ctx.st.peers.lock().unwrap().contains_key(&key) {
+    if ctx.st.peers.contains(&key) {
         Some(key)
     } else {
         None
@@ -2909,7 +2902,7 @@ pub async fn mark_read_and_receipt(ctx: &NetCtx, key: &str, pkts: &[u32]) -> Res
     }
     let pkts = &todo[..];
 
-    let peer = ctx.st.peers.lock().unwrap().get(key).cloned();
+    let peer = ctx.st.peers.get(key);
     let Some(peer) = peer else {
         return Ok(0); // 对方不在线：仅本地标记
     };
@@ -2947,7 +2940,7 @@ pub async fn recall_message(ctx: &NetCtx, key: &str, pkt: u32) -> Result<(), Str
     if kind != "text" {
         return Err("E_RECALL_HAS_FILES|附件消息不支持撤回（对方可能已开始下载）".into());
     }
-    let peer = ctx.st.peers.lock().unwrap().get(key).cloned();
+    let peer = ctx.st.peers.get(key);
     if let Some(peer) = peer {
         if let Some(target) = peer_addr(&peer) {
             let cfg = ctx.st.config();
@@ -2987,8 +2980,7 @@ pub async fn broadcast_message(ctx: &NetCtx, text: &str) -> Result<(), String> {
         .map(|ip| SocketAddr::from((ip, ctx.port)))
         .collect();
     {
-        let peers = ctx.st.peers.lock().unwrap();
-        targets.extend(peers.values().filter_map(peer_addr));
+        targets.extend(ctx.st.peers.snapshot().iter().filter_map(peer_addr));
     } // 守卫在此释放，之后才 await
     let mut sent = 0;
     for t in targets {
@@ -3088,10 +3080,7 @@ pub async fn request_absence_info(ctx: &NetCtx, key: &str) -> Result<(), String>
     let peer = ctx
         .st
         .peers
-        .lock()
-        .unwrap()
         .get(key)
-        .cloned()
         .ok_or("对方不在线")?;
     let Some(target) = peer_addr(&peer) else {
         return Ok(());
@@ -3539,8 +3528,8 @@ async fn handle_dict_datagram(ctx: &NetCtx, dict: &crate::ipdict::Dict, from: So
             announce(ctx).await;
             tokio::time::sleep(Duration::from_millis(4000)).await;
             let hosts: Vec<crate::ipdict::Dict> = {
-                let peers = ctx.st.peers.lock().unwrap();
-                peers.values().map(make_host_dict).collect()
+                let peers = ctx.st.peers.snapshot();
+                peers.iter().map(make_host_dict).collect()
             };
             if let Some(master) = cfg_master_addr(&cfg) {
                 let mut d = dict_init(&cfg, cmd::DIR_ANSBROAD, 0, &my_user(&cfg), &my_host());
@@ -3597,7 +3586,7 @@ async fn handle_dict_datagram(ctx: &NetCtx, dict: &crate::ipdict::Dict, from: So
                     {
                         continue;
                     }
-                    changed |= ctx.st.upsert_peer(p);
+                    changed |= ctx.st.peers.upsert_peer(p);
                 }
             }
             if changed {
@@ -3624,7 +3613,7 @@ async fn handle_dict_datagram(ctx: &NetCtx, dict: &crate::ipdict::Dict, from: So
             let mut changed = false;
             for h in &hosts {
                 if let Some(p) = peer_from_host_dict(h) {
-                    changed |= ctx.st.upsert_peer(p);
+                    changed |= ctx.st.peers.upsert_peer(p);
                 }
             }
             if changed {
@@ -5123,7 +5112,7 @@ mod tests {
         // 两台机器都绑定回环：会话 key 就是来源 IP，注册时给真实端口
         let key = "127.0.0.1";
         for (st, port) in [(&st_a, port_b), (&st_b, port_a)] {
-            st.upsert_peer(PeerInfo {
+            st.peers.upsert_peer(PeerInfo {
                 key: key.into(),
                 ip: key.into(),
                 port,
@@ -5307,7 +5296,7 @@ mod tests {
 
         let key = "127.0.0.1";
         for (st, port) in [(&st_a, port_b), (&st_b, port_a)] {
-            st.upsert_peer(PeerInfo {
+            st.peers.upsert_peer(PeerInfo {
                 key: key.into(),
                 ip: key.into(),
                 port,
@@ -5376,7 +5365,7 @@ mod tests {
 
     /// 登记一台回环上的「在线对端」，直发路径才会走网络而不是离线队列。
     fn register_loopback_peer(st: &AppState, port: u16) {
-        st.upsert_peer(PeerInfo {
+        st.peers.upsert_peer(PeerInfo {
             key: "127.0.0.1".into(),
             ip: "127.0.0.1".into(),
             port,
@@ -5558,7 +5547,7 @@ mod tests {
         let mut cfg = crate::state::Config::default();
         cfg.encrypt = true;
         st.set_config(cfg);
-        st.upsert_peer(PeerInfo {
+        st.peers.upsert_peer(PeerInfo {
             key: key.clone(),
             ip: key.clone(),
             port: from.port(),
@@ -5825,7 +5814,7 @@ mod tests {
             .await
             .unwrap();
         let listen_addr = listener.local_addr().unwrap();
-        st.upsert_peer(PeerInfo {
+        st.peers.upsert_peer(PeerInfo {
             key: "127.0.0.1".into(),
             ip: "127.0.0.1".into(),
             port: listen_addr.port(),
@@ -5912,7 +5901,7 @@ mod tests {
         assert_eq!(record["peer"]["ip"].as_str(), Some("192.168.2.115"));
         assert_eq!(record["peer"]["nickname"].as_str(), Some("ubuntu"));
         // 广播发送方不因此进入在线名单（存在性只由上线类报文维护）
-        assert!(st.peers.lock().unwrap().get(&key).is_none());
+        assert!(st.peers.get(&key).is_none());
 
         // 中栏：广播信箱常驻且置顶，但条目本身不挂发送方身份（固定显示「广播」）
         let session = st
@@ -5932,7 +5921,7 @@ mod tests {
         let (ctx, st, _peer, data_dir) = encipdict_test_ctx("broadcast-known-name").await;
         let from: std::net::SocketAddr = "192.168.2.115:2425".parse().unwrap();
         let key = from.ip().to_string();
-        st.peers.lock().unwrap().insert(key.clone(), crate::state::PeerInfo {
+        st.peers.insert_for_test(crate::state::PeerInfo {
             key: key.clone(),
             ip: key.clone(),
             port: from.port(),
@@ -5959,7 +5948,7 @@ mod tests {
             .expect("广播记录应落在广播信箱");
         assert_eq!(record["peer"]["nickname"].as_str(), Some("张三"));
         assert_eq!(record["peer"]["ip"].as_str(), Some(key.as_str()));
-        assert_eq!(st.peers.lock().unwrap().get(&key).unwrap().last_seen, 1);
+        assert_eq!(st.peers.get(&key).unwrap().last_seen, 1);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -6169,9 +6158,10 @@ mod tests {
 
         super::handle_encipdict(&ctx, &outer, from).await;
 
-        let peers = st.peers.lock().unwrap();
+        let peers = st.peers.snapshot();
         let peer_info = peers
-            .get(&key)
+            .iter()
+            .find(|p| p.key == key)
             .expect("allowed unknown peer should be added");
         assert_eq!(peer_info.nickname, "Display Name");
         assert_eq!(peer_info.group, "Research");
@@ -6192,7 +6182,7 @@ mod tests {
         let sender = crate::crypto::KeyPair::generate().unwrap();
         let from = peer.local_addr().unwrap();
         let key = from.ip().to_string();
-        st.upsert_peer(PeerInfo {
+        st.peers.upsert_peer(PeerInfo {
             key: key.clone(),
             ip: key.clone(),
             port: 2425,
@@ -6235,8 +6225,8 @@ mod tests {
         super::handle_encipdict(&ctx, &changed, from).await;
 
         {
-            let peers = st.peers.lock().unwrap();
-            let refreshed = peers.get(&key).unwrap();
+            let peers = st.peers.snapshot();
+            let refreshed = peers.iter().find(|p| p.key == key).unwrap();
             assert_eq!(refreshed.nickname, "Refreshed Nick");
             assert_eq!(refreshed.group, "Refreshed Group");
             assert_eq!(refreshed.vs.as_deref(), Some("05080006"));
@@ -6267,7 +6257,7 @@ mod tests {
         super::handle_encipdict(&ctx, &identical, from).await;
 
         assert_eq!(users_updated.load(Ordering::SeqCst), 0);
-        assert_eq!(st.peers.lock().unwrap().get(&key).unwrap().port, 2425);
+        assert_eq!(st.peers.get(&key).unwrap().port, 2425);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -6284,7 +6274,7 @@ mod tests {
 
         super::handle_encipdict(&ctx, &outer, from).await;
 
-        assert!(!st.peers.lock().unwrap().contains_key(&key));
+        assert!(!st.peers.contains(&key));
         assert!(st.find_in_record(&key, 665500).is_some());
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -7429,10 +7419,7 @@ pub async fn download_file_task(
     let peer = ctx
         .st
         .peers
-        .lock()
-        .unwrap()
         .get(key)
-        .cloned()
         .ok_or_else(|| "对方不在线".to_string())?;
     let target = peer_addr(&peer).ok_or("无效的对方地址")?;
 

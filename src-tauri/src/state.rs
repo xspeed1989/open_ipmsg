@@ -408,7 +408,8 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
 
 pub struct AppState {
     pub config: Mutex<Config>,
-    pub peers: Mutex<HashMap<String, PeerInfo>>,
+    /// 对端在线状态（字段、不在文案都在 peers 里）
+    pub(crate) peers: peers::PeerStore,
     pub offered: Mutex<HashMap<(u32, u32), OfferedFile>>,
     /// 对端 IP → 上次成功取文件用的请求方言下标（见 net::DIALECTS）
     dialect: Mutex<HashMap<String, usize>>,
@@ -428,9 +429,6 @@ pub struct AppState {
     hidden_contacts: Mutex<HashSet<String>>,
     /// 成员主登记（DIR_MASTER 服务端一侧）：成员 IP → 登记
     dir_members: Mutex<HashMap<String, DirMember>>,
-    /// 会话 key → 已缓存的对端不在通知文（GETABSENCEINFO 结果；BR_ABSENCE
-    /// 重新通告清掉，避免展示过期内容）
-    peer_absence: Mutex<HashMap<String, String>>,
     /// 主机列表获取窗口（unix 秒截止）：窗口内收到 OKGETLIST 才发起 GETLIST
     /// （官方 entryStartTime 窗口同款节流；启动与手动刷新时重开窗口）
     hostlist_window: Mutex<Option<u64>>,
@@ -481,7 +479,7 @@ impl AppState {
         let logs_dir = data_dir.join("logs");
         AppState {
             config: Mutex::new(Config::default()),
-            peers: Mutex::new(HashMap::new()),
+            peers: peers::PeerStore::new(),
             offered: Mutex::new(HashMap::new()),
             dialect: Mutex::new(HashMap::new()),
             outbox: outbox::OutboxStore::new(data_dir.clone()),
@@ -492,7 +490,6 @@ impl AppState {
             trust: trust::TrustStore::new(data_dir.clone()),
             hidden_contacts: Mutex::new(load_hidden_contacts(&data_dir)),
             dir_members: Mutex::new(HashMap::new()),
-            peer_absence: Mutex::new(HashMap::new()),
             hostlist_window: Mutex::new(None),
             master_hosts: Mutex::new(Vec::new()),
             agent_until: Mutex::new(HashMap::new()),
@@ -605,40 +602,6 @@ impl AppState {
     ///
     /// 身份以 IP 为准：key 一律归一化为 `info.ip`，同 IP 的重复广播
     /// （哪怕源端口不同）原地合并；端口仅作为投递地址随最新报文刷新。
-    pub fn upsert_peer(&self, mut info: PeerInfo) -> bool {
-        use crate::protocol::strip_control;
-        info.nickname = strip_control(&info.nickname);
-        info.group = strip_control(&info.group);
-        info.host = strip_control(&info.host);
-        info.user = strip_control(&info.user);
-        info.last_seen = now_secs();
-        info.key = info.ip.clone();
-        let mut peers = self.peers.lock().unwrap();
-        match peers.get_mut(&info.key) {
-            Some(existing) => {
-                existing.last_seen = info.last_seen;
-                existing.port = info.port;
-                if !info.nickname.is_empty() {
-                    existing.nickname = info.nickname;
-                }
-                if !info.group.is_empty() {
-                    existing.group = info.group;
-                }
-                if !info.host.is_empty() {
-                    existing.host = info.host;
-                }
-                if !info.user.is_empty() {
-                    existing.user = info.user;
-                }
-                existing.encrypt_announced = info.encrypt_announced;
-                false
-            }
-            None => {
-                peers.insert(info.key.clone(), info);
-                true
-            }
-        }
-    }
 
     /// 记一次送达确认，返回这是第几次（从 0 开始）。
     /// 对端如果没认我们的确认会重发同一包号，据此可以换一种写法再确认。
@@ -665,30 +628,9 @@ impl AppState {
         self.offered.lock().unwrap().retain(|_, o| o.ts >= cutoff);
     }
 
-    pub fn remove_peer(&self, key: &str) -> Option<PeerInfo> {
-        self.peers.lock().unwrap().remove(key)
-    }
 
-    pub fn touch_peer(&self, key: &str) {
-        if let Some(p) = self.peers.lock().unwrap().get_mut(key) {
-            p.last_seen = now_secs();
-        }
-    }
 
     /// 清理超时未刷新的用户（默认 30 分钟），返回被移除的 key 列表
-    pub fn prune_stale_peers(&self, timeout_secs: u64) -> Vec<String> {
-        let cutoff = now_secs().saturating_sub(timeout_secs);
-        let mut peers = self.peers.lock().unwrap();
-        let stale: Vec<String> = peers
-            .iter()
-            .filter(|(_, p)| p.last_seen < cutoff)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in &stale {
-            peers.remove(k);
-        }
-        stale
-    }
 
     /* ---------- 去重（UDP 可能重复投递） ---------- */
 
@@ -823,21 +765,9 @@ impl AppState {
     }
 
     /// 缓存对端不在通知文；同 key 覆盖。返回旧值
-    pub fn set_peer_absence(&self, key: &str, text: &str) -> Option<String> {
-        self.peer_absence
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), text.to_string())
-    }
 
-    pub fn peer_absence_of(&self, key: &str) -> Option<String> {
-        self.peer_absence.lock().unwrap().get(key).cloned()
-    }
 
     /// 对端退出（BR_EXIT）或重新通告时（BR_ABSENCE 无不在标记）清除缓存
-    pub fn clear_peer_absence(&self, key: &str) {
-        self.peer_absence.lock().unwrap().remove(key);
-    }
 
     /* ---------- 成员主登记（DIR_MASTER） ---------- */
 
@@ -2528,6 +2458,147 @@ pub(crate) mod outbox {
     }
 }
 
+
+/// 对端在线状态（架构评审候选 4 的第三组，见 docs/adr/0003）。
+///
+/// 这是全仓**裸锁最多**的一处：`net.rs` 里 25 处 `st.peers.lock().unwrap()` 直接伸手进来。
+/// 现在字段转私有，组外只能走这里的 interface —— 读一律返回**克隆**（`get` / `snapshot`），
+/// 所以锁不会跨 `await`；改一律通过 `with_peer` 闭包，调用方拿不到守卫。
+///
+/// 不在模式文案（`peer_absence`）是对端状态的一部分，跟着这组走。
+pub(crate) mod peers {
+    use super::*;
+
+    pub(crate) struct PeerStore {
+        pub peers: Mutex<HashMap<String, PeerInfo>>,
+        /// 会话 key → 已缓存的对端不在通知文（GETABSENCEINFO 结果；BR_ABSENCE
+        /// 重新通告清掉，避免展示过期内容）
+        peer_absence: Mutex<HashMap<String, String>>,
+    }
+
+    impl PeerStore {
+        pub(crate) fn new() -> Self {
+            Self {
+                peers: Mutex::new(HashMap::new()),
+                peer_absence: Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// 取一个对端的**克隆**（锁不跨 await）
+        pub(crate) fn get(&self, key: &str) -> Option<PeerInfo> {
+            self.peers.lock().unwrap().get(key).cloned()
+        }
+
+        /// 全部对端的克隆快照（遍历用：调用方不必持锁）
+        pub(crate) fn snapshot(&self) -> Vec<PeerInfo> {
+            self.peers.lock().unwrap().values().cloned().collect()
+        }
+
+        /// 测试专用：绕过 `upsert_peer` 的 `last_seen = now` 刷新，直接播种一条记录
+        /// （构造「陈旧对端」这类场景；生产路径一律走 upsert_peer）
+        #[cfg(test)]
+        pub(crate) fn insert_for_test(&self, info: PeerInfo) {
+            self.peers.lock().unwrap().insert(info.key.clone(), info);
+        }
+
+        pub(crate) fn contains(&self, key: &str) -> bool {
+            self.peers.lock().unwrap().contains_key(key)
+        }
+
+        /// 全部对端 key 的克隆（遍历/广播目标用）
+        pub(crate) fn keys(&self) -> Vec<String> {
+            self.peers.lock().unwrap().keys().cloned().collect()
+        }
+
+        #[allow(dead_code)] // 只有测试用
+        pub(crate) fn is_empty(&self) -> bool {
+            self.peers.lock().unwrap().is_empty()
+        }
+
+        /// 就地改一个对端（守卫不出这层，调用方拿不到锁）。
+        /// 返回闭包的结果；对端不存在时为 None。
+        pub(crate) fn with_peer<R>(&self, key: &str, f: impl FnOnce(&mut PeerInfo) -> R) -> Option<R> {
+            self.peers.lock().unwrap().get_mut(key).map(f)
+        }
+
+        pub fn upsert_peer(&self, mut info: PeerInfo) -> bool {
+            use crate::protocol::strip_control;
+            info.nickname = strip_control(&info.nickname);
+            info.group = strip_control(&info.group);
+            info.host = strip_control(&info.host);
+            info.user = strip_control(&info.user);
+            info.last_seen = now_secs();
+            info.key = info.ip.clone();
+            let mut peers = self.peers.lock().unwrap();
+            match peers.get_mut(&info.key) {
+                Some(existing) => {
+                    existing.last_seen = info.last_seen;
+                    existing.port = info.port;
+                    if !info.nickname.is_empty() {
+                        existing.nickname = info.nickname;
+                    }
+                    if !info.group.is_empty() {
+                        existing.group = info.group;
+                    }
+                    if !info.host.is_empty() {
+                        existing.host = info.host;
+                    }
+                    if !info.user.is_empty() {
+                        existing.user = info.user;
+                    }
+                    existing.encrypt_announced = info.encrypt_announced;
+                    false
+                }
+                None => {
+                    peers.insert(info.key.clone(), info);
+                    true
+                }
+            }
+        }
+
+        pub fn remove_peer(&self, key: &str) -> Option<PeerInfo> {
+            self.peers.lock().unwrap().remove(key)
+        }
+
+        #[allow(dead_code)] // 暂无调用方（拆分前是 pub 方法，不报死代码）
+        pub fn touch_peer(&self, key: &str) {
+            if let Some(p) = self.peers.lock().unwrap().get_mut(key) {
+                p.last_seen = now_secs();
+            }
+        }
+
+        pub fn prune_stale_peers(&self, timeout_secs: u64) -> Vec<String> {
+            let cutoff = now_secs().saturating_sub(timeout_secs);
+            let mut peers = self.peers.lock().unwrap();
+            let stale: Vec<String> = peers
+                .iter()
+                .filter(|(_, p)| p.last_seen < cutoff)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in &stale {
+                peers.remove(k);
+            }
+            stale
+        }
+
+        pub fn set_peer_absence(&self, key: &str, text: &str) -> Option<String> {
+            self.peer_absence
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), text.to_string())
+        }
+
+        #[allow(dead_code)] // 暂无调用方（同上；留给不在文案的读取）
+        pub fn peer_absence_of(&self, key: &str) -> Option<String> {
+            self.peer_absence.lock().unwrap().get(key).cloned()
+        }
+
+        pub fn clear_peer_absence(&self, key: &str) {
+            self.peer_absence.lock().unwrap().remove(key);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3302,7 +3373,7 @@ mod tests {
         let st = temp_state("peers");
         // 同一主机先从固定端口 :2425 上线；NAT 改写/套接字重绑后，
         // 后续广播可能来自任意临时端口 —— 必须识别为同一个用户
-        assert!(st.upsert_peer(PeerInfo {
+        assert!(st.peers.upsert_peer(PeerInfo {
             key: "10.0.0.3:2425".into(),
             ip: "10.0.0.3".into(),
             port: 2425,
@@ -3317,7 +3388,7 @@ mod tests {
             encrypt_announced: false,
 }));
         let t0 = now_secs();
-        assert!(!st.upsert_peer(PeerInfo {
+        assert!(!st.peers.upsert_peer(PeerInfo {
             key: "10.0.0.3:50000".into(),
             ip: "10.0.0.3".into(),
             port: 50000,
@@ -3332,24 +3403,19 @@ mod tests {
             vs: None,
             encrypt_announced: false,
 }));
-        let peers = st.peers.lock().unwrap();
+        let peers = st.peers.snapshot();
         assert_eq!(peers.len(), 1, "同 IP 不同源端口只允许一条记录");
-        let p = &peers["10.0.0.3"];
+        let p = peers.iter().find(|p| p.key == "10.0.0.3").unwrap();
         assert_eq!(p.nickname, "老王", "新报文字段为空时保留既有昵称");
         assert_eq!(p.group, "财务");
         assert_eq!(p.port, 50000, "端口随最新报文更新，否则回包发往失效地址");
         assert!(p.last_seen >= t0, "活跃时间随最新报文刷新");
         drop(peers);
-        assert!(st.prune_stale_peers(u64::MAX).is_empty());
+        assert!(st.peers.prune_stale_peers(u64::MAX).is_empty());
         // 手动回拨时间戳，模拟长时间未刷新
-        st.peers
-            .lock()
-            .unwrap()
-            .get_mut("10.0.0.3")
-            .unwrap()
-            .last_seen = 1;
-        assert_eq!(st.prune_stale_peers(60).len(), 1);
-        assert!(st.peers.lock().unwrap().is_empty());
+        st.peers.with_peer("10.0.0.3", |p| p.last_seen = 1);
+        assert_eq!(st.peers.prune_stale_peers(60).len(), 1);
+        assert!(st.peers.is_empty());
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
