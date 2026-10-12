@@ -204,7 +204,8 @@ test('原故障时序：会话已加载时照旧直接落地', async () => {
 test('store.onFileProgress 不再因为会话未加载就丢弃事件', () => {
   assert.doesNotMatch(onFileProgressBody, /if \(!chat\) return/, '旧的直接 return 必须消失')
   assert.match(onFileProgressBody, /bufferFileProgress\(/, '落不下去的必须暂存')
-  assert.match(storeSource, /from '\.\/lib\/fileprogress'/, '要引入纯函数模块')
+  // 只钉「引了哪个 module」，不钉 import 语句的字面写法（补个 .js 扩展名不该让它红）
+  assert.match(storeSource, /from '\.\/lib\/fileprogress/, '要引入纯函数模块')
   const replays = storeSource.match(/replayFileProgress\(pendingFileProgress/g) || []
   assert.ok(
     replays.length >= 2,

@@ -5,21 +5,21 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import {
   isPermissionGranted, requestPermission, sendNotification,
 } from '@tauri-apps/plugin-notification'
-import * as ipc from './lib/ipc'
-import { splitDelayedNote } from './lib/text'
-import { pickLatestUnread, pickLatestActive, applyUnreadFromSessions } from './lib/unread'
-import { unreadReceiptPkts } from './lib/receipts'
-import { mergeSessions } from './lib/sessions'
+import * as ipc from './lib/ipc.js'
+import { splitDelayedNote } from './lib/text.js'
+import { pickLatestUnread, pickLatestActive, applyUnreadFromSessions } from './lib/unread.js'
+import { unreadReceiptPkts } from './lib/receipts.js'
+import { mergeSessions } from './lib/sessions.js'
 import {
   BROADCAST_SESSION_KEY, isBroadcastSession, senderOf, senderIp,
-} from './lib/sessions'
-import { normalizeEmojis } from './lib/emoji'
-import { sealedPreviewKey } from './lib/secret'
+} from './lib/sessions.js'
+import { normalizeEmojis } from './lib/emoji.js'
+import { sealedPreviewKey } from './lib/secret.js'
 import {
   applyFileProgress, bufferFileProgress, replayFileProgress,
-} from './lib/fileprogress'
-import { applyTheme } from './lib/theme'
-import { t, setLocale, detectLocale, dayLabel as i18nDayLabel } from './lib/i18n'
+} from './lib/fileprogress.js'
+import { applyTheme } from './lib/theme.js'
+import { t, setLocale, detectLocale, dayLabel as i18nDayLabel } from './lib/i18n.js'
 
 export const store = reactive({
   booted: false,
