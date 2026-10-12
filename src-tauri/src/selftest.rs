@@ -237,7 +237,7 @@ async fn async_run() -> bool {
     .await;
     log.check("附件公告收到对端的 RECVMSG 送达确认", acked);
     let dequeued = wait_for(2000, || {
-        !st.retry_for(&peer_key).iter().any(|i| i.pkt == file_pkt)
+        !st.outbox.retry_for(&peer_key).iter().any(|i| i.pkt == file_pkt)
     })
     .await;
     log.check("附件公告确认后移出送达重发队列（不再每 4s 重发）", dequeued);
@@ -1352,10 +1352,10 @@ async fn offline_file_delivery() -> bool {
         rec["files"].as_array().map(|a| a.len()) == Some(1)
             && rec["files"][0]["name"] == "offline_upload.bin",
     );
-    let queued = wait_for(1500, || st_a.pending_for(key_b).len() == 1).await;
+    let queued = wait_for(1500, || st_a.outbox.pending_for(key_b).len() == 1).await;
     log.check(
         "离线附件进入待投递队列（含本地路径）",
-        queued && st_a.pending_for(key_b)[0].paths.len() == 1,
+        queued && st_a.outbox.pending_for(key_b)[0].paths.len() == 1,
     );
 
     /* ---- 2. 附件路径不可读：报错而不是入队 ---- */
@@ -1437,7 +1437,7 @@ async fn offline_file_delivery() -> bool {
     log.check("B 从重投公告取回附件且逐字节一致", fetched_ok);
 
     /* ---- 5. 送达确认后队列清空 ---- */
-    let drained = wait_for(4000, || st_a.pending_for(key_b).is_empty()).await;
+    let drained = wait_for(4000, || st_a.outbox.pending_for(key_b).is_empty()).await;
     log.check("B 回 RECVMSG 确认后 A 清空待投递队列", drained);
 
     finish_offline_file(log, &base)
@@ -2720,7 +2720,7 @@ async fn extended_protocols() -> bool {
     log.check("E: 目标经代理收到消息", y_got);
     let _ = rec_x;
     // X 的重发队列应被 Y 的 RECVMSG（经代理回流）确认清空
-    let acked = wait_for(6000, || ctx_x.st.retry_for("127.0.0.6").is_empty()).await;
+    let acked = wait_for(6000, || ctx_x.st.outbox.retry_for("127.0.0.6").is_empty()).await;
     log.check("E: 代理中继的送达确认回流（重发队列清空）", acked);
 
     /* ---- E10. 官方 v5 密文消息（EncIPDict）端到端 ---- */

@@ -404,7 +404,7 @@ fn spawn_retry_loop(ctx: Arc<NetCtx>) {
         tick.tick().await;
         loop {
             tick.tick().await;
-            let keys = ctx.st.retry_keys();
+            let keys = ctx.st.outbox.retry_keys();
             for k in keys {
                 retry_pending_for(ctx.clone(), &k).await;
             }
@@ -470,12 +470,12 @@ pub const RETRY_MAX: u32 = 4;
 /// 重发某个会话到期的未确认消息（同一包号、同一文件 ID）。
 async fn retry_pending_for(ctx: Arc<NetCtx>, key: &str) {
     let now = now_secs();
-    for item in ctx.st.retry_for(key) {
+    for item in ctx.st.outbox.retry_for(key) {
         if item.ts + RETRY_INTERVAL_SECS > now {
             continue; // 未到重发点
         }
         // 独占计数：超限即放弃（该条消息保持「已发送」状态）
-        if !ctx.st.bump_retry(key, item.pkt) {
+        if !ctx.st.outbox.bump_retry(key, item.pkt) {
             ctx.st.diag(&format!(
                 "-> {key} pkt={} 重发 {} 次未确认，放弃",
                 item.pkt, RETRY_MAX
@@ -485,7 +485,7 @@ async fn retry_pending_for(ctx: Arc<NetCtx>, key: &str) {
         // 对方离线：整体转入待投递队列（对方回来时补投）
         let peer = ctx.st.peers.lock().unwrap().get(key).cloned();
         let Some(peer) = peer else {
-            ctx.st.demote_retry_to_pending(key);
+            ctx.st.outbox.demote_retry_to_pending(key);
             return;
         };
         let Some(target) = peer_addr(&peer) else {
@@ -605,7 +605,7 @@ async fn retry_pending_for(ctx: Arc<NetCtx>, key: &str) {
             },
         };
         if ctx.sock.send_to(&wire, send_to).await.is_ok() {
-            ctx.st.touch_retry_sent(key, item.pkt, now);
+            ctx.st.outbox.touch_retry_sent(key, item.pkt, now);
             ctx.st.diag(&format!(
                 "-> {key} 在线消息重发 pkt={}（第 {} 次）",
                 item.pkt, item.attempts
@@ -640,7 +640,7 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
     };
     let cfg = ctx.st.config();
     let utf8 = proto::is_utf8_mode(&cfg.encoding);
-    for item in ctx.st.pending_for(key) {
+    for item in ctx.st.outbox.pending_for(key) {
         // 附件消息：重投前重新校验文件并登记文件槽（复用直发路径）。
         // 文件已丢失/不可读 → 该条无法投递，出队并记诊断（否则无限重试）。
         let mut entries: Vec<proto::FileEntry> = Vec::new();
@@ -652,7 +652,7 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
                         "-> {key} 离线附件消息 pkt={} 文件不可用，丢弃：{e}",
                         item.pkt
                     ));
-                    ctx.st.ack_pending(key, item.pkt);
+                    ctx.st.outbox.ack_pending(key, item.pkt);
                     continue;
                 }
             }
@@ -1103,7 +1103,7 @@ async fn ack_classic_sendmsg(
     if packet.command & opt::SENDCHECKOPT == 0 {
         return true;
     }
-    let count = ctx.st.bump_ack(from.ip(), packet.pkt_no);
+    let count = ctx.st.outbox.bump_ack(from.ip(), packet.pkt_no);
     let body = if count % 2 == 0 {
         packet.pkt_no.to_string()
     } else {
@@ -1255,7 +1255,7 @@ mod inbound {
                 for k in &hit {
                     peers.remove(k);
                     // 未确认的在线消息转入待投递（对方回来补投）
-                    ctx.st.demote_retry_to_pending(k);
+                    ctx.st.outbox.demote_retry_to_pending(k);
                     ctx.st.clear_peer_absence(k);
                 }
                 hit
@@ -1279,8 +1279,8 @@ mod inbound {
             let no = String::from_utf8_lossy(first).trim().to_string();
             if let Some(k) = resolve_session_key(ctx, from.ip()) {
                 for c in id_candidates(&no) {
-                    let acked_offline = ctx.st.ack_pending(&k, c);
-                    let acked_retry = ctx.st.ack_retry(&k, c);
+                    let acked_offline = ctx.st.outbox.ack_pending(&k, c);
+                    let acked_retry = ctx.st.outbox.ack_retry(&k, c);
                     if acked_offline || acked_retry {
                         ctx.st
                             .diag(&format!("<- {from} RECVMSG 送达确认 pkt={c}（离线:{acked_offline} 重发:{acked_retry}）已送达"));
@@ -2440,7 +2440,7 @@ fn offline_enqueue_record(
             entries.push(e);
         }
     }
-    if ctx.st.enqueue_pending(PendingOut {
+    if ctx.st.outbox.enqueue_pending(PendingOut {
         key: key.to_string(),
         pkt: pkt_no,
         text: text.to_string(),
@@ -2795,7 +2795,7 @@ pub async fn send_message_opts(
     // 在线消息登记送达重发（官方 §4-12）：无 RECVMSG 时按 4s 间隔重发同一包号，
     // 累计 RETRY_MAX 次放弃。附件与纯文本一视同仁：公告丢包、对端换钥解密失败
     // 都能在下一轮重发自愈（重发会重新登记文件槽、按当前公钥重新密封）。
-    ctx.st.enqueue_retry(RetryOut {
+    ctx.st.outbox.enqueue_retry(RetryOut {
         key: key.to_string(),
         pkt: pkt_no,
         text: text.to_string(),
@@ -2888,8 +2888,8 @@ pub async fn recall_message(ctx: &NetCtx, key: &str, pkt: u32) -> Result<(), Str
         r["recalled"] = json!(true);
     });
     // 撤回后无需重发/回执跟踪
-    let _ = ctx.st.ack_retry(key, pkt);
-    let _ = ctx.st.ack_pending(key, pkt);
+    let _ = ctx.st.outbox.ack_retry(key, pkt);
+    let _ = ctx.st.outbox.ack_pending(key, pkt);
     ctx.st
         .emit(wire::evt::MSG_RECALLED, json!({"key": key, "pkt": pkt, "peer": ""}));
     Ok(())
@@ -5384,13 +5384,13 @@ mod tests {
 
         // 队列里登记的重发项必须记住封书标志，并且到期重发仍带 SECRETEXOPT
         let mut item = st
-            .retry_for("127.0.0.1")
+            .outbox.retry_for("127.0.0.1")
             .into_iter()
             .find(|i| i.pkt == pkt)
             .expect("纯文本消息应登记送达重发");
         assert!(item.secret, "重发项必须记住封书标志");
         item.ts = item.ts.saturating_sub(super::RETRY_INTERVAL_SECS + 1);
-        st.enqueue_retry(item);
+        st.outbox.enqueue_retry(item);
         super::retry_pending_for(Arc::new(ctx), "127.0.0.1").await;
 
         let resent = sent_sendmsg(&peer);
@@ -5450,7 +5450,7 @@ mod tests {
 
         // 2) 这一包假设在网络上丢了（测试里不投递给对端）：必须登记了重发项
         let mut item = st
-            .retry_for("127.0.0.1")
+            .outbox.retry_for("127.0.0.1")
             .into_iter()
             .find(|i| i.pkt == pkt)
             .expect("附件公告必须登记送达重发，否则丢包后对端永远收不到");
@@ -5458,7 +5458,7 @@ mod tests {
 
         // 3) 到期重发：同包号、同文件 ID、仍然声明 FILEATTACHOPT
         item.ts = item.ts.saturating_sub(super::RETRY_INTERVAL_SECS + 1);
-        st.enqueue_retry(item);
+        st.outbox.enqueue_retry(item);
         super::retry_pending_for(Arc::new(ctx), "127.0.0.1").await;
 
         let resent = sent_sendmsg(&peer);

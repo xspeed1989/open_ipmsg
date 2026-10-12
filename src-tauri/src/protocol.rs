@@ -320,6 +320,7 @@ pub struct FileEntry {
 
 impl FileEntry {
     /// 取指定编号的扩展属性值（首个匹配）
+    #[allow(dead_code)] // 只有测试读它：生产侧直接用 ext_attrs 字段
     pub fn ext(&self, id: u32) -> Option<&str> {
         self.ext_attrs
             .iter()

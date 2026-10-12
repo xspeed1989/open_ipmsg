@@ -1798,7 +1798,7 @@ pub fn run() {
             // 界面语言：原生 UI（托盘菜单等）按 config.lang 取简中/英文
             let ui_lang = st.config().lang.clone();
             // 恢复离线消息待投递队列（对方上线后自动重投）
-            st.load_pending();
+            st.outbox.load_pending();
             // 恢复对端公钥缓存（加密会话重启后无需重新交换公钥）
             st.trust.load_peer_keys();
             // 会话键从 ip:port 归一化为纯 IP：把旧命名的 `<ip>_<端口>.jsonl`

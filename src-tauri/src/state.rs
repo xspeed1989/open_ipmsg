@@ -408,24 +408,20 @@ pub struct AppState {
     pub offered: Mutex<HashMap<(u32, u32), OfferedFile>>,
     /// 对端 IP → 上次成功取文件用的请求方言下标（见 net::DIALECTS）
     dialect: Mutex<HashMap<String, usize>>,
-    /// (对端IP, 包编号) → 已回送达确认的次数
-    ack_count: Mutex<HashMap<(IpAddr, u32), u32>>,
     seen_queue: Mutex<VecDeque<(IpAddr, u32)>>,
     seen_set: Mutex<HashSet<(IpAddr, u32)>>,
     /// 聊天记录文件的读-改-写互斥（防止并发追加与重写互相覆盖）;
     /// ipmsg_import 的会话归并需要整段持锁做原子合并
     pub(crate) hist_lock: Mutex<()>,
-    /// 待投递的离线消息：会话 key → 队列（FIFO）
-    pending_out: Mutex<HashMap<String, Vec<PendingOut>>>,
     on_event: Mutex<Option<EventFn>>,
     /// 对端公钥信任与本机密钥（字段、落盘、不变量都在 trust 里）
     pub(crate) trust: trust::TrustStore,
+    /// 未确认重发与离线待投递（字段、落盘、搬运不变量都在 outbox 里）
+    pub(crate) outbox: outbox::OutboxStore,
     /// 被用户删除（隐藏）的会话 key 集合：微信式「删除会话」语义——
     /// 删除后从列表消失（记录一并删除），对方再发消息时自动恢复。
     /// 持久化到 hidden_contacts.json，重启不丢。
     hidden_contacts: Mutex<HashSet<String>>,
-    /// 在线消息送达重发队列：(会话 key, 包号) → 重发项（RECVMSG 确认后移除）
-    retry_out: Mutex<HashMap<(String, u32), RetryOut>>,
     /// 成员主登记（DIR_MASTER 服务端一侧）：成员 IP → 登记
     dir_members: Mutex<HashMap<String, DirMember>>,
     /// 会话 key → 已缓存的对端不在通知文（GETABSENCEINFO 结果；BR_ABSENCE
@@ -484,15 +480,13 @@ impl AppState {
             peers: Mutex::new(HashMap::new()),
             offered: Mutex::new(HashMap::new()),
             dialect: Mutex::new(HashMap::new()),
-            ack_count: Mutex::new(HashMap::new()),
+            outbox: outbox::OutboxStore::new(data_dir.clone()),
             seen_queue: Mutex::new(VecDeque::new()),
             seen_set: Mutex::new(HashSet::new()),
             hist_lock: Mutex::new(()),
-            pending_out: Mutex::new(HashMap::new()),
             on_event: Mutex::new(None),
             trust: trust::TrustStore::new(data_dir.clone()),
             hidden_contacts: Mutex::new(load_hidden_contacts(&data_dir)),
-            retry_out: Mutex::new(HashMap::new()),
             dir_members: Mutex::new(HashMap::new()),
             peer_absence: Mutex::new(HashMap::new()),
             hostlist_window: Mutex::new(None),
@@ -643,16 +637,6 @@ impl AppState {
 
     /// 记一次送达确认，返回这是第几次（从 0 开始）。
     /// 对端如果没认我们的确认会重发同一包号，据此可以换一种写法再确认。
-    pub fn bump_ack(&self, ip: IpAddr, pkt: u32) -> u32 {
-        let mut m = self.ack_count.lock().unwrap();
-        if m.len() > 4096 {
-            m.clear();
-        }
-        let e = m.entry((ip, pkt)).or_insert(0);
-        let n = *e;
-        *e += 1;
-        n
-    }
 
     /// 取文件请求方言：把该对端上次成功的那种排到最前面
     pub fn dialect_order(&self, ip: &str, total: usize) -> Vec<usize> {
@@ -734,161 +718,6 @@ impl AppState {
 
     /* ---------- 离线消息待投递队列 ---------- */
 
-    fn pending_path(&self) -> PathBuf {
-        self.data_dir.join("pending_out.json")
-    }
-
-    fn persist_pending(&self) {
-        let data = self.pending_out.lock().unwrap();
-        let bytes = serde_json::to_vec(&*data).unwrap_or_default();
-        drop(data);
-        if let Some(dir) = self.pending_path().parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(self.pending_path(), bytes);
-    }
-
-    /// 启动时从磁盘恢复待投递队列（重启不丢，官方 IPMsg 语义）
-    pub fn load_pending(&self) {
-        let Ok(content) = std::fs::read_to_string(self.pending_path()) else {
-            return;
-        };
-        if let Ok(map) = serde_json::from_str::<HashMap<String, Vec<PendingOut>>>(&content) {
-            *self.pending_out.lock().unwrap() = map;
-        }
-    }
-
-    /// 入队一条离线消息；同 key 同包号已存在时不重复入队，返回是否新增
-    pub fn enqueue_pending(&self, item: PendingOut) -> bool {
-        let mut map = self.pending_out.lock().unwrap();
-        let q = map.entry(item.key.clone()).or_default();
-        if q.iter().any(|p| p.pkt == item.pkt) {
-            return false;
-        }
-        q.push(item);
-        drop(map);
-        self.persist_pending();
-        true
-    }
-
-    /// 某会话的待投递列表（副本，FIFO 顺序；投递复查用，不取出）
-    pub fn pending_for(&self, key: &str) -> Vec<PendingOut> {
-        self.pending_out
-            .lock()
-            .unwrap()
-            .get(key)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// 取出某会话全部待投递并清空（当前仅测试用；线上投递走 ack 出队）
-    pub fn take_pending(&self, key: &str) -> Vec<PendingOut> {
-        let mut map = self.pending_out.lock().unwrap();
-        let taken = map.remove(key).unwrap_or_default();
-        drop(map);
-        if !taken.is_empty() {
-            self.persist_pending();
-        }
-        taken
-    }
-
-    /// 对端回 RECVMSG（送达确认）：把该会话对应包号的待投递出队，返回是否有变更
-    pub fn ack_pending(&self, key: &str, pkt: u32) -> bool {
-        let mut map = self.pending_out.lock().unwrap();
-        let Some(q) = map.get_mut(key) else {
-            return false;
-        };
-        let before = q.len();
-        q.retain(|p| p.pkt != pkt);
-        let changed = q.len() != before;
-        drop(map);
-        if changed {
-            self.persist_pending();
-        }
-        changed
-    }
-
-    /* ---------- 在线消息送达重发（官方 §4-12 確認・リトライ） ---------- */
-
-    /// 登记一条在线发送、等待 RECVMSG 确认的消息（仅纯文本，附件重发语义
-    /// 复杂且公告/槽位需一致，暂不重发附件）。
-    pub fn enqueue_retry(&self, item: RetryOut) {
-        let mut map = self.retry_out.lock().unwrap();
-        map.insert((item.key.clone(), item.pkt), item);
-    }
-
-    /// 某会话的所有待确认消息（副本）
-    pub fn retry_for(&self, key: &str) -> Vec<RetryOut> {
-        self.retry_out
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|((k, _), _)| k == key)
-            .map(|(_, v)| v.clone())
-            .collect()
-    }
-
-    /// RECVMSG 确认：出队重发项，返回是否有变更
-    pub fn ack_retry(&self, key: &str, pkt: u32) -> bool {
-        let mut map = self.retry_out.lock().unwrap();
-        map.remove(&(key.to_string(), pkt)).is_some()
-    }
-
-    /// 重发次数 +1；超过上限返回 false（调用方出队放弃）
-    pub fn bump_retry(&self, key: &str, pkt: u32) -> bool {
-        let mut map = self.retry_out.lock().unwrap();
-        match map.get_mut(&(key.to_string(), pkt)) {
-            Some(item) => {
-                item.attempts += 1;
-                item.attempts <= crate::net::RETRY_MAX
-            }
-            None => false,
-        }
-    }
-
-    /// 清理某会话全部重发项（对端离线/退场时）
-    pub fn clear_retry(&self, key: &str) {
-        let mut map = self.retry_out.lock().unwrap();
-        map.retain(|(k, _), _| k != key);
-    }
-
-    /// 全部待确认重发项的会话 key（去重）
-    pub fn retry_keys(&self) -> Vec<String> {
-        let map = self.retry_out.lock().unwrap();
-        let mut keys: Vec<String> = map.keys().map(|(k, _)| k.clone()).collect();
-        keys.sort();
-        keys.dedup();
-        keys
-    }
-
-    /// 更新重发项的最近发送时刻（timestamp 复用 ts 字段）
-    pub fn touch_retry_sent(&self, key: &str, pkt: u32, now: u64) {
-        let mut map = self.retry_out.lock().unwrap();
-        if let Some(item) = map.get_mut(&(key.to_string(), pkt)) {
-            item.ts = now;
-        }
-    }
-
-    /// 对端离线（BR_EXIT）：未确认的在线消息转入待投递队列（对方回来补投）
-    pub fn demote_retry_to_pending(&self, key: &str) {
-        let items: Vec<RetryOut> = self.retry_for(key);
-        if items.is_empty() {
-            return;
-        }
-        for it in items {
-            self.enqueue_pending(PendingOut {
-                key: key.to_string(),
-                pkt: it.pkt,
-                text: it.text.clone(),
-                ts: it.ts,
-                paths: it.paths.clone(),
-                // 转投递也要保住封书/密码锁：对方回来时收到的仍是原来的消息
-                secret: it.secret,
-                password: it.password,
-            });
-        }
-        self.clear_retry(key);
-    }
 
     /* ---------- 主机列表窗口（BR_ISGETLIST/OKGETLIST/GETLIST/ANSLIST） ---------- */
 
@@ -2466,6 +2295,210 @@ pub(crate) mod trust {
     }
 }
 
+
+/// 未确认重发与离线待投递两条队列（架构评审候选 4 的第二组，见 docs/adr/0003）。
+///
+/// 两条队列之间只有一个不变量：`demote_retry_to_pending` —— 对端退场时，未确认的**在线
+/// 重发**项整体转入**待投递**队列（同包号，对方回来补投）。此外 `pending_out.json` 的
+/// 读写与送达确认计数（`ack_count`，同一包号重复确认时换写法再回）也在这组里。
+///
+/// 组外只要「进队 / 取队 / 确认」这几个动作，不需要知道两条队列各自怎么落盘、
+/// 什么时机互相搬运。
+pub(crate) mod outbox {
+    use super::*;
+
+    /// 未确认重发 + 离线待投递（含送达确认计数）
+    pub(crate) struct OutboxStore {
+        /// 落盘根（`pending_out.json` 在它下面；两条重发队列只存内存）
+        data_dir: PathBuf,
+            /// (对端IP, 包编号) → 已回送达确认的次数
+            ack_count: Mutex<HashMap<(IpAddr, u32), u32>>,
+        /// 待投递的离线消息：会话 key → 队列（FIFO）
+        pending_out: Mutex<HashMap<String, Vec<PendingOut>>>,
+        /// 在线消息送达重发队列：(会话 key, 包号) → 重发项（RECVMSG 确认后移除）
+        retry_out: Mutex<HashMap<(String, u32), RetryOut>>,
+    }
+
+    impl OutboxStore {
+        pub(crate) fn new(data_dir: PathBuf) -> Self {
+            Self {
+                data_dir,
+                ack_count: Mutex::new(HashMap::new()),
+                pending_out: Mutex::new(HashMap::new()),
+                retry_out: Mutex::new(HashMap::new()),
+            }
+        }
+
+        pub fn bump_ack(&self, ip: IpAddr, pkt: u32) -> u32 {
+            let mut m = self.ack_count.lock().unwrap();
+            if m.len() > 4096 {
+                m.clear();
+            }
+            let e = m.entry((ip, pkt)).or_insert(0);
+            let n = *e;
+            *e += 1;
+            n
+        }
+
+        pub(crate) fn pending_path(&self) -> PathBuf {
+            self.data_dir.join("pending_out.json")
+        }
+
+        fn persist_pending(&self) {
+            let data = self.pending_out.lock().unwrap();
+            let bytes = serde_json::to_vec(&*data).unwrap_or_default();
+            drop(data);
+            if let Some(dir) = self.pending_path().parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(self.pending_path(), bytes);
+        }
+
+        /// 启动时从磁盘恢复待投递队列（重启不丢，官方 IPMsg 语义）
+        pub fn load_pending(&self) {
+            let Ok(content) = std::fs::read_to_string(self.pending_path()) else {
+                return;
+            };
+            if let Ok(map) = serde_json::from_str::<HashMap<String, Vec<PendingOut>>>(&content) {
+                *self.pending_out.lock().unwrap() = map;
+            }
+        }
+
+        /// 入队一条离线消息；同 key 同包号已存在时不重复入队，返回是否新增
+        pub fn enqueue_pending(&self, item: PendingOut) -> bool {
+            let mut map = self.pending_out.lock().unwrap();
+            let q = map.entry(item.key.clone()).or_default();
+            if q.iter().any(|p| p.pkt == item.pkt) {
+                return false;
+            }
+            q.push(item);
+            drop(map);
+            self.persist_pending();
+            true
+        }
+
+        /// 某会话的待投递列表（副本，FIFO 顺序；投递复查用，不取出）
+        pub fn pending_for(&self, key: &str) -> Vec<PendingOut> {
+            self.pending_out
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        /// 取出某会话全部待投递并清空（当前仅测试用；线上投递走 ack 出队）
+        #[allow(dead_code)] // 生产路径走 ack_pending 出队；「取走整条队列」只有测试用
+        pub fn take_pending(&self, key: &str) -> Vec<PendingOut> {
+            let mut map = self.pending_out.lock().unwrap();
+            let taken = map.remove(key).unwrap_or_default();
+            drop(map);
+            if !taken.is_empty() {
+                self.persist_pending();
+            }
+            taken
+        }
+
+        /// 对端回 RECVMSG（送达确认）：把该会话对应包号的待投递出队，返回是否有变更
+        pub fn ack_pending(&self, key: &str, pkt: u32) -> bool {
+            let mut map = self.pending_out.lock().unwrap();
+            let Some(q) = map.get_mut(key) else {
+                return false;
+            };
+            let before = q.len();
+            q.retain(|p| p.pkt != pkt);
+            let changed = q.len() != before;
+            drop(map);
+            if changed {
+                self.persist_pending();
+            }
+            changed
+        }
+
+        /* ---------- 在线消息送达重发（官方 §4-12 確認・リトライ） ---------- */
+
+        /// 登记一条在线发送、等待 RECVMSG 确认的消息（仅纯文本，附件重发语义
+        /// 复杂且公告/槽位需一致，暂不重发附件）。
+        pub fn enqueue_retry(&self, item: RetryOut) {
+            let mut map = self.retry_out.lock().unwrap();
+            map.insert((item.key.clone(), item.pkt), item);
+        }
+
+        /// 某会话的所有待确认消息（副本）
+        pub fn retry_for(&self, key: &str) -> Vec<RetryOut> {
+            self.retry_out
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((k, _), _)| k == key)
+                .map(|(_, v)| v.clone())
+                .collect()
+        }
+
+        /// RECVMSG 确认：出队重发项，返回是否有变更
+        pub fn ack_retry(&self, key: &str, pkt: u32) -> bool {
+            let mut map = self.retry_out.lock().unwrap();
+            map.remove(&(key.to_string(), pkt)).is_some()
+        }
+
+        /// 重发次数 +1；超过上限返回 false（调用方出队放弃）
+        pub fn bump_retry(&self, key: &str, pkt: u32) -> bool {
+            let mut map = self.retry_out.lock().unwrap();
+            match map.get_mut(&(key.to_string(), pkt)) {
+                Some(item) => {
+                    item.attempts += 1;
+                    item.attempts <= crate::net::RETRY_MAX
+                }
+                None => false,
+            }
+        }
+
+        /// 清理某会话全部重发项（对端离线/退场时）
+        pub fn clear_retry(&self, key: &str) {
+            let mut map = self.retry_out.lock().unwrap();
+            map.retain(|(k, _), _| k != key);
+        }
+
+        /// 全部待确认重发项的会话 key（去重）
+        pub fn retry_keys(&self) -> Vec<String> {
+            let map = self.retry_out.lock().unwrap();
+            let mut keys: Vec<String> = map.keys().map(|(k, _)| k.clone()).collect();
+            keys.sort();
+            keys.dedup();
+            keys
+        }
+
+        /// 更新重发项的最近发送时刻（timestamp 复用 ts 字段）
+        pub fn touch_retry_sent(&self, key: &str, pkt: u32, now: u64) {
+            let mut map = self.retry_out.lock().unwrap();
+            if let Some(item) = map.get_mut(&(key.to_string(), pkt)) {
+                item.ts = now;
+            }
+        }
+
+        /// 对端离线（BR_EXIT）：未确认的在线消息转入待投递队列（对方回来补投）
+        pub fn demote_retry_to_pending(&self, key: &str) {
+            let items: Vec<RetryOut> = self.retry_for(key);
+            if items.is_empty() {
+                return;
+            }
+            for it in items {
+                self.enqueue_pending(PendingOut {
+                    key: key.to_string(),
+                    pkt: it.pkt,
+                    text: it.text.clone(),
+                    ts: it.ts,
+                    paths: it.paths.clone(),
+                    // 转投递也要保住封书/密码锁：对方回来时收到的仍是原来的消息
+                    secret: it.secret,
+                    password: it.password,
+                });
+            }
+            self.clear_retry(key);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3056,7 +3089,7 @@ mod tests {
     fn pending_out_queue_roundtrip_and_ack() {
         let st = temp_state("pending");
         // 离线人发消息：入队并持久化
-        assert!(st.enqueue_pending(PendingOut {
+        assert!(st.outbox.enqueue_pending(PendingOut {
             key: "10.0.0.9".into(),
             pkt: 777,
             text: "等你上线".into(),
@@ -3065,7 +3098,7 @@ mod tests {
             secret: true,
             password: false,
         }));
-        let list = st.pending_for("10.0.0.9");
+        let list = st.outbox.pending_for("10.0.0.9");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].pkt, 777);
         assert_eq!(
@@ -3073,23 +3106,23 @@ mod tests {
             vec!["/tmp/a.zip", "/tmp/docs"],
             "附件路径随队列持久化"
         );
-        assert!(st.pending_for("10.0.0.8").is_empty());
+        assert!(st.outbox.pending_for("10.0.0.8").is_empty());
 
         // 重启（新实例读同一数据目录）后队列仍在
         let st2 = AppState::new(st.data_dir.clone());
-        st2.load_pending();
-        let list2 = st2.pending_for("10.0.0.9");
+        st2.outbox.load_pending();
+        let list2 = st2.outbox.pending_for("10.0.0.9");
         assert_eq!(list2.len(), 1, "重启不丢待投递");
         assert_eq!(list2[0].text, "等你上线");
         assert_eq!(list2[0].paths.len(), 2, "重启后附件路径仍在");
         assert!(list2[0].secret, "重启后封书标志仍在");
 
         // 收到 RECVMSG 确认后出队
-        assert!(st2.ack_pending("10.0.0.9", 777));
-        assert!(st2.pending_for("10.0.0.9").is_empty());
+        assert!(st2.outbox.ack_pending("10.0.0.9", 777));
+        assert!(st2.outbox.pending_for("10.0.0.9").is_empty());
         let st3 = AppState::new(st.data_dir.clone());
-        st3.load_pending();
-        assert!(st3.pending_for("10.0.0.9").is_empty(), "确认后持久化移除");
+        st3.outbox.load_pending();
+        assert!(st3.outbox.pending_for("10.0.0.9").is_empty(), "确认后持久化移除");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -3099,12 +3132,12 @@ mod tests {
         // 旧版队列 JSON 没有 paths 字段：必须能兼容加载（serde default 补空）
         std::fs::create_dir_all(&st.data_dir).unwrap();
         std::fs::write(
-            st.pending_path(),
+            st.outbox.pending_path(),
             r#"{"10.0.0.9":[{"key":"10.0.0.9","pkt":1,"text":"旧版","ts":1}]}"#,
         )
         .unwrap();
-        st.load_pending();
-        let list = st.pending_for("10.0.0.9");
+        st.outbox.load_pending();
+        let list = st.outbox.pending_for("10.0.0.9");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].pkt, 1);
         assert!(list[0].paths.is_empty(), "旧记录无附件字段，补空");
@@ -3115,7 +3148,7 @@ mod tests {
     fn pending_out_can_drop_all_for_key() {
         let st = temp_state("pending-drop");
         for pkt in [1u32, 2, 3] {
-            st.enqueue_pending(PendingOut {
+            st.outbox.enqueue_pending(PendingOut {
                 key: "10.0.0.9".into(),
                 pkt,
                 text: "x".into(),
@@ -3125,9 +3158,9 @@ mod tests {
                 password: false,
             });
         }
-        let taken = st.take_pending("10.0.0.9");
+        let taken = st.outbox.take_pending("10.0.0.9");
         assert_eq!(taken.len(), 3);
-        assert!(st.pending_for("10.0.0.9").is_empty(), "取出后即清空");
+        assert!(st.outbox.pending_for("10.0.0.9").is_empty(), "取出后即清空");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
