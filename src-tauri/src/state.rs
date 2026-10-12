@@ -233,6 +233,7 @@ pub struct OfferedFile {
     pub ts: u64,
     /// 公告是否按 UTF-8 发出：对端取文件请求应带 UTF8OPT（官方 §3-9），
     /// 目录流内的文件名编码据此决定
+    #[allow(dead_code)] // 拆分前就没人读（当时是 pub 字段所以不报死代码）；保留待确认
     pub utf8: bool,
 }
 
@@ -410,9 +411,8 @@ pub struct AppState {
     pub config: Mutex<Config>,
     /// 对端在线状态（字段、不在文案都在 peers 里）
     pub(crate) peers: peers::PeerStore,
-    pub offered: Mutex<HashMap<(u32, u32), OfferedFile>>,
-    /// 对端 IP → 上次成功取文件用的请求方言下标（见 net::DIALECTS）
-    dialect: Mutex<HashMap<String, usize>>,
+    /// 文件传输的会话级状态（附件槽 + 取文件方言，都在 transfer 里）
+    pub(crate) transfer: transfer::TransferStore,
     seen_queue: Mutex<VecDeque<(IpAddr, u32)>>,
     seen_set: Mutex<HashSet<(IpAddr, u32)>>,
     /// 聊天记录文件的读-改-写互斥（防止并发追加与重写互相覆盖）;
@@ -480,8 +480,7 @@ impl AppState {
         AppState {
             config: Mutex::new(Config::default()),
             peers: peers::PeerStore::new(),
-            offered: Mutex::new(HashMap::new()),
-            dialect: Mutex::new(HashMap::new()),
+            transfer: transfer::TransferStore::new(),
             outbox: outbox::OutboxStore::new(data_dir.clone()),
             seen_queue: Mutex::new(VecDeque::new()),
             seen_set: Mutex::new(HashSet::new()),
@@ -607,26 +606,10 @@ impl AppState {
     /// 对端如果没认我们的确认会重发同一包号，据此可以换一种写法再确认。
 
     /// 取文件请求方言：把该对端上次成功的那种排到最前面
-    pub fn dialect_order(&self, ip: &str, total: usize) -> Vec<usize> {
-        let first = self.dialect.lock().unwrap().get(ip).copied();
-        let mut out: Vec<usize> = Vec::with_capacity(total);
-        if let Some(i) = first.filter(|i| *i < total) {
-            out.push(i);
-        }
-        out.extend((0..total).filter(|i| Some(*i) != first));
-        out
-    }
 
     /// 记住该对端可用的请求方言
-    pub fn remember_dialect(&self, ip: &str, idx: usize) {
-        self.dialect.lock().unwrap().insert(ip.to_string(), idx);
-    }
 
     /// 清理超过 TTL 未被领取的文件槽（每次登记新文件时顺带执行）
-    pub fn prune_offered(&self) {
-        let cutoff = now_secs().saturating_sub(OFFER_TTL_SECS);
-        self.offered.lock().unwrap().retain(|_, o| o.ts >= cutoff);
-    }
 
 
 
@@ -2595,6 +2578,94 @@ pub(crate) mod peers {
 
         pub fn clear_peer_absence(&self, key: &str) {
             self.peer_absence.lock().unwrap().remove(key);
+        }
+    }
+}
+
+
+/// 文件传输的会话级状态（架构评审候选 4 的第四组，见 docs/adr/0003）。
+///
+/// 两样东西同处一室，因为它们只被「取文件」这一条路径用：
+/// - `offered`：**附件槽** —— 发出附件后为对端取文件预留的 (包号, 附件编号) → 本地路径；
+/// - `dialect`：**取文件方言** —— 该对端上次成功的请求写法（进制/换行）。
+///
+/// 与 presence 组零交集（ADR-0003 里把它们列为「归属未定」，这里落定）。原先
+/// `net.rs` 直接往这两个 Mutex 里伸手（5 处），现在只走下面这几个动作。
+pub(crate) mod transfer {
+    use super::*;
+
+    pub(crate) struct TransferStore {
+        pub offered: Mutex<HashMap<(u32, u32), OfferedFile>>,
+        /// 对端 IP → 上次成功取文件用的请求方言下标（见 net::DIALECTS）
+        dialect: Mutex<HashMap<String, usize>>,
+    }
+
+    impl TransferStore {
+        pub(crate) fn new() -> Self {
+            Self {
+                offered: Mutex::new(HashMap::new()),
+                dialect: Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// 登记一个附件槽（对端稍后来取）
+        pub(crate) fn offer_slot(&self, pkt: u32, file_id: u32, slot: OfferedFile) {
+            self.offered.lock().unwrap().insert((pkt, file_id), slot);
+        }
+
+        /// 撤销一个附件槽（UDP 发送失败时回滚）
+        pub(crate) fn release_slot(&self, pkt: u32, file_id: u32) {
+            self.offered.lock().unwrap().remove(&(pkt, file_id));
+        }
+
+        /// 取文件请求落槽：包号与附件编号的进制不明，两种解释都试（官方十六进制、
+        /// 部分实现十进制）—— 这段匹配逻辑属于本组，所以搬进来而不是留在 serve_getfile。
+        pub(crate) fn lookup_slot(
+            &self,
+            pkt_cands: &[u32],
+            fid_cands: &[u32],
+        ) -> Option<(PathBuf, u64, bool)> {
+            let offered = self.offered.lock().unwrap();
+            for p in pkt_cands {
+                for f in fid_cands {
+                    if let Some(o) = offered.get(&(*p, *f)) {
+                        return Some((o.path.clone(), o.size, o.is_dir));
+                    }
+                }
+            }
+            None
+        }
+
+        /// 对端放弃接收（RELEASEFILES）：撤销该包号下的全部附件槽
+        pub(crate) fn release_packets(&self, pkt_cands: &[u32]) {
+            self.offered
+                .lock()
+                .unwrap()
+                .retain(|(p, _), _| !pkt_cands.contains(p));
+        }
+
+        /// 诊断用：当前已提供槽位的前 n 个 key（不泄露路径）
+        pub(crate) fn slot_keys_preview(&self, n: usize) -> Vec<(u32, u32)> {
+            self.offered.lock().unwrap().keys().copied().take(n).collect()
+        }
+
+        pub fn dialect_order(&self, ip: &str, total: usize) -> Vec<usize> {
+            let first = self.dialect.lock().unwrap().get(ip).copied();
+            let mut out: Vec<usize> = Vec::with_capacity(total);
+            if let Some(i) = first.filter(|i| *i < total) {
+                out.push(i);
+            }
+            out.extend((0..total).filter(|i| Some(*i) != first));
+            out
+        }
+
+        pub fn remember_dialect(&self, ip: &str, idx: usize) {
+            self.dialect.lock().unwrap().insert(ip.to_string(), idx);
+        }
+
+        pub fn prune_offered(&self) {
+            let cutoff = now_secs().saturating_sub(OFFER_TTL_SECS);
+            self.offered.lock().unwrap().retain(|_, o| o.ts >= cutoff);
         }
     }
 }

@@ -580,9 +580,10 @@ async fn retry_pending_for(ctx: Arc<NetCtx>, key: &str) {
         let cfg = ctx.st.config();
         let utf8 = proto::is_utf8_mode(&cfg.encoding);
         for (p, e) in item.paths.iter().zip(item.entries.iter()) {
-            ctx.st.prune_offered();
-            ctx.st.offered.lock().unwrap().insert(
-                (item.pkt, e.id),
+            ctx.st.transfer.prune_offered();
+            ctx.st.transfer.offer_slot(
+                item.pkt,
+                e.id,
                 OfferedFile {
                     path: PathBuf::from(p),
                     size: e.size,
@@ -1583,11 +1584,7 @@ mod inbound {
             let first = pkt.extra.split(|&b| b == b':').next().unwrap_or(b"");
             let cands = id_candidates(&String::from_utf8_lossy(first));
             if !cands.is_empty() {
-                ctx.st
-                    .offered
-                    .lock()
-                    .unwrap()
-                    .retain(|(p, _), _| !cands.contains(p));
+                ctx.st.transfer.release_packets(&cands);
             }
         }
     }
@@ -2464,23 +2461,20 @@ fn register_offer_files(
     utf8: bool,
 ) -> Result<(Vec<proto::FileEntry>, Vec<(u32, u32)>), String> {
     let stats = stat_file_entries(paths)?;
-    ctx.st.prune_offered();
+    ctx.st.transfer.prune_offered();
     let mut entries = Vec::with_capacity(stats.len());
     let mut inserted = Vec::with_capacity(stats.len());
     for (s, p) in stats.iter().zip(paths.iter()) {
         let id = FILE_ID_SEQ.fetch_add(1, Ordering::Relaxed).max(1);
         let mut e = s.clone();
         e.id = id;
-        ctx.st.offered.lock().unwrap().insert(
-            (pkt_no, id),
-            OfferedFile {
+        ctx.st.transfer.offer_slot(pkt_no, id, OfferedFile {
                 path: PathBuf::from(p),
                 size: e.size,
                 is_dir: e.attr & 0xFF == fileattr::DIR,
                 ts: now_secs(),
                 utf8,
-            },
-        );
+            });
         entries.push(e);
         inserted.push((pkt_no, id));
     }
@@ -2828,9 +2822,8 @@ pub async fn send_message_opts(
     };
     if let Err(e) = ctx.sock.send_to(&wire, send_to).await {
         // 发送失败：回滚文件槽
-        let mut offered = ctx.st.offered.lock().unwrap();
         for k in &inserted {
-            offered.remove(k);
+            ctx.st.transfer.release_slot(k.0, k.1);
         }
         return Err(format!("UDP 发送失败: {e}"));
     }
@@ -7088,23 +7081,12 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
     // 对两种解释都尝试匹配，最大化兼容
     let pkt_cands = id_candidates(&parts[0]);
     let fid_cands = id_candidates(&parts[1]);
-    let mut slot: Option<(PathBuf, u64, bool)> = None;
-    {
-        let offered = ctx.st.offered.lock().unwrap();
-        'outer: for p in &pkt_cands {
-            for f in &fid_cands {
-                if let Some(o) = offered.get(&(*p, *f)) {
-                    slot = Some((o.path.clone(), o.size, o.is_dir));
-                    break 'outer;
-                }
-            }
-        }
-    }
+    let slot = ctx.st.transfer.lookup_slot(&pkt_cands, &fid_cands);
     let Some((path, size, is_dir)) = slot else {
         oim_log!(
             "[tcp] GETFILEDATA 未命中: from={peer} extra={:?} 候选pkt={pkt_cands:?} 候选id={fid_cands:?} 已提供={:?}",
             req.extra,
-            ctx.st.offered.lock().unwrap().keys().take(8).collect::<Vec<_>>()
+            ctx.st.transfer.slot_keys_preview(8)
         );
         ctx.st.diag(&format!(
             "tcp-miss {peer} extra={:?} pkt候选={pkt_cands:?} id候选={fid_cands:?}",
@@ -7480,7 +7462,7 @@ pub async fn download_file_task(
     // 立即收工，不再花往返试其余方言（结果不会因方言而不同），否则 4 种
     // 方言全部返回 0 字节后会被误判成「对方未返回文件数据」而失败。
     let mut result: Result<(u64, bool), String> = Ok((0, false));
-    for idx in ctx.st.dialect_order(&peer.ip, DIALECTS.len()) {
+    for idx in ctx.st.transfer.dialect_order(&peer.ip, DIALECTS.len()) {
         let d = DIALECTS[idx];
         result = fetch_to_file(
             ctx,
@@ -7504,7 +7486,7 @@ pub async fn download_file_task(
                 continue;
             }
             Ok((n, _)) => {
-                ctx.st.remember_dialect(&peer.ip, idx);
+                ctx.st.transfer.remember_dialect(&peer.ip, idx);
                 ctx.st
                     .diag(&format!("dl-try {key} 方言#{idx} 命中，收到 {n} 字节"));
                 break;
@@ -7657,7 +7639,7 @@ async fn download_dir_task(
     // 与取文件同理：对端不认我方请求方言时换一种重试
     let peer_ip = target.ip().to_string();
     let mut res: Result<Option<u64>, String> = Ok(None);
-    for idx in ctx.st.dialect_order(&peer_ip, DIALECTS.len()) {
+    for idx in ctx.st.transfer.dialect_order(&peer_ip, DIALECTS.len()) {
         res = fetch_dir_tree(
             ctx,
             key,
@@ -7679,7 +7661,7 @@ async fn download_dir_task(
                 continue;
             }
             Ok(Some(_)) => {
-                ctx.st.remember_dialect(&peer_ip, idx);
+                ctx.st.transfer.remember_dialect(&peer_ip, idx);
                 break;
             }
             // 目录流解析出错说明对端确实在回数据，只是内容有问题，换方言无益
