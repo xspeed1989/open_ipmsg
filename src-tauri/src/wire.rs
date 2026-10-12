@@ -94,6 +94,48 @@ wire_names!(
     COPY_IMAGE_TO_CLIPBOARD => "copy_image_to_clipboard",
 );
 
+/// 每个事件 payload 的字段名（**前端读的键**）。
+///
+/// `emit` 点用 `json!` 拼载荷，形状没法由类型保证，靠 `event_payload_keys_are_declared`
+/// 对着真实发射结果核：**实际键必须落在声明里**。`file-progress` 有五种发法（进度 /
+/// 完成 / 失败 / 加密流），这里取并集 —— 改名的键会落到并集之外被抓住，而可选字段
+/// （path / error / enc）不必为每种组合各写一条。
+pub mod fields {
+    pub const ABSENCE_INFO: &[&str] = &["key", "text"];
+    pub const FILE_PROGRESS: &[&str] = &[
+        "key", "pkt", "file_id", "transferred", "total", "done", "path", "error", "enc",
+    ];
+    pub const MSG_DELIVERED: &[&str] = &["key", "pkt"];
+    pub const MSG_IN: &[&str] = &["key", "msg", "resend"];
+    pub const MSG_OUT: &[&str] = &["key", "msg"];
+    pub const MSG_READ: &[&str] = &["key", "pkt"];
+    pub const MSG_RECALLED: &[&str] = &["key", "pkt", "peer"];
+    pub const MSG_UNLOCKED: &[&str] = &["key", "pkt"];
+    /// `open-unread` 只叫人「跳过去」，不带载荷（`emit(…, ())`）
+    pub const OPEN_UNREAD: &[&str] = &[];
+    pub const OPEN_CHAT: &[&str] = &["key"];
+    /// `users-updated` 只表示「列表变了」，不带字段
+    pub const USERS_UPDATED: &[&str] = &[];
+}
+
+/// 事件名 → payload 字段声明（产物生成与对照测试共用一张表）。
+pub fn declared_fields(event: &str) -> Option<&'static [&'static str]> {
+    Some(match event {
+        evt::ABSENCE_INFO => fields::ABSENCE_INFO,
+        evt::FILE_PROGRESS => fields::FILE_PROGRESS,
+        evt::MSG_DELIVERED => fields::MSG_DELIVERED,
+        evt::MSG_IN => fields::MSG_IN,
+        evt::MSG_OUT => fields::MSG_OUT,
+        evt::MSG_READ => fields::MSG_READ,
+        evt::MSG_RECALLED => fields::MSG_RECALLED,
+        evt::MSG_UNLOCKED => fields::MSG_UNLOCKED,
+        evt::OPEN_UNREAD => fields::OPEN_UNREAD,
+        evt::OPEN_CHAT => fields::OPEN_CHAT,
+        evt::USERS_UPDATED => fields::USERS_UPDATED,
+        _ => return None,
+    })
+}
+
 /// 生成给前端的 JS 产物。**产物进仓**（`src/lib/wire.generated.js`），
 /// `wire_artifact_is_current` 守着它不许漂 —— 改了名字忘了重新生成，测试就红。
 pub fn js_artifact() -> String {
@@ -106,6 +148,15 @@ pub fn js_artifact() -> String {
     s.push_str("  },\n  /** 命令名（#[tauri::command] 的线上名字），键即线上名 */\n  cmd: {\n");
     for name in cmd::ALL {
         s.push_str(&format!("    {name}: '{name}',\n"));
+    }
+    s.push_str("  },\n  /** 每个事件 payload 的字段（前端读的键；file-progress 是并集，可选字段靠 ⊆ 约束） */\n  fields: {\n");
+    for name in evt::ALL {
+        let list: Vec<String> = declared_fields(name)
+            .unwrap_or(&[])
+            .iter()
+            .map(|f| format!("'{f}'"))
+            .collect();
+        s.push_str(&format!("    '{name}': [{}],\n", list.join(", ")));
     }
     s.push_str("  },\n};\n");
     s

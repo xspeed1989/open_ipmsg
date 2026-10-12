@@ -5383,6 +5383,125 @@ mod tests {
     /// 的 READMSG 只在封书开封时发），没有这个中间态，气泡就永远挂在「未读」——
     /// 真机表现为「给原生客户端发消息，本端无法及时已读」。
 
+    /// 每个事件真实发出来的 payload 键，必须落在 `wire::fields` 的声明里（候选 1 下半）。
+    ///
+    /// 载荷是 `json!` 手拼的，形状没法由类型保证；这条对着**真实 emitter** 抓一次：
+    /// 改名的键会落到声明之外被抓住，而 file-progress 的可选字段（path/error/enc）
+    /// 因为声明取并集、测试只查 ⊆ 而不受影响。
+    ///
+    /// 覆盖 9/11：`open-unread` / `open-chat` 由 lib.rs 的托盘与原生通知路径发出
+    /// （要 AppHandle），单元测试驱动不到 —— 那两条的形状由前端的 characterization 网守着。
+    #[tokio::test]
+    async fn event_payload_keys_are_declared() {
+        use std::sync::Mutex;
+
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("wire-payload").await;
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        // 不预先注册对端：BR_ENTRY 只在**新**对端时才发 users-updated，
+        // 让它自己走一遍「首见注册 + 通知列表变了」
+        let seen: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_in = seen.clone();
+        st.set_event(Box::new(move |e, v| {
+            seen_in.lock().unwrap().push((e.to_string(), v));
+        }));
+
+        /// 抓到的某事件载荷里，每个键都必须声明过；没抓到算失败
+        fn check(seen: &Arc<Mutex<Vec<(String, Value)>>>, event: &str) {
+            let taken = std::mem::take(&mut *seen.lock().unwrap());
+            let payloads: Vec<Value> = taken
+                .into_iter()
+                .filter(|(e, _)| e == event)
+                .map(|(_, v)| v)
+                .collect();
+            assert!(!payloads.is_empty(), "没抓到「{event}」的事件，驱动路径失效了");
+            let declared = crate::wire::declared_fields(event).expect("事件未声明字段");
+            for v in payloads {
+                if let Some(obj) = v.as_object() {
+                    for k in obj.keys() {
+                        assert!(
+                            declared.contains(&k.as_str()),
+                            "「{event}」的载荷里有未声明的键 {k}（改名了？同步 wire::fields）"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 1) users-updated：有人上线
+        let mut entry = crate::protocol::Packet::new(crate::protocol::cmd::BR_ENTRY);
+        entry.extra = crate::protocol::build_entry_extra("peer", "grp", "utf8");
+        handle_datagram(&ctx, &entry.encode("peer", "peer-host"), from).await;
+        check(&seen, wire::evt::USERS_UPDATED);
+
+        // 2) msg-in：收到一条文本
+        let mut sendmsg = crate::protocol::Packet::new(
+            crate::protocol::cmd::SENDMSG | crate::protocol::opt::UTF8OPT,
+        );
+        sendmsg.extra = b"hi".to_vec();
+        let identity = super::classic_payload_identity(&sendmsg);
+        super::handle_sendmsg(&ctx, from, &sendmsg, &key, None, &identity, false, None)
+            .await
+            .unwrap();
+        check(&seen, wire::evt::MSG_IN);
+
+        // 3) msg-out：广播（本地也进广播信箱）
+        super::broadcast_message(&ctx, "hi").await.unwrap();
+        check(&seen, wire::evt::MSG_OUT);
+
+        // 4~7) 回执与撤回都要求历史里有对应记录。**一条记录只喂一种回执**：
+        // READMSG 会顺带把 delivered 置上，共用一条会让后面的 RECVMSG 不再翻转、不发事件。
+        for pkt in [501u32, 502, 503] {
+            st.log_record(
+                &key,
+                &json!({"dir": "out", "kind": "text", "text": "x", "files": [], "ts": now_secs(),
+                        "pkt": pkt, "peer": {"key": key}, "rcpt": true, "read": false,
+                        "delivered": false, "secret": true, "locked": false}),
+            );
+        }
+        for (cmd_name, pkt, expect) in [
+            (crate::protocol::cmd::READMSG, 501u32, wire::evt::MSG_READ),
+            (crate::protocol::cmd::RECVMSG, 502, wire::evt::MSG_DELIVERED),
+            (crate::protocol::cmd::DELMSG, 503, wire::evt::MSG_RECALLED),
+        ] {
+            let mut p = crate::protocol::Packet::new(cmd_name);
+            p.extra = pkt.to_string().into_bytes();
+            handle_datagram(&ctx, &p.encode("peer", "peer-host"), from).await;
+            check(&seen, expect);
+        }
+        // 开封只轮得到入站消息（自己的记录没有「开封」一说）
+        st.log_record(
+            &key,
+            &json!({"dir": "in", "kind": "text", "text": "x", "files": [], "ts": now_secs(),
+                    "pkt": 504, "peer": {"key": key}, "need_read": false, "read": false,
+                    "secret": true, "locked": false, "unlocked": false}),
+        );
+        super::unlock_message(&ctx, &key, 504, None).await.unwrap();
+        check(&seen, wire::evt::MSG_UNLOCKED);
+
+        // 8) absence-info：对端的不在通知文
+        let mut absence = crate::protocol::Packet::new(crate::protocol::cmd::SENDABSENCEINFO);
+        absence.extra = b"busy".to_vec();
+        handle_datagram(&ctx, &absence.encode("peer", "peer-host"), from).await;
+        check(&seen, wire::evt::ABSENCE_INFO);
+
+        // 9) file-progress：下载完成与失败两种发法（进度/加密流那三种共用同一份并集）
+        super::emit_download_done(&ctx, &key, 601, 7, std::path::Path::new("/tmp/x.png"), 12);
+        check(&seen, wire::evt::FILE_PROGRESS);
+        super::fail_download(&ctx, &key, 602, 8, "boom");
+        check(&seen, wire::evt::FILE_PROGRESS);
+
+        // 声明表覆盖全部 11 个事件（新增事件时别忘了同时在 fields 里声明）
+        for name in wire::evt::ALL {
+            assert!(
+                crate::wire::declared_fields(name).is_some(),
+                "{name} 没有字段声明"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
     /// 对方离线时入队、上线后重投的封书消息同样要保持封书语义
     /// （本地留痕 + 线上标志都不能降级）。
     #[tokio::test]

@@ -68,4 +68,18 @@ export const WIRE = {
     save_shot_png: 'save_shot_png',
     copy_image_to_clipboard: 'copy_image_to_clipboard',
   },
+  /** 每个事件 payload 的字段（前端读的键；file-progress 是并集，可选字段靠 ⊆ 约束） */
+  fields: {
+    'absence-info': ['key', 'text'],
+    'file-progress': ['key', 'pkt', 'file_id', 'transferred', 'total', 'done', 'path', 'error', 'enc'],
+    'msg-delivered': ['key', 'pkt'],
+    'msg-in': ['key', 'msg', 'resend'],
+    'msg-out': ['key', 'msg'],
+    'msg-read': ['key', 'pkt'],
+    'msg-recalled': ['key', 'pkt', 'peer'],
+    'msg-unlocked': ['key', 'pkt'],
+    'open-chat': ['key'],
+    'open-unread': [],
+    'users-updated': [],
+  },
 };
