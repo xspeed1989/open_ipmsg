@@ -1,6 +1,6 @@
 # 入站报文处理：dispatcher 只留 preamble，每个命令一个 handler module
 
-`net.rs` 的入站路径现在是两个巨函数：`handle_datagram` 569 行（解析、去重、解密、命令分发、回执、事件、自动应答、自动下载 spawn 全在一个 body 里）、`handle_sendmsg` 288 行（15 步，从拆附件段到 spawn 自动下载）。任何一处协议行为改动都落在同一个函数里，78 个用例也只能从文件底部伸手进来（`mod tests` 还把文件劈成两段：测试之后仍有产线代码，`file_request_inner` 被测试前向引用）。决定按 base command 拆：dispatcher 只保留所有命令共享的那几步 + 一张 handler 表，11 个「只是回一条报文 / 转发」的 arm 合成一个 module，5 个会改会话状态的（`SENDMSG` / `BR_ENTRY` / `ANSENTRY` / `ANSLIST` / `BR_EXIT`）各占一个。**实施尚未开始**，本 ADR 先钉住形状与边界，免得下一轮评审重新推一遍。
+`net.rs` 的入站路径现在是两个巨函数：`handle_datagram` 569 行（解析、去重、解密、命令分发、回执、事件、自动应答、自动下载 spawn 全在一个 body 里）、`handle_sendmsg` 288 行（15 步，从拆附件段到 spawn 自动下载）。任何一处协议行为改动都落在同一个函数里，78 个用例也只能从文件底部伸手进来（`mod tests` 还把文件劈成两段：测试之后仍有产线代码，`file_request_inner` 被测试前向引用）。决定按 base command 拆：dispatcher 只保留所有命令共享的那几步 + 一张 handler 表，11 个「只是回一条报文 / 转发」的 arm 合成一个 module，5 个会改会话状态的（`SENDMSG` / `BR_ENTRY` / `ANSENTRY` / `ANSLIST` / `BR_EXIT`）各占一个。**已按此落地。** 实际 interface 是 `(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key: &str)` —— 比「`(pkt, &NetCtx)`」多两个参数，因为每次分派都得知道来源地址与会话 key；四个参数由 dispatcher 统一备好，handler 不再各自重算。`handle_datagram` 与 `handle_sendmsg` 的签名都保持可从测试调用，所以当时钉着签名的 8 + 14 个调用点没有重写 —— 「用例搬到 handler interface」那条留给真正重写用例时做，本次先保住回归网不动。
 
 ## Considered Options
 

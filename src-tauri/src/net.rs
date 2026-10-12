@@ -1128,6 +1128,861 @@ async fn ack_classic_sendmsg(
     }
 }
 
+/* ================= 入站处理：每个命令一个 handler ================= */
+
+/// 一次入站报文的处理者（架构评审候选 3 的拆分，见 docs/adr/0002）。
+///
+/// 拆分前这些逻辑都挤在 `handle_datagram` 的 569 行里：解析、去重、解密、命令分发、
+/// 回执、事件、自动应答、自动下载 spawn 全在一个 body —— 任何一处协议行为改动都落在
+/// 同一个函数里，无法局部验证，78 个用例也只能从文件底部伸手进来。现在 dispatcher 只
+/// 留所有命令共享的 preamble + 一张路由表，行为按命令分家。
+///
+/// 接口统一为 `(ctx, from, pkt, key)`：报文已由 dispatcher 解析好、去重过；回执与事件
+/// 由 handler 用拿到的 `ctx` 自己发（Rust 侧的问题是 locality 不是可测性，所以不像前端
+/// 的事件迁移那样返回 effect 清单 —— 见 ADR-0002 的 Considered Options）。
+mod inbound {
+    use super::*;
+    /// 上线通告（BR_ENTRY）：注册对端 + 回应 ANSENTRY + 预握手 + 重投离线消息。
+    pub(crate) mod entry {
+        use super::*;
+
+        pub(crate) async fn br_entry(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key: &str) {
+            // dispatcher 里算好的 base（pkt 已被解析过）
+            let base = pkt.command & 0xFF;
+            let info = proto::parse_entry_extra(&pkt.extra, pkt.command);
+            let added = ctx.st.upsert_peer(PeerInfo {
+                key: key.to_string(),
+                ip: from.ip().to_string(),
+                port: from.port(),
+                nickname: info.nick,
+                group: info.group,
+                host: pkt.host.clone(),
+                user: pkt.user.clone(),
+                last_seen: now_secs(),
+                absence: pkt.command & opt::ABSENCEOPT != 0,
+                absence_text: None,
+                vs: info.vs,
+            });
+            // 回应 ANSENTRY（单播），携带自己的昵称\0群组；能力位随总开关一起广告。
+            // BR 应答遵循官方：不带 UTF8OPT（BR 系禁用），UTF-8 走 \0\nNN:/GN: 扩展
+            let cfg = ctx.st.config();
+            let ans = proto::Packet {
+                extra: proto::build_entry_extra_ex(
+                    &cfg.nickname,
+                    &cfg.group,
+                    &my_user(&cfg),
+                    &my_host(),
+                    &cfg.encoding,
+                ),
+                command: cmd::ANSENTRY
+                    | opt::CAPUTF8OPT
+                    // BR 系报文规范禁用 UTF8OPT（官方 HostStatus 同款），
+                    // UTF-8 名字走上面 build_entry_extra_ex 的 \nNN:/GN: 扩展
+                    | entry_caps(&cfg),
+                ..proto::Packet::new(0)
+            };
+            let bytes = ans.encode(&my_user(&cfg), &my_host());
+            let _ = ctx.sock.send_to(&bytes, from).await;
+            if added {
+                ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
+            }
+            maybe_start_handshake(ctx, from, &pkt, &key, &cfg).await;
+            maybe_withdraw_peer_key(ctx, from, &pkt, &key, &cfg);
+            // 对方刚上线（BR_ENTRY）：立即重投此前的离线消息
+            flush_pending_for(ctx, &key).await;
+            // 代理窗口内：把本段 entry 事件转发给 master（DIR_EVBROAD）
+            maybe_forward_entry_event(ctx, &pkt, &key, base).await;
+        }
+    }
+    /// 对端上线应答与不在模式通告：注册/更新对端，触发预握手与离线重投。
+    pub(crate) mod ansentry {
+        use super::*;
+
+        pub(crate) async fn ans_entry(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key: &str) {
+            // dispatcher 里算好的 base（pkt 已被解析过）
+            let base = pkt.command & 0xFF;
+            let info = proto::parse_entry_extra(&pkt.extra, pkt.command);
+            let absence = pkt.command & opt::ABSENCEOPT != 0;
+            ctx.st.upsert_peer(PeerInfo {
+                key: key.to_string(),
+                ip: from.ip().to_string(),
+                port: from.port(),
+                nickname: info.nick,
+                group: info.group,
+                host: pkt.host.clone(),
+                user: pkt.user.clone(),
+                last_seen: now_secs(),
+                absence,
+                absence_text: None,
+                vs: info.vs,
+            });
+            ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
+            // 不在模式通告（BR_ABSENCE）说明对方状态切换：旧缓存的不在通知文作废
+            if base == cmd::BR_ABSENCE {
+                ctx.st.clear_peer_absence(&key);
+            }
+            // 对端应答里若声明加密能力，同样触发预握手（对方可能没收到我们的 BR_ENTRY）
+            let cfg = ctx.st.config();
+            maybe_start_handshake(ctx, from, &pkt, &key, &cfg).await;
+            // 撤回只认 ANSENTRY：第三方客户端的下线通告（BR_ABSENCE）常不带
+            // 能力位，若据此撤回会把仍在线、支持加密的对端公钥误丢 ——
+            // 虽然下次上线会自愈，但表现为反复横跳的加解密抖动。
+            if base == cmd::ANSENTRY {
+                maybe_withdraw_peer_key(ctx, from, &pkt, &key, &cfg);
+            }
+            // ANSENTRY 通常是对我们上线通告的应答：对方在线，重投离线消息
+            flush_pending_for(ctx, &key).await;
+            maybe_forward_entry_event(ctx, &pkt, &key, base).await;
+        }
+    }
+    /// 退出通告（BR_EXIT）：按 IP 清理会话，未确认消息转入待投递。
+    pub(crate) mod exit {
+        use super::*;
+
+        pub(crate) async fn br_exit(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key: &str) {
+            // dispatcher 里算好的 base（pkt 已被解析过）
+            let base = pkt.command & 0xFF;
+            // 退出广播可能来自临时端口（进程收尾时无法复用主 socket），
+            // 因此按 IP 清理该主机的所有会话条目，而不是只按 ip:port 精确匹配
+            let ip = from.ip().to_string();
+            let removed: Vec<String> = {
+                let mut peers = ctx.st.peers.lock().unwrap();
+                let hit: Vec<String> = peers
+                    .values()
+                    .filter(|p| p.ip == ip)
+                    .map(|p| p.key.to_string())
+                    .collect();
+                for k in &hit {
+                    peers.remove(k);
+                    // 未确认的在线消息转入待投递（对方回来补投）
+                    ctx.st.demote_retry_to_pending(k);
+                    ctx.st.clear_peer_absence(k);
+                }
+                hit
+            };
+            if !removed.is_empty() {
+                ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
+            }
+            maybe_forward_entry_event(ctx, &pkt, &key, base).await;
+        }
+    }
+    /// 「收到就回一条 / 只做记录」类命令：各自 interface 相同，合在一个 module 里；
+    /// 拆成十几个 module 只会得到十几个 shallow module。
+    pub(crate) mod ack {
+        use super::*;
+
+        pub(crate) async fn recvmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, _key: &str) {
+            // 对方确认送达（我们发 SENDCHECKOPT 时对方回 RECVMSG，附加数据是包号）：
+            // 把对应的待投递离线消息出队，避免对方在线时每 45s 无限重投；
+            // 同时移除在线重发队列项（官方 §4-12 確認・リトライ闭环）
+            let first = pkt.extra.split(|&b| b == b':').next().unwrap_or(b"");
+            let no = String::from_utf8_lossy(first).trim().to_string();
+            if let Some(k) = resolve_session_key(ctx, from.ip()) {
+                for c in id_candidates(&no) {
+                    let acked_offline = ctx.st.ack_pending(&k, c);
+                    let acked_retry = ctx.st.ack_retry(&k, c);
+                    if acked_offline || acked_retry {
+                        ctx.st
+                            .diag(&format!("<- {from} RECVMSG 送达确认 pkt={c}（离线:{acked_offline} 重发:{acked_retry}）已送达"));
+                    }
+                    // 送达确认同时落一条「已送达」：官方 Windows 客户端对普通消息
+                    // 只回 RECVMSG、从不回 READMSG（recvdlg 的 READMSG 只在封书
+                    // 开封时发），不记这个中间态，气泡就永远停在「未读」。
+                    if ctx.st.mark_out_delivered(&k, c) {
+                        ctx.st.emit(wire::evt::MSG_DELIVERED, json!({"key": k, "pkt": c}));
+                    }
+                }
+            }
+        }
+
+        pub(crate) async fn readmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, _key: &str) {
+            // 对端已读回执：extra = 原消息包编号，把对应出站消息标记为已读
+            let no = String::from_utf8_lossy(&pkt.extra)
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse::<u32>()
+                .ok();
+            #[cfg(feature = "net_debug")]
+            oim_log!("[read] READMSG from {from} no={no:?}");
+            if let Some(no) = no {
+                if let Some(key) = resolve_session_key(ctx, from.ip()) {
+                    let changed = ctx.st.mark_out_read(&key, no);
+                    #[cfg(feature = "net_debug")]
+                    oim_log!("[read] key={key} changed={changed}");
+                    if changed {
+                        ctx.st.emit(wire::evt::MSG_READ, json!({"key": key, "pkt": no}));
+                    }
+                }
+            }
+        }
+
+        pub(crate) async fn delmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, _key: &str) {
+            // 封书破弃/消息撤回通知（官方语义：recvdlg 的「破弃」按钮；
+            // 本客户端扩展：对方撤回我方会话里的消息）
+            let no = String::from_utf8_lossy(&pkt.extra)
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse::<u32>();
+            if let Some(no) = no.ok() {
+                let k = match resolve_session_key(ctx, from.ip()) {
+                    Some(k) => k,
+                    None => from.ip().to_string(), // 离线会话也可能被撤回
+                };
+                if ctx.st.update_history_pkt(&k, no, |rec| {
+                    rec["recalled"] = json!(true);
+                }) {
+                    ctx.st.emit(
+                        wire::evt::MSG_RECALLED,
+                        json!({"key": k, "pkt": no, "peer": pkt.user}),
+                    );
+                    ctx.st
+                        .diag(&format!("<- {from} DELMSG 撤回 pkt={no}（会话 {k}）"));
+                }
+            }
+        }
+
+        pub(crate) async fn ansreadmsg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, _key: &str) {
+            // READMSG 带 READCHECKOPT 时的确认（8 版协议）：我方出站消息视为已读
+            let no = String::from_utf8_lossy(&pkt.extra)
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse::<u32>()
+                .ok();
+            if let Some(no) = no {
+                if let Some(k) = resolve_session_key(ctx, from.ip()) {
+                    if ctx.st.mark_out_read(&k, no) {
+                        ctx.st.emit(wire::evt::MSG_READ, json!({"key": k, "pkt": no}));
+                    }
+                }
+            }
+        }
+
+        pub(crate) async fn get_absence_info(ctx: &NetCtx, from: SocketAddr, _pkt: &proto::Packet, _key: &str) {
+            // 官方 §3-11：不在模式成员返回不在通知文；非不在模式回占位串
+            let cfg = ctx.st.config();
+            let text = if cfg.absence_enabled && !cfg.absence_text.trim().is_empty() {
+                cfg.absence_text.clone()
+            } else {
+                "Not absence mode".to_string()
+            };
+            let utf8 = proto::is_utf8_mode(&cfg.encoding);
+            let mut r = proto::Packet::new(
+                cmd::SENDABSENCEINFO | opt::AUTORETOPT | if utf8 { opt::UTF8OPT } else { 0 },
+            );
+            r.extra = proto::encode_out(&text, &cfg.encoding);
+            let bytes = r.encode(&my_user(&cfg), &my_host());
+            let _ = ctx.sock.send_to(&bytes, from).await;
+        }
+
+        pub(crate) async fn send_absence_info(ctx: &NetCtx, _from: SocketAddr, pkt: &proto::Packet, key: &str) {
+            // 对端的不在通知文：缓存到会话，供前端展示
+            let text = proto::text_of(&pkt);
+            ctx.st.set_peer_absence(&key, &text);
+            ctx.st
+                .emit(wire::evt::ABSENCE_INFO, json!({"key": key, "text": text}));
+        }
+
+        pub(crate) async fn br_isgetlist(ctx: &NetCtx, from: SocketAddr, _pkt: &proto::Packet, _key: &str) {
+            // 主机列表能力探索：我方允许就回 OKGETLIST（官方 MsgBrIsGetList 同款）
+            let cfg = ctx.st.config();
+            if cfg.allow_send_list {
+                let r = proto::Packet::new(cmd::OKGETLIST);
+                let bytes = r.encode(&my_user(&cfg), &my_host());
+                let _ = ctx.sock.send_to(&bytes, from).await;
+            }
+        }
+
+        pub(crate) async fn okgetlist(ctx: &NetCtx, from: SocketAddr, _pkt: &proto::Packet, _key: &str) {
+            // 对方可回主机列表：窗口期（启动/手动刷新后）内发起 GETLIST
+            if ctx.st.hostlist_window_open() {
+                let cfg = ctx.st.config();
+                let mut r = proto::Packet::new(cmd::GETLIST);
+                r.extra = b"0".to_vec(); // 起始索引
+                let bytes = r.encode(&my_user(&cfg), &my_host());
+                let _ = ctx.sock.send_to(&bytes, from).await;
+            }
+        }
+
+        pub(crate) async fn anslist_dict(_ctx: &NetCtx, _from: SocketAddr, pkt: &proto::Packet, _key: &str) {
+            // IPDict 版主机列表（v5）：纯 IPDict 报文，实际走 handle_dict_datagram；
+            // 经典报文路径出现该命令时按普通 ANSLIST 语义忽略
+            let _ = &pkt;
+        }
+
+        pub(crate) async fn agent_req(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, _key: &str) {
+            // 代理侧：有人在找通向某目标的路由 —— 我们能否送到？
+            let targ = String::from_utf8_lossy(&pkt.extra)
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let reachable = targ
+                .parse::<IpAddr>()
+                .map(|ip| {
+                    ctx.st.peers.lock().unwrap().contains_key(&ip.to_string())
+                        || local_ip_set().contains(&ip)
+                })
+                .unwrap_or(false);
+            let cfg = ctx.st.config();
+            let mut r = proto::Packet::new(cmd::AGENT_ANSREQ);
+            r.extra = format!("{targ}:{}", if reachable { 1 } else { 0 }).into_bytes();
+            let bytes = r.encode(&my_user(&cfg), &my_host());
+            let _ = ctx.sock.send_to(&bytes, from).await;
+            ctx.st.diag(&format!(
+                "<- {from} AGENT_REQ {targ} → {}",
+                if reachable { "可达" } else { "不可达" }
+            ));
+        }
+
+        pub(crate) async fn agent_ansreq(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, _key: &str) {
+            // 代理能力应答：仅记录
+            ctx.st.diag(&format!(
+                "<- {from} AGENT_ANSREQ {}",
+                String::from_utf8_lossy(&pkt.extra)
+            ));
+        }
+
+        pub(crate) async fn agent_packet(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, _key: &str) {
+            handle_agent_packet(ctx, &pkt, from).await;
+        }
+
+        pub(crate) async fn getinfo(ctx: &NetCtx, from: SocketAddr, _pkt: &proto::Packet, _key: &str) {
+            let cfg = ctx.st.config();
+            let utf8 = proto::is_utf8_mode(&cfg.encoding);
+            let reply = proto::Packet::new(
+                cmd::SENDINFO | opt::AUTORETOPT | if utf8 { opt::UTF8OPT } else { 0 },
+            );
+            let mut r = reply;
+            r.extra = proto::encode_out(
+                concat!("OpenIPMsg v", env!("CARGO_PKG_VERSION")),
+                &cfg.encoding,
+            );
+            let bytes = r.encode(&my_user(&cfg), &my_host());
+            let _ = ctx.sock.send_to(&bytes, from).await;
+        }
+
+        pub(crate) async fn getpubkey(ctx: &NetCtx, from: SocketAddr, _pkt: &proto::Packet, _key: &str) {
+            // 公钥握手请求（spec §5）：我方开关关闭时不广告、不应答，对端会回退明文
+            let cfg = ctx.st.config();
+            if cfg.encrypt {
+                let capa = entry_caps(&cfg) | crypto::CAPA_OUR_SEND;
+                let mut r = proto::Packet::new(cmd::ANSPUBKEY);
+                r.extra = crypto::build_anspubkey(capa, &ctx.st.own_keypair()).into_bytes();
+                let bytes = r.encode(&my_user(&cfg), &my_host());
+                let _ = ctx.sock.send_to(&bytes, from).await;
+                ctx.st.diag(&format!("-> {from} ANSPUBKEY capa={capa:X}"));
+            } else {
+                ctx.st
+                    .diag(&format!("<- {from} GETPUBKEY 忽略：本机加密已关闭"));
+            }
+        }
+
+        pub(crate) async fn anspubkey(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key: &str) {
+            // 对端公钥应答：宽容解析后缓存能力位与公钥（持久化，重启免握手）
+            // 「解析失败」时附上长度与冒号/连字符位置，便于定位官方 revendian
+            // 或非标长度模数等互通格式差异（2026-08 现场排查用）
+            match crypto::parse_anspubkey(&String::from_utf8_lossy(&pkt.extra)) {
+                Some((capa, pubk)) => match ctx.st.remember_peer_key(&key, capa, &pubk) {
+                    Ok(()) => ctx
+                        .st
+                        .diag(&format!("<- {from} ANSPUBKEY 已缓存 capa={capa:X}")),
+                    Err(error) => ctx.st.diag(&format!(
+                        "<- {from} ANSPUBKEY 缓存失败 capa={capa:X}：{error}"
+                    )),
+                },
+                None => {
+                    let s = String::from_utf8_lossy(&pkt.extra);
+                    let colon = s.find(':').map(|i| i.to_string()).unwrap_or("-".into());
+                    let dash = s.find('-').map(|i| i.to_string()).unwrap_or("-".into());
+                    ctx.st.diag(&format!(
+                        "<- {from} ANSPUBKEY 解析失败，忽略 len={} colon@{colon} dash@{dash} head={}",
+                        s.len(),
+                        s.chars().take(24).collect::<String>()
+                    ));
+                }
+            }
+        }
+
+        pub(crate) async fn releasefiles(ctx: &NetCtx, _from: SocketAddr, pkt: &proto::Packet, _key: &str) {
+            // 对端放弃接收：释放对应的文件槽。包编号的进制约定各家不一，两种都试
+            let first = pkt.extra.split(|&b| b == b':').next().unwrap_or(b"");
+            let cands = id_candidates(&String::from_utf8_lossy(first));
+            if !cands.is_empty() {
+                ctx.st
+                    .offered
+                    .lock()
+                    .unwrap()
+                    .retain(|(p, _), _| !cands.contains(p));
+            }
+        }
+    }
+    /// 文本与附件消息（SENDMSG）：解密 + 去重 + 落库 + 事件 + 自动接收，最重的一条。
+    pub(crate) mod sendmsg {
+        use super::*;
+
+        pub(crate) async fn send_msg(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, key: &str) {
+            // 入站加密消息拦截：在进入普通明文处理路径前还原报文。
+            // 只拦 base==SENDMSG 且带 ENCRYPTOPT 的包；其余报文零开销直通。
+            let mut pkt = pkt.clone(); // 解密后要改写 command/extra，取得所有权
+            let mut enc_meta: Option<bool> = None; // Some(sig_ok)：该消息曾加密
+            if pkt.command & opt::ENCRYPTOPT != 0 {
+                let cfg = ctx.st.config();
+                if cfg.encrypt {
+                    let peer_pubs = ctx.st.peer_pubkeys(&key);
+                    match crypto::open_message(
+                        &ctx.st.own_keypair(),
+                        &String::from_utf8_lossy(&pkt.extra),
+                        &peer_pubs,
+                        pkt.pkt_no,
+                    ) {
+                        Ok(m) => {
+                            // 解包明文已剥掉密封时附加的尾部 \0（crypto::OpenMsg.plain），
+                            // 直接换回原扩展部并清掉 ENCRYPTOPT，重构出等价明文报文；
+                            // 其余命令标志（READCHECKOPT 等）原样保留，下游按普通
+                            // 明文路径处理。
+                            let capa_head = String::from_utf8_lossy(&pkt.extra)
+                                .split(':')
+                                .next()
+                                .unwrap_or("")
+                                .to_string();
+                            let head = String::from_utf8_lossy(&m.plain[..m.plain.len().min(16)])
+                                .into_owned();
+                            ctx.st.diag(&format!(
+                                "dec-msg {from} pkt={} capa={capa_head} len={} sig={} head={head:?}",
+                                pkt.pkt_no,
+                                m.plain.len(),
+                                m.sig_ok
+                            ));
+                            // 验签失败但解密成功：最常见于对端换过密钥而缓存仍是旧钥
+                            // （「有缓存不握手」从不刷新）。触发双向自愈重握手。
+                            if !m.sig_ok && !peer_pubs.is_empty() {
+                                crypto_rehandshake(ctx, from, &key, "sig=false").await;
+                            }
+                            pkt.extra = m.plain;
+                            pkt.command &= !opt::ENCRYPTOPT;
+                            enc_meta = Some(m.sig_ok);
+                        }
+                        Err(e) => {
+                            // 无法解密的报文按垃圾丢弃（对端会重发或回退明文）；
+                            // 会话钥解不开 = 对方持我方的旧公钥签发——主动推送新钥
+                            // 并索取对方新钥（双向自愈）
+                            ctx.st.diag(&format!("decrypt-fail {from}: {e}"));
+                            crypto_rehandshake(ctx, from, &key, "decrypt-fail").await;
+                            return;
+                        }
+                    }
+                } else {
+                    // 加密关闭但收到密文：以占位文本入会话，避免静默丢消息；
+                    // 清掉 ENCRYPTOPT 让它走普通明文路径。sig 无法核验 → Some(false)
+                    // 占位文案按界面语言（config.lang）取简中/英文
+                    let lang = ctx.st.config().lang;
+                    pkt.extra = if lang.eq_ignore_ascii_case("en") {
+                        "🔒 Cannot decrypt (encryption is off)".as_bytes().to_vec()
+                    } else {
+                        "🔒 无法解密（加密已关闭）".as_bytes().to_vec()
+                    };
+                    pkt.command &= !opt::ENCRYPTOPT;
+                    enc_meta = Some(false);
+                }
+            }
+            let identity = classic_payload_identity(&pkt);
+            match inbound::sendmsg::handle_sendmsg(ctx, from, &pkt, &key, enc_meta, &identity, false, None).await {
+                Ok(_) => {
+                    let _ = ack_classic_sendmsg(ctx, from, &key, &pkt).await;
+                }
+                Err(error) => {
+                    ctx.st.diag(&format!(
+                        "<- {from} SENDMSG stage=persist pkt={} command={:#010x} 失败：{error}",
+                        pkt.pkt_no, pkt.command
+                    ));
+                }
+            }
+        }
+
+        pub(crate) async fn handle_sendmsg(
+            ctx: &NetCtx,
+            from: SocketAddr,
+            pkt: &proto::Packet,
+            key: &str,
+            enc_meta: Option<bool>,
+            identity: &str,
+            verified_payload: bool,
+            peer_metadata: Option<&ResolvedPeerMetadata>,
+        ) -> Result<InRecordOutcome, String> {
+            // 广播群发消息（BROADCASTOPT）：统一进「广播」会话（key=__broadcast__），
+            // 不回任何确认、不触发不在自动应答（官方 MsgSendMsg 同款门控）
+            let is_broadcast = pkt.command & opt::BROADCASTOPT != 0;
+            let session_key = if is_broadcast { "255.255.255.255" } else { key };
+            let attach = pkt.command & opt::FILEATTACHOPT != 0;
+            let files = if attach {
+                proto::parse_file_entries(&pkt.extra)
+            } else {
+                Vec::new()
+            };
+            let text_end = pkt
+                .extra
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(pkt.extra.len());
+            let text = proto::decode_for_command(&pkt.extra[..text_end], pkt.command);
+
+            let prior = ctx.st.find_in_record(session_key, pkt.pkt_no);
+            let prior = prior.filter(|record| {
+                let field = if verified_payload {
+                    "payload_id"
+                } else {
+                    "classic_payload_id"
+                };
+                record.get(field).and_then(Value::as_str) == Some(identity)
+            });
+            let prior_files: Vec<Value> = prior
+                .as_ref()
+                .and_then(|record| record.get("files").and_then(Value::as_array).cloned())
+                .unwrap_or_default();
+            let prior_file = |id: u32| -> Option<Value> {
+                prior_files
+                    .iter()
+                    .find(|file| file.get("id").and_then(Value::as_u64) == Some(id as u64))
+                    .cloned()
+            };
+
+            let mut auto_ids = Vec::new();
+            let mut file_jsons = Vec::new();
+            for file in &files {
+                let is_dir = file.attr & 0xff == fileattr::DIR;
+                let auto = !is_dir && file.size <= 30 * 1024 * 1024 && is_inline_media_name(&file.name);
+                let previous = prior_file(file.id);
+                let inherited = previous
+                    .as_ref()
+                    .and_then(|value| value.get("state"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if auto && matches!(inherited.as_deref(), None | Some("pending")) {
+                    auto_ids.push(file.id);
+                }
+                let mut object = json!({
+                    "id": file.id,
+                    "rid": file.raw_id,
+                    "name": file.name,
+                    "size": file.size,
+                    "mtime": file.mtime,
+                    "attr": file.attr,
+                    "ext_attrs": file.ext_attrs,
+                    "dir_entry": is_dir,
+                    "state": inherited.unwrap_or_else(|| if auto { "downloading" } else { "pending" }.into()),
+                });
+                if let Some(previous) = previous.as_ref() {
+                    if previous.get("state").and_then(Value::as_str) == Some("done") {
+                        if let Some(path) = previous.get("path") {
+                            object["path"] = path.clone();
+                        }
+                    }
+                    if let Some(error) = previous.get("error") {
+                        object["error"] = error.clone();
+                    }
+                }
+                file_jsons.push(object);
+            }
+
+            let already_read = prior
+                .as_ref()
+                .and_then(|record| record.get("read").and_then(Value::as_bool))
+                .unwrap_or(false);
+            let secret = pkt.command & opt::SECRETOPT != 0;
+            let password_protected = pkt.command & opt::PASSWORDOPT != 0;
+            let prior_unlocked = prior
+                .as_ref()
+                .and_then(|record| record.get("unlocked").and_then(Value::as_bool))
+                .unwrap_or(false);
+            // 入站封书/密码锁的「未开封」状态：
+            // - 密码锁（PASSWORDOPT）一律保持未开封 —— 必须收件人输口令才能看，
+            //   自动打开也不能绕过这道门；
+            // - 无密码封书按设置项 `auto_open_secret`（默认开）处理：开启时等价于
+            //   收件人一收到就点了「开封」，正文直接上屏、回执随之走常规已读流程；
+            //   关闭时保持信封占位、不回 READMSG，由收件人手动开封。
+            //   曾经这里写死「一律未开封」，理由是无条件自动开封会让封书在接收端
+            //   退化成普通消息；现在这是用户可选的开关，关掉即回到那个语义。
+            // 同一 payload 的重投沿用既有开封状态（用户开过的信不必再开一次）。
+            let auto_open = secret && !password_protected && ctx.st.config().auto_open_secret;
+            let unlocked = prior_unlocked || auto_open;
+
+            // key 是真实发送方 IP，不是广播信箱 key；广播同样复用已知昵称。
+            let existing_peer = ctx.st.peers.lock().unwrap().get(key).cloned();
+            let metadata_nickname = peer_metadata
+                .and_then(|metadata| metadata.nickname.as_deref())
+                .filter(|nickname| !nickname.is_empty());
+            let metadata_group = peer_metadata
+                .and_then(|metadata| metadata.group.as_deref())
+                .filter(|group| !group.is_empty());
+            let display = metadata_nickname
+                .map(str::to_string)
+                .or_else(|| {
+                    existing_peer
+                        .as_ref()
+                        .map(|peer| peer.nickname.clone())
+                        .filter(|name| !name.is_empty())
+                })
+                .unwrap_or_else(|| pkt.user.clone());
+            let group = metadata_group
+                .map(str::to_string)
+                .or_else(|| {
+                    existing_peer
+                        .as_ref()
+                        .map(|peer| peer.group.clone())
+                        .filter(|group| !group.is_empty())
+                })
+                .unwrap_or_default();
+
+            let mut record = json!({
+                "dir": "in",
+                "kind": if files.is_empty() { "text" } else { "file" },
+                "text": text,
+                "files": file_jsons,
+                "ts": now_secs(),
+                "pkt": pkt.pkt_no,
+                // ip = 本次报文的真实来源地址。单播时会话 key 就等于它，冗余但无害；
+                // 广播会话（key=255.255.255.255）没有它就只能显示昵称/主机 —— 界面上
+                // 就成了「一个没有 IP 的离线联系人」，而这台机器其实是活的。
+                "peer": {"key": session_key, "ip": from.ip().to_string(), "nickname": display, "host": pkt.host, "group": group},
+                "need_read": pkt.command & opt::READCHECKOPT != 0,
+                "read": already_read,
+                "enc": enc_meta.is_some(),
+                "sig_ok": enc_meta.unwrap_or(true),
+                "secret": secret,
+                "locked": password_protected && !unlocked,
+                "unlocked": unlocked,
+                "broadcast": is_broadcast,
+            });
+            if verified_payload {
+                record["payload_id"] = json!(identity);
+            } else {
+                record["classic_payload_id"] = json!(identity);
+            }
+
+            let outcome = ctx
+                .st
+                .upsert_in_record_fallible(session_key, &record)
+                .map_err(|error| format!("E_PERSIST_FAILED|{error}"))?;
+            if outcome == InRecordOutcome::Duplicate {
+                return Ok(outcome);
+            }
+
+            // 从这里往后持久化已确认成功；UI、自动下载、联系人恢复和自动应答等副作用
+            // 一律放在这个边界之后。
+            let was_unhidden = !is_broadcast && ctx.st.unhide_contact(key);
+
+            if !is_broadcast {
+                let no_add_list = pkt.command & opt::NOADDLISTOPT != 0;
+                let metadata_changed = if existing_peer.is_some() {
+                    let nickname = metadata_nickname.map(proto::strip_control);
+                    let group = metadata_group.map(proto::strip_control);
+                    let version = peer_metadata
+                        .and_then(|metadata| metadata.client_version.as_deref())
+                        .map(proto::strip_control);
+                    let absence = peer_metadata
+                        .and_then(|metadata| metadata.status)
+                        .map(|status| status & opt::ABSENCEOPT != 0);
+                    let mut peers = ctx.st.peers.lock().unwrap();
+                    match peers.get_mut(key) {
+                        Some(existing) => {
+                            existing.last_seen = now_secs();
+                            let mut changed = false;
+                            if peer_metadata.is_some() {
+                                existing.host = pkt.host.clone();
+                                existing.user = pkt.user.clone();
+                                if let Some(nickname) = nickname {
+                                    changed |= existing.nickname != nickname;
+                                    existing.nickname = nickname;
+                                }
+                                if let Some(group) = group {
+                                    changed |= existing.group != group;
+                                    existing.group = group;
+                                }
+                                if let Some(version) = version {
+                                    changed |= existing.vs.as_deref() != Some(version.as_str());
+                                    existing.vs = Some(version);
+                                }
+                                if let Some(absence) = absence {
+                                    changed |= existing.absence != absence;
+                                    existing.absence = absence;
+                                }
+                            }
+                            changed
+                        }
+                        None => false,
+                    }
+                } else if !no_add_list {
+                    let metadata = peer_metadata.cloned().unwrap_or_default();
+                    let added = ctx.st.upsert_peer(PeerInfo {
+                        key: key.to_string(),
+                        ip: from.ip().to_string(),
+                        port: from.port(),
+                        nickname: metadata
+                            .nickname
+                            .filter(|nickname| !nickname.is_empty())
+                            .unwrap_or_else(|| pkt.user.clone()),
+                        group: metadata.group.unwrap_or_default(),
+                        host: pkt.host.clone(),
+                        user: pkt.user.clone(),
+                        last_seen: now_secs(),
+                        absence: metadata.status.unwrap_or(0) & opt::ABSENCEOPT != 0,
+                        absence_text: None,
+                        vs: metadata.client_version,
+                    });
+                    added
+                } else {
+                    false
+                };
+                if was_unhidden || metadata_changed {
+                    ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
+                }
+            }
+
+            if !is_broadcast && pkt.command & opt::AUTORETOPT == 0 {
+                let config = ctx.st.config();
+                if config.absence_enabled && !config.absence_text.trim().is_empty() {
+                    let utf8 = proto::is_utf8_mode(&config.encoding);
+                    let mut reply = proto::Packet::new(
+                        cmd::SENDMSG | opt::AUTORETOPT | if utf8 { opt::UTF8OPT } else { 0 },
+                    );
+                    reply.extra = proto::encode_out(&config.absence_text, &config.encoding);
+                    let bytes = reply.encode(&my_user(&config), &my_host());
+                    let _ = ctx.sock.send_to(&bytes, from).await;
+                    ctx.st
+                        .diag(&format!("-> {from} 不在模式自动应答（AUTORETOPT）"));
+                }
+            }
+
+            ctx.st.emit(
+                wire::evt::MSG_IN,
+                json!({"key": session_key, "msg": record, "resend": false}),
+            );
+
+            if !is_broadcast {
+                for file in files.iter().filter(|file| auto_ids.contains(&file.id)) {
+                    let state = ctx.st.clone();
+                    let socket = ctx.sock.clone();
+                    let port = ctx.port;
+                    let key = key.to_string();
+                    let name = file.name.clone();
+                    let raw_id = file.raw_id.clone();
+                    let id = file.id;
+                    let size = file.size;
+                    let packet_no = pkt.pkt_no;
+                    tokio::spawn(async move {
+                        let context = NetCtx {
+                            st: state,
+                            sock: socket,
+                            v6_sock: tokio::sync::Mutex::new(None),
+                            port,
+                        };
+                        if let Err(error) =
+                            download_file_task(&context, &key, packet_no, id, &name, &raw_id, size, false)
+                                .await
+                        {
+                            oim_log!("[auto-dl] {key} #{id} {name}: {error}");
+                        }
+                    });
+                }
+            }
+            Ok(outcome)
+        }
+    }
+    /// 主机列表协议（GETLIST 请求 / ANSLIST 回包）：请求方与应答方都在这一个 module 里。
+    pub(crate) mod roster {
+        use super::*;
+
+        pub(crate) async fn get_list(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, _key: &str) {
+            // 对方请求主机列表：官方 ANSLIST 结构（分页续传）
+            let cfg = ctx.st.config();
+            if !cfg.allow_send_list {
+                return;
+            }
+            let start = String::from_utf8_lossy(&pkt.extra)
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(0);
+            let hosts: Vec<proto::HostListEntry> = {
+                let peers = ctx.st.peers.lock().unwrap();
+                peers
+                    .values()
+                    .map(|p| proto::HostListEntry {
+                        user: p.user.clone(),
+                        host: p.host.clone(),
+                        status: cmd::BR_ENTRY | if p.absence { opt::ABSENCEOPT } else { 0 },
+                        ip: p.ip.clone(),
+                        port: p.port,
+                        nick: p.nickname.clone(),
+                        group: p.group.clone(),
+                    })
+                    .collect()
+            };
+            let (wire, _n) = proto::build_anslist(&hosts, start, 4000, &cfg.encoding);
+            let utf8 = proto::is_utf8_mode(&cfg.encoding);
+            let mut r = proto::Packet::new(
+                cmd::ANSLIST | opt::AUTORETOPT | if utf8 { opt::UTF8OPT } else { 0 },
+            );
+            r.extra = wire;
+            let bytes = r.encode(&my_user(&cfg), &my_host());
+            let _ = ctx.sock.send_to(&bytes, from).await;
+        }
+
+        pub(crate) async fn ans_list(ctx: &NetCtx, from: SocketAddr, pkt: &proto::Packet, _key: &str) {
+            // 主机列表回包：并入用户表；续传索引非 0 则继续取下一批
+            let (cont, hosts) = proto::parse_anslist(&pkt.extra, pkt.command);
+            let mut changed = false;
+            for h in hosts {
+                let ip = match h.ip.parse::<IpAddr>() {
+                    Ok(ip) => ip,
+                    Err(_) => continue,
+                };
+                if h.status & 0xFF == cmd::BR_EXIT {
+                    let mut peers = ctx.st.peers.lock().unwrap();
+                    if peers.remove(ip.to_string().as_str()).is_some() {
+                        changed = true;
+                    }
+                    continue;
+                }
+                let add = ctx.st.upsert_peer(PeerInfo {
+                    key: ip.to_string(),
+                    ip: ip.to_string(),
+                    port: if h.port == 0 { 2425 } else { h.port },
+                    nickname: if h.nick.is_empty() {
+                        h.user.clone()
+                    } else {
+                        h.nick.clone()
+                    },
+                    group: h.group.clone(),
+                    host: h.host.clone(),
+                    user: h.user.clone(),
+                    last_seen: now_secs(),
+                    absence: h.status & opt::ABSENCEOPT != 0,
+                    absence_text: None,
+                    vs: None,
+                });
+                changed |= add;
+            }
+            if changed {
+                ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
+            }
+            if cont != 0 {
+                let cfg = ctx.st.config();
+                let mut r = proto::Packet::new(cmd::GETLIST);
+                r.extra = cont.to_string().into_bytes();
+                let bytes = r.encode(&my_user(&cfg), &my_host());
+                let _ = ctx.sock.send_to(&bytes, from).await;
+            }
+        }
+    }
+}
+
 async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
     // 自身回声先过滤（IPDict 与经典解析共用同一口径）
     if from.port() == ctx.port && is_self_ip(ctx, from.ip()) {
@@ -1197,503 +2052,28 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
     }
 
     match base {
-        cmd::BR_ENTRY => {
-            let info = proto::parse_entry_extra(&pkt.extra, pkt.command);
-            let added = ctx.st.upsert_peer(PeerInfo {
-                key: key.clone(),
-                ip: from.ip().to_string(),
-                port: from.port(),
-                nickname: info.nick,
-                group: info.group,
-                host: pkt.host.clone(),
-                user: pkt.user.clone(),
-                last_seen: now_secs(),
-                absence: pkt.command & opt::ABSENCEOPT != 0,
-                absence_text: None,
-                vs: info.vs,
-            });
-            // 回应 ANSENTRY（单播），携带自己的昵称\0群组；能力位随总开关一起广告。
-            // BR 应答遵循官方：不带 UTF8OPT（BR 系禁用），UTF-8 走 \0\nNN:/GN: 扩展
-            let cfg = ctx.st.config();
-            let ans = proto::Packet {
-                extra: proto::build_entry_extra_ex(
-                    &cfg.nickname,
-                    &cfg.group,
-                    &my_user(&cfg),
-                    &my_host(),
-                    &cfg.encoding,
-                ),
-                command: cmd::ANSENTRY
-                    | opt::CAPUTF8OPT
-                    // BR 系报文规范禁用 UTF8OPT（官方 HostStatus 同款），
-                    // UTF-8 名字走上面 build_entry_extra_ex 的 \nNN:/GN: 扩展
-                    | entry_caps(&cfg),
-                ..proto::Packet::new(0)
-            };
-            let bytes = ans.encode(&my_user(&cfg), &my_host());
-            let _ = ctx.sock.send_to(&bytes, from).await;
-            if added {
-                ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
-            }
-            maybe_start_handshake(ctx, from, &pkt, &key, &cfg).await;
-            maybe_withdraw_peer_key(ctx, from, &pkt, &key, &cfg);
-            // 对方刚上线（BR_ENTRY）：立即重投此前的离线消息
-            flush_pending_for(ctx, &key).await;
-            // 代理窗口内：把本段 entry 事件转发给 master（DIR_EVBROAD）
-            maybe_forward_entry_event(ctx, &pkt, &key, base).await;
-        }
-        cmd::ANSENTRY | cmd::BR_ABSENCE => {
-            let info = proto::parse_entry_extra(&pkt.extra, pkt.command);
-            let absence = pkt.command & opt::ABSENCEOPT != 0;
-            ctx.st.upsert_peer(PeerInfo {
-                key: key.clone(),
-                ip: from.ip().to_string(),
-                port: from.port(),
-                nickname: info.nick,
-                group: info.group,
-                host: pkt.host.clone(),
-                user: pkt.user.clone(),
-                last_seen: now_secs(),
-                absence,
-                absence_text: None,
-                vs: info.vs,
-            });
-            ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
-            // 不在模式通告（BR_ABSENCE）说明对方状态切换：旧缓存的不在通知文作废
-            if base == cmd::BR_ABSENCE {
-                ctx.st.clear_peer_absence(&key);
-            }
-            // 对端应答里若声明加密能力，同样触发预握手（对方可能没收到我们的 BR_ENTRY）
-            let cfg = ctx.st.config();
-            maybe_start_handshake(ctx, from, &pkt, &key, &cfg).await;
-            // 撤回只认 ANSENTRY：第三方客户端的下线通告（BR_ABSENCE）常不带
-            // 能力位，若据此撤回会把仍在线、支持加密的对端公钥误丢 ——
-            // 虽然下次上线会自愈，但表现为反复横跳的加解密抖动。
-            if base == cmd::ANSENTRY {
-                maybe_withdraw_peer_key(ctx, from, &pkt, &key, &cfg);
-            }
-            // ANSENTRY 通常是对我们上线通告的应答：对方在线，重投离线消息
-            flush_pending_for(ctx, &key).await;
-            maybe_forward_entry_event(ctx, &pkt, &key, base).await;
-        }
-        cmd::BR_EXIT => {
-            // 退出广播可能来自临时端口（进程收尾时无法复用主 socket），
-            // 因此按 IP 清理该主机的所有会话条目，而不是只按 ip:port 精确匹配
-            let ip = from.ip().to_string();
-            let removed: Vec<String> = {
-                let mut peers = ctx.st.peers.lock().unwrap();
-                let hit: Vec<String> = peers
-                    .values()
-                    .filter(|p| p.ip == ip)
-                    .map(|p| p.key.clone())
-                    .collect();
-                for k in &hit {
-                    peers.remove(k);
-                    // 未确认的在线消息转入待投递（对方回来补投）
-                    ctx.st.demote_retry_to_pending(k);
-                    ctx.st.clear_peer_absence(k);
-                }
-                hit
-            };
-            if !removed.is_empty() {
-                ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
-            }
-            maybe_forward_entry_event(ctx, &pkt, &key, base).await;
-        }
-        cmd::RECVMSG => {
-            // 对方确认送达（我们发 SENDCHECKOPT 时对方回 RECVMSG，附加数据是包号）：
-            // 把对应的待投递离线消息出队，避免对方在线时每 45s 无限重投；
-            // 同时移除在线重发队列项（官方 §4-12 確認・リトライ闭环）
-            let first = pkt.extra.split(|&b| b == b':').next().unwrap_or(b"");
-            let no = String::from_utf8_lossy(first).trim().to_string();
-            if let Some(k) = resolve_session_key(ctx, from.ip()) {
-                for c in id_candidates(&no) {
-                    let acked_offline = ctx.st.ack_pending(&k, c);
-                    let acked_retry = ctx.st.ack_retry(&k, c);
-                    if acked_offline || acked_retry {
-                        ctx.st
-                            .diag(&format!("<- {from} RECVMSG 送达确认 pkt={c}（离线:{acked_offline} 重发:{acked_retry}）已送达"));
-                    }
-                    // 送达确认同时落一条「已送达」：官方 Windows 客户端对普通消息
-                    // 只回 RECVMSG、从不回 READMSG（recvdlg 的 READMSG 只在封书
-                    // 开封时发），不记这个中间态，气泡就永远停在「未读」。
-                    if ctx.st.mark_out_delivered(&k, c) {
-                        ctx.st.emit(wire::evt::MSG_DELIVERED, json!({"key": k, "pkt": c}));
-                    }
-                }
-            }
-        }
-        cmd::SENDMSG => {
-            // 入站加密消息拦截：在进入普通明文处理路径前还原报文。
-            // 只拦 base==SENDMSG 且带 ENCRYPTOPT 的包；其余报文零开销直通。
-            let mut pkt = pkt; // 解密后要改写 command/extra，取得所有权
-            let mut enc_meta: Option<bool> = None; // Some(sig_ok)：该消息曾加密
-            if pkt.command & opt::ENCRYPTOPT != 0 {
-                let cfg = ctx.st.config();
-                if cfg.encrypt {
-                    let peer_pubs = ctx.st.peer_pubkeys(&key);
-                    match crypto::open_message(
-                        &ctx.st.own_keypair(),
-                        &String::from_utf8_lossy(&pkt.extra),
-                        &peer_pubs,
-                        pkt.pkt_no,
-                    ) {
-                        Ok(m) => {
-                            // 解包明文已剥掉密封时附加的尾部 \0（crypto::OpenMsg.plain），
-                            // 直接换回原扩展部并清掉 ENCRYPTOPT，重构出等价明文报文；
-                            // 其余命令标志（READCHECKOPT 等）原样保留，下游按普通
-                            // 明文路径处理。
-                            let capa_head = String::from_utf8_lossy(&pkt.extra)
-                                .split(':')
-                                .next()
-                                .unwrap_or("")
-                                .to_string();
-                            let head = String::from_utf8_lossy(&m.plain[..m.plain.len().min(16)])
-                                .into_owned();
-                            ctx.st.diag(&format!(
-                                "dec-msg {from} pkt={} capa={capa_head} len={} sig={} head={head:?}",
-                                pkt.pkt_no,
-                                m.plain.len(),
-                                m.sig_ok
-                            ));
-                            // 验签失败但解密成功：最常见于对端换过密钥而缓存仍是旧钥
-                            // （「有缓存不握手」从不刷新）。触发双向自愈重握手。
-                            if !m.sig_ok && !peer_pubs.is_empty() {
-                                crypto_rehandshake(ctx, from, &key, "sig=false").await;
-                            }
-                            pkt.extra = m.plain;
-                            pkt.command &= !opt::ENCRYPTOPT;
-                            enc_meta = Some(m.sig_ok);
-                        }
-                        Err(e) => {
-                            // 无法解密的报文按垃圾丢弃（对端会重发或回退明文）；
-                            // 会话钥解不开 = 对方持我方的旧公钥签发——主动推送新钥
-                            // 并索取对方新钥（双向自愈）
-                            ctx.st.diag(&format!("decrypt-fail {from}: {e}"));
-                            crypto_rehandshake(ctx, from, &key, "decrypt-fail").await;
-                            return;
-                        }
-                    }
-                } else {
-                    // 加密关闭但收到密文：以占位文本入会话，避免静默丢消息；
-                    // 清掉 ENCRYPTOPT 让它走普通明文路径。sig 无法核验 → Some(false)
-                    // 占位文案按界面语言（config.lang）取简中/英文
-                    let lang = ctx.st.config().lang;
-                    pkt.extra = if lang.eq_ignore_ascii_case("en") {
-                        "🔒 Cannot decrypt (encryption is off)".as_bytes().to_vec()
-                    } else {
-                        "🔒 无法解密（加密已关闭）".as_bytes().to_vec()
-                    };
-                    pkt.command &= !opt::ENCRYPTOPT;
-                    enc_meta = Some(false);
-                }
-            }
-            let identity = classic_payload_identity(&pkt);
-            match handle_sendmsg(ctx, from, &pkt, &key, enc_meta, &identity, false, None).await {
-                Ok(_) => {
-                    let _ = ack_classic_sendmsg(ctx, from, &key, &pkt).await;
-                }
-                Err(error) => {
-                    ctx.st.diag(&format!(
-                        "<- {from} SENDMSG stage=persist pkt={} command={:#010x} 失败：{error}",
-                        pkt.pkt_no, pkt.command
-                    ));
-                }
-            }
-        }
-        cmd::READMSG => {
-            // 对端已读回执：extra = 原消息包编号，把对应出站消息标记为已读
-            let no = String::from_utf8_lossy(&pkt.extra)
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .parse::<u32>()
-                .ok();
-            #[cfg(feature = "net_debug")]
-            oim_log!("[read] READMSG from {from} no={no:?}");
-            if let Some(no) = no {
-                if let Some(key) = resolve_session_key(ctx, from.ip()) {
-                    let changed = ctx.st.mark_out_read(&key, no);
-                    #[cfg(feature = "net_debug")]
-                    oim_log!("[read] key={key} changed={changed}");
-                    if changed {
-                        ctx.st.emit(wire::evt::MSG_READ, json!({"key": key, "pkt": no}));
-                    }
-                }
-            }
-        }
-        cmd::DELMSG => {
-            // 封书破弃/消息撤回通知（官方语义：recvdlg 的「破弃」按钮；
-            // 本客户端扩展：对方撤回我方会话里的消息）
-            let no = String::from_utf8_lossy(&pkt.extra)
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .parse::<u32>();
-            if let Some(no) = no.ok() {
-                let k = match resolve_session_key(ctx, from.ip()) {
-                    Some(k) => k,
-                    None => from.ip().to_string(), // 离线会话也可能被撤回
-                };
-                if ctx.st.update_history_pkt(&k, no, |rec| {
-                    rec["recalled"] = json!(true);
-                }) {
-                    ctx.st.emit(
-                        wire::evt::MSG_RECALLED,
-                        json!({"key": k, "pkt": no, "peer": pkt.user}),
-                    );
-                    ctx.st
-                        .diag(&format!("<- {from} DELMSG 撤回 pkt={no}（会话 {k}）"));
-                }
-            }
-        }
-        cmd::ANSREADMSG => {
-            // READMSG 带 READCHECKOPT 时的确认（8 版协议）：我方出站消息视为已读
-            let no = String::from_utf8_lossy(&pkt.extra)
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .parse::<u32>()
-                .ok();
-            if let Some(no) = no {
-                if let Some(k) = resolve_session_key(ctx, from.ip()) {
-                    if ctx.st.mark_out_read(&k, no) {
-                        ctx.st.emit(wire::evt::MSG_READ, json!({"key": k, "pkt": no}));
-                    }
-                }
-            }
-        }
-        cmd::GETABSENCEINFO => {
-            // 官方 §3-11：不在模式成员返回不在通知文；非不在模式回占位串
-            let cfg = ctx.st.config();
-            let text = if cfg.absence_enabled && !cfg.absence_text.trim().is_empty() {
-                cfg.absence_text.clone()
-            } else {
-                "Not absence mode".to_string()
-            };
-            let utf8 = proto::is_utf8_mode(&cfg.encoding);
-            let mut r = proto::Packet::new(
-                cmd::SENDABSENCEINFO | opt::AUTORETOPT | if utf8 { opt::UTF8OPT } else { 0 },
-            );
-            r.extra = proto::encode_out(&text, &cfg.encoding);
-            let bytes = r.encode(&my_user(&cfg), &my_host());
-            let _ = ctx.sock.send_to(&bytes, from).await;
-        }
-        cmd::SENDABSENCEINFO => {
-            // 对端的不在通知文：缓存到会话，供前端展示
-            let text = proto::text_of(&pkt);
-            ctx.st.set_peer_absence(&key, &text);
-            ctx.st
-                .emit(wire::evt::ABSENCE_INFO, json!({"key": key, "text": text}));
-        }
-        cmd::BR_ISGETLIST => {
-            // 主机列表能力探索：我方允许就回 OKGETLIST（官方 MsgBrIsGetList 同款）
-            let cfg = ctx.st.config();
-            if cfg.allow_send_list {
-                let r = proto::Packet::new(cmd::OKGETLIST);
-                let bytes = r.encode(&my_user(&cfg), &my_host());
-                let _ = ctx.sock.send_to(&bytes, from).await;
-            }
-        }
-        cmd::OKGETLIST => {
-            // 对方可回主机列表：窗口期（启动/手动刷新后）内发起 GETLIST
-            if ctx.st.hostlist_window_open() {
-                let cfg = ctx.st.config();
-                let mut r = proto::Packet::new(cmd::GETLIST);
-                r.extra = b"0".to_vec(); // 起始索引
-                let bytes = r.encode(&my_user(&cfg), &my_host());
-                let _ = ctx.sock.send_to(&bytes, from).await;
-            }
-        }
-        cmd::GETLIST => {
-            // 对方请求主机列表：官方 ANSLIST 结构（分页续传）
-            let cfg = ctx.st.config();
-            if !cfg.allow_send_list {
-                return;
-            }
-            let start = String::from_utf8_lossy(&pkt.extra)
-                .trim()
-                .parse::<usize>()
-                .unwrap_or(0);
-            let hosts: Vec<proto::HostListEntry> = {
-                let peers = ctx.st.peers.lock().unwrap();
-                peers
-                    .values()
-                    .map(|p| proto::HostListEntry {
-                        user: p.user.clone(),
-                        host: p.host.clone(),
-                        status: cmd::BR_ENTRY | if p.absence { opt::ABSENCEOPT } else { 0 },
-                        ip: p.ip.clone(),
-                        port: p.port,
-                        nick: p.nickname.clone(),
-                        group: p.group.clone(),
-                    })
-                    .collect()
-            };
-            let (wire, _n) = proto::build_anslist(&hosts, start, 4000, &cfg.encoding);
-            let utf8 = proto::is_utf8_mode(&cfg.encoding);
-            let mut r = proto::Packet::new(
-                cmd::ANSLIST | opt::AUTORETOPT | if utf8 { opt::UTF8OPT } else { 0 },
-            );
-            r.extra = wire;
-            let bytes = r.encode(&my_user(&cfg), &my_host());
-            let _ = ctx.sock.send_to(&bytes, from).await;
-        }
-        cmd::ANSLIST => {
-            // 主机列表回包：并入用户表；续传索引非 0 则继续取下一批
-            let (cont, hosts) = proto::parse_anslist(&pkt.extra, pkt.command);
-            let mut changed = false;
-            for h in hosts {
-                let ip = match h.ip.parse::<IpAddr>() {
-                    Ok(ip) => ip,
-                    Err(_) => continue,
-                };
-                if h.status & 0xFF == cmd::BR_EXIT {
-                    let mut peers = ctx.st.peers.lock().unwrap();
-                    if peers.remove(ip.to_string().as_str()).is_some() {
-                        changed = true;
-                    }
-                    continue;
-                }
-                let add = ctx.st.upsert_peer(PeerInfo {
-                    key: ip.to_string(),
-                    ip: ip.to_string(),
-                    port: if h.port == 0 { 2425 } else { h.port },
-                    nickname: if h.nick.is_empty() {
-                        h.user.clone()
-                    } else {
-                        h.nick.clone()
-                    },
-                    group: h.group.clone(),
-                    host: h.host.clone(),
-                    user: h.user.clone(),
-                    last_seen: now_secs(),
-                    absence: h.status & opt::ABSENCEOPT != 0,
-                    absence_text: None,
-                    vs: None,
-                });
-                changed |= add;
-            }
-            if changed {
-                ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
-            }
-            if cont != 0 {
-                let cfg = ctx.st.config();
-                let mut r = proto::Packet::new(cmd::GETLIST);
-                r.extra = cont.to_string().into_bytes();
-                let bytes = r.encode(&my_user(&cfg), &my_host());
-                let _ = ctx.sock.send_to(&bytes, from).await;
-            }
-        }
-        cmd::ANSLIST_DICT => {
-            // IPDict 版主机列表（v5）：纯 IPDict 报文，实际走 handle_dict_datagram；
-            // 经典报文路径出现该命令时按普通 ANSLIST 语义忽略
-            let _ = &pkt;
-        }
-        cmd::AGENT_REQ | cmd::AGENT_PROXYREQ => {
-            // 代理侧：有人在找通向某目标的路由 —— 我们能否送到？
-            let targ = String::from_utf8_lossy(&pkt.extra)
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let reachable = targ
-                .parse::<IpAddr>()
-                .map(|ip| {
-                    ctx.st.peers.lock().unwrap().contains_key(&ip.to_string())
-                        || local_ip_set().contains(&ip)
-                })
-                .unwrap_or(false);
-            let cfg = ctx.st.config();
-            let mut r = proto::Packet::new(cmd::AGENT_ANSREQ);
-            r.extra = format!("{targ}:{}", if reachable { 1 } else { 0 }).into_bytes();
-            let bytes = r.encode(&my_user(&cfg), &my_host());
-            let _ = ctx.sock.send_to(&bytes, from).await;
-            ctx.st.diag(&format!(
-                "<- {from} AGENT_REQ {targ} → {}",
-                if reachable { "可达" } else { "不可达" }
-            ));
-        }
-        cmd::AGENT_ANSREQ => {
-            // 代理能力应答：仅记录
-            ctx.st.diag(&format!(
-                "<- {from} AGENT_ANSREQ {}",
-                String::from_utf8_lossy(&pkt.extra)
-            ));
-        }
-        cmd::AGENT_PACKET => {
-            handle_agent_packet(ctx, &pkt, from).await;
-        }
-        cmd::GETINFO => {
-            let cfg = ctx.st.config();
-            let utf8 = proto::is_utf8_mode(&cfg.encoding);
-            let reply = proto::Packet::new(
-                cmd::SENDINFO | opt::AUTORETOPT | if utf8 { opt::UTF8OPT } else { 0 },
-            );
-            let mut r = reply;
-            r.extra = proto::encode_out(
-                concat!("OpenIPMsg v", env!("CARGO_PKG_VERSION")),
-                &cfg.encoding,
-            );
-            let bytes = r.encode(&my_user(&cfg), &my_host());
-            let _ = ctx.sock.send_to(&bytes, from).await;
-        }
-        cmd::GETPUBKEY => {
-            // 公钥握手请求（spec §5）：我方开关关闭时不广告、不应答，对端会回退明文
-            let cfg = ctx.st.config();
-            if cfg.encrypt {
-                let capa = entry_caps(&cfg) | crypto::CAPA_OUR_SEND;
-                let mut r = proto::Packet::new(cmd::ANSPUBKEY);
-                r.extra = crypto::build_anspubkey(capa, &ctx.st.own_keypair()).into_bytes();
-                let bytes = r.encode(&my_user(&cfg), &my_host());
-                let _ = ctx.sock.send_to(&bytes, from).await;
-                ctx.st.diag(&format!("-> {from} ANSPUBKEY capa={capa:X}"));
-            } else {
-                ctx.st
-                    .diag(&format!("<- {from} GETPUBKEY 忽略：本机加密已关闭"));
-            }
-        }
-        cmd::ANSPUBKEY => {
-            // 对端公钥应答：宽容解析后缓存能力位与公钥（持久化，重启免握手）
-            // 「解析失败」时附上长度与冒号/连字符位置，便于定位官方 revendian
-            // 或非标长度模数等互通格式差异（2026-08 现场排查用）
-            match crypto::parse_anspubkey(&String::from_utf8_lossy(&pkt.extra)) {
-                Some((capa, pubk)) => match ctx.st.remember_peer_key(&key, capa, &pubk) {
-                    Ok(()) => ctx
-                        .st
-                        .diag(&format!("<- {from} ANSPUBKEY 已缓存 capa={capa:X}")),
-                    Err(error) => ctx.st.diag(&format!(
-                        "<- {from} ANSPUBKEY 缓存失败 capa={capa:X}：{error}"
-                    )),
-                },
-                None => {
-                    let s = String::from_utf8_lossy(&pkt.extra);
-                    let colon = s.find(':').map(|i| i.to_string()).unwrap_or("-".into());
-                    let dash = s.find('-').map(|i| i.to_string()).unwrap_or("-".into());
-                    ctx.st.diag(&format!(
-                        "<- {from} ANSPUBKEY 解析失败，忽略 len={} colon@{colon} dash@{dash} head={}",
-                        s.len(),
-                        s.chars().take(24).collect::<String>()
-                    ));
-                }
-            }
-        }
-        cmd::RELEASEFILES => {
-            // 对端放弃接收：释放对应的文件槽。包编号的进制约定各家不一，两种都试
-            let first = pkt.extra.split(|&b| b == b':').next().unwrap_or(b"");
-            let cands = id_candidates(&String::from_utf8_lossy(first));
-            if !cands.is_empty() {
-                ctx.st
-                    .offered
-                    .lock()
-                    .unwrap()
-                    .retain(|(p, _), _| !cands.contains(p));
-            }
-        }
+        cmd::BR_ENTRY => inbound::entry::br_entry(ctx, from, &pkt, &key).await,
+        cmd::ANSENTRY | cmd::BR_ABSENCE => inbound::ansentry::ans_entry(ctx, from, &pkt, &key).await,
+        cmd::BR_EXIT => inbound::exit::br_exit(ctx, from, &pkt, &key).await,
+        cmd::RECVMSG => inbound::ack::recvmsg(ctx, from, &pkt, &key).await,
+        cmd::SENDMSG => inbound::sendmsg::send_msg(ctx, from, &pkt, &key).await,
+        cmd::READMSG => inbound::ack::readmsg(ctx, from, &pkt, &key).await,
+        cmd::DELMSG => inbound::ack::delmsg(ctx, from, &pkt, &key).await,
+        cmd::ANSREADMSG => inbound::ack::ansreadmsg(ctx, from, &pkt, &key).await,
+        cmd::GETABSENCEINFO => inbound::ack::get_absence_info(ctx, from, &pkt, &key).await,
+        cmd::SENDABSENCEINFO => inbound::ack::send_absence_info(ctx, from, &pkt, &key).await,
+        cmd::BR_ISGETLIST => inbound::ack::br_isgetlist(ctx, from, &pkt, &key).await,
+        cmd::OKGETLIST => inbound::ack::okgetlist(ctx, from, &pkt, &key).await,
+        cmd::GETLIST => inbound::roster::get_list(ctx, from, &pkt, &key).await,
+        cmd::ANSLIST => inbound::roster::ans_list(ctx, from, &pkt, &key).await,
+        cmd::ANSLIST_DICT => inbound::ack::anslist_dict(ctx, from, &pkt, &key).await,
+        cmd::AGENT_REQ | cmd::AGENT_PROXYREQ => inbound::ack::agent_req(ctx, from, &pkt, &key).await,
+        cmd::AGENT_ANSREQ => inbound::ack::agent_ansreq(ctx, from, &pkt, &key).await,
+        cmd::AGENT_PACKET => inbound::ack::agent_packet(ctx, from, &pkt, &key).await,
+        cmd::GETINFO => inbound::ack::getinfo(ctx, from, &pkt, &key).await,
+        cmd::GETPUBKEY => inbound::ack::getpubkey(ctx, from, &pkt, &key).await,
+        cmd::ANSPUBKEY => inbound::ack::anspubkey(ctx, from, &pkt, &key).await,
+        cmd::RELEASEFILES => inbound::ack::releasefiles(ctx, from, &pkt, &key).await,
         _ => {}
     }
 }
@@ -1812,294 +2192,6 @@ fn verified_ipdict_payload_identity(inner: &crate::ipdict::Dict) -> String {
     sha256_identity(b"verified-ipdict-v1", &[&inner.pack()])
 }
 
-async fn handle_sendmsg(
-    ctx: &NetCtx,
-    from: SocketAddr,
-    pkt: &proto::Packet,
-    key: &str,
-    enc_meta: Option<bool>,
-    identity: &str,
-    verified_payload: bool,
-    peer_metadata: Option<&ResolvedPeerMetadata>,
-) -> Result<InRecordOutcome, String> {
-    // 广播群发消息（BROADCASTOPT）：统一进「广播」会话（key=__broadcast__），
-    // 不回任何确认、不触发不在自动应答（官方 MsgSendMsg 同款门控）
-    let is_broadcast = pkt.command & opt::BROADCASTOPT != 0;
-    let session_key = if is_broadcast { "255.255.255.255" } else { key };
-    let attach = pkt.command & opt::FILEATTACHOPT != 0;
-    let files = if attach {
-        proto::parse_file_entries(&pkt.extra)
-    } else {
-        Vec::new()
-    };
-    let text_end = pkt
-        .extra
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(pkt.extra.len());
-    let text = proto::decode_for_command(&pkt.extra[..text_end], pkt.command);
-
-    let prior = ctx.st.find_in_record(session_key, pkt.pkt_no);
-    let prior = prior.filter(|record| {
-        let field = if verified_payload {
-            "payload_id"
-        } else {
-            "classic_payload_id"
-        };
-        record.get(field).and_then(Value::as_str) == Some(identity)
-    });
-    let prior_files: Vec<Value> = prior
-        .as_ref()
-        .and_then(|record| record.get("files").and_then(Value::as_array).cloned())
-        .unwrap_or_default();
-    let prior_file = |id: u32| -> Option<Value> {
-        prior_files
-            .iter()
-            .find(|file| file.get("id").and_then(Value::as_u64) == Some(id as u64))
-            .cloned()
-    };
-
-    let mut auto_ids = Vec::new();
-    let mut file_jsons = Vec::new();
-    for file in &files {
-        let is_dir = file.attr & 0xff == fileattr::DIR;
-        let auto = !is_dir && file.size <= 30 * 1024 * 1024 && is_inline_media_name(&file.name);
-        let previous = prior_file(file.id);
-        let inherited = previous
-            .as_ref()
-            .and_then(|value| value.get("state"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        if auto && matches!(inherited.as_deref(), None | Some("pending")) {
-            auto_ids.push(file.id);
-        }
-        let mut object = json!({
-            "id": file.id,
-            "rid": file.raw_id,
-            "name": file.name,
-            "size": file.size,
-            "mtime": file.mtime,
-            "attr": file.attr,
-            "ext_attrs": file.ext_attrs,
-            "dir_entry": is_dir,
-            "state": inherited.unwrap_or_else(|| if auto { "downloading" } else { "pending" }.into()),
-        });
-        if let Some(previous) = previous.as_ref() {
-            if previous.get("state").and_then(Value::as_str) == Some("done") {
-                if let Some(path) = previous.get("path") {
-                    object["path"] = path.clone();
-                }
-            }
-            if let Some(error) = previous.get("error") {
-                object["error"] = error.clone();
-            }
-        }
-        file_jsons.push(object);
-    }
-
-    let already_read = prior
-        .as_ref()
-        .and_then(|record| record.get("read").and_then(Value::as_bool))
-        .unwrap_or(false);
-    let secret = pkt.command & opt::SECRETOPT != 0;
-    let password_protected = pkt.command & opt::PASSWORDOPT != 0;
-    let prior_unlocked = prior
-        .as_ref()
-        .and_then(|record| record.get("unlocked").and_then(Value::as_bool))
-        .unwrap_or(false);
-    // 入站封书/密码锁的「未开封」状态：
-    // - 密码锁（PASSWORDOPT）一律保持未开封 —— 必须收件人输口令才能看，
-    //   自动打开也不能绕过这道门；
-    // - 无密码封书按设置项 `auto_open_secret`（默认开）处理：开启时等价于
-    //   收件人一收到就点了「开封」，正文直接上屏、回执随之走常规已读流程；
-    //   关闭时保持信封占位、不回 READMSG，由收件人手动开封。
-    //   曾经这里写死「一律未开封」，理由是无条件自动开封会让封书在接收端
-    //   退化成普通消息；现在这是用户可选的开关，关掉即回到那个语义。
-    // 同一 payload 的重投沿用既有开封状态（用户开过的信不必再开一次）。
-    let auto_open = secret && !password_protected && ctx.st.config().auto_open_secret;
-    let unlocked = prior_unlocked || auto_open;
-
-    // key 是真实发送方 IP，不是广播信箱 key；广播同样复用已知昵称。
-    let existing_peer = ctx.st.peers.lock().unwrap().get(key).cloned();
-    let metadata_nickname = peer_metadata
-        .and_then(|metadata| metadata.nickname.as_deref())
-        .filter(|nickname| !nickname.is_empty());
-    let metadata_group = peer_metadata
-        .and_then(|metadata| metadata.group.as_deref())
-        .filter(|group| !group.is_empty());
-    let display = metadata_nickname
-        .map(str::to_string)
-        .or_else(|| {
-            existing_peer
-                .as_ref()
-                .map(|peer| peer.nickname.clone())
-                .filter(|name| !name.is_empty())
-        })
-        .unwrap_or_else(|| pkt.user.clone());
-    let group = metadata_group
-        .map(str::to_string)
-        .or_else(|| {
-            existing_peer
-                .as_ref()
-                .map(|peer| peer.group.clone())
-                .filter(|group| !group.is_empty())
-        })
-        .unwrap_or_default();
-
-    let mut record = json!({
-        "dir": "in",
-        "kind": if files.is_empty() { "text" } else { "file" },
-        "text": text,
-        "files": file_jsons,
-        "ts": now_secs(),
-        "pkt": pkt.pkt_no,
-        // ip = 本次报文的真实来源地址。单播时会话 key 就等于它，冗余但无害；
-        // 广播会话（key=255.255.255.255）没有它就只能显示昵称/主机 —— 界面上
-        // 就成了「一个没有 IP 的离线联系人」，而这台机器其实是活的。
-        "peer": {"key": session_key, "ip": from.ip().to_string(), "nickname": display, "host": pkt.host, "group": group},
-        "need_read": pkt.command & opt::READCHECKOPT != 0,
-        "read": already_read,
-        "enc": enc_meta.is_some(),
-        "sig_ok": enc_meta.unwrap_or(true),
-        "secret": secret,
-        "locked": password_protected && !unlocked,
-        "unlocked": unlocked,
-        "broadcast": is_broadcast,
-    });
-    if verified_payload {
-        record["payload_id"] = json!(identity);
-    } else {
-        record["classic_payload_id"] = json!(identity);
-    }
-
-    let outcome = ctx
-        .st
-        .upsert_in_record_fallible(session_key, &record)
-        .map_err(|error| format!("E_PERSIST_FAILED|{error}"))?;
-    if outcome == InRecordOutcome::Duplicate {
-        return Ok(outcome);
-    }
-
-    // 从这里往后持久化已确认成功；UI、自动下载、联系人恢复和自动应答等副作用
-    // 一律放在这个边界之后。
-    let was_unhidden = !is_broadcast && ctx.st.unhide_contact(key);
-
-    if !is_broadcast {
-        let no_add_list = pkt.command & opt::NOADDLISTOPT != 0;
-        let metadata_changed = if existing_peer.is_some() {
-            let nickname = metadata_nickname.map(proto::strip_control);
-            let group = metadata_group.map(proto::strip_control);
-            let version = peer_metadata
-                .and_then(|metadata| metadata.client_version.as_deref())
-                .map(proto::strip_control);
-            let absence = peer_metadata
-                .and_then(|metadata| metadata.status)
-                .map(|status| status & opt::ABSENCEOPT != 0);
-            let mut peers = ctx.st.peers.lock().unwrap();
-            match peers.get_mut(key) {
-                Some(existing) => {
-                    existing.last_seen = now_secs();
-                    let mut changed = false;
-                    if peer_metadata.is_some() {
-                        existing.host = pkt.host.clone();
-                        existing.user = pkt.user.clone();
-                        if let Some(nickname) = nickname {
-                            changed |= existing.nickname != nickname;
-                            existing.nickname = nickname;
-                        }
-                        if let Some(group) = group {
-                            changed |= existing.group != group;
-                            existing.group = group;
-                        }
-                        if let Some(version) = version {
-                            changed |= existing.vs.as_deref() != Some(version.as_str());
-                            existing.vs = Some(version);
-                        }
-                        if let Some(absence) = absence {
-                            changed |= existing.absence != absence;
-                            existing.absence = absence;
-                        }
-                    }
-                    changed
-                }
-                None => false,
-            }
-        } else if !no_add_list {
-            let metadata = peer_metadata.cloned().unwrap_or_default();
-            let added = ctx.st.upsert_peer(PeerInfo {
-                key: key.to_string(),
-                ip: from.ip().to_string(),
-                port: from.port(),
-                nickname: metadata
-                    .nickname
-                    .filter(|nickname| !nickname.is_empty())
-                    .unwrap_or_else(|| pkt.user.clone()),
-                group: metadata.group.unwrap_or_default(),
-                host: pkt.host.clone(),
-                user: pkt.user.clone(),
-                last_seen: now_secs(),
-                absence: metadata.status.unwrap_or(0) & opt::ABSENCEOPT != 0,
-                absence_text: None,
-                vs: metadata.client_version,
-            });
-            added
-        } else {
-            false
-        };
-        if was_unhidden || metadata_changed {
-            ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
-        }
-    }
-
-    if !is_broadcast && pkt.command & opt::AUTORETOPT == 0 {
-        let config = ctx.st.config();
-        if config.absence_enabled && !config.absence_text.trim().is_empty() {
-            let utf8 = proto::is_utf8_mode(&config.encoding);
-            let mut reply = proto::Packet::new(
-                cmd::SENDMSG | opt::AUTORETOPT | if utf8 { opt::UTF8OPT } else { 0 },
-            );
-            reply.extra = proto::encode_out(&config.absence_text, &config.encoding);
-            let bytes = reply.encode(&my_user(&config), &my_host());
-            let _ = ctx.sock.send_to(&bytes, from).await;
-            ctx.st
-                .diag(&format!("-> {from} 不在模式自动应答（AUTORETOPT）"));
-        }
-    }
-
-    ctx.st.emit(
-        wire::evt::MSG_IN,
-        json!({"key": session_key, "msg": record, "resend": false}),
-    );
-
-    if !is_broadcast {
-        for file in files.iter().filter(|file| auto_ids.contains(&file.id)) {
-            let state = ctx.st.clone();
-            let socket = ctx.sock.clone();
-            let port = ctx.port;
-            let key = key.to_string();
-            let name = file.name.clone();
-            let raw_id = file.raw_id.clone();
-            let id = file.id;
-            let size = file.size;
-            let packet_no = pkt.pkt_no;
-            tokio::spawn(async move {
-                let context = NetCtx {
-                    st: state,
-                    sock: socket,
-                    v6_sock: tokio::sync::Mutex::new(None),
-                    port,
-                };
-                if let Err(error) =
-                    download_file_task(&context, &key, packet_no, id, &name, &raw_id, size, false)
-                        .await
-                {
-                    oim_log!("[auto-dl] {key} #{id} {name}: {error}");
-                }
-            });
-        }
-    }
-    Ok(outcome)
-}
 
 /* ================= 剪贴板图片 ================= */
 
@@ -3236,7 +3328,7 @@ async fn handle_encipdict(ctx: &NetCtx, outer: &crate::ipdict::Dict, from: Socke
         return;
     }
     let identity = verified_ipdict_payload_identity(&inner);
-    match handle_sendmsg(
+    match inbound::sendmsg::handle_sendmsg(
         ctx,
         from,
         packet,
@@ -5082,7 +5174,7 @@ mod tests {
         packet.pkt_no = pkt_no;
         let identity = super::classic_payload_identity(&packet);
 
-        super::handle_sendmsg(&ctx, from, &packet, &key, None, &identity, false, None)
+        super::inbound::sendmsg::handle_sendmsg(&ctx, from, &packet, &key, None, &identity, false, None)
             .await
             .unwrap();
 
@@ -5441,7 +5533,7 @@ mod tests {
         );
         sendmsg.extra = b"hi".to_vec();
         let identity = super::classic_payload_identity(&sendmsg);
-        super::handle_sendmsg(&ctx, from, &sendmsg, &key, None, &identity, false, None)
+        super::inbound::sendmsg::handle_sendmsg(&ctx, from, &sendmsg, &key, None, &identity, false, None)
             .await
             .unwrap();
         check(&seen, wire::evt::MSG_IN);
@@ -5554,7 +5646,7 @@ mod tests {
         let mut first = classic_identity_packet(extra, base_command);
         first.pkt_no = pkt_no;
         let first_identity = super::classic_payload_identity(&first);
-        super::handle_sendmsg(&ctx, from, &first, &key, None, &first_identity, false, None)
+        super::inbound::sendmsg::handle_sendmsg(&ctx, from, &first, &key, None, &first_identity, false, None)
             .await
             .unwrap();
         st.mark_in_read(&key, &[pkt_no]);
@@ -5574,7 +5666,7 @@ mod tests {
         replacement.command |= crate::protocol::opt::PASSWORDOPT;
         let replacement_identity = super::classic_payload_identity(&replacement);
         assert_ne!(first_identity, replacement_identity);
-        super::handle_sendmsg(
+        super::inbound::sendmsg::handle_sendmsg(
             &ctx,
             from,
             &replacement,
@@ -5680,7 +5772,7 @@ mod tests {
         let key = from.ip().to_string();
 
         let identity = super::classic_payload_identity(&packet);
-        super::handle_sendmsg(&ctx, from, &packet, &key, None, &identity, false, None)
+        super::inbound::sendmsg::handle_sendmsg(&ctx, from, &packet, &key, None, &identity, false, None)
             .await
             .unwrap();
 
@@ -5731,7 +5823,7 @@ mod tests {
         packet.user = "ubuntu".into();
         packet.extra = b"Hello".to_vec();
         let identity = super::classic_payload_identity(&packet);
-        super::handle_sendmsg(&ctx, from, &packet, &key, None, &identity, false, None)
+        super::inbound::sendmsg::handle_sendmsg(&ctx, from, &packet, &key, None, &identity, false, None)
             .await
             .unwrap();
         let record = st.find_history_pkt(crate::state::BROADCAST_SESSION_KEY, 771002)
@@ -5761,7 +5853,7 @@ mod tests {
         let key = from.ip().to_string();
 
         let identity = super::classic_payload_identity(&packet);
-        super::handle_sendmsg(&ctx, from, &packet, &key, None, &identity, false, None)
+        super::inbound::sendmsg::handle_sendmsg(&ctx, from, &packet, &key, None, &identity, false, None)
             .await
             .unwrap();
 
@@ -5800,7 +5892,7 @@ mod tests {
         let key = from.ip().to_string();
 
         let identity = super::classic_payload_identity(&packet);
-        super::handle_sendmsg(&ctx, from, &packet, &key, None, &identity, false, None)
+        super::inbound::sendmsg::handle_sendmsg(&ctx, from, &packet, &key, None, &identity, false, None)
             .await
             .unwrap();
 
