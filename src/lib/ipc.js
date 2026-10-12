@@ -209,6 +209,8 @@ export const EVT = {
   /** 点击系统通知（Linux 原生）：弹出主窗口并切到对应会话 */
   openChat: 'open-chat',
   msgRead: 'msg-read',
+  /** 对端送达确认（RECVMSG）：气泡从「未读」翻到「已送达」（官方客户端只会给这个） */
+  msgDelivered: 'msg-delivered',
   /** 对端撤回消息（DELMSG） */
   msgRecalled: 'msg-recalled',
   /** 封书/密码锁开封 */

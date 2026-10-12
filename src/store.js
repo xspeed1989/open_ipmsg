@@ -332,7 +332,25 @@ function onMsgRead({ key, pkt }) {
   if (!chat) return
   // 这是对端回来的 READMSG：被读的是「我方发出」的那条消息
   const msg = chat.msgs.find((m) => m.pkt === pkt && m.dir === 'out')
-  if (msg) msg.read = true
+  if (msg) {
+    msg.read = true
+    // 已读蕴含已送达：两条记录状态不自相矛盾（同后端 mark_out_read）
+    msg.delivered = true
+  }
+}
+
+/**
+ * 对端送达确认（RECVMSG）：把出站气泡从「未读」翻到「已送达」。
+ *
+ * 官方 Windows 客户端对普通消息只回 RECVMSG、从不回 READMSG，没有这一档
+ * 气泡就永远挂在「未读」（只能等对方回话走兜底）。已读是更强的状态，
+ * 这里不反向覆盖 read。
+ */
+function onMsgDelivered({ key, pkt }) {
+  const chat = store.chats[key]
+  if (!chat) return
+  const msg = chat.msgs.find((m) => m.pkt === pkt && m.dir === 'out')
+  if (msg) msg.delivered = true
 }
 
 /* ---------------- 系统通知 ---------------- */
@@ -663,6 +681,7 @@ export async function boot() {
     }
   })
   await ipc.listenEvent(ipc.EVT.msgRead, onMsgRead)
+  await ipc.listenEvent(ipc.EVT.msgDelivered, onMsgDelivered)
   await ipc.listenEvent(ipc.EVT.fileProgress, onFileProgress)
   await ipc.listenEvent(ipc.EVT.msgRecalled, ({ key, pkt }) => {
     const chat = store.chats[key]

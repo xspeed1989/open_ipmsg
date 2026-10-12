@@ -2379,7 +2379,10 @@ impl AppState {
             .last()
     }
 
-    /// 标记出站消息已被对端已读（收到 READMSG 回执），返回是否有变更
+    /// 标记出站消息已被对端已读（收到 READMSG 回执），返回是否有变更。
+    ///
+    /// 顺带置 `delivered`：已读必然意味着已送达，不能让历史里出现
+    /// 「已读但未送达」这种自相矛盾的记录。
     pub fn mark_out_read(&self, key: &str, pkt: u32) -> bool {
         self.rewrite_history(
             key,
@@ -2389,6 +2392,28 @@ impl AppState {
             },
             |rec| {
                 rec["read"] = true.into();
+                rec["delivered"] = true.into();
+            },
+        )
+    }
+
+    /// 标记出站消息已被对端客户端收下（收到 RECVMSG 送达确认），返回是否翻转。
+    ///
+    /// 「已送达」与「已读」是两个状态。官方 Windows 客户端对普通消息**只回
+    /// RECVMSG、从不回 READMSG**（`recvdlg.cpp` 的 READMSG 只在封书开封时发），
+    /// 没有这个中间态，气泡就会一直挂在「未读」，只能等对方回话走
+    /// 「对方回话即视为已读」兜底 —— 表现为「无法及时已读」。
+    /// 已置位的记录不再算变更，调用方据此只推一次事件。
+    pub fn mark_out_delivered(&self, key: &str, pkt: u32) -> bool {
+        self.rewrite_history(
+            key,
+            |rec| {
+                rec.get("dir").and_then(|v| v.as_str()) == Some("out")
+                    && rec.get("pkt").and_then(|v| v.as_u64()) == Some(pkt as u64)
+                    && rec.get("delivered").and_then(|v| v.as_bool()) != Some(true)
+            },
+            |rec| {
+                rec["delivered"] = true.into();
             },
         )
     }

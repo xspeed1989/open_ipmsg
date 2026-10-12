@@ -14,6 +14,7 @@ import { computePopupPosition } from '../lib/popup'
 import { isSealedEnvelope, isPasswordEnvelope, showsSealTag } from '../lib/secret'
 import { composeReplyBody, quotePreview } from '../lib/reply'
 import { recalledEditState } from '../lib/recall'
+import { deliveryState } from '../lib/receipts'
 import { forwardPayload, mergeForward } from '../lib/forward'
 import { groupPayload, sendToEach } from '../lib/groupsend'
 import { copyTextOf } from '../lib/copymsg'
@@ -1403,8 +1404,8 @@ watch(
               <span v-if="showsSealTag(v.m)" class="seal-tag" :title="t('chat.secretSend')">
                 🔒 {{ t('chat.secretTag') }}
               </span>
-              <span v-if="v.m.dir === 'out' && v.m.rcpt && !v.m.queued" class="read-tag" :class="{ done: v.m.read }">
-                {{ v.m.read ? t('chat.read') : t('chat.unread') }}
+              <span v-if="deliveryState(v.m)" class="read-tag" :class="deliveryState(v.m)">
+                {{ t(`chat.${deliveryState(v.m)}`) }}
               </span>
               {{ fmtTime(v.m.ts) }}<svg v-if="v.m.enc" class="m-lock" width="10" height="10" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                 <rect x="4.5" y="10" width="15" height="10" rx="2" stroke="currentColor" stroke-width="2" />
@@ -1954,8 +1955,14 @@ watch(
   color: var(--c-weak);
   margin-left: 6px;
 }
-.read-tag.done {
+.read-tag.read {
   color: var(--c-accent);
+}
+/* 已送达（对端客户端收下了，但还没给已读）：介于未读与已读之间的弱强调。
+   官方 Windows 客户端对普通消息永远停在这一档（它从不回 READMSG） */
+.read-tag.delivered {
+  color: var(--c-accent);
+  opacity: 0.62;
 }
 /* 加密锁标：仅 enc===true 的记录显示（旧记录/明文消息无该字段，渲染保持原样） */
 .m-lock {

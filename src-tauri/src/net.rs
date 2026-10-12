@@ -1312,6 +1312,12 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                         ctx.st
                             .diag(&format!("<- {from} RECVMSG 送达确认 pkt={c}（离线:{acked_offline} 重发:{acked_retry}）已送达"));
                     }
+                    // 送达确认同时落一条「已送达」：官方 Windows 客户端对普通消息
+                    // 只回 RECVMSG、从不回 READMSG（recvdlg 的 READMSG 只在封书
+                    // 开封时发），不记这个中间态，气泡就永远停在「未读」。
+                    if ctx.st.mark_out_delivered(&k, c) {
+                        ctx.st.emit("msg-delivered", json!({"key": k, "pkt": c}));
+                    }
                 }
             }
         }
@@ -2369,6 +2375,8 @@ fn offline_enqueue_record(
         // 文件消息不请求已读回执（与直发一致）；文本保留回执
         "rcpt": entries.is_empty(),
         "read": false,
+        // 送达/已读由重投后的回执回填（见 mark_out_delivered / mark_out_read）
+        "delivered": false,
         "queued": true,
         // 入队时必然明文暂存；实际是否加密由重投时的 flush_pending_for 决定
         "enc": false, "sig_ok": true,
@@ -2680,6 +2688,9 @@ pub async fn send_message_opts(
         "peer": {"key": peer.key, "nickname": peer.nickname, "host": peer.host, "group": peer.group},
         "rcpt": want_read,
         "read": false,
+        // 送达确认（RECVMSG）落成的中间态：官方客户端下气泡会从「未读」翻到
+        // 「已送达」而不再等一个永远不会来的 READMSG（见 state::mark_out_delivered）
+        "delivered": false,
         // 本次实际是否加密发出；我方发出的消息签名恒可核验
         "enc": enc, "sig_ok": true,
         "secret": flags.secret,
@@ -6207,6 +6218,89 @@ mod tests {
     #[test]
     fn encfileopt_matches_official_wire_value() {
         assert_eq!(opt::ENCFILEOPT, 0x0000_0800);
+    }
+
+    #[tokio::test]
+    async fn recvmsg_marks_out_record_delivered_and_hex_body_is_accepted() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("recvmsg-delivered").await;
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        register_loopback_peer(&st, from.port());
+
+        // 每次调用都取新包号：handle_datagram 对非 SENDMSG 报文按包号去重，
+        // 复用同一报头会直接被当成重复包丢掉，测不出「重复确认不再推事件」。
+        fn recvmsg(body: &str) -> crate::protocol::Packet {
+            let mut p = crate::protocol::Packet::new(
+                crate::protocol::cmd::RECVMSG | crate::protocol::opt::AUTORETOPT,
+            );
+            p.extra = body.as_bytes().to_vec();
+            p
+        }
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+        let events_in = events.clone();
+        st.set_event(Box::new(move |event, value| {
+            events_in.lock().unwrap().push((event.to_string(), value));
+        }));
+        let count = |name: &str| {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(n, _)| n == name)
+                .count()
+        };
+
+        let rec = super::send_message(&ctx, &key, "等送达确认", vec![])
+            .await
+            .expect("发送文本");
+        let pkt = rec["pkt"].as_u64().unwrap() as u32;
+        assert_eq!(rec["delivered"], false, "刚发出时既未送达也未读");
+        assert_eq!(rec["rcpt"], true, "文本消息要请求已读回执");
+
+        // 1) 十进制包号的 RECVMSG（官方 %ld/%d 写法）
+        super::handle_datagram(&ctx, &recvmsg(&pkt.to_string()).encode("peer", "peer-host"), from)
+            .await;
+        let after = st.find_history_any(&key, pkt).unwrap();
+        assert_eq!(after["delivered"], true, "RECVMSG 要落成已送达");
+        assert_eq!(after["read"], false, "送达不等于已读");
+        assert_eq!(count("msg-delivered"), 1, "要推一条 msg-delivered 供前端翻状态");
+        assert_eq!(count("msg-read"), 0);
+
+        // 2) 重复的送达确认不再推事件（记录已置位 → mark_out_delivered 返回 false）
+        super::handle_datagram(&ctx, &recvmsg(&pkt.to_string()).encode("peer", "peer-host"), from)
+            .await;
+        assert_eq!(count("msg-delivered"), 1, "重复确认不得重复推事件");
+
+        // 3) 十六进制包号也要认（部分中文客户端用十六进制书写回执）
+        let rec2 = super::send_message(&ctx, &key, "十六进制回执", vec![])
+            .await
+            .unwrap();
+        let pkt2 = rec2["pkt"].as_u64().unwrap() as u32;
+        super::handle_datagram(
+            &ctx,
+            &recvmsg(&format!("{pkt2:x}")).encode("peer", "peer-host"),
+            from,
+        )
+        .await;
+        assert_eq!(
+            st.find_history_any(&key, pkt2).unwrap()["delivered"],
+            true,
+            "十六进制包号的送达确认也要认"
+        );
+
+        // 4) READMSG 才是已读；已读反过来也把 delivered 置上，两者不自相矛盾
+        let mut read = crate::protocol::Packet::new(
+            crate::protocol::cmd::READMSG | crate::protocol::opt::AUTORETOPT,
+        );
+        read.extra = pkt.to_string().into_bytes();
+        super::handle_datagram(&ctx, &read.encode("peer", "peer-host"), from).await;
+        let after_read = st.find_history_any(&key, pkt).unwrap();
+        assert_eq!(after_read["read"], true, "READMSG 落已读");
+        assert_eq!(after_read["delivered"], true);
+        assert_eq!(count("msg-read"), 1);
+
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]

@@ -568,6 +568,20 @@ async fn async_run() -> bool {
     );
 
     /* ---- 5. 已读回执 ---- */
+    // 送达确认先落「已送达」：官方 Windows 客户端对普通消息只回 RECVMSG、
+    // 从不回 READMSG（它的 READMSG 只在封书开封时发），没有这一档气泡就永远
+    // 挂在「未读」。假对端现在像真机一样按 SENDCHECKOPT 回 RECVMSG。
+    let delivered = wait_for(3000, || {
+        st.read_history(&peer_key, 50)
+            .iter()
+            .find(|r| r["dir"] == "out" && r["text"] == "你好，假对端！")
+            .and_then(|r| r.get("delivered"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    })
+    .await;
+    log.check("收到 RECVMSG 送达确认后出站消息标记已送达", delivered);
+
     // 出站方向：我们发的消息带 READCHECKOPT，假对端回复 READMSG 后应标记为已读。
     // 注意：read_history 只保留末尾 limit 条，前面的新增记录（如空文件公告）会
     // 把最早的消息挤出窗口 —— 这里按文本找最早的出站消息，limit 必须足够大
