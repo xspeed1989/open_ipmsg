@@ -236,7 +236,7 @@ async fn get_config(st: State<'_, SharedState>) -> Result<Value, String> {
             }
         }
     }
-    Ok(config_view(cfg, hostname, ips, st.fingerprint()))
+    Ok(config_view(cfg, hostname, ips, st.trust.fingerprint()))
 }
 
 /// 把前端补丁合并到已有配置上（纯函数，便于回归测试）。
@@ -1800,7 +1800,7 @@ pub fn run() {
             // 恢复离线消息待投递队列（对方上线后自动重投）
             st.load_pending();
             // 恢复对端公钥缓存（加密会话重启后无需重新交换公钥）
-            st.load_peer_keys();
+            st.trust.load_peer_keys();
             // 会话键从 ip:port 归一化为纯 IP：把旧命名的 `<ip>_<端口>.jsonl`
             // 迁移成 `<ip>.jsonl`，并改写记录内的 peer.key 快照
             let migrated = st.migrate_legacy_history_keys();

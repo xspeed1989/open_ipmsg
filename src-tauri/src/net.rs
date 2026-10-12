@@ -547,8 +547,8 @@ async fn retry_pending_for(ctx: Arc<NetCtx>, key: &str) {
         let mut enc = false;
         let mut wire_extra = extra.clone();
         if cfg.encrypt {
-            if let Some(pubk) = ctx.st.peer_pubkey(key) {
-                match crypto::seal_message(&pubk, &ctx.st.own_keypair(), &plain_payload(&extra)) {
+            if let Some(pubk) = ctx.st.trust.peer_pubkey(key) {
+                match crypto::seal_message(&pubk, &ctx.st.trust.own_keypair(), &plain_payload(&extra)) {
                     Ok(sealed) => {
                         wire_extra = sealed.into_bytes();
                         enc = true;
@@ -674,12 +674,12 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
         // 尾注后超限）同样降级明文并记诊断，保证离线留言最终可达。
         let mut enc = false;
         let wire_extra = match if cfg.encrypt {
-            ctx.st.peer_pubkey(key)
+            ctx.st.trust.peer_pubkey(key)
         } else {
             None
         } {
             Some(pubk) => {
-                match crypto::seal_message(&pubk, &ctx.st.own_keypair(), &plain_payload(&plain)) {
+                match crypto::seal_message(&pubk, &ctx.st.trust.own_keypair(), &plain_payload(&plain)) {
                     Ok(sealed) => {
                         enc = true;
                         sealed.into_bytes()
@@ -858,8 +858,8 @@ async fn maybe_start_handshake(
 ) {
     if !cfg.encrypt
         || pkt.command & opt::ENCRYPTOPT == 0
-        || ctx.st.peer_pubkey(key).is_some()
-        || ctx.st.peer_marked_plain(key)
+        || ctx.st.trust.peer_pubkey(key).is_some()
+        || ctx.st.trust.peer_marked_plain(key)
     {
         return;
     }
@@ -877,8 +877,8 @@ fn maybe_withdraw_peer_key(
     key: &str,
     cfg: &Config,
 ) {
-    if cfg.encrypt && pkt.command & opt::ENCRYPTOPT == 0 && ctx.st.peer_pubkey(key).is_some() {
-        match ctx.st.forget_peer_key(key) {
+    if cfg.encrypt && pkt.command & opt::ENCRYPTOPT == 0 && ctx.st.trust.peer_pubkey(key).is_some() {
+        match ctx.st.trust.forget_peer_key(key) {
             Ok(()) => ctx.st.diag(&format!(
                 "<- {from} 上线通告未声明 ENCRYPTOPT，撤回该对端公钥缓存"
             )),
@@ -895,7 +895,7 @@ fn maybe_withdraw_peer_key(
 /// 每次发出都计入该 IP 的探测预算（会话键即对端 IP，见 handle_datagram 注释）；
 /// 预算语义见 AppState::retire_probe_budget。
 async fn send_getpubkey(ctx: &NetCtx, target: SocketAddr, cfg: &Config) {
-    let n = ctx.st.record_probe(&target.ip().to_string());
+    let n = ctx.st.trust.record_probe(&target.ip().to_string());
     let capa = entry_caps(cfg) | crypto::CAPA_OUR_SEND;
     let mut g = proto::Packet::new(cmd::GETPUBKEY);
     g.extra = format!("{capa:x}").into_bytes();
@@ -913,7 +913,7 @@ async fn send_getpubkey(ctx: &NetCtx, target: SocketAddr, cfg: &Config) {
 /// 把我方最新公钥推给对方（官方协议应答报，对端按普通应答缓存，无害）。
 /// 限频由 AppState::try_rehandshake_gate（10s/IP）兜底。
 async fn crypto_rehandshake(ctx: &NetCtx, from: SocketAddr, key: &str, reason: &str) {
-    if !ctx.st.try_rehandshake_gate(key) {
+    if !ctx.st.trust.try_rehandshake_gate(key) {
         return;
     }
     let cfg = ctx.st.config();
@@ -927,7 +927,7 @@ async fn crypto_rehandshake(ctx: &NetCtx, from: SocketAddr, key: &str, reason: &
         .await;
     // 2) 主动推送我方最新公钥（对方换钥后其缓存里可能还是我的旧钥）
     let mut a = proto::Packet::new(cmd::ANSPUBKEY);
-    a.extra = crypto::build_anspubkey(capa, &ctx.st.own_keypair()).into_bytes();
+    a.extra = crypto::build_anspubkey(capa, &ctx.st.trust.own_keypair()).into_bytes();
     let _ = ctx
         .sock
         .send_to(&a.encode(&my_user(&cfg), &my_host()), from)
@@ -1474,7 +1474,7 @@ mod inbound {
             if cfg.encrypt {
                 let capa = entry_caps(&cfg) | crypto::CAPA_OUR_SEND;
                 let mut r = proto::Packet::new(cmd::ANSPUBKEY);
-                r.extra = crypto::build_anspubkey(capa, &ctx.st.own_keypair()).into_bytes();
+                r.extra = crypto::build_anspubkey(capa, &ctx.st.trust.own_keypair()).into_bytes();
                 let bytes = r.encode(&my_user(&cfg), &my_host());
                 let _ = ctx.sock.send_to(&bytes, from).await;
                 ctx.st.diag(&format!("-> {from} ANSPUBKEY capa={capa:X}"));
@@ -1489,7 +1489,7 @@ mod inbound {
             // 「解析失败」时附上长度与冒号/连字符位置，便于定位官方 revendian
             // 或非标长度模数等互通格式差异（2026-08 现场排查用）
             match crypto::parse_anspubkey(&String::from_utf8_lossy(&pkt.extra)) {
-                Some((capa, pubk)) => match ctx.st.remember_peer_key(&key, capa, &pubk) {
+                Some((capa, pubk)) => match ctx.st.trust.remember_peer_key(&key, capa, &pubk) {
                     Ok(()) => ctx
                         .st
                         .diag(&format!("<- {from} ANSPUBKEY 已缓存 capa={capa:X}")),
@@ -1535,9 +1535,9 @@ mod inbound {
             if pkt.command & opt::ENCRYPTOPT != 0 {
                 let cfg = ctx.st.config();
                 if cfg.encrypt {
-                    let peer_pubs = ctx.st.peer_pubkeys(&key);
+                    let peer_pubs = ctx.st.trust.peer_pubkeys(&key);
                     match crypto::open_message(
-                        &ctx.st.own_keypair(),
+                        &ctx.st.trust.own_keypair(),
                         &String::from_utf8_lossy(&pkt.extra),
                         &peer_pubs,
                         pkt.pkt_no,
@@ -2502,7 +2502,7 @@ pub async fn send_message_multi(
 ) -> Result<Vec<Value>, String> {
     let cfg = ctx.st.config();
     // 与 send_message 的出站加密决策一致：encrypt 开启且已缓存对端公钥才会密封
-    let will_seal = cfg.encrypt && ctx.st.peer_pubkey(key).is_some();
+    let will_seal = cfg.encrypt && ctx.st.trust.peer_pubkey(key).is_some();
     let parts: Vec<String> = if !will_seal {
         vec![text.to_string()]
     } else if paths.is_empty() {
@@ -2540,7 +2540,7 @@ pub async fn send_message_multi_opts(
 ) -> Result<Vec<Value>, String> {
     let cfg = ctx.st.config();
     // 与 send_message 的出站加密决策一致：encrypt 开启且已缓存对方公钥才会密封
-    let will_seal = cfg.encrypt && ctx.st.peer_pubkey(key).is_some();
+    let will_seal = cfg.encrypt && ctx.st.trust.peer_pubkey(key).is_some();
     let parts: Vec<String> = if !will_seal {
         vec![text.to_string()]
     } else if paths.is_empty() {
@@ -2662,7 +2662,7 @@ pub async fn send_message_opts(
     let mut enc = false;
     let mut wire_extra = extra.clone();
     if cfg.encrypt {
-        if let Some(pubk) = ctx.st.peer_pubkey(key) {
+        if let Some(pubk) = ctx.st.trust.peer_pubkey(key) {
             // 现场诊断（2026-08 官方客户端互通排查）：出站加密前落盘实际
             // 公告明文（含分隔与尾部 \0），用于与官方规范逐字节比对
             let plain = plain_payload(&extra);
@@ -2683,14 +2683,14 @@ pub async fn send_message_opts(
                 "send-plain {key} enc len={} body={plain_dbg}",
                 plain.len()
             ));
-            match crypto::seal_message(&pubk, &ctx.st.own_keypair(), &plain) {
+            match crypto::seal_message(&pubk, &ctx.st.trust.own_keypair(), &plain) {
                 Ok(sealed) => {
                     wire_extra = sealed.into_bytes();
                     enc = true;
                 }
                 Err(e) => return Err(e), // 「消息过长…」等直接抛给前端
             }
-        } else if ctx.st.retire_probe_budget(key) {
+        } else if ctx.st.trust.retire_probe_budget(key) {
             // 预算用尽：内部恰在阈值穿越点 mark_peer_plain 一次，本条起走明文
         } else {
             send_getpubkey(ctx, target, &cfg).await;
@@ -3073,7 +3073,7 @@ fn dict_init(cfg: &Config, cmd: u32, flags: u32, user: &str, host: &str) -> crat
 /// 中已被推翻（见 crypto.rs 注释），这里按标准大端实现，解析端宽容。
 fn dict_sign(ctx: &NetCtx, d: &mut crate::ipdict::Dict) -> Result<(), String> {
     let capa = entry_caps(&ctx.st.config()) | crypto::CAPA_OUR_SEND;
-    crypto::sign_ipdict(d, &ctx.st.own_keypair(), capa)
+    crypto::sign_ipdict(d, &ctx.st.trust.own_keypair(), capa)
 }
 
 /// 校验 IPDict 签名：从 PUB_E/PUB_N/SIGN 重建公钥核验（SHA-256）。
@@ -3185,7 +3185,7 @@ async fn commit_verified_encipdict_key(
     inner_len: usize,
     key_count: usize,
 ) -> bool {
-    match ctx.st.commit_verified_peer_key(key, capa, public) {
+    match ctx.st.trust.commit_verified_peer_key(key, capa, public) {
         Ok(
             VerifiedPeerKeyDecision::TofuStored
             | VerifiedPeerKeyDecision::Current
@@ -3218,7 +3218,7 @@ async fn handle_encipdict(ctx: &NetCtx, outer: &crate::ipdict::Dict, from: Socke
         ));
         return;
     }
-    let inner = match crypto::open_encipdict(&ctx.st.own_keypair(), outer) {
+    let inner = match crypto::open_encipdict(&ctx.st.trust.own_keypair(), outer) {
         Ok(inner) => inner,
         Err(error) => {
             ctx.st.diag(&format!(
@@ -3231,7 +3231,7 @@ async fn handle_encipdict(ctx: &NetCtx, outer: &crate::ipdict::Dict, from: Socke
         }
     };
     let inner_len = inner.pack().len();
-    let candidates = ctx.st.peer_pubkeys(&key);
+    let candidates = ctx.st.trust.peer_pubkeys(&key);
     let (verified_public, verified_capa) = if candidates.is_empty() {
         match crypto::verify_ipdict(&inner) {
             Ok(Some((public, capa))) => (public, capa),
@@ -4154,7 +4154,7 @@ mod tests {
     #[tokio::test]
     async fn encipdict_missing_signature_has_no_side_effects() {
         let (ctx, st, peer, data_dir) = encipdict_test_ctx("unsigned").await;
-        let receiver = st.own_keypair();
+        let receiver = st.trust.own_keypair();
         let inner = official_sendmsg_dict("unsigned", crate::protocol::opt::SENDCHECKOPT);
         let outer = seal_raw_ipdict(&receiver.public_key(), &inner);
         let from = peer.local_addr().unwrap();
@@ -4162,7 +4162,7 @@ mod tests {
         super::handle_encipdict(&ctx, &outer, from).await;
 
         assert!(st.find_in_record(&from.ip().to_string(), 665500).is_none());
-        assert!(st.peer_pubkey(&from.ip().to_string()).is_none());
+        assert!(st.trust.peer_pubkey(&from.ip().to_string()).is_none());
         assert!(peer.recv_from(&mut [0u8; 2048]).is_err(), "不能回 ACK");
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -4170,7 +4170,7 @@ mod tests {
     #[tokio::test]
     async fn encipdict_invalid_signature_has_no_side_effects() {
         let (ctx, st, peer, data_dir) = encipdict_test_ctx("bad-signature").await;
-        let receiver = st.own_keypair();
+        let receiver = st.trust.own_keypair();
         let sender = crate::crypto::KeyPair::generate().unwrap();
         let mut inner = official_sendmsg_dict("signed", crate::protocol::opt::SENDCHECKOPT);
         crate::crypto::sign_ipdict(&mut inner, &sender, crate::crypto::CAPA_OUR_SEND).unwrap();
@@ -4181,7 +4181,7 @@ mod tests {
         super::handle_encipdict(&ctx, &outer, from).await;
 
         assert!(st.find_in_record(&from.ip().to_string(), 665500).is_none());
-        assert!(st.peer_pubkey(&from.ip().to_string()).is_none());
+        assert!(st.trust.peer_pubkey(&from.ip().to_string()).is_none());
         assert!(peer.recv_from(&mut [0u8; 2048]).is_err(), "不能回 ACK");
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -4192,13 +4192,13 @@ mod tests {
         let sender = crate::crypto::KeyPair::generate().unwrap();
         let inner = official_sendmsg_dict("tofu", 0);
         let outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &inner).unwrap();
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &inner).unwrap();
         let from = peer.local_addr().unwrap();
 
         super::handle_encipdict(&ctx, &outer, from).await;
 
         assert_eq!(
-            st.peer_pubkey(&from.ip().to_string()),
+            st.trust.peer_pubkey(&from.ip().to_string()),
             Some(sender.public_key())
         );
         assert_eq!(
@@ -4216,7 +4216,7 @@ mod tests {
         let sender = crate::crypto::KeyPair::generate().unwrap();
         let inner = official_sendmsg_dict("must-not-dispatch", crate::protocol::opt::SENDCHECKOPT);
         let outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &inner).unwrap();
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &inner).unwrap();
         std::fs::create_dir_all(&st.logs_dir).unwrap();
         std::fs::write(st.logs_dir.join("writable-probe"), b"ok").unwrap();
         std::fs::create_dir(data_dir.join("peer_keys.json")).unwrap();
@@ -4233,7 +4233,7 @@ mod tests {
         super::handle_encipdict(&ctx, &outer, from).await;
 
         assert!(
-            st.peer_pubkey(&key).is_none(),
+            st.trust.peer_pubkey(&key).is_none(),
             "failed TOFU must not publish memory state"
         );
         assert!(st.find_in_record(&key, 665500).is_none());
@@ -4254,7 +4254,7 @@ mod tests {
         let sender_public = sender.public_key();
         let inner = official_sendmsg_dict("must-not-dispatch", crate::protocol::opt::SENDCHECKOPT);
         let outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &inner).unwrap();
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &inner).unwrap();
         let from = peer.local_addr().unwrap();
         let key = from.ip().to_string();
         let emitted = Arc::new(AtomicUsize::new(0));
@@ -4264,15 +4264,15 @@ mod tests {
                 emitted_in_event.fetch_add(1, Ordering::SeqCst);
             }
         }));
-        st.set_peer_key_parent_sync_failure_for_test(true);
+        st.trust.set_peer_key_parent_sync_failure_for_test(true);
 
         super::handle_encipdict(&ctx, &outer, from).await;
 
-        assert_eq!(st.peer_pubkey(&key), Some(sender_public.clone()));
-        assert!(st.peer_key_durability_indeterminate_for_test());
+        assert_eq!(st.trust.peer_pubkey(&key), Some(sender_public.clone()));
+        assert!(st.trust.peer_key_durability_indeterminate_for_test());
         let reloaded = AppState::new(data_dir.clone());
-        reloaded.load_peer_keys();
-        assert_eq!(reloaded.peer_pubkey(&key), Some(sender_public));
+        reloaded.trust.load_peer_keys();
+        assert_eq!(reloaded.trust.peer_pubkey(&key), Some(sender_public));
         assert!(st.find_in_record(&key, 665500).is_none());
         assert_eq!(emitted.load(Ordering::SeqCst), 0);
         assert!(recv_test_packets(&peer)
@@ -4287,15 +4287,15 @@ mod tests {
         let sender = crate::crypto::KeyPair::generate().unwrap();
         let from = peer.local_addr().unwrap();
         let key = from.ip().to_string();
-        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &sender.public_key())
+        st.trust.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &sender.public_key())
             .unwrap();
         let inner = official_sendmsg_dict("known-current", 0);
         let outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &inner).unwrap();
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &inner).unwrap();
 
         super::handle_encipdict(&ctx, &outer, from).await;
 
-        assert_eq!(st.peer_pubkey(&key), Some(sender.public_key()));
+        assert_eq!(st.trust.peer_pubkey(&key), Some(sender.public_key()));
         assert_eq!(
             st.find_in_record(&key, 665500).unwrap()["text"],
             "known-current"
@@ -4312,7 +4312,7 @@ mod tests {
         let attacker = crate::crypto::KeyPair::generate().unwrap();
         let from = peer.local_addr().unwrap();
         let key = from.ip().to_string();
-        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &trusted.public_key())
+        st.trust.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &trusted.public_key())
             .unwrap();
         let emitted = Arc::new(AtomicUsize::new(0));
         let emitted_in_event = emitted.clone();
@@ -4324,14 +4324,14 @@ mod tests {
 
         let attacker_inner = official_sendmsg_dict("attacker", crate::protocol::opt::SENDCHECKOPT);
         let attacker_outer = crate::crypto::seal_encipdict(
-            &st.own_keypair().public_key(),
+            &st.trust.own_keypair().public_key(),
             &attacker,
             &attacker_inner,
         )
         .unwrap();
         super::handle_encipdict(&ctx, &attacker_outer, from).await;
 
-        assert_eq!(st.peer_pubkey(&key), Some(trusted.public_key()));
+        assert_eq!(st.trust.peer_pubkey(&key), Some(trusted.public_key()));
         assert!(st.find_in_record(&key, 665500).is_none());
         assert_eq!(emitted.load(Ordering::SeqCst), 0);
         let responses = recv_test_packets(&peer);
@@ -4344,7 +4344,7 @@ mod tests {
 
         let trusted_inner = official_sendmsg_dict("trusted", 0);
         let trusted_outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &trusted, &trusted_inner)
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &trusted, &trusted_inner)
                 .unwrap();
         super::handle_encipdict(&ctx, &trusted_outer, from).await;
         assert_eq!(st.find_in_record(&key, 665500).unwrap()["text"], "trusted");
@@ -4365,7 +4365,7 @@ mod tests {
         let stale_verified = crate::crypto::KeyPair::generate().unwrap().public_key();
         let from = peer.local_addr().unwrap();
         let key = from.ip().to_string();
-        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &trusted)
+        st.trust.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &trusted)
             .unwrap();
         let emitted = Arc::new(AtomicUsize::new(0));
         let emitted_in_event = emitted.clone();
@@ -4389,7 +4389,7 @@ mod tests {
             "a verified snapshot key that is no longer cached must stop receive dispatch"
         );
 
-        assert_eq!(st.peer_pubkey(&key), Some(trusted));
+        assert_eq!(st.trust.peer_pubkey(&key), Some(trusted));
         assert!(st.find_in_record(&key, 665500).is_none());
         assert_eq!(emitted.load(Ordering::SeqCst), 0);
         let responses = recv_test_packets(&peer);
@@ -4409,17 +4409,17 @@ mod tests {
         let current = crate::crypto::KeyPair::generate().unwrap();
         let from = peer.local_addr().unwrap();
         let key = from.ip().to_string();
-        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &previous.public_key())
+        st.trust.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &previous.public_key())
             .unwrap();
-        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &current.public_key())
+        st.trust.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &current.public_key())
             .unwrap();
         assert_eq!(
-            st.peer_pubkeys(&key),
+            st.trust.peer_pubkeys(&key),
             vec![current.public_key(), previous.public_key()]
         );
         let inner = official_sendmsg_dict("previous-key", 0);
         let outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &previous, &inner)
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &previous, &inner)
                 .unwrap();
 
         super::handle_encipdict(&ctx, &outer, from).await;
@@ -4428,9 +4428,9 @@ mod tests {
             st.find_in_record(&key, 665500).unwrap()["text"],
             "previous-key"
         );
-        assert_eq!(st.peer_pubkey(&key), Some(current.public_key()));
+        assert_eq!(st.trust.peer_pubkey(&key), Some(current.public_key()));
         assert_eq!(
-            st.peer_pubkeys(&key),
+            st.trust.peer_pubkeys(&key),
             vec![current.public_key(), previous.public_key()]
         );
         let _ = std::fs::remove_dir_all(data_dir);
@@ -4443,11 +4443,11 @@ mod tests {
         let rotated_current = crate::crypto::KeyPair::generate().unwrap();
         let from = peer.local_addr().unwrap();
         let key = from.ip().to_string();
-        st.remember_peer_key(&key, 0x11, &formerly_current.public_key())
+        st.trust.remember_peer_key(&key, 0x11, &formerly_current.public_key())
             .unwrap();
         let inner = official_sendmsg_dict("stale-current", 0);
         let outer = crate::crypto::seal_encipdict(
-            &st.own_keypair().public_key(),
+            &st.trust.own_keypair().public_key(),
             &formerly_current,
             &inner,
         )
@@ -4457,7 +4457,7 @@ mod tests {
 
         let rotate_after_verify = async {
             hook.reached.notified().await;
-            let rotated = st.remember_peer_key(&key, 0x22, &rotated_current.public_key());
+            let rotated = st.trust.remember_peer_key(&key, 0x22, &rotated_current.public_key());
             hook.resume.notify_one();
             rotated.unwrap();
         };
@@ -4471,19 +4471,19 @@ mod tests {
             st.find_in_record(&key, 665500).unwrap()["text"],
             "stale-current"
         );
-        assert_eq!(st.peer_pubkey(&key), Some(rotated_current.public_key()));
+        assert_eq!(st.trust.peer_pubkey(&key), Some(rotated_current.public_key()));
         assert_eq!(
-            st.peer_pubkeys(&key),
+            st.trust.peer_pubkeys(&key),
             vec![rotated_current.public_key(), formerly_current.public_key()]
         );
-        assert_eq!(st.peer_capa(&key), 0x22);
+        assert_eq!(st.trust.peer_capa(&key), 0x22);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]
     async fn encipdict_persists_before_ack_and_dedups_by_inner_packet() {
         let (ctx, st, peer, data_dir) = encipdict_test_ctx("ack-order").await;
-        let receiver = st.own_keypair();
+        let receiver = st.trust.own_keypair();
         let sender = crate::crypto::KeyPair::generate().unwrap();
         let flags = crate::protocol::opt::SENDCHECKOPT
             | crate::protocol::opt::SECRETOPT
@@ -4512,7 +4512,7 @@ mod tests {
         super::handle_encipdict(&ctx, &outer, from).await;
 
         assert_eq!(&*observations.lock().unwrap(), &[(true, true)]);
-        assert!(st.peer_pubkey(&from.ip().to_string()).is_some());
+        assert!(st.trust.peer_pubkey(&from.ip().to_string()).is_some());
         let mut ack = [0u8; 2048];
         let (len, _) = peer.recv_from(&mut ack).expect("ACK timeout");
         let ack = crate::protocol::parse(&ack[..len]).unwrap();
@@ -4539,7 +4539,7 @@ mod tests {
         let key = from.ip().to_string();
         let inner = official_sendmsg_dict("restart-duplicate", crate::protocol::opt::SENDCHECKOPT);
         let outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &inner).unwrap();
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &inner).unwrap();
 
         super::handle_encipdict(&ctx, &outer, from).await;
         assert_eq!(
@@ -4553,7 +4553,7 @@ mod tests {
         drop(st);
 
         let restarted = Arc::new(AppState::new(data_dir.clone()));
-        restarted.load_peer_keys();
+        restarted.trust.load_peer_keys();
         let restarted_sock = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
         let restarted_ctx = NetCtx {
             st: restarted.clone(),
@@ -4608,7 +4608,7 @@ mod tests {
         let mut inner = official_sendmsg_dict("concurrent", flags);
         inner.put_dict_list(crate::ipdict::DICT_FILE, &[file]);
         let outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &inner).unwrap();
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &inner).unwrap();
         let listener = TcpListener::bind(from).await.unwrap();
         let download_connections = Arc::new(AtomicUsize::new(0));
         let download_connections_in_server = download_connections.clone();
@@ -4665,9 +4665,9 @@ mod tests {
         let first = official_sendmsg_dict("payload-one", 0);
         let second = official_sendmsg_dict("payload-two", 0);
         let first_outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &first).unwrap();
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &first).unwrap();
         let second_outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &second)
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &second)
                 .unwrap();
         let emitted = Arc::new(AtomicUsize::new(0));
         let emitted_in_event = emitted.clone();
@@ -4692,7 +4692,7 @@ mod tests {
     #[tokio::test]
     async fn handle_datagram_dispatches_full_ip2_encbody() {
         let (ctx, st, peer, data_dir) = encipdict_test_ctx("dispatch").await;
-        let receiver = st.own_keypair();
+        let receiver = st.trust.own_keypair();
         let sender = crate::crypto::KeyPair::generate().unwrap();
         let inner = official_sendmsg_dict("official", 0);
         let outer = crate::crypto::seal_encipdict(&receiver.public_key(), &sender, &inner).unwrap();
@@ -4966,7 +4966,7 @@ mod tests {
         assert!(st.find_in_record(&key, pkt_no).is_none());
         let _ = recv_test_packets(&peer);
 
-        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &sender.public_key())
+        st.trust.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &sender.public_key())
             .unwrap();
         let mut valid = crate::protocol::Packet::new(
             crate::protocol::cmd::SENDMSG
@@ -4975,7 +4975,7 @@ mod tests {
         )
         .with_pkt_no(pkt_no);
         valid.extra = crate::crypto::seal_message(
-            &st.own_keypair().public_key(),
+            &st.trust.own_keypair().public_key(),
             &sender,
             &super::plain_payload(b"valid retry"),
         )
@@ -5064,9 +5064,9 @@ mod tests {
             });
         }
         // 等价于双方已完成 GETPUBKEY/ANSPUBKEY：各自缓存对方公钥
-        st_a.remember_peer_key(key, crate::crypto::CAPA_OUR_SEND, &st_b.own_keypair().public_key())
+        st_a.trust.remember_peer_key(key, crate::crypto::CAPA_OUR_SEND, &st_b.trust.own_keypair().public_key())
             .unwrap();
-        st_b.remember_peer_key(key, crate::crypto::CAPA_OUR_SEND, &st_a.own_keypair().public_key())
+        st_b.trust.remember_peer_key(key, crate::crypto::CAPA_OUR_SEND, &st_a.trust.own_keypair().public_key())
             .unwrap();
 
         let emitted = Arc::new(AtomicUsize::new(0));
@@ -5247,16 +5247,16 @@ mod tests {
             });
         }
         // 等价于双方已完成 GETPUBKEY/ANSPUBKEY（加密路径下标志位同样要保住）
-        st_a.remember_peer_key(
+        st_a.trust.remember_peer_key(
             key,
             crate::crypto::CAPA_OUR_SEND,
-            &st_b.own_keypair().public_key(),
+            &st_b.trust.own_keypair().public_key(),
         )
         .unwrap();
-        st_b.remember_peer_key(
+        st_b.trust.remember_peer_key(
             key,
             crate::crypto::CAPA_OUR_SEND,
-            &st_a.own_keypair().public_key(),
+            &st_a.trust.own_keypair().public_key(),
         )
         .unwrap();
 
@@ -5927,9 +5927,9 @@ mod tests {
         let first = official_sendmsg_dict("first password payload", flags);
         let second = official_sendmsg_dict("second password payload", flags);
         let first_outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &first).unwrap();
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &first).unwrap();
         let second_outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &second)
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &second)
                 .unwrap();
 
         super::handle_encipdict(&ctx, &first_outer, from).await;
@@ -5980,7 +5980,7 @@ mod tests {
             crate::protocol::opt::SENDCHECKOPT,
         );
         let outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &inner).unwrap();
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &inner).unwrap();
         let emitted = Arc::new(AtomicUsize::new(0));
         let emitted_in_event = emitted.clone();
         st.set_event(Box::new(move |event, _| {
@@ -6036,7 +6036,7 @@ mod tests {
                 crate::protocol::opt::ABSENCEOPT as i64,
             );
         let outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &inner).unwrap();
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &inner).unwrap();
 
         super::handle_encipdict(&ctx, &outer, from).await;
 
@@ -6076,7 +6076,7 @@ mod tests {
             absence_text: None,
             vs: Some("05070000".into()),
         });
-        st.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &sender.public_key())
+        st.trust.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &sender.public_key())
             .unwrap();
         st.delete_contact(&key);
         assert!(st.is_hidden(&key));
@@ -6099,7 +6099,7 @@ mod tests {
                 crate::protocol::opt::ABSENCEOPT as i64,
             );
         let changed =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &changed)
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &changed)
                 .unwrap();
 
         super::handle_encipdict(&ctx, &changed, from).await;
@@ -6131,7 +6131,7 @@ mod tests {
                 crate::protocol::opt::ABSENCEOPT as i64,
             );
         let identical =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &identical)
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &identical)
                 .unwrap();
 
         super::handle_encipdict(&ctx, &identical, from).await;
@@ -6150,7 +6150,7 @@ mod tests {
         let mut inner = official_sendmsg_dict("metadata", crate::protocol::opt::NOADDLISTOPT);
         inner.put_str(crate::ipdict::DICT_NCK, "Must Not Add");
         let outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &inner).unwrap();
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &inner).unwrap();
 
         super::handle_encipdict(&ctx, &outer, from).await;
 
@@ -6181,7 +6181,7 @@ mod tests {
         let mut inner = official_sendmsg_dict("attachment", flags);
         inner.put_dict_list(crate::ipdict::DICT_FILE, &[file]);
         let outer =
-            crate::crypto::seal_encipdict(&st.own_keypair().public_key(), &sender, &inner).unwrap();
+            crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &inner).unwrap();
 
         super::handle_datagram(&ctx, &outer.pack(), from).await;
 
@@ -6905,7 +6905,7 @@ async fn serve_getfile(ctx: &NetCtx, mut stream: TcpStream, peer: std::net::Sock
     let parts: Vec<String>;
     if req.command & opt::ENCRYPTOPT != 0 {
         let inner = match crypto::open_file_request(
-            &ctx.st.own_keypair(),
+            &ctx.st.trust.own_keypair(),
             &String::from_utf8_lossy(&req.extra),
             req.pkt_no,
         ) {
@@ -7967,10 +7967,10 @@ pub(crate) async fn open_transfer(
     let peer_ip = target.ip().to_string();
     // 密封失败（如公钥缺失）直接报错而不是回退明文：
     // 对端既然广告了文件流加密能力，静默明文会让用户误以为传输是加密的
-    let enc = if cfg.encrypt && ctx.st.peer_capa(&peer_ip) & crypto::CAPA_CAPFILEENC != 0 {
+    let enc = if cfg.encrypt && ctx.st.trust.peer_capa(&peer_ip) & crypto::CAPA_CAPFILEENC != 0 {
         let peer_pub = ctx
             .st
-            .peer_pubkey(&peer_ip)
+            .trust.peer_pubkey(&peer_ip)
             .ok_or_else(|| format!("{peer_ip} 广告了文件流加密能力但缺少公钥缓存，拒绝明文回退"))?;
         let key: [u8; 32] = rand::random();
         let inner = file_request_inner(
@@ -7980,7 +7980,7 @@ pub(crate) async fn open_transfer(
             &crypto::hex_lower(&key),
         );
         let sealed =
-            crypto::seal_file_request(&peer_pub, &ctx.st.own_keypair(), req_pkt_no, &inner)?;
+            crypto::seal_file_request(&peer_pub, &ctx.st.trust.own_keypair(), req_pkt_no, &inner)?;
         Some((key, sealed))
     } else {
         None

@@ -281,22 +281,6 @@ type EventFn = Box<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 /// 对端密钥的内存缓存条目：最新公钥（加密/验签首选）+ 上一把（验签备选）。
 /// 备选解决多客户端交替/多实例场景：同一 IP 轮流用不同密钥对发言时，
 /// 缓存被覆盖导致验签随缓存浮动（2026-08-26 实测场景），保留上一把可
-/// 让两个密钥的签名都验证通过。备选不持久化（重启后由自愈重握手重新学习）。
-#[derive(Clone)]
-struct PeerCryptoEntry {
-    capa: u32,
-    pub_key: RsaPublicKey,
-    prev_key: Option<RsaPublicKey>,
-}
-
-#[cfg(test)]
-#[derive(Default)]
-struct PeerKeyPersistenceTestHooks {
-    write_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    before_replace: Option<Arc<dyn Fn() + Send + Sync>>,
-    fail_replace: bool,
-    fail_parent_sync: bool,
-}
 
 enum PeerKeyPersistenceFailure {
     PreCommit(std::io::Error),
@@ -434,21 +418,8 @@ pub struct AppState {
     /// 待投递的离线消息：会话 key → 队列（FIFO）
     pending_out: Mutex<HashMap<String, Vec<PendingOut>>>,
     on_event: Mutex<Option<EventFn>>,
-    /// 对端 IP → 密钥缓存（最新公钥 + 上一把备选）；持久化到 peer_keys.json（仅最新）
-    peer_crypto: Mutex<HashMap<String, PeerCryptoEntry>>,
-    /// canonical 已 replace，但 parent directory sync 失败；内存已发布同一
-    /// proposed snapshot，后续 trust mutation 必须先修复持久性。
-    peer_key_durability_indeterminate: AtomicBool,
-    #[cfg(test)]
-    peer_key_persistence_test_hooks: Mutex<PeerKeyPersistenceTestHooks>,
-    /// 已确认走明文协议的对端 IP（仅内存态：重启后重新协商）
-    peer_plain: Mutex<HashSet<String>>,
-    /// 对端 IP → 已发出的 GETPUBKEY 探测次数（仅内存态：重启即重置）
-    probe_counts: Mutex<HashMap<String, u32>>,
-    /// 自愈重握手限频：IP → 最近一次触发时刻（秒）（任一端换钥后自动恢复用）
-    rehandshake_at: Mutex<HashMap<String, u64>>,
-    /// 本机密钥对：懒加载生成 + ipmsg_key.json 持久化（进程内只生成一次）
-    own_key: OnceLock<Arc<KeyPair>>,
+    /// 对端公钥信任与本机密钥（字段、落盘、不变量都在 trust 里）
+    pub(crate) trust: trust::TrustStore,
     /// 被用户删除（隐藏）的会话 key 集合：微信式「删除会话」语义——
     /// 删除后从列表消失（记录一并删除），对方再发消息时自动恢复。
     /// 持久化到 hidden_contacts.json，重启不丢。
@@ -519,14 +490,7 @@ impl AppState {
             hist_lock: Mutex::new(()),
             pending_out: Mutex::new(HashMap::new()),
             on_event: Mutex::new(None),
-            peer_crypto: Mutex::new(HashMap::new()),
-            peer_key_durability_indeterminate: AtomicBool::new(false),
-            #[cfg(test)]
-            peer_key_persistence_test_hooks: Mutex::new(PeerKeyPersistenceTestHooks::default()),
-            peer_plain: Mutex::new(HashSet::new()),
-            probe_counts: Mutex::new(HashMap::new()),
-            rehandshake_at: Mutex::new(HashMap::new()),
-            own_key: OnceLock::new(),
+            trust: trust::TrustStore::new(data_dir.clone()),
             hidden_contacts: Mutex::new(load_hidden_contacts(&data_dir)),
             retry_out: Mutex::new(HashMap::new()),
             dir_members: Mutex::new(HashMap::new()),
@@ -582,13 +546,21 @@ impl AppState {
     /// 记录入站报文摘要与文件传输失败原因，用于远程定位互通问题。
     /// 日志默认关闭：`--log` 参数启动才写（见 LOG_ENABLED）。
     pub fn diag(&self, line: &str) {
+        diag_to(&self.data_dir, line);
+    }
+
+}
+
+/// 写一行线路诊断（`data_dir/diag.log`）。自由函数：`AppState` 与 trust 组都要写，
+/// 而 trust 组不该为了这一件事拿到整个 `AppState`。
+fn diag_to(data_dir: &std::path::Path, line: &str) {
         if !log_enabled() {
             return;
         }
         use std::io::Write;
         static DIAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = DIAG_LOCK.lock().unwrap();
-        let path = self.data_dir.join("diag.log");
+        let path = data_dir.join("diag.log");
         let mut f = match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -611,7 +583,9 @@ impl AppState {
             }
         }
         let _ = writeln!(f, "{} {}", now_secs(), line.trim_end());
-    }
+}
+
+impl AppState {
 
     /* ---------- 事件桥接 ---------- */
 
@@ -757,488 +731,6 @@ impl AppState {
 
     /* ---------- 端到端加密：本机密钥与对端公钥缓存 ---------- */
 
-    fn own_key_path(&self) -> PathBuf {
-        self.data_dir.join("ipmsg_key.json")
-    }
-
-    fn peer_keys_path(&self) -> PathBuf {
-        self.data_dir.join("peer_keys.json")
-    }
-
-    /// 本机 RSA 密钥对（懒加载）：进程内只生成/读取一次。
-    /// 首次调用时读 `ipmsg_key.json`，有且合法 → 加载；无 → 生成并落盘；
-    /// 文件损坏 → 记 diag 后重新生成并覆盖写回，绝不因坏文件而 panic。
-    pub fn own_keypair(&self) -> Arc<KeyPair> {
-        self.own_key
-            .get_or_init(|| {
-                let path = self.own_key_path();
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    match KeyPair::from_json(&content) {
-                        Ok(kp) => return Arc::new(kp),
-                        Err(e) => self.diag(&format!("own-key 密钥文件损坏，重新生成：{e}")),
-                    }
-                }
-                let kp = Arc::new(KeyPair::generate().expect("RSA-2048 密钥生成失败"));
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                if let Err(e) = std::fs::write(&path, kp.to_json()) {
-                    self.diag(&format!("own-key 密钥落盘失败：{e}"));
-                }
-                // 私钥文件是未加密 PKCS#8：落盘后立即收紧为属主可读写，
-                // 覆盖 umask 默认（0644 会把私钥暴露给同机其它用户）。
-                // 初次生成与损坏重写共用这一处写入，两条路径都生效。
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-                }
-                kp
-            })
-            .clone()
-    }
-
-    /// 本机公钥指纹（设置页核对用；get_config 透出）
-    pub fn fingerprint(&self) -> String {
-        self.own_keypair().fingerprint()
-    }
-
-    /// 对端最近一次公告的公钥（未缓存返回 None；发送加密用最新一把）
-    pub fn peer_pubkey(&self, ip: &str) -> Option<RsaPublicKey> {
-        self.peer_crypto
-            .lock()
-            .unwrap()
-            .get(ip)
-            .map(|e| e.pub_key.clone())
-    }
-
-    /// 对端最近一次公告的能力位（未缓存返回 0）
-    pub fn peer_capa(&self, ip: &str) -> u32 {
-        self.peer_crypto
-            .lock()
-            .unwrap()
-            .get(ip)
-            .map(|e| e.capa)
-            .unwrap_or(0)
-    }
-
-    /// 验签候选公钥（最新在前、上一把备选在后）：多客户端交替/多实例场景下
-    /// 任一一把命中即验签通过
-    pub fn peer_pubkeys(&self, ip: &str) -> Vec<RsaPublicKey> {
-        let m = self.peer_crypto.lock().unwrap();
-        match m.get(ip) {
-            Some(e) => {
-                let mut v = vec![e.pub_key.clone()];
-                if let Some(p) = &e.prev_key {
-                    if p != &e.pub_key {
-                        v.push(p.clone());
-                    }
-                }
-                v
-            }
-            None => Vec::new(),
-        }
-    }
-
-    /// Compare a cryptographically verified embedded key against the live
-    /// cache and apply the allowed cache update as one atomic operation.
-    /// RSA verification must be completed by the caller before entering here.
-    /// A pre-replace I/O failure leaves memory unchanged. If replace succeeded
-    /// but directory sync failed, proposed is published to match canonical and
-    /// the store is marked durability-indeterminate until a later repair.
-    pub fn commit_verified_peer_key(
-        &self,
-        ip: &str,
-        capa: u32,
-        embedded: &RsaPublicKey,
-    ) -> std::io::Result<VerifiedPeerKeyDecision> {
-        let mut peers = self.peer_crypto.lock().unwrap();
-        self.repair_peer_key_durability_if_needed(&peers)?;
-        let decision = match peers.get(ip) {
-            None => VerifiedPeerKeyDecision::TofuStored,
-            Some(entry) if &entry.pub_key == embedded && entry.capa == capa => {
-                return Ok(VerifiedPeerKeyDecision::Current);
-            }
-            Some(entry) if &entry.pub_key == embedded => VerifiedPeerKeyDecision::Current,
-            Some(entry) if entry.prev_key.as_ref() == Some(embedded) => {
-                return Ok(VerifiedPeerKeyDecision::Previous);
-            }
-            Some(_) => return Ok(VerifiedPeerKeyDecision::Mismatch),
-        };
-        let mut proposed = peers.clone();
-        match decision {
-            VerifiedPeerKeyDecision::TofuStored => {
-                proposed.insert(
-                    ip.to_string(),
-                    PeerCryptoEntry {
-                        capa,
-                        pub_key: embedded.clone(),
-                        prev_key: None,
-                    },
-                );
-                if proposed.len() > PEER_KEY_CAP {
-                    proposed.clear();
-                    proposed.insert(
-                        ip.to_string(),
-                        PeerCryptoEntry {
-                            capa,
-                            pub_key: embedded.clone(),
-                            prev_key: None,
-                        },
-                    );
-                }
-            }
-            VerifiedPeerKeyDecision::Current => {
-                proposed.get_mut(ip).unwrap().capa = capa;
-            }
-            VerifiedPeerKeyDecision::Previous | VerifiedPeerKeyDecision::Mismatch => {
-                unreachable!()
-            }
-        }
-        self.persist_and_publish_peer_keys(&mut peers, proposed)?;
-        Ok(decision)
-    }
-
-    /// 缓存对端公钥并持久化到 peer_keys.json（重启不丢）
-    pub fn remember_peer_key(
-        &self,
-        ip: &str,
-        capa: u32,
-        pubk: &RsaPublicKey,
-    ) -> std::io::Result<()> {
-        let mut peers = self.peer_crypto.lock().unwrap();
-        self.repair_peer_key_durability_if_needed(&peers)?;
-        let mut proposed = peers.clone();
-        let mut key_change = None;
-        match proposed.get_mut(ip) {
-            Some(entry) if &entry.pub_key == pubk => {
-                entry.capa = capa;
-            }
-            Some(entry) => {
-                use rsa::traits::PublicKeyParts;
-                if entry.prev_key.is_none() {
-                    let old_fp = entry.pub_key.n().to_bytes_be()[..3].to_vec();
-                    let new_fp = pubk.n().to_bytes_be()[..3].to_vec();
-                    key_change = Some((old_fp, new_fp));
-                    entry.prev_key = Some(entry.pub_key.clone());
-                }
-                entry.capa = capa;
-                entry.pub_key = pubk.clone();
-            }
-            None => {
-                proposed.insert(
-                    ip.to_string(),
-                    PeerCryptoEntry {
-                        capa,
-                        pub_key: pubk.clone(),
-                        prev_key: None,
-                    },
-                );
-            }
-        }
-        if proposed.len() > PEER_KEY_CAP {
-            // 防御性上限：异常洪泛时不无限膨胀。保留当前这条，其余清空，
-            // 避免把刚学到的对端也丢掉、或把空表写回磁盘
-            let prev_key = proposed.get(ip).and_then(|entry| entry.prev_key.clone());
-            proposed.clear();
-            proposed.insert(
-                ip.to_string(),
-                PeerCryptoEntry {
-                    capa,
-                    pub_key: pubk.clone(),
-                    prev_key,
-                },
-            );
-        }
-        self.persist_and_publish_peer_keys(&mut peers, proposed)?;
-        drop(peers);
-        if let Some((old_fp, new_fp)) = key_change {
-            self.diag(&format!(
-                "peer-key-change {ip} capa={:X} 指纹 {old_fp:02x?} → {new_fp:02x?}（保留旧钥作备选）",
-                capa
-            ));
-        }
-        Ok(())
-    }
-
-    /// 撤回对端公钥缓存并持久化（能力撤回规则）。
-    ///
-    /// 先前广告过加密能力的对端重新上线时不再声明 ENCRYPTOPT，说明对方已
-    /// 关闭加密 —— 继续持有旧公钥会让我方误发密文、对方永远解不开。
-    /// 未缓存的对端是安全空操作；只影响目标 IP，其它缓存原样保留。
-    pub fn forget_peer_key(&self, ip: &str) -> std::io::Result<()> {
-        let mut peers = self.peer_crypto.lock().unwrap();
-        self.repair_peer_key_durability_if_needed(&peers)?;
-        if !peers.contains_key(ip) {
-            return Ok(());
-        }
-        let mut proposed = peers.clone();
-        proposed.remove(ip);
-        self.persist_and_publish_peer_keys(&mut peers, proposed)
-    }
-
-    fn repair_peer_key_durability_if_needed(
-        &self,
-        current: &HashMap<String, PeerCryptoEntry>,
-    ) -> std::io::Result<()> {
-        if !self
-            .peer_key_durability_indeterminate
-            .load(Ordering::Acquire)
-        {
-            return Ok(());
-        }
-        match self.persist_peer_keys_snapshot(current) {
-            Ok(()) => {
-                self.peer_key_durability_indeterminate
-                    .store(false, Ordering::Release);
-                Ok(())
-            }
-            Err(failure) => Err(failure.into_io_error()),
-        }
-    }
-
-    fn persist_and_publish_peer_keys(
-        &self,
-        current: &mut HashMap<String, PeerCryptoEntry>,
-        proposed: HashMap<String, PeerCryptoEntry>,
-    ) -> std::io::Result<()> {
-        match self.persist_peer_keys_snapshot(&proposed) {
-            Ok(()) => {
-                *current = proposed;
-                self.peer_key_durability_indeterminate
-                    .store(false, Ordering::Release);
-                Ok(())
-            }
-            Err(failure @ PeerKeyPersistenceFailure::PreCommit(_)) => Err(failure.into_io_error()),
-            Err(failure @ PeerKeyPersistenceFailure::PostCommit(_)) => {
-                // rename/move 已经把 canonical 换成 proposed；即使 parent fsync
-                // 失败，内存也必须发布同一快照，避免进程内外 trust 分裂。
-                *current = proposed;
-                self.peer_key_durability_indeterminate
-                    .store(true, Ordering::Release);
-                Err(failure.into_io_error())
-            }
-        }
-    }
-
-    fn persist_peer_keys_snapshot(
-        &self,
-        data: &HashMap<String, PeerCryptoEntry>,
-    ) -> Result<(), PeerKeyPersistenceFailure> {
-        use rsa::traits::PublicKeyParts;
-        #[cfg(test)]
-        let (write_count, before_replace, fail_replace, fail_parent_sync) = {
-            let hooks = self.peer_key_persistence_test_hooks.lock().unwrap();
-            (
-                hooks.write_count.clone(),
-                hooks.before_replace.clone(),
-                hooks.fail_replace,
-                hooks.fail_parent_sync,
-            )
-        };
-        #[cfg(test)]
-        if let Some(write_count) = write_count {
-            write_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        let keys: HashMap<String, PeerKeyEntry> = data
-            .iter()
-            .map(|(ip, e)| {
-                (
-                    ip.clone(),
-                    PeerKeyEntry {
-                        capa: e.capa,
-                        n_b64: b64_encode(&e.pub_key.n().to_bytes_be()),
-                        e_b64: b64_encode(&e.pub_key.e().to_bytes_be()),
-                    },
-                )
-            })
-            .collect();
-        let bytes = serde_json::to_vec(&PeerKeyFile {
-            rev: PEER_KEY_FILE_REV,
-            keys,
-        })
-        .map_err(|error| {
-            PeerKeyPersistenceFailure::PreCommit(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                error,
-            ))
-        })?;
-        let target = self.peer_keys_path();
-        let parent = target.parent().ok_or_else(|| {
-            PeerKeyPersistenceFailure::PreCommit(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "peer_keys.json has no parent directory",
-            ))
-        })?;
-        std::fs::create_dir_all(parent).map_err(PeerKeyPersistenceFailure::PreCommit)?;
-
-        let temp = loop {
-            let sequence = PEER_KEY_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-            let candidate = parent.join(format!(
-                ".peer_keys.json.{}.{}.tmp",
-                std::process::id(),
-                sequence
-            ));
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-            {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
-                        drop(file);
-                        let _ = std::fs::remove_file(&candidate);
-                        return Err(PeerKeyPersistenceFailure::PreCommit(error));
-                    }
-                    drop(file);
-                    break candidate;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(PeerKeyPersistenceFailure::PreCommit(error)),
-            }
-        };
-        #[cfg(test)]
-        if let Some(before_replace) = before_replace {
-            before_replace();
-        }
-        #[cfg(test)]
-        if fail_replace {
-            let _ = std::fs::remove_file(&temp);
-            return Err(PeerKeyPersistenceFailure::PreCommit(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "injected peer-key replacement failure",
-            )));
-        }
-        if let Err(error) = replace_peer_key_file(&temp, &target) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(PeerKeyPersistenceFailure::PreCommit(error));
-        }
-        #[cfg(test)]
-        if fail_parent_sync {
-            return Err(PeerKeyPersistenceFailure::PostCommit(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "injected peer-key parent sync failure",
-            )));
-        }
-        sync_peer_key_parent(parent).map_err(PeerKeyPersistenceFailure::PostCommit)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_peer_key_parent_sync_failure_for_test(&self, fail: bool) {
-        self.peer_key_persistence_test_hooks
-            .lock()
-            .unwrap()
-            .fail_parent_sync = fail;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn peer_key_durability_indeterminate_for_test(&self) -> bool {
-        self.peer_key_durability_indeterminate
-            .load(Ordering::Acquire)
-    }
-
-    /// 启动时从磁盘恢复对端密钥缓存；单条损坏跳过该条，整体损坏视为无缓存。
-    /// 版本不符（rev<2，旧公钥字节序错误）时整体作废，等待重新握手。
-    pub fn load_peer_keys(&self) {
-        let Ok(content) = std::fs::read_to_string(self.peer_keys_path()) else {
-            return;
-        };
-        let Ok(file) = serde_json::from_str::<PeerKeyFile>(&content) else {
-            return;
-        };
-        if file.rev != PEER_KEY_FILE_REV {
-            return;
-        }
-        let map = file.keys;
-        let mut out: HashMap<String, (u32, RsaPublicKey)> = HashMap::new();
-        for (ip, ent) in map {
-            let (Some(n), Some(e)) = (b64_decode(&ent.n_b64), b64_decode(&ent.e_b64)) else {
-                continue;
-            };
-            if let Ok(pubk) =
-                RsaPublicKey::new(BigUint::from_bytes_be(&n), BigUint::from_bytes_be(&e))
-            {
-                out.insert(ip, (ent.capa, pubk));
-            }
-        }
-        let loaded = out
-            .into_iter()
-            .map(|(ip, (capa, k))| {
-                (
-                    ip,
-                    PeerCryptoEntry {
-                        capa,
-                        pub_key: k,
-                        prev_key: None,
-                    },
-                )
-            })
-            .collect();
-        *self.peer_crypto.lock().unwrap() = loaded;
-        self.peer_key_durability_indeterminate
-            .store(false, Ordering::Release);
-    }
-
-    /// 标记该对端只走明文协议（仅内存态：重启后按报文重新协商）
-    pub fn mark_peer_plain(&self, ip: &str) {
-        self.peer_plain.lock().unwrap().insert(ip.to_string());
-    }
-
-    pub fn peer_marked_plain(&self, ip: &str) -> bool {
-        self.peer_plain.lock().unwrap().contains(ip)
-    }
-
-    /// 记一次 GETPUBKEY 探测（send_getpubkey 发出时调用），返回含本次的累计次数
-    pub fn record_probe(&self, ip: &str) -> u32 {
-        let mut m = self.probe_counts.lock().unwrap();
-        let c = m.entry(ip.to_string()).or_insert(0);
-        *c += 1;
-        *c
-    }
-
-    /// 该 IP 的历史 GETPUBKEY 探测次数（无记录为 0）
-    pub fn probe_count(&self, ip: &str) -> u32 {
-        self.probe_counts
-            .lock()
-            .unwrap()
-            .get(ip)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// send_message 无缓存分支的探测决策（spec §5）：
-    /// - 预算未用尽 → false，调用方继续发 GETPUBKEY；
-    /// - 恰在阈值穿越点 → true 并把对端标记为明文（只发生一次），
-    ///   此后消息经 peer_marked_plain 静默走明文、不再探测。
-    ///
-    /// 与规格的偏差：预算是纯内存计数，重启即满血重来；规格原文是
-    /// 「对方重新上线广播后重置」。这里放宽为进程生命周期粒度 —— 不持久化
-    /// 误标结果，对端真上线后一条 ENCRYPTOPT 报文即可重新握手。
-    /// 自愈重握手限频闸门：同 IP 每 REHANDSHAKE_INTERVAL 秒至多一次，
-    /// 避免对端换钥/缓存错乱时触发握手风暴
-    pub fn try_rehandshake_gate(&self, ip: &str) -> bool {
-        const REHANDSHAKE_INTERVAL: u64 = 10;
-        let now = now_secs();
-        let mut m = self.rehandshake_at.lock().unwrap();
-        match m.get(ip) {
-            Some(t) if now.saturating_sub(*t) < REHANDSHAKE_INTERVAL => false,
-            _ => {
-                m.insert(ip.to_string(), now);
-                true
-            }
-        }
-    }
-
-    pub fn retire_probe_budget(&self, ip: &str) -> bool {
-        if self.probe_count(ip) < PLAIN_PROBE_BUDGET {
-            return false;
-        }
-        if !self.peer_marked_plain(ip) {
-            self.mark_peer_plain(ip);
-        }
-        true
-    }
 
     /* ---------- 离线消息待投递队列 ---------- */
 
@@ -2421,6 +1913,559 @@ impl AppState {
 
 /* ---------------- 单元测试 ---------------- */
 
+
+/// 对端公钥信任与本机密钥（架构评审候选 4 的第一组，见 docs/adr/0003）。
+///
+/// 这组状态**不可分**：字段、落盘文件与不变量一起搬进来。此前它们散在 `AppState` 上——
+/// `remember_peer_key` ↔ `peer_key_durability_indeterminate` ↔ 测试钩子的**落盘顺序**
+/// 是这一组唯一的硬不变量，而每个调用方都得自己记住它；`peer_keys.json` 的读写、
+/// `ipmsg_key.json` 的懒生成与损坏重写也各自散着。
+///
+/// interface 只有 `pub(crate)` 方法与一个 `data_dir`：组外不需要知道它内部有几把锁、
+/// 落盘顺序如何。唯一的外部依赖是 `diag_to`（写 diag.log 的自由函数）。
+pub(crate) mod trust {
+    use super::*;
+
+    /// 让两个密钥的签名都验证通过。备选不持久化（重启后由自愈重握手重新学习）。
+    #[derive(Clone)]
+    struct PeerCryptoEntry {
+        capa: u32,
+        pub_key: RsaPublicKey,
+        prev_key: Option<RsaPublicKey>,
+    }
+
+    #[cfg(test)]
+    /// 落盘失败注入钩子（`#[cfg(test)]`）：字段对测试可见 —— 它们本来就只有测试在用
+    #[cfg(test)]
+    #[derive(Default)]
+    pub(crate) struct PeerKeyPersistenceTestHooks {
+        pub(crate) write_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
+        pub(crate) before_replace: Option<Arc<dyn Fn() + Send + Sync>>,
+        pub(crate) fail_replace: bool,
+        pub(crate) fail_parent_sync: bool,
+    }
+
+    /// 本机密钥对 + 对端公钥信任（含明文探测与重握手限频的临时状态）
+    pub(crate) struct TrustStore {
+        /// 落盘根（`ipmsg_key.json` / `peer_keys.json` / `diag.log` 都在它下面）
+        data_dir: PathBuf,
+        /// 对端 IP → 密钥缓存（最新公钥 + 上一把备选）；持久化到 peer_keys.json（仅最新）
+        peer_crypto: Mutex<HashMap<String, PeerCryptoEntry>>,
+        /// canonical 已 replace，但 parent directory sync 失败；内存已发布同一
+        /// proposed snapshot，后续 trust mutation 必须先修复持久性。
+        peer_key_durability_indeterminate: AtomicBool,
+        #[cfg(test)]
+        pub(crate) peer_key_persistence_test_hooks: Mutex<PeerKeyPersistenceTestHooks>,
+        /// 已确认走明文协议的对端 IP（仅内存态：重启后重新协商）
+        peer_plain: Mutex<HashSet<String>>,
+        /// 对端 IP → 已发出的 GETPUBKEY 探测次数（仅内存态：重启即重置）
+        probe_counts: Mutex<HashMap<String, u32>>,
+        /// 自愈重握手限频：IP → 最近一次触发时刻（秒）（任一端换钥后自动恢复用）
+        rehandshake_at: Mutex<HashMap<String, u64>>,
+        /// 本机密钥对：懒加载生成 + ipmsg_key.json 持久化（进程内只生成一次）
+        own_key: OnceLock<Arc<KeyPair>>,
+    }
+
+    impl TrustStore {
+        pub(crate) fn new(data_dir: PathBuf) -> Self {
+            Self {
+                data_dir,
+                peer_crypto: Mutex::new(HashMap::new()),
+                peer_key_durability_indeterminate: AtomicBool::new(false),
+                #[cfg(test)]
+                peer_key_persistence_test_hooks: Mutex::new(PeerKeyPersistenceTestHooks::default()),
+                peer_plain: Mutex::new(HashSet::new()),
+                probe_counts: Mutex::new(HashMap::new()),
+                rehandshake_at: Mutex::new(HashMap::new()),
+                own_key: OnceLock::new(),
+            }
+        }
+
+        pub(crate) fn own_key_path(&self) -> PathBuf {
+            self.data_dir.join("ipmsg_key.json")
+        }
+
+        pub(crate) fn peer_keys_path(&self) -> PathBuf {
+            self.data_dir.join("peer_keys.json")
+        }
+
+        /// 本机 RSA 密钥对（懒加载）：进程内只生成/读取一次。
+        /// 首次调用时读 `ipmsg_key.json`，有且合法 → 加载；无 → 生成并落盘；
+        /// 文件损坏 → 记 diag 后重新生成并覆盖写回，绝不因坏文件而 panic。
+        pub fn own_keypair(&self) -> Arc<KeyPair> {
+            self.own_key
+                .get_or_init(|| {
+                    let path = self.own_key_path();
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        match KeyPair::from_json(&content) {
+                            Ok(kp) => return Arc::new(kp),
+                            Err(e) => diag_to(&self.data_dir, &format!("own-key 密钥文件损坏，重新生成：{e}")),
+                        }
+                    }
+                    let kp = Arc::new(KeyPair::generate().expect("RSA-2048 密钥生成失败"));
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    if let Err(e) = std::fs::write(&path, kp.to_json()) {
+                        diag_to(&self.data_dir, &format!("own-key 密钥落盘失败：{e}"));
+                    }
+                    // 私钥文件是未加密 PKCS#8：落盘后立即收紧为属主可读写，
+                    // 覆盖 umask 默认（0644 会把私钥暴露给同机其它用户）。
+                    // 初次生成与损坏重写共用这一处写入，两条路径都生效。
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                    }
+                    kp
+                })
+                .clone()
+        }
+
+        /// 本机公钥指纹（设置页核对用；get_config 透出）
+        pub fn fingerprint(&self) -> String {
+            self.own_keypair().fingerprint()
+        }
+
+        /// 对端最近一次公告的公钥（未缓存返回 None；发送加密用最新一把）
+        pub fn peer_pubkey(&self, ip: &str) -> Option<RsaPublicKey> {
+            self.peer_crypto
+                .lock()
+                .unwrap()
+                .get(ip)
+                .map(|e| e.pub_key.clone())
+        }
+
+        /// 对端最近一次公告的能力位（未缓存返回 0）
+        pub fn peer_capa(&self, ip: &str) -> u32 {
+            self.peer_crypto
+                .lock()
+                .unwrap()
+                .get(ip)
+                .map(|e| e.capa)
+                .unwrap_or(0)
+        }
+
+        /// 验签候选公钥（最新在前、上一把备选在后）：多客户端交替/多实例场景下
+        /// 任一一把命中即验签通过
+        pub fn peer_pubkeys(&self, ip: &str) -> Vec<RsaPublicKey> {
+            let m = self.peer_crypto.lock().unwrap();
+            match m.get(ip) {
+                Some(e) => {
+                    let mut v = vec![e.pub_key.clone()];
+                    if let Some(p) = &e.prev_key {
+                        if p != &e.pub_key {
+                            v.push(p.clone());
+                        }
+                    }
+                    v
+                }
+                None => Vec::new(),
+            }
+        }
+
+        /// Compare a cryptographically verified embedded key against the live
+        /// cache and apply the allowed cache update as one atomic operation.
+        /// RSA verification must be completed by the caller before entering here.
+        /// A pre-replace I/O failure leaves memory unchanged. If replace succeeded
+        /// but directory sync failed, proposed is published to match canonical and
+        /// the store is marked durability-indeterminate until a later repair.
+        pub fn commit_verified_peer_key(
+            &self,
+            ip: &str,
+            capa: u32,
+            embedded: &RsaPublicKey,
+        ) -> std::io::Result<VerifiedPeerKeyDecision> {
+            let mut peers = self.peer_crypto.lock().unwrap();
+            self.repair_peer_key_durability_if_needed(&peers)?;
+            let decision = match peers.get(ip) {
+                None => VerifiedPeerKeyDecision::TofuStored,
+                Some(entry) if &entry.pub_key == embedded && entry.capa == capa => {
+                    return Ok(VerifiedPeerKeyDecision::Current);
+                }
+                Some(entry) if &entry.pub_key == embedded => VerifiedPeerKeyDecision::Current,
+                Some(entry) if entry.prev_key.as_ref() == Some(embedded) => {
+                    return Ok(VerifiedPeerKeyDecision::Previous);
+                }
+                Some(_) => return Ok(VerifiedPeerKeyDecision::Mismatch),
+            };
+            let mut proposed = peers.clone();
+            match decision {
+                VerifiedPeerKeyDecision::TofuStored => {
+                    proposed.insert(
+                        ip.to_string(),
+                        PeerCryptoEntry {
+                            capa,
+                            pub_key: embedded.clone(),
+                            prev_key: None,
+                        },
+                    );
+                    if proposed.len() > PEER_KEY_CAP {
+                        proposed.clear();
+                        proposed.insert(
+                            ip.to_string(),
+                            PeerCryptoEntry {
+                                capa,
+                                pub_key: embedded.clone(),
+                                prev_key: None,
+                            },
+                        );
+                    }
+                }
+                VerifiedPeerKeyDecision::Current => {
+                    proposed.get_mut(ip).unwrap().capa = capa;
+                }
+                VerifiedPeerKeyDecision::Previous | VerifiedPeerKeyDecision::Mismatch => {
+                    unreachable!()
+                }
+            }
+            self.persist_and_publish_peer_keys(&mut peers, proposed)?;
+            Ok(decision)
+        }
+
+        /// 缓存对端公钥并持久化到 peer_keys.json（重启不丢）
+        pub fn remember_peer_key(
+            &self,
+            ip: &str,
+            capa: u32,
+            pubk: &RsaPublicKey,
+        ) -> std::io::Result<()> {
+            let mut peers = self.peer_crypto.lock().unwrap();
+            self.repair_peer_key_durability_if_needed(&peers)?;
+            let mut proposed = peers.clone();
+            let mut key_change = None;
+            match proposed.get_mut(ip) {
+                Some(entry) if &entry.pub_key == pubk => {
+                    entry.capa = capa;
+                }
+                Some(entry) => {
+                    use rsa::traits::PublicKeyParts;
+                    if entry.prev_key.is_none() {
+                        let old_fp = entry.pub_key.n().to_bytes_be()[..3].to_vec();
+                        let new_fp = pubk.n().to_bytes_be()[..3].to_vec();
+                        key_change = Some((old_fp, new_fp));
+                        entry.prev_key = Some(entry.pub_key.clone());
+                    }
+                    entry.capa = capa;
+                    entry.pub_key = pubk.clone();
+                }
+                None => {
+                    proposed.insert(
+                        ip.to_string(),
+                        PeerCryptoEntry {
+                            capa,
+                            pub_key: pubk.clone(),
+                            prev_key: None,
+                        },
+                    );
+                }
+            }
+            if proposed.len() > PEER_KEY_CAP {
+                // 防御性上限：异常洪泛时不无限膨胀。保留当前这条，其余清空，
+                // 避免把刚学到的对端也丢掉、或把空表写回磁盘
+                let prev_key = proposed.get(ip).and_then(|entry| entry.prev_key.clone());
+                proposed.clear();
+                proposed.insert(
+                    ip.to_string(),
+                    PeerCryptoEntry {
+                        capa,
+                        pub_key: pubk.clone(),
+                        prev_key,
+                    },
+                );
+            }
+            self.persist_and_publish_peer_keys(&mut peers, proposed)?;
+            drop(peers);
+            if let Some((old_fp, new_fp)) = key_change {
+                diag_to(&self.data_dir, &format!(
+                    "peer-key-change {ip} capa={:X} 指纹 {old_fp:02x?} → {new_fp:02x?}（保留旧钥作备选）",
+                    capa
+                ));
+            }
+            Ok(())
+        }
+
+        /// 撤回对端公钥缓存并持久化（能力撤回规则）。
+        ///
+        /// 先前广告过加密能力的对端重新上线时不再声明 ENCRYPTOPT，说明对方已
+        /// 关闭加密 —— 继续持有旧公钥会让我方误发密文、对方永远解不开。
+        /// 未缓存的对端是安全空操作；只影响目标 IP，其它缓存原样保留。
+        pub fn forget_peer_key(&self, ip: &str) -> std::io::Result<()> {
+            let mut peers = self.peer_crypto.lock().unwrap();
+            self.repair_peer_key_durability_if_needed(&peers)?;
+            if !peers.contains_key(ip) {
+                return Ok(());
+            }
+            let mut proposed = peers.clone();
+            proposed.remove(ip);
+            self.persist_and_publish_peer_keys(&mut peers, proposed)
+        }
+
+        fn repair_peer_key_durability_if_needed(
+            &self,
+            current: &HashMap<String, PeerCryptoEntry>,
+        ) -> std::io::Result<()> {
+            if !self
+                .peer_key_durability_indeterminate
+                .load(Ordering::Acquire)
+            {
+                return Ok(());
+            }
+            match self.persist_peer_keys_snapshot(current) {
+                Ok(()) => {
+                    self.peer_key_durability_indeterminate
+                        .store(false, Ordering::Release);
+                    Ok(())
+                }
+                Err(failure) => Err(failure.into_io_error()),
+            }
+        }
+
+        fn persist_and_publish_peer_keys(
+            &self,
+            current: &mut HashMap<String, PeerCryptoEntry>,
+            proposed: HashMap<String, PeerCryptoEntry>,
+        ) -> std::io::Result<()> {
+            match self.persist_peer_keys_snapshot(&proposed) {
+                Ok(()) => {
+                    *current = proposed;
+                    self.peer_key_durability_indeterminate
+                        .store(false, Ordering::Release);
+                    Ok(())
+                }
+                Err(failure @ PeerKeyPersistenceFailure::PreCommit(_)) => Err(failure.into_io_error()),
+                Err(failure @ PeerKeyPersistenceFailure::PostCommit(_)) => {
+                    // rename/move 已经把 canonical 换成 proposed；即使 parent fsync
+                    // 失败，内存也必须发布同一快照，避免进程内外 trust 分裂。
+                    *current = proposed;
+                    self.peer_key_durability_indeterminate
+                        .store(true, Ordering::Release);
+                    Err(failure.into_io_error())
+                }
+            }
+        }
+
+        fn persist_peer_keys_snapshot(
+            &self,
+            data: &HashMap<String, PeerCryptoEntry>,
+        ) -> Result<(), PeerKeyPersistenceFailure> {
+            use rsa::traits::PublicKeyParts;
+            #[cfg(test)]
+            let (write_count, before_replace, fail_replace, fail_parent_sync) = {
+                let hooks = self.peer_key_persistence_test_hooks.lock().unwrap();
+                (
+                    hooks.write_count.clone(),
+                    hooks.before_replace.clone(),
+                    hooks.fail_replace,
+                    hooks.fail_parent_sync,
+                )
+            };
+            #[cfg(test)]
+            if let Some(write_count) = write_count {
+                write_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            let keys: HashMap<String, PeerKeyEntry> = data
+                .iter()
+                .map(|(ip, e)| {
+                    (
+                        ip.clone(),
+                        PeerKeyEntry {
+                            capa: e.capa,
+                            n_b64: b64_encode(&e.pub_key.n().to_bytes_be()),
+                            e_b64: b64_encode(&e.pub_key.e().to_bytes_be()),
+                        },
+                    )
+                })
+                .collect();
+            let bytes = serde_json::to_vec(&PeerKeyFile {
+                rev: PEER_KEY_FILE_REV,
+                keys,
+            })
+            .map_err(|error| {
+                PeerKeyPersistenceFailure::PreCommit(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error,
+                ))
+            })?;
+            let target = self.peer_keys_path();
+            let parent = target.parent().ok_or_else(|| {
+                PeerKeyPersistenceFailure::PreCommit(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "peer_keys.json has no parent directory",
+                ))
+            })?;
+            std::fs::create_dir_all(parent).map_err(PeerKeyPersistenceFailure::PreCommit)?;
+
+            let temp = loop {
+                let sequence = PEER_KEY_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+                let candidate = parent.join(format!(
+                    ".peer_keys.json.{}.{}.tmp",
+                    std::process::id(),
+                    sequence
+                ));
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                {
+                    Ok(mut file) => {
+                        use std::io::Write;
+                        if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+                            drop(file);
+                            let _ = std::fs::remove_file(&candidate);
+                            return Err(PeerKeyPersistenceFailure::PreCommit(error));
+                        }
+                        drop(file);
+                        break candidate;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(PeerKeyPersistenceFailure::PreCommit(error)),
+                }
+            };
+            #[cfg(test)]
+            if let Some(before_replace) = before_replace {
+                before_replace();
+            }
+            #[cfg(test)]
+            if fail_replace {
+                let _ = std::fs::remove_file(&temp);
+                return Err(PeerKeyPersistenceFailure::PreCommit(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected peer-key replacement failure",
+                )));
+            }
+            if let Err(error) = replace_peer_key_file(&temp, &target) {
+                let _ = std::fs::remove_file(&temp);
+                return Err(PeerKeyPersistenceFailure::PreCommit(error));
+            }
+            #[cfg(test)]
+            if fail_parent_sync {
+                return Err(PeerKeyPersistenceFailure::PostCommit(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected peer-key parent sync failure",
+                )));
+            }
+            sync_peer_key_parent(parent).map_err(PeerKeyPersistenceFailure::PostCommit)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn set_peer_key_parent_sync_failure_for_test(&self, fail: bool) {
+            self.peer_key_persistence_test_hooks
+                .lock()
+                .unwrap()
+                .fail_parent_sync = fail;
+        }
+
+        #[cfg(test)]
+        pub(crate) fn peer_key_durability_indeterminate_for_test(&self) -> bool {
+            self.peer_key_durability_indeterminate
+                .load(Ordering::Acquire)
+        }
+
+        /// 启动时从磁盘恢复对端密钥缓存；单条损坏跳过该条，整体损坏视为无缓存。
+        /// 版本不符（rev<2，旧公钥字节序错误）时整体作废，等待重新握手。
+        pub fn load_peer_keys(&self) {
+            let Ok(content) = std::fs::read_to_string(self.peer_keys_path()) else {
+                return;
+            };
+            let Ok(file) = serde_json::from_str::<PeerKeyFile>(&content) else {
+                return;
+            };
+            if file.rev != PEER_KEY_FILE_REV {
+                return;
+            }
+            let map = file.keys;
+            let mut out: HashMap<String, (u32, RsaPublicKey)> = HashMap::new();
+            for (ip, ent) in map {
+                let (Some(n), Some(e)) = (b64_decode(&ent.n_b64), b64_decode(&ent.e_b64)) else {
+                    continue;
+                };
+                if let Ok(pubk) =
+                    RsaPublicKey::new(BigUint::from_bytes_be(&n), BigUint::from_bytes_be(&e))
+                {
+                    out.insert(ip, (ent.capa, pubk));
+                }
+            }
+            let loaded = out
+                .into_iter()
+                .map(|(ip, (capa, k))| {
+                    (
+                        ip,
+                        PeerCryptoEntry {
+                            capa,
+                            pub_key: k,
+                            prev_key: None,
+                        },
+                    )
+                })
+                .collect();
+            *self.peer_crypto.lock().unwrap() = loaded;
+            self.peer_key_durability_indeterminate
+                .store(false, Ordering::Release);
+        }
+
+        /// 标记该对端只走明文协议（仅内存态：重启后按报文重新协商）
+        pub fn mark_peer_plain(&self, ip: &str) {
+            self.peer_plain.lock().unwrap().insert(ip.to_string());
+        }
+
+        pub fn peer_marked_plain(&self, ip: &str) -> bool {
+            self.peer_plain.lock().unwrap().contains(ip)
+        }
+
+        /// 记一次 GETPUBKEY 探测（send_getpubkey 发出时调用），返回含本次的累计次数
+        pub fn record_probe(&self, ip: &str) -> u32 {
+            let mut m = self.probe_counts.lock().unwrap();
+            let c = m.entry(ip.to_string()).or_insert(0);
+            *c += 1;
+            *c
+        }
+
+        /// 该 IP 的历史 GETPUBKEY 探测次数（无记录为 0）
+        pub fn probe_count(&self, ip: &str) -> u32 {
+            self.probe_counts
+                .lock()
+                .unwrap()
+                .get(ip)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        /// send_message 无缓存分支的探测决策（spec §5）：
+        /// - 预算未用尽 → false，调用方继续发 GETPUBKEY；
+        /// - 恰在阈值穿越点 → true 并把对端标记为明文（只发生一次），
+        ///   此后消息经 peer_marked_plain 静默走明文、不再探测。
+        ///
+        /// 与规格的偏差：预算是纯内存计数，重启即满血重来；规格原文是
+        /// 「对方重新上线广播后重置」。这里放宽为进程生命周期粒度 —— 不持久化
+        /// 误标结果，对端真上线后一条 ENCRYPTOPT 报文即可重新握手。
+        /// 自愈重握手限频闸门：同 IP 每 REHANDSHAKE_INTERVAL 秒至多一次，
+        /// 避免对端换钥/缓存错乱时触发握手风暴
+        pub fn try_rehandshake_gate(&self, ip: &str) -> bool {
+            const REHANDSHAKE_INTERVAL: u64 = 10;
+            let now = now_secs();
+            let mut m = self.rehandshake_at.lock().unwrap();
+            match m.get(ip) {
+                Some(t) if now.saturating_sub(*t) < REHANDSHAKE_INTERVAL => false,
+                _ => {
+                    m.insert(ip.to_string(), now);
+                    true
+                }
+            }
+        }
+
+        pub fn retire_probe_budget(&self, ip: &str) -> bool {
+            if self.probe_count(ip) < PLAIN_PROBE_BUDGET {
+                return false;
+            }
+            if !self.peer_marked_plain(ip) {
+                self.mark_peer_plain(ip);
+            }
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3290,33 +3335,33 @@ mod tests {
         use rsa::traits::PublicKeyParts;
         let st = temp_state("pcrypt");
         let kp = KeyPair::generate().unwrap();
-        st.remember_peer_key("10.0.0.9", 0x40100004, &kp.public_key())
+        st.trust.remember_peer_key("10.0.0.9", 0x40100004, &kp.public_key())
             .unwrap();
-        assert!(st.peer_pubkey("10.0.0.9").is_some());
-        assert_eq!(st.peer_capa("10.0.0.9") & 0x40100004, 0x40100004);
+        assert!(st.trust.peer_pubkey("10.0.0.9").is_some());
+        assert_eq!(st.trust.peer_capa("10.0.0.9") & 0x40100004, 0x40100004);
         // 未缓存的对端：公钥 None、能力位 0
-        assert!(st.peer_pubkey("10.0.0.99").is_none());
-        assert_eq!(st.peer_capa("10.0.0.99"), 0);
+        assert!(st.trust.peer_pubkey("10.0.0.99").is_none());
+        assert_eq!(st.trust.peer_capa("10.0.0.99"), 0);
 
         // 新建同目录实例模拟重启
         let st2 = AppState::new(st.data_dir.clone());
-        st2.load_peer_keys();
-        assert!(st2.peer_pubkey("10.0.0.9").is_some(), "重启后密钥仍在");
+        st2.trust.load_peer_keys();
+        assert!(st2.trust.peer_pubkey("10.0.0.9").is_some(), "重启后密钥仍在");
         assert_eq!(
-            st2.peer_pubkey("10.0.0.9").unwrap().n().to_bytes_be(),
+            st2.trust.peer_pubkey("10.0.0.9").unwrap().n().to_bytes_be(),
             kp.public_key().n().to_bytes_be()
         );
         assert_eq!(
-            st2.peer_capa("10.0.0.9"),
+            st2.trust.peer_capa("10.0.0.9"),
             0x40100004,
             "能力位随密钥一起恢复"
         );
 
         // 明文标记是内存态，不跨实例
-        st.mark_peer_plain("10.0.0.8");
-        assert!(st.peer_marked_plain("10.0.0.8"));
-        assert!(!st.peer_marked_plain("10.0.0.9"));
-        assert!(!st2.peer_marked_plain("10.0.0.8"), "明文标记不持久化");
+        st.trust.mark_peer_plain("10.0.0.8");
+        assert!(st.trust.peer_marked_plain("10.0.0.8"));
+        assert!(!st.trust.peer_marked_plain("10.0.0.9"));
+        assert!(!st2.trust.peer_marked_plain("10.0.0.8"), "明文标记不持久化");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -3335,7 +3380,7 @@ mod tests {
             std::thread::spawn(move || {
                 barrier.wait();
                 let decision = st
-                    .commit_verified_peer_key("10.0.0.77", capa, &public)
+                    .trust.commit_verified_peer_key("10.0.0.77", capa, &public)
                     .unwrap();
                 (decision, public)
             })
@@ -3365,9 +3410,9 @@ mod tests {
             .iter()
             .find(|(decision, _)| *decision == VerifiedPeerKeyDecision::TofuStored)
             .unwrap();
-        assert_eq!(st.peer_pubkey("10.0.0.77"), Some(winner.1.clone()));
+        assert_eq!(st.trust.peer_pubkey("10.0.0.77"), Some(winner.1.clone()));
         assert_eq!(
-            st.peer_capa("10.0.0.77"),
+            st.trust.peer_capa("10.0.0.77"),
             if winner.1 == results[0].1 { 0x11 } else { 0x22 },
             "stored capability must belong to the winning key"
         );
@@ -3388,7 +3433,7 @@ mod tests {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                st.commit_verified_peer_key(ip, capa, &public).unwrap()
+                st.trust.commit_verified_peer_key(ip, capa, &public).unwrap()
             })
         };
         let a = spawn_commit("10.0.0.71", first.clone(), 0x11);
@@ -3398,11 +3443,11 @@ mod tests {
         assert_eq!(a.join().unwrap(), VerifiedPeerKeyDecision::TofuStored);
         assert_eq!(b.join().unwrap(), VerifiedPeerKeyDecision::TofuStored);
         let reloaded = AppState::new(st.data_dir.clone());
-        reloaded.load_peer_keys();
-        assert_eq!(reloaded.peer_pubkey("10.0.0.71"), Some(first));
-        assert_eq!(reloaded.peer_capa("10.0.0.71"), 0x11);
-        assert_eq!(reloaded.peer_pubkey("10.0.0.72"), Some(second));
-        assert_eq!(reloaded.peer_capa("10.0.0.72"), 0x22);
+        reloaded.trust.load_peer_keys();
+        assert_eq!(reloaded.trust.peer_pubkey("10.0.0.71"), Some(first));
+        assert_eq!(reloaded.trust.peer_capa("10.0.0.71"), 0x11);
+        assert_eq!(reloaded.trust.peer_pubkey("10.0.0.72"), Some(second));
+        assert_eq!(reloaded.trust.peer_capa("10.0.0.72"), 0x22);
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -3410,16 +3455,16 @@ mod tests {
     fn failed_current_capability_persistence_keeps_old_memory_state() {
         let st = temp_state("failed-current-capability-persistence");
         let key = KeyPair::generate().unwrap().public_key();
-        st.remember_peer_key("10.0.0.73", 0x11, &key).unwrap();
-        std::fs::remove_file(st.peer_keys_path()).unwrap();
-        std::fs::create_dir(st.peer_keys_path()).unwrap();
+        st.trust.remember_peer_key("10.0.0.73", 0x11, &key).unwrap();
+        std::fs::remove_file(st.trust.peer_keys_path()).unwrap();
+        std::fs::create_dir(st.trust.peer_keys_path()).unwrap();
 
         assert!(st
-            .commit_verified_peer_key("10.0.0.73", 0x22, &key)
+            .trust.commit_verified_peer_key("10.0.0.73", 0x22, &key)
             .is_err());
-        assert_eq!(st.peer_pubkey("10.0.0.73"), Some(key));
+        assert_eq!(st.trust.peer_pubkey("10.0.0.73"), Some(key));
         assert_eq!(
-            st.peer_capa("10.0.0.73"),
+            st.trust.peer_capa("10.0.0.73"),
             0x11,
             "failed persistence must not publish the proposed capability"
         );
@@ -3432,27 +3477,27 @@ mod tests {
 
         let st = temp_state("current-noop-skips-persistence");
         let key = KeyPair::generate().unwrap().public_key();
-        st.remember_peer_key("10.0.0.79", 0x11, &key).unwrap();
+        st.trust.remember_peer_key("10.0.0.79", 0x11, &key).unwrap();
         let writes = Arc::new(AtomicUsize::new(0));
-        st.peer_key_persistence_test_hooks
+        st.trust.peer_key_persistence_test_hooks
             .lock()
             .unwrap()
             .write_count = Some(writes.clone());
 
         assert_eq!(
-            st.commit_verified_peer_key("10.0.0.79", 0x11, &key)
+            st.trust.commit_verified_peer_key("10.0.0.79", 0x11, &key)
                 .unwrap(),
             VerifiedPeerKeyDecision::Current
         );
         assert_eq!(writes.load(Ordering::SeqCst), 0);
 
         assert_eq!(
-            st.commit_verified_peer_key("10.0.0.79", 0x22, &key)
+            st.trust.commit_verified_peer_key("10.0.0.79", 0x22, &key)
                 .unwrap(),
             VerifiedPeerKeyDecision::Current
         );
         assert_eq!(writes.load(Ordering::SeqCst), 1);
-        assert_eq!(st.peer_capa("10.0.0.79"), 0x22);
+        assert_eq!(st.trust.peer_capa("10.0.0.79"), 0x22);
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -3460,22 +3505,22 @@ mod tests {
     fn replacement_failure_preserves_canonical_file_and_memory_trust() {
         let st = temp_state("replacement-failure-preserves-canonical");
         let key = KeyPair::generate().unwrap().public_key();
-        st.remember_peer_key("10.0.0.80", 0x11, &key).unwrap();
-        let canonical_before = std::fs::read(st.peer_keys_path()).unwrap();
-        st.peer_key_persistence_test_hooks
+        st.trust.remember_peer_key("10.0.0.80", 0x11, &key).unwrap();
+        let canonical_before = std::fs::read(st.trust.peer_keys_path()).unwrap();
+        st.trust.peer_key_persistence_test_hooks
             .lock()
             .unwrap()
             .fail_replace = true;
 
         assert!(st
-            .commit_verified_peer_key("10.0.0.80", 0x22, &key)
+            .trust.commit_verified_peer_key("10.0.0.80", 0x22, &key)
             .is_err());
         assert_eq!(
-            std::fs::read(st.peer_keys_path()).unwrap(),
+            std::fs::read(st.trust.peer_keys_path()).unwrap(),
             canonical_before
         );
-        assert_eq!(st.peer_pubkey("10.0.0.80"), Some(key));
-        assert_eq!(st.peer_capa("10.0.0.80"), 0x11);
+        assert_eq!(st.trust.peer_pubkey("10.0.0.80"), Some(key));
+        assert_eq!(st.trust.peer_capa("10.0.0.80"), 0x11);
         assert!(std::fs::read_dir(&st.data_dir).unwrap().all(|entry| !entry
             .unwrap()
             .file_name()
@@ -3489,26 +3534,26 @@ mod tests {
     fn parent_directory_sync_failure_publishes_committed_state_and_marks_poisoned() {
         let st = temp_state("parent-sync-failure");
         let key = KeyPair::generate().unwrap().public_key();
-        st.remember_peer_key("10.0.0.81", 0x11, &key).unwrap();
-        st.peer_key_persistence_test_hooks
+        st.trust.remember_peer_key("10.0.0.81", 0x11, &key).unwrap();
+        st.trust.peer_key_persistence_test_hooks
             .lock()
             .unwrap()
             .fail_parent_sync = true;
 
         assert!(st
-            .commit_verified_peer_key("10.0.0.81", 0x22, &key)
+            .trust.commit_verified_peer_key("10.0.0.81", 0x22, &key)
             .is_err());
-        assert_eq!(st.peer_pubkey("10.0.0.81"), Some(key.clone()));
+        assert_eq!(st.trust.peer_pubkey("10.0.0.81"), Some(key.clone()));
         assert_eq!(
-            st.peer_capa("10.0.0.81"),
+            st.trust.peer_capa("10.0.0.81"),
             0x22,
             "rename committed proposed state, so memory must match canonical despite Err"
         );
-        assert!(st.peer_key_durability_indeterminate_for_test());
+        assert!(st.trust.peer_key_durability_indeterminate_for_test());
         let reloaded = AppState::new(st.data_dir.clone());
-        reloaded.load_peer_keys();
-        assert_eq!(reloaded.peer_pubkey("10.0.0.81"), Some(key));
-        assert_eq!(reloaded.peer_capa("10.0.0.81"), 0x22);
+        reloaded.trust.load_peer_keys();
+        assert_eq!(reloaded.trust.peer_pubkey("10.0.0.81"), Some(key));
+        assert_eq!(reloaded.trust.peer_capa("10.0.0.81"), 0x22);
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -3519,49 +3564,49 @@ mod tests {
 
         let st = temp_state("poisoned-store-recovery");
         let key = KeyPair::generate().unwrap().public_key();
-        st.remember_peer_key("10.0.0.84", 0x11, &key).unwrap();
+        st.trust.remember_peer_key("10.0.0.84", 0x11, &key).unwrap();
         let writes = Arc::new(AtomicUsize::new(0));
         {
-            let mut hooks = st.peer_key_persistence_test_hooks.lock().unwrap();
+            let mut hooks = st.trust.peer_key_persistence_test_hooks.lock().unwrap();
             hooks.write_count = Some(writes.clone());
             hooks.fail_parent_sync = true;
         }
 
         assert!(st
-            .commit_verified_peer_key("10.0.0.84", 0x22, &key)
+            .trust.commit_verified_peer_key("10.0.0.84", 0x22, &key)
             .is_err());
-        assert_eq!(st.peer_capa("10.0.0.84"), 0x22);
-        assert!(st.peer_key_durability_indeterminate_for_test());
+        assert_eq!(st.trust.peer_capa("10.0.0.84"), 0x22);
+        assert!(st.trust.peer_key_durability_indeterminate_for_test());
 
         assert!(st
-            .commit_verified_peer_key("10.0.0.84", 0x33, &key)
+            .trust.commit_verified_peer_key("10.0.0.84", 0x33, &key)
             .is_err());
         assert_eq!(
-            st.peer_capa("10.0.0.84"),
+            st.trust.peer_capa("10.0.0.84"),
             0x22,
             "failed poison repair must block the requested new capability"
         );
-        assert!(st.peer_key_durability_indeterminate_for_test());
+        assert!(st.trust.peer_key_durability_indeterminate_for_test());
 
-        st.peer_key_persistence_test_hooks
+        st.trust.peer_key_persistence_test_hooks
             .lock()
             .unwrap()
             .fail_parent_sync = false;
         assert_eq!(
-            st.commit_verified_peer_key("10.0.0.84", 0x33, &key)
+            st.trust.commit_verified_peer_key("10.0.0.84", 0x33, &key)
                 .unwrap(),
             VerifiedPeerKeyDecision::Current
         );
-        assert_eq!(st.peer_capa("10.0.0.84"), 0x33);
-        assert!(!st.peer_key_durability_indeterminate_for_test());
+        assert_eq!(st.trust.peer_capa("10.0.0.84"), 0x33);
+        assert!(!st.trust.peer_key_durability_indeterminate_for_test());
         assert_eq!(
             writes.load(Ordering::SeqCst),
             4,
             "initial indeterminate write, failed repair, successful repair, then new change"
         );
         let reloaded = AppState::new(st.data_dir.clone());
-        reloaded.load_peer_keys();
-        assert_eq!(reloaded.peer_capa("10.0.0.84"), 0x33);
+        reloaded.trust.load_peer_keys();
+        assert_eq!(reloaded.trust.peer_capa("10.0.0.84"), 0x33);
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -3580,7 +3625,7 @@ mod tests {
         let reached_in_hook = reached_replace.clone();
         let release_in_hook = release_replace.clone();
         let calls_in_hook = hook_calls.clone();
-        st.peer_key_persistence_test_hooks
+        st.trust.peer_key_persistence_test_hooks
             .lock()
             .unwrap()
             .before_replace = Some(Arc::new(move || {
@@ -3594,14 +3639,14 @@ mod tests {
         let first_state = st.clone();
         let first_done = done_tx.clone();
         let first_thread = std::thread::spawn(move || {
-            let result = first_state.commit_verified_peer_key("10.0.0.82", 0x82, &first);
+            let result = first_state.trust.commit_verified_peer_key("10.0.0.82", 0x82, &first);
             first_done.send(result).unwrap();
         });
         reached_replace.wait();
 
         let second_state = st.clone();
         let second_thread = std::thread::spawn(move || {
-            let result = second_state.commit_verified_peer_key("10.0.0.83", 0x83, &second);
+            let result = second_state.trust.commit_verified_peer_key("10.0.0.83", 0x83, &second);
             done_tx.send(result).unwrap();
         });
         assert!(
@@ -3623,9 +3668,9 @@ mod tests {
         second_thread.join().unwrap();
         assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
         let reloaded = AppState::new(st.data_dir.clone());
-        reloaded.load_peer_keys();
-        assert!(reloaded.peer_pubkey("10.0.0.82").is_some());
-        assert!(reloaded.peer_pubkey("10.0.0.83").is_some());
+        reloaded.trust.load_peer_keys();
+        assert!(reloaded.trust.peer_pubkey("10.0.0.82").is_some());
+        assert!(reloaded.trust.peer_pubkey("10.0.0.83").is_some());
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -3634,13 +3679,13 @@ mod tests {
         let st = temp_state("failed-tofu-persistence");
         let key = KeyPair::generate().unwrap().public_key();
         std::fs::create_dir_all(&st.data_dir).unwrap();
-        std::fs::create_dir(st.peer_keys_path()).unwrap();
+        std::fs::create_dir(st.trust.peer_keys_path()).unwrap();
 
         assert!(st
-            .commit_verified_peer_key("10.0.0.76", 0x66, &key)
+            .trust.commit_verified_peer_key("10.0.0.76", 0x66, &key)
             .is_err());
-        assert!(st.peer_pubkey("10.0.0.76").is_none());
-        assert_eq!(st.peer_capa("10.0.0.76"), 0);
+        assert!(st.trust.peer_pubkey("10.0.0.76").is_none());
+        assert_eq!(st.trust.peer_capa("10.0.0.76"), 0);
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -3649,17 +3694,17 @@ mod tests {
         let st = temp_state("remember-forget-transaction-reload");
         let kept = KeyPair::generate().unwrap().public_key();
         let removed = KeyPair::generate().unwrap().public_key();
-        st.remember_peer_key("10.0.0.74", 0x44, &kept).unwrap();
-        st.remember_peer_key("10.0.0.75", 0x55, &removed).unwrap();
-        st.forget_peer_key("10.0.0.75").unwrap();
+        st.trust.remember_peer_key("10.0.0.74", 0x44, &kept).unwrap();
+        st.trust.remember_peer_key("10.0.0.75", 0x55, &removed).unwrap();
+        st.trust.forget_peer_key("10.0.0.75").unwrap();
 
         let reloaded = AppState::new(st.data_dir.clone());
-        reloaded.load_peer_keys();
-        assert_eq!(st.peer_pubkey("10.0.0.74"), Some(kept.clone()));
-        assert_eq!(reloaded.peer_pubkey("10.0.0.74"), Some(kept));
-        assert_eq!(reloaded.peer_capa("10.0.0.74"), 0x44);
-        assert!(st.peer_pubkey("10.0.0.75").is_none());
-        assert!(reloaded.peer_pubkey("10.0.0.75").is_none());
+        reloaded.trust.load_peer_keys();
+        assert_eq!(st.trust.peer_pubkey("10.0.0.74"), Some(kept.clone()));
+        assert_eq!(reloaded.trust.peer_pubkey("10.0.0.74"), Some(kept));
+        assert_eq!(reloaded.trust.peer_capa("10.0.0.74"), 0x44);
+        assert!(st.trust.peer_pubkey("10.0.0.75").is_none());
+        assert!(reloaded.trust.peer_pubkey("10.0.0.75").is_none());
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -3668,27 +3713,27 @@ mod tests {
         let st = temp_state("verified-stale-current");
         let formerly_current = KeyPair::generate().unwrap().public_key();
         let rotated_current = KeyPair::generate().unwrap().public_key();
-        st.remember_peer_key("10.0.0.78", 0x11, &formerly_current)
+        st.trust.remember_peer_key("10.0.0.78", 0x11, &formerly_current)
             .unwrap();
 
-        let verified_snapshot = st.peer_pubkeys("10.0.0.78");
+        let verified_snapshot = st.trust.peer_pubkeys("10.0.0.78");
         assert_eq!(verified_snapshot, vec![formerly_current.clone()]);
-        st.remember_peer_key("10.0.0.78", 0x22, &rotated_current)
+        st.trust.remember_peer_key("10.0.0.78", 0x22, &rotated_current)
             .unwrap();
 
         assert_eq!(
-            st.commit_verified_peer_key("10.0.0.78", 0x33, &verified_snapshot[0])
+            st.trust.commit_verified_peer_key("10.0.0.78", 0x33, &verified_snapshot[0])
                 .unwrap(),
             VerifiedPeerKeyDecision::Previous
         );
-        assert_eq!(st.peer_pubkey("10.0.0.78"), Some(rotated_current.clone()));
+        assert_eq!(st.trust.peer_pubkey("10.0.0.78"), Some(rotated_current.clone()));
         assert_eq!(
-            st.peer_pubkeys("10.0.0.78"),
+            st.trust.peer_pubkeys("10.0.0.78"),
             vec![rotated_current, formerly_current],
             "accepting a stale verified snapshot must not rotate it back to current"
         );
         assert_eq!(
-            st.peer_capa("10.0.0.78"),
+            st.trust.peer_capa("10.0.0.78"),
             0x22,
             "Previous must not update the current key's capability"
         );
@@ -3704,29 +3749,29 @@ mod tests {
         let ip = "10.9.9.9";
         // 每发一次 GETPUBKEY 计一次数；未达阈值时分支继续探测、不标记
         for sent in 1..PLAIN_PROBE_BUDGET {
-            assert_eq!(st.record_probe(ip), sent, "计数按发送次数累加");
+            assert_eq!(st.trust.record_probe(ip), sent, "计数按发送次数累加");
             assert!(
-                !st.retire_probe_budget(ip),
+                !st.trust.retire_probe_budget(ip),
                 "预算未用尽前应返回「继续探测」"
             );
-            assert!(!st.peer_marked_plain(ip), "穿越前不得标记明文");
+            assert!(!st.trust.peer_marked_plain(ip), "穿越前不得标记明文");
         }
         // 第 3 次：恰在此刻穿越阈值 → 分支把对端标记为明文
-        st.record_probe(ip);
+        st.trust.record_probe(ip);
         assert!(
-            st.retire_probe_budget(ip),
+            st.trust.retire_probe_budget(ip),
             "第 {PLAIN_PROBE_BUDGET} 次探测后预算用尽，应触发明文标记"
         );
         assert!(
-            st.peer_marked_plain(ip),
+            st.trust.peer_marked_plain(ip),
             "阈值穿越后 peer_marked_plain 必须翻转，后续消息静默走明文"
         );
         // 幂等：已标记后再评估不产生副作用，计数不受影响
-        assert!(st.retire_probe_budget(ip));
-        assert_eq!(st.probe_count(ip), PLAIN_PROBE_BUDGET);
+        assert!(st.trust.retire_probe_budget(ip));
+        assert_eq!(st.trust.probe_count(ip), PLAIN_PROBE_BUDGET);
         // 计数按 IP 相互独立
-        st.record_probe("10.9.9.10");
-        assert_eq!(st.probe_count("10.9.9.10"), 1);
+        st.trust.record_probe("10.9.9.10");
+        assert_eq!(st.trust.probe_count("10.9.9.10"), 1);
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -3734,46 +3779,46 @@ mod tests {
     fn forget_peer_key_drops_cache_and_persists_withdrawal() {
         let st = temp_state("forget");
         let kp = KeyPair::generate().unwrap();
-        st.remember_peer_key("10.0.0.9", 0x40100004, &kp.public_key())
+        st.trust.remember_peer_key("10.0.0.9", 0x40100004, &kp.public_key())
             .unwrap();
-        assert!(st.peer_pubkey("10.0.0.9").is_some());
+        assert!(st.trust.peer_pubkey("10.0.0.9").is_some());
 
         // 能力撤回：对端重新上线却不再声明 ENCRYPTOPT 时必须清掉其公钥缓存，
         // 否则我方会继续向已关闭加密的对端发送密文（对方永远解不开）
-        st.forget_peer_key("10.0.0.9").unwrap();
+        st.trust.forget_peer_key("10.0.0.9").unwrap();
         assert!(
-            st.peer_pubkey("10.0.0.9").is_none(),
+            st.trust.peer_pubkey("10.0.0.9").is_none(),
             "撤回后内存缓存立即失效"
         );
         // 撤回必须持久化：重启（新实例读盘）后旧公钥不得复活
         let st2 = AppState::new(st.data_dir.clone());
-        st2.load_peer_keys();
+        st2.trust.load_peer_keys();
         assert!(
-            st2.peer_pubkey("10.0.0.9").is_none(),
+            st2.trust.peer_pubkey("10.0.0.9").is_none(),
             "撤回写盘，重启不复活"
         );
 
         // 未缓存的对端撤回是安全空操作；其它对端的缓存不受影响
-        st.forget_peer_key("10.0.0.99").unwrap();
-        st.remember_peer_key("10.0.0.8", 1, &kp.public_key())
+        st.trust.forget_peer_key("10.0.0.99").unwrap();
+        st.trust.remember_peer_key("10.0.0.8", 1, &kp.public_key())
             .unwrap();
-        st.forget_peer_key("10.0.0.9").unwrap();
-        assert!(st.peer_pubkey("10.0.0.8").is_some(), "只撤回目标对端");
+        st.trust.forget_peer_key("10.0.0.9").unwrap();
+        assert!(st.trust.peer_pubkey("10.0.0.8").is_some(), "只撤回目标对端");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
     #[test]
     fn own_keypair_lazy_generates_and_persists() {
         let st = temp_state("ownkey");
-        let fp1 = st.own_keypair().fingerprint();
+        let fp1 = st.trust.own_keypair().fingerprint();
         assert!(st.data_dir.join("ipmsg_key.json").exists(), "生成即落盘");
         // 幂等：同一实例反复取是同一把钥匙
-        assert_eq!(st.own_keypair().fingerprint(), fp1);
+        assert_eq!(st.trust.own_keypair().fingerprint(), fp1);
 
         // 重启（新实例读同一数据目录）后仍是同一把钥匙
         let st2 = AppState::new(st.data_dir.clone());
-        assert_eq!(st2.own_keypair().fingerprint(), fp1);
-        assert_eq!(st.fingerprint(), fp1);
+        assert_eq!(st2.trust.own_keypair().fingerprint(), fp1);
+        assert_eq!(st.trust.fingerprint(), fp1);
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -3783,11 +3828,11 @@ mod tests {
         std::fs::create_dir_all(&st.data_dir).unwrap();
         std::fs::write(st.data_dir.join("ipmsg_key.json"), "{{{不是JSON").unwrap();
         // 损坏文件不能让进程崩：重新生成一把并覆盖写回
-        let kp = st.own_keypair();
+        let kp = st.trust.own_keypair();
         assert_eq!(kp.modulus_be().len(), crate::crypto::RSA_BITS / 8);
         let fp = kp.fingerprint();
         let st2 = AppState::new(st.data_dir.clone());
-        assert_eq!(st2.own_keypair().fingerprint(), fp, "重生的钥匙已落盘");
+        assert_eq!(st2.trust.own_keypair().fingerprint(), fp, "重生的钥匙已落盘");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -3835,13 +3880,13 @@ mod tests {
         // 1) 首次生成路径
         let st = temp_state("keymode");
         std::fs::create_dir_all(&st.data_dir).unwrap();
-        let _ = st.own_keypair();
+        let _ = st.trust.own_keypair();
         assert_eq!(mode_of(&st.data_dir), 0o600, "初次生成的私钥文件应为 0o600");
 
         // 2) 损坏后重写路径（重新生成并覆盖写回，同样要收紧）
         std::fs::write(st.data_dir.join("ipmsg_key.json"), "{{{不是JSON").unwrap();
         let st2 = AppState::new(st.data_dir.clone());
-        let _ = st2.own_keypair();
+        let _ = st2.trust.own_keypair();
         assert_eq!(
             mode_of(&st.data_dir),
             0o600,

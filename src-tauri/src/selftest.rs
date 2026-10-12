@@ -2741,7 +2741,7 @@ async fn extended_protocols() -> bool {
             )
             .put_str(crate::ipdict::DICT_BODY, "1111111");
         let outer =
-            crate::crypto::seal_encipdict(&ctx.st.own_keypair().public_key(), &kp_sender, &inner)
+            crate::crypto::seal_encipdict(&ctx.st.trust.own_keypair().public_key(), &kp_sender, &inner)
                 .unwrap();
         let wire = outer.pack();
         sender.send_to(&wire, target_app).await.unwrap();
@@ -2826,7 +2826,7 @@ async fn extended_protocols() -> bool {
             )
             .put_str(crate::ipdict::DICT_BODY, "官方封书正文");
         let secret_outer = crate::crypto::seal_encipdict(
-            &ctx.st.own_keypair().public_key(),
+            &ctx.st.trust.own_keypair().public_key(),
             &kp_sender,
             &secret_inner,
         )
