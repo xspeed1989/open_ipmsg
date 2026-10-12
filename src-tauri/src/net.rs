@@ -1855,7 +1855,7 @@ async fn handle_sendmsg(
     let mut file_jsons = Vec::new();
     for file in &files {
         let is_dir = file.attr & 0xff == fileattr::DIR;
-        let auto = !is_dir && file.size <= 30 * 1024 * 1024 && is_image_name(&file.name);
+        let auto = !is_dir && file.size <= 30 * 1024 * 1024 && is_inline_media_name(&file.name);
         let previous = prior_file(file.id);
         let inherited = previous
             .as_ref()
@@ -2219,10 +2219,10 @@ fn prune_clipboard_cache(dir: &std::path::Path) {
     }
 }
 
-/// 常见图片扩展名判断（用于聊天内联预览与自动接收）
-fn is_image_name(name: &str) -> bool {
+/// 常见图片/WebM 扩展名判断（用于聊天内联预览与自动接收，调用方仍限制体积）
+fn is_inline_media_name(name: &str) -> bool {
     let lower = name.to_lowercase();
-    [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"]
+    [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".webm"]
         .iter()
         .any(|ext| lower.ends_with(ext))
 }
@@ -6273,7 +6273,7 @@ mod tests {
         assert_eq!(std::fs::read(&p1).unwrap(), png);
         assert_eq!(p1.extension().unwrap(), "png");
         // 扩展名要能被内联预览识别，否则对端收到也不会直接显示
-        assert!(is_image_name(&p1.file_name().unwrap().to_string_lossy()));
+        assert!(is_inline_media_name(&p1.file_name().unwrap().to_string_lossy()));
 
         // 同一秒内连续粘贴不能互相覆盖
         let p2 = stage_clipboard_image(&dir, &b64, "image/png").expect("stage 2");
@@ -6283,6 +6283,26 @@ mod tests {
         assert!(stage_clipboard_image(&dir, &b64, "image/tiff").is_err());
         assert!(stage_clipboard_image(&dir, "", "image/png").is_err());
         assert!(stage_clipboard_image(&dir, "@@not-base64@@", "image/png").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_stickers_are_inline_media_but_webm_is_a_regular_attachment() {
+        for name in ["static.webp", "ANIMATED.WEBP", "sticker.webm", "STICKER.WEBM"] {
+            assert!(is_inline_media_name(name), "{name}");
+        }
+        for name in ["clip.mp4", "clip.mkv", "fake.webm.exe", "x.wbem", ""] {
+            assert!(!is_inline_media_name(name), "{name}");
+        }
+        use base64::Engine as _;
+        let dir = std::env::temp_dir().join(format!("oim-webm-offer-{}", std::process::id()));
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(include_bytes!("../tests/fixtures/sticker.webm"));
+        let path = stage_clipboard_file(&dir, "sticker.webm", &b64).unwrap();
+        let entries = stat_file_entries(&[path.to_string_lossy().into_owned()]).unwrap();
+        assert_eq!(entries[0].attr, fileattr::REGULAR);
+        assert!(entries[0].ext_attrs.is_empty());
+        assert!(stage_clipboard_image(&dir, &b64, "video/webm").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

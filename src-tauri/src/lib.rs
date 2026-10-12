@@ -567,8 +567,8 @@ async fn send_clipboard_image(
     ))
 }
 
-/// 读取本地图片并转为 base64 数据（供聊天内联预览）。
-/// 仅允许常见位图扩展名，超过 32MB 拒绝预览。
+/// 读取本地图片或 WebM 并转为 base64 数据（供聊天/表情预览，保留旧命令名）。
+/// 仅允许常见位图与 WebM 扩展名，超过 32MB 拒绝预览。
 #[tauri::command]
 async fn read_image_data(path: String) -> Result<Value, String> {
     let ext = std::path::Path::new(&path)
@@ -576,14 +576,9 @@ async fn read_image_data(path: String) -> Result<Value, String> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    let mime = match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "bmp" => "image/bmp",
-        "webp" => "image/webp",
-        _ => return Err("E_IMAGE_UNSUPPORTED|不支持的图片类型".into()),
-    };
+    let kind = if ext == "jpeg" { "jpg" } else { ext.as_str() };
+    let mime = emoji::mime_for_kind(kind)
+        .ok_or_else(|| "E_IMAGE_UNSUPPORTED|不支持的图片类型".to_string())?;
     let meta = tokio::fs::metadata(&path)
         .await
         .map_err(|e| format!("E_READ_FAILED|{e}"))?;
@@ -601,7 +596,7 @@ async fn read_image_data(path: String) -> Result<Value, String> {
 }
 
 /// 图片查看器「另存为」：把本地图片复制到用户选择的目标路径。
-/// 只允许复制已存在的常见图片文件（与 read_image_data 同一白名单），
+/// 只允许复制已存在的常见图片文件（不包括 WebM；视频由系统播放器打开），
 /// 目标路径由前端保存对话框给出。
 #[tauri::command]
 async fn copy_file_as(source: String, dest: String) -> Result<(), String> {

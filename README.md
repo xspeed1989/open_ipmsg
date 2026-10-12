@@ -29,6 +29,7 @@ Open IPMsg is a cross-platform LAN instant messenger compatible with [IP Messeng
 | --- | --- |
 | Contact discovery | Automatic LAN discovery (broadcast), presence (online/offline), 45s refresh, 30min timeout cleanup |
 | Messaging | Text messages, Unicode/emoji, message deduplication |
+| Custom stickers | Save images (including static/animated WebP) and WebM, up to 16MB each; import local files, save from chat, and import/export sticker packs. WebM previews loop muted and send as regular attachments; playback depends on system WebView codec support |
 | Files | Multi-file attachments, TCP streaming, progress, resume, folder transfer (both directions) |
 | Paste image | Send screenshots via Ctrl+V; inline preview of images pasted by official clients |
 | Screenshot sending | Toolbar button or global hotkey, drag a selection and annotate (rectangle / ellipse / arrow / pen / text / mosaic), then confirm into the pending attachment list |

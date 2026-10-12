@@ -13,7 +13,7 @@ import { confirm } from '../lib/dialog'
 import { store } from '../store'
 import {
   normalizeEmojis, importSummary, packSummary, packItemState, defaultPackSelection,
-  packFileName,
+  packFileName, isVideoSticker,
 } from '../lib/emoji'
 
 const emit = defineEmits(['pick', 'pickSticker', 'need-layout'])
@@ -157,13 +157,13 @@ onMounted(() => {
   nextTick(() => emit('need-layout'))
 })
 
-/* ---------------- 导入本地图片 ---------------- */
+/* ---------------- 导入本地表情（图片 / WebM） ---------------- */
 
 /** 选多少张都收：读盘/校验全在后端按批进行（内存有界），前端不再设批次上限 */
 async function importImages() {
   if (busy.value) return
   try {
-    const sel = await ipc.pickImageFiles()
+    const sel = await ipc.pickStickerFiles()
     if (!sel) return
     const paths = (Array.isArray(sel) ? sel : [sel]).filter(Boolean)
     if (!paths.length) return
@@ -527,7 +527,11 @@ defineExpose({ showCustom, reload: loadList })
             @drop.prevent="onDrop($event, e)"
           >
             <button class="sticker" @click="emit('pickSticker', e)" @contextmenu.prevent.stop="openMenu($event, e)">
-              <img v-if="thumbs[e.id] && thumbs[e.id] !== 'loading'" :src="thumbs[e.id]" :alt="e.name" />
+              <template v-if="thumbs[e.id] && thumbs[e.id] !== 'loading'">
+                <video v-if="isVideoSticker(e.file)" :src="thumbs[e.id]" :aria-label="e.name"
+                  autoplay loop muted playsinline />
+                <img v-else :src="thumbs[e.id]" :alt="e.name" />
+              </template>
             </button>
           </div>
         </div>
@@ -538,8 +542,11 @@ defineExpose({ showCustom, reload: loadList })
           class="hover-preview"
           :style="{ left: hoverPreview.x + 'px', top: hoverPreview.y + 'px', width: PREVIEW_SIZE + 'px', height: PREVIEW_SIZE + 'px' }"
         >
-          <img v-if="thumbs[hoverPreview.entry.id] && thumbs[hoverPreview.entry.id] !== 'loading'"
-            :src="thumbs[hoverPreview.entry.id]" :alt="hoverPreview.entry.name" />
+          <template v-if="thumbs[hoverPreview.entry.id] && thumbs[hoverPreview.entry.id] !== 'loading'">
+            <video v-if="isVideoSticker(hoverPreview.entry.file)" :src="thumbs[hoverPreview.entry.id]"
+              :aria-label="hoverPreview.entry.name" autoplay loop muted playsinline />
+            <img v-else :src="thumbs[hoverPreview.entry.id]" :alt="hoverPreview.entry.name" />
+          </template>
         </div>
       </div>
 
@@ -572,7 +579,11 @@ defineExpose({ showCustom, reload: loadList })
             @drop.prevent="onDrop($event, e)"
           >
             <button class="sticker" @click="emit('pickSticker', e)" @contextmenu.prevent.stop="openMenu($event, e)">
-              <img v-if="thumbs[e.id] && thumbs[e.id] !== 'loading'" :src="thumbs[e.id]" :alt="e.name" />
+              <template v-if="thumbs[e.id] && thumbs[e.id] !== 'loading'">
+                <video v-if="isVideoSticker(e.file)" :src="thumbs[e.id]" :aria-label="e.name"
+                  autoplay loop muted playsinline />
+                <img v-else :src="thumbs[e.id]" :alt="e.name" />
+              </template>
             </button>
           </div>
         </div>
@@ -583,8 +594,11 @@ defineExpose({ showCustom, reload: loadList })
           class="hover-preview"
           :style="{ left: hoverPreview.x + 'px', top: hoverPreview.y + 'px', width: PREVIEW_SIZE + 'px', height: PREVIEW_SIZE + 'px' }"
         >
-          <img v-if="thumbs[hoverPreview.entry.id] && thumbs[hoverPreview.entry.id] !== 'loading'"
-            :src="thumbs[hoverPreview.entry.id]" :alt="hoverPreview.entry.name" />
+          <template v-if="thumbs[hoverPreview.entry.id] && thumbs[hoverPreview.entry.id] !== 'loading'">
+            <video v-if="isVideoSticker(hoverPreview.entry.file)" :src="thumbs[hoverPreview.entry.id]"
+              :aria-label="hoverPreview.entry.name" autoplay loop muted playsinline />
+            <img v-else :src="thumbs[hoverPreview.entry.id]" :alt="hoverPreview.entry.name" />
+          </template>
         </div>
       </div>
 
@@ -755,7 +769,8 @@ defineExpose({ showCustom, reload: loadList })
 .cell:hover .sticker {
   background: var(--c-list-hover);
 }
-.sticker img {
+.sticker img,
+.sticker video {
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
@@ -776,7 +791,8 @@ defineExpose({ showCustom, reload: loadList })
   justify-content: center;
   pointer-events: none;
 }
-.hover-preview img {
+.hover-preview img,
+.hover-preview video {
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;

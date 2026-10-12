@@ -171,6 +171,40 @@ test('addToEmojiPlan 区分「可直接入库」与「需先下载」', () => {
   assert.equal(addToEmojiPlan(null).ok, false)
 })
 
+test('WebM 和静态/动态 WebP 都可收藏，但 WebM 不冒充图片', () => {
+  assert.deepEqual(emojiLib.STICKER_EXTS, [...emojiLib.IMAGE_EXTS, 'webm'])
+  for (const name of ['sticker.webm', 'STICKER.WEBM', 'static.webp', 'ANIMATED.WEBP']) {
+    assert.equal(emojiLib.looksLikeSticker(name), true, name)
+    assert.deepEqual(addToEmojiPlan({ name, path: `/cache/${name}`, state: 'done' }), {
+      ok: true, needDownload: false,
+    })
+    assert.deepEqual(addToEmojiPlan({ name, state: 'pending' }), { ok: true, needDownload: true })
+    assert.equal(addToEmojiPlan({ name, dir_entry: true }).ok, false)
+    assert.equal(addToEmojiPlan({ name, state: 'done' }).ok, false)
+  }
+  assert.equal(looksLikeImage('sticker.webm'), false)
+  assert.equal(emojiLib.isVideoSticker('STICKER.WEBM'), true)
+  for (const name of ['animated.webp', 'sticker.webm.exe', 'clip.mp4', null, '']) {
+    assert.equal(emojiLib.isVideoSticker(name), false)
+  }
+  for (const name of ['clip.mp4', 'fake.webm.exe', 'x.wbem', '.webm', '', null]) {
+    assert.equal(emojiLib.looksLikeSticker(name), false)
+    assert.equal(addToEmojiPlan({ name }).ok, false)
+  }
+})
+
+test('表情包预览默认勾选 WebM / WebP，保留格式与路径', () => {
+  const items = [
+    { file: 'images/a.webm', kind: 'webm' },
+    { file: 'images/b.webp', kind: 'webp' },
+  ]
+  assert.deepEqual([...defaultPackSelection({ items })], items.map((i) => i.file))
+  assert.equal(packSummary({ items }, t).importable, 2)
+  const list = normalizeEmojis(items.map((it, i) => ({ id: `id${i}`, ...it })))
+  assert.deepEqual(list.map((e) => e.file), items.map((i) => i.file))
+  assert.equal(isStickerFile({ name: 'images/a.webm' }, list.map((e) => e.file)), true)
+})
+
 /* ---------------- 缩略渲染判定 ---------------- */
 
 test('isStickerFile 命中表情库文件名（含已发出的缓存副本名）', () => {

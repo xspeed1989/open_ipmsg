@@ -18,7 +18,9 @@ import { forwardPayload, mergeForward } from '../lib/forward'
 import { groupPayload, sendToEach } from '../lib/groupsend'
 import { copyTextOf } from '../lib/copymsg'
 import { pendingImgFromB64, b64ToBytes } from '../lib/clipimg'
-import { addToEmojiPlan, attachPath, importSummary, isStickerFile } from '../lib/emoji'
+import {
+  addToEmojiPlan, attachPath, importSummary, isStickerFile, looksLikeSticker, isVideoSticker,
+} from '../lib/emoji'
 import { t } from '../lib/i18n'
 import { toast, confirm, prompt as promptDialog } from '../lib/dialog'
 import { describeError, errorCode } from '../lib/errors'
@@ -167,13 +169,13 @@ async function sendSticker(entry) {
   }
 }
 
-/** 附件是否可加入表情库：图片、还没入库（已在库里的不重复给入口）、且可入库 */
+/** 附件是否可加入表情库：图片/WebM、还没入库（已在库里的不重复给入口） */
 function canAddToEmoji(m) {
   return (m?.files || []).some((f) => !isSticker(f) && addToEmojiPlan(f).ok)
 }
 
 /**
- * 把消息里的图片收进表情库（右键菜单「添加到表情」）：
+ * 把消息里的图片/WebM 收进表情库（右键菜单「添加到表情」）：
  * 先让后端确认本地到底有没有这个文件（它会按记录路径找，找不到再按文件名
  * 去下载目录兜底找）—— 消息上的 state 与 path 都可能不准（下载完整落盘却
  * 记成 failed、历史导入的附件只有名字等）。
@@ -1166,15 +1168,10 @@ async function doClearHistory() {
   }
 }
 
-/* ---------- 图片内联预览 ---------- */
-const IMG_RE = /\.(png|jpe?g|gif|bmp|webp)$/i
-function isImg(name) {
-  return IMG_RE.test(name || '')
-}
-
-/** 本地已有图片内容时加载 base64 预览（发出即显；接收在下载完成后显） */
+/* ---------- 图片 / WebM 内联预览 ---------- */
+/** 本地已有内容时加载 base64 预览（发出即显；接收在下载完成后显） */
 async function ensureImg(m, f) {
-  if (!isImg(f.name) || f.src || f._imgLoading) return
+  if (!looksLikeSticker(f.name) || f.src || f._imgLoading || f._previewFailed) return
   if (f.size > 32 * 1024 * 1024) return // 超大图不做内联预览
   const path = f.path
   if (!path) return
@@ -1186,7 +1183,7 @@ async function ensureImg(m, f) {
     f.src = `data:${r.mime};base64,${r.b64}`
     scrollBottom(true)
   } catch {
-    /* 预览失败静默降级为文件卡片 */
+    f._previewFailed = true // 降级为文件卡片，避免深度 watch 反复读失败的文件
   } finally {
     f._imgLoading = false
   }
@@ -1321,12 +1318,17 @@ watch(
                 <template v-else>{{ bodyOf(v.m) }}</template>
               </div>
               <template v-for="f in bubbleFiles(v.m)" :key="f.id">
-                <!-- 图片：本地已有内容时直接内联预览，点击查看原图（多选模式下点击改为切换选中）；
+                <!-- 图片/WebM：本地已有内容时内联预览；WebM 静音循环，点击用系统播放器打开。
                      自定义表情（命中表情库）按缩略尺寸渲染，不占满气泡 -->
-                <div v-if="isImg(f.name) && f.src" class="img-wrap" :class="{ 'sticker-wrap': isSticker(f) }">
-                  <img :src="f.src" class="chat-img" :class="{ 'emoji-sticker': isSticker(f) }"
+                <div v-if="looksLikeSticker(f.name) && f.src && !f._previewFailed" class="img-wrap" :class="{ 'sticker-wrap': isSticker(f) }">
+                  <video v-if="isVideoSticker(f.name)" :src="f.src" class="chat-img" :class="{ 'emoji-sticker': isSticker(f) }"
+                    :title="t('chat.open')" :aria-label="f.name" autoplay loop muted playsinline
+                    @click="selMode ? toggleSel(v.m) : openFile(f.path)"
+                    @contextmenu.prevent="openCtx(v.m, $event)" @loadeddata="scrollBottom(true)"
+                    @error="f._previewFailed = true" />
+                  <img v-else :src="f.src" class="chat-img" :class="{ 'emoji-sticker': isSticker(f) }"
                     :title="t('chat.viewImg')" @click="selMode ? toggleSel(v.m) : viewImage(f)"
-                    @contextmenu.prevent="openCtx(v.m, $event)" />
+                    @contextmenu.prevent="openCtx(v.m, $event)" @error="f._previewFailed = true" />
                 </div>
                 <!-- 无预览时显示文件卡片（下载中/失败/非图片/超大图） -->
                 <div v-else class="file-card" @contextmenu.prevent="openCtx(v.m, $event)">
@@ -1981,6 +1983,10 @@ watch(
   max-height: 200px;
   border-radius: 4px;
   cursor: zoom-in;
+}
+video.chat-img {
+  object-fit: contain;
+  cursor: pointer;
 }
 /* 自定义表情：不加白底衬垫，最长边限制在 150px（与 lib/emoji.js 的
    STICKER_DISPLAY_MAX 同值），避免 16MB 大图把气泡撑满 */

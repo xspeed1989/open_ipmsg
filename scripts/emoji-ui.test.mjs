@@ -158,6 +158,41 @@ test('缩略图滚动到可见才加载（懒加载 data URL），失败留占�
   )
 })
 
+test('导入对话框与收藏使用同一份表情格式白名单', () => {
+  assert.match(ipc, /import \{ STICKER_EXTS \} from '\.\/emoji\.js'/)
+  assert.match(ipc, /extensions: STICKER_EXTS/)
+  assert.match(picker, /ipc\.pickStickerFiles\(\)/)
+})
+
+test('WebM 在表情网格与悬停预览用 video 静音循环播放，WebP 仍用 img', () => {
+  const videos = [...picker.matchAll(/<video\b[\s\S]*?\/>/g)].map((m) => m[0])
+  assert.equal(videos.length, 4, '两种表情视图的网格与悬停预览都需要视频渲染')
+  for (const video of videos) {
+    assert.match(video, /v-if="isVideoSticker\(/)
+    for (const attr of ['autoplay', 'loop', 'muted', 'playsinline']) {
+      assert.match(video, new RegExp(`\\b${attr}\\b`))
+    }
+    assert.match(video, /:src="thumbs\[/)
+    assert.doesNotMatch(video, /\bcontrols\b/)
+  }
+  assert.equal((picker.match(/<img v-else\b/g) || []).length, 4)
+  assert.match(cssOf(picker), /\.sticker img,\s*\.sticker video\s*\{/)
+  assert.match(cssOf(picker), /\.hover-preview img,\s*\.hover-preview video\s*\{/)
+})
+
+test('聊天 WebM 预览可右键收藏，解码失败退回文件卡片且不反复读取', () => {
+  const video = chat.match(/<video\b[\s\S]*?\/>/)?.[0] || ''
+  assert.match(video, /isVideoSticker\(f\.name\)/)
+  for (const attr of ['autoplay', 'loop', 'muted', 'playsinline']) {
+    assert.match(video, new RegExp(`\\b${attr}\\b`))
+  }
+  assert.match(video, /@contextmenu\.prevent="openCtx\(v\.m, \$event\)"/)
+  assert.match(video, /@error="f\._previewFailed = true"/)
+  assert.match(chat, /v-if="looksLikeSticker\(f\.name\) && f\.src && !f\._previewFailed"/)
+  assert.match(chat, /if \(!looksLikeSticker\(f\.name\) \|\| f\.src \|\| f\._imgLoading \|\| f\._previewFailed\) return/)
+  assert.match(chat, /<img v-else :src="f\.src"/)
+})
+
 test('导入数量不设上限：前端不再有批次拦截，文案也一并清掉', () => {
   assert.doesNotMatch(picker, /MAX_IMPORT_BATCH/)
   assert.doesNotMatch(picker, /emoji\.tooMany/)
@@ -179,7 +214,7 @@ test('点选自定义表情直接发出（不进草稿框）', () => {
   assert.doesNotMatch(chat, /insertEmoji\(entry/)
 })
 
-test('右键菜单有「添加到表情」，且只对可入库的图片出现', () => {
+test('右键菜单有「添加到表情」，且只对可入库的图片/WebM 出现', () => {
   assert.match(chat, /v-if="canAddToEmoji\(ctxMenu\.msg\)"/)
   assert.match(chat, /emoji\.addToEmoji/)
   assert.match(chat, /async function addMsgToEmoji/)
@@ -255,10 +290,13 @@ test('图片与文件卡片都能右键打开菜单（未下载的小图也能�
 
 /* ---------------- 协议复用 ---------------- */
 
-test('发送走「粘贴图片」协议，不新增 wire 标记', () => {
+test('图片仍走「粘贴图片」协议，WebM 走普通附件，不新增 wire 标记', () => {
   const rs = readFileSync(new URL('../src-tauri/src/emoji.rs', import.meta.url), 'utf8')
   assert.match(rs, /stage_clipboard_image/)
   assert.match(rs, /clip_pos: Some\(0\)/)
+  assert.match(rs, /if kind == "webm"/)
+  assert.match(rs, /stage_clipboard_file\(data_dir, file, &b64\)/)
+  assert.match(rs, /let \(path, opts\) = stage_for_send/)
   // 官方客户端不认识的表情专属属性位不能出现
   assert.doesNotMatch(rs, /FILE_EMOJI|EMOJIOPT/)
 })

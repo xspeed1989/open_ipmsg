@@ -5,13 +5,13 @@
 //! ```text
 //! <data_dir>/emojis/
 //!   registry.json           索引：{ version, emojis: [{ id, name, file, size, sha, added_at }] }
-//!   <id>.<ext>              图片本体，导入即固化，重命名/排序不动文件名
+//!   <id>.<ext>              表情本体，导入即固化，重命名/排序不动文件名
 //!   tmp-<pid>/              导入包时的临时解压目录，用完即删
 //! ```
 //!
-//! 发送不走新协议：把表情复制成官方「粘贴图片」的 `ipmsgclip_s_<id>_0.<ext>`
-//! 再按 FILE_CLIPBOARD(0x20)+CLIPBOARDPOS 公告（见 net::send_message_multi_opts），
-//! 官方 IPMsg / iptux 等对端都能内嵌收到。
+//! 发送不走新协议：图片复制成官方「粘贴图片」的 `ipmsgclip_s_<id>_0.<ext>`，
+//! 再按 FILE_CLIPBOARD(0x20)+CLIPBOARDPOS 公告（见 net::send_message_multi_opts）。
+//! WebM 则复制为普通附件；本端内联播放，旧客户端仍可下载，不冒充剪贴板图片。
 //!
 //! 表情包是标准 zip（后缀 .ipmojis，可用系统解压工具直接打开）：
 //!
@@ -36,9 +36,9 @@ use tauri::State;
 const REGISTRY_FILE: &str = "registry.json";
 /// 表情库目录名
 const DIR_NAME: &str = "emojis";
-/// 单张表情上限：16MB（覆盖动图/高清截图）
+/// 单个表情上限：16MB（图片 / WebM 同一口径）
 pub const MAX_EMOJI_BYTES: u64 = 16 * 1024 * 1024;
-/// 一个表情包内所有图片累计上限
+/// 一个表情包内所有表情文件累计上限
 pub const MAX_PACK_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 /// 一次读盘入库的批量。
 ///
@@ -76,7 +76,7 @@ pub struct EmojiEntry {
     pub sha: String,
     #[serde(default)]
     pub added_at: u64,
-    /// 最近一次发送时缓存目录里的副本名（ipmsgclip_s_*.ext）。
+    /// 最近一次发送时缓存目录里的副本名（图片为 ipmsgclip_s_*.ext，WebM 为普通附件名）。
     /// 前端据此把「自己发出的这条消息」认成表情并按缩略渲染 —— 缓存副本是
     /// 逐字节复制，但文件名与库内文件名不同，只能记下映射。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -124,6 +124,59 @@ pub fn detect_image_kind(bytes: &[u8]) -> Option<&'static str> {
         return Some("bmp");
     }
     None
+}
+
+/// 可收藏的格式：图片（含静态/动态 WebP）或 DocType 明确为 webm 的 EBML。
+/// 不能只认 EBML 魔数：Matroska 也有相同文件头。
+pub fn detect_sticker_kind(bytes: &[u8]) -> Option<&'static str> {
+    detect_image_kind(bytes).or_else(|| detect_webm(bytes))
+}
+
+/// EBML 元素长度：1–8 字节 VINT；文件头内不允许 unknown-size。
+fn ebml_size(bytes: &[u8]) -> Option<(usize, usize)> {
+    let first = *bytes.first()?;
+    let width = first.leading_zeros() as usize + 1;
+    if width > 8 {
+        return None;
+    }
+    let encoded = bytes.get(..width)?;
+    let mut size = u64::from(first) & (0xff >> width);
+    for byte in &encoded[1..] {
+        size = (size << 8) | u64::from(*byte);
+    }
+    if size == (1u64 << (7 * width)) - 1 {
+        return None;
+    }
+    Some((usize::try_from(size).ok()?, width))
+}
+
+fn detect_webm(bytes: &[u8]) -> Option<&'static str> {
+    if !bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        return None;
+    }
+    let (size, width) = ebml_size(&bytes[4..])?;
+    let start = 4 + width;
+    let mut header = bytes.get(start..start.checked_add(size)?)?;
+    let mut found = false;
+    while !header.is_empty() {
+        let id_width = header[0].leading_zeros() as usize + 1;
+        if id_width > 4 {
+            return None;
+        }
+        let id = header.get(..id_width)?;
+        let (size, width) = ebml_size(header.get(id_width..)?)?;
+        let start = id_width + width;
+        let end = start.checked_add(size)?;
+        let value = header.get(start..end)?;
+        if id == [0x42, 0x82] {
+            if found || value != b"webm" {
+                return None;
+            }
+            found = true;
+        }
+        header = header.get(end..)?;
+    }
+    found.then_some("webm")
 }
 
 /// 名字清洗：去首尾空白与控制字符、去掉换行、限长；为空时回落默认名
@@ -251,7 +304,7 @@ type ImportOutcome = (Vec<EmojiEntry>, Vec<(String, String)>);
 
 /// 把一批已读进内存的源文件拷进表情库，返回这一批成功入库的条目。
 ///
-/// 校验：≤16MB、魔数判定为图片、指纹去重。**不限制表情库总量** —— 用户存多少张
+/// 校验：≤16MB、文件头判定为图片/WebM、指纹去重。**不限制表情库总量** —— 用户存多少张
 /// 就存多少张，占用是用户自己的磁盘，不再用一个人为的数字把新表情挡在门外。
 ///
 /// 调用方必须持有 REGISTRY_LOCK，并在最后 write_registry：这样「分批读盘导入」
@@ -273,13 +326,16 @@ fn import_sources(
             ));
             continue;
         }
-        let Some(kind) = detect_image_kind(bytes) else {
-            skipped.push((label.clone(), "不是支持的图片格式".to_string()));
+        let Some(kind) = detect_sticker_kind(bytes) else {
+            skipped.push((
+                label.clone(),
+                "不是支持的表情格式（图片或 WebM）".to_string(),
+            ));
             continue;
         };
         let sha = content_sha(bytes);
         if known.contains(&sha) {
-            skipped.push((label.clone(), "表情库里已有相同图片".to_string()));
+            skipped.push((label.clone(), "表情库里已有相同表情".to_string()));
             continue;
         }
         let id = next_id();
@@ -437,7 +493,7 @@ pub fn export_pack(
         "README.txt",
         format!(
             "Open IPMsg 自定义表情包（{} 张）\n\
-             本文件是标准 zip：emoji-pack.json 是清单，images/ 下是原始图片，可直接解压取用。\n\
+             本文件是标准 zip：emoji-pack.json 是清单，images/ 下是原始表情文件，可直接解压取用。\n\
              在 Open IPMsg 的表情面板「自定义 → 导入表情包」里选择本文件即可整包导入。\n",
             items.len()
         )
@@ -472,7 +528,7 @@ pub struct PackInspectItem {
     pub file: String,
     pub name: String,
     pub size: u64,
-    /// 魔数判定的图片类型；None = 非法
+    /// 文件头判定的表情类型（图片/WebM）；None = 非法
     pub kind: Option<String>,
     /// 与本地表情库重复（按指纹）
     pub duplicate: bool,
@@ -605,10 +661,10 @@ pub fn inspect_pack(data_dir: &Path, src: &Path) -> Result<PackInspect, String> 
             continue;
         }
         item.size = bytes.len() as u64;
-        match detect_image_kind(&bytes) {
+        match detect_sticker_kind(&bytes) {
             Some(kind) => item.kind = Some(kind.to_string()),
             None => {
-                item.problem = Some("E_PACK_BAD_FORMAT|不是支持的图片格式".into());
+                item.problem = Some("E_PACK_BAD_FORMAT|不是支持的表情格式（图片或 WebM）".into());
                 items.push(item);
                 continue;
             }
@@ -620,13 +676,13 @@ pub fn inspect_pack(data_dir: &Path, src: &Path) -> Result<PackInspect, String> 
         }
         total_bytes += bytes.len() as u64;
         if total_bytes > MAX_PACK_TOTAL_BYTES {
-            item.problem = Some("E_PACK_TOTAL_TOO_BIG|包内图片总大小超限".into());
+            item.problem = Some("E_PACK_TOTAL_TOO_BIG|包内表情总大小超限".into());
             items.push(item);
             continue;
         }
         if local.contains(&content_sha(&bytes)) {
             item.duplicate = true;
-            item.problem = Some("E_PACK_DUPLICATE|表情库里已有相同图片".into());
+            item.problem = Some("E_PACK_DUPLICATE|表情库里已有相同表情".into());
         }
         items.push(item);
     }
@@ -710,7 +766,7 @@ pub fn import_pack(
         }
         total_bytes += bytes.len() as u64;
         if total_bytes > MAX_PACK_TOTAL_BYTES {
-            skipped.push((label, "包内图片总大小超限".to_string()));
+            skipped.push((label, "包内表情总大小超限".to_string()));
             continue;
         }
         // 用包内条目名做默认名来源（保留原始文件名信息）
@@ -724,11 +780,7 @@ pub fn import_pack(
 
 /* ================= 发送 ================= */
 
-/// 魔数判定结果 → MIME。
-///
-/// 必须与 net::stage_clipboard_image 支持的 MIME 集合完全一致：
-/// 表情落盘要按官方「粘贴图片」公告，那里只认这五种；漏一种就会在发送时才报错，
-/// 所以这里返回 Option，由调用方在落盘前给出明确失败（并有单测锁住）。
+/// 文件头判定结果 → MIME。图片走 stage_clipboard_image，WebM 走普通附件缓存。
 pub fn mime_for_kind(kind: &str) -> Option<&'static str> {
     match kind {
         "png" => Some("image/png"),
@@ -736,11 +788,37 @@ pub fn mime_for_kind(kind: &str) -> Option<&'static str> {
         "gif" => Some("image/gif"),
         "webp" => Some("image/webp"),
         "bmp" => Some("image/bmp"),
+        "webm" => Some("video/webm"),
         _ => None,
     }
 }
 
-/// 发送自定义表情：把库里的图复制成官方「粘贴图片」命名后按附件发出。
+/// 固化发送副本：删掉表情库原件也不影响已发送附件，且不把视频标成官方贴图。
+fn stage_for_send(
+    data_dir: &Path,
+    file: &str,
+    bytes: &[u8],
+) -> Result<(PathBuf, crate::net::MsgSendOpts), String> {
+    let kind = detect_sticker_kind(bytes).ok_or_else(|| "表情文件已损坏".to_string())?;
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    if kind == "webm" {
+        let path = crate::net::stage_clipboard_file(data_dir, file, &b64)?;
+        Ok((path, crate::net::MsgSendOpts::default()))
+    } else {
+        let mime = mime_for_kind(kind).ok_or_else(|| format!("暂不支持发送这种表情：{kind}"))?;
+        let path = crate::net::stage_clipboard_image(data_dir, &b64, mime)?;
+        Ok((
+            path,
+            crate::net::MsgSendOpts {
+                clip_pos: Some(0),
+                ..Default::default()
+            },
+        ))
+    }
+}
+
+/// 发送自定义表情：图片走官方贴图，WebM 走普通附件。
 /// 返回送出的消息记录数组（与 send_files 一致）。
 pub async fn send_one(
     ctx: &crate::SharedCtx,
@@ -756,11 +834,7 @@ pub async fn send_one(
         .ok_or_else(|| "表情不存在（可能已被删除）".to_string())?;
     let src = dir.join(&entry.file);
     let bytes = std::fs::read(&src).map_err(|e| format!("读取表情失败：{e}"))?;
-    let kind = detect_image_kind(&bytes).ok_or_else(|| "表情文件已损坏".to_string())?;
-    let mime = mime_for_kind(kind).ok_or_else(|| format!("暂不支持发送这种图片：{kind}"))?;
-    use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let path = crate::net::stage_clipboard_image(&st.data_dir, &b64, mime)?;
+    let (path, opts) = stage_for_send(&st.data_dir, &entry.file, &bytes)?;
     // 记下这次发送用的缓存副本名：前端据此把发出的消息认成表情（缩略渲染），
     // 也用于「添加到表情」时识别自己刚发过的图
     if let Some(staged) = path.file_name().and_then(|s| s.to_str()) {
@@ -779,10 +853,7 @@ pub async fn send_one(
             key,
             text,
             vec![path.to_string_lossy().into_owned()],
-            crate::net::MsgSendOpts {
-                clip_pos: Some(0),
-                ..Default::default()
-            },
+            opts,
         )
         .await?
     ))
@@ -1118,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn every_supported_kind_maps_to_a_stageable_mime() {
+    fn every_image_kind_maps_to_a_stageable_mime() {
         // 五种魔数都要有 MIME，且必须是 net::stage_clipboard_image 认的那几种
         let kinds = ["png", "jpg", "gif", "webp", "bmp"];
         for k in kinds {
@@ -1152,6 +1223,139 @@ mod tests {
         // 伪装成 png 的可执行文件/文本一律拒绝
         assert_eq!(detect_image_kind(b"#!/bin/sh\nrm -rf /"), None);
         assert_eq!(detect_image_kind(b""), None);
+    }
+
+    const WEBM: &[u8] = include_bytes!("../tests/fixtures/sticker.webm");
+    const STATIC_WEBP: &[u8] = include_bytes!("../tests/fixtures/static.webp");
+    const ANIMATED_WEBP: &[u8] = include_bytes!("../tests/fixtures/animated.webp");
+
+    #[test]
+    fn detects_webm_and_static_or_animated_webp() {
+        assert_eq!(detect_sticker_kind(WEBM), Some("webm"));
+        assert_eq!(detect_sticker_kind(STATIC_WEBP), Some("webp"));
+        assert_eq!(detect_sticker_kind(ANIMATED_WEBP), Some("webp"));
+        assert!(ANIMATED_WEBP.windows(4).any(|w| w == b"ANIM"));
+        assert_eq!(ANIMATED_WEBP.windows(4).filter(|w| *w == b"ANMF").count(), 2);
+        assert_eq!(mime_for_kind("webm"), Some("video/webm"));
+    }
+
+    #[test]
+    fn webm_detection_checks_ebml_doctype_not_just_magic_or_substrings() {
+        // EBML Header 包含 DocType=webm（ID 0x4282）；后面不必解码视频帧。
+        let header = b"\x1a\x45\xdf\xa3\x87\x42\x82\x84webm";
+        assert_eq!(detect_sticker_kind(header), Some("webm"));
+        // 两字节长度编码也合法，不能把文件头布局写死。
+        assert_eq!(
+            detect_sticker_kind(b"\x1a\x45\xdf\xa3\x40\x08\x42\x82\x40\x04webm"),
+            Some("webm")
+        );
+        for len in 0..header.len() {
+            assert_eq!(
+                detect_sticker_kind(&header[..len]),
+                None,
+                "truncated at {len}"
+            );
+        }
+        for bad in [
+            &b"not a video.webm"[..],
+            &b"\x1a\x45\xdf\xa3webm"[..],
+            &b"\x1a\x45\xdf\xa3\x8b\x42\x82\x88matroska"[..],
+            // Void 字段内的 webm 字符串不是 DocType。
+            &b"\x1a\x45\xdf\xa3\x89\xec\x87\x42\x82\x84webm"[..],
+            // 未知长度、非法 VINT、溢出的字段长度都必须拒绝，且不得 panic。
+            &b"\x1a\x45\xdf\xa3\xff\x42\x82\x84webm"[..],
+            &b"\x1a\x45\xdf\xa3\x00\x42\x82\x84webm"[..],
+            &b"\x1a\x45\xdf\xa3\x8a\x42\x82\x01\xff\xff\xff\xff\xff\xff\xfe"[..],
+        ] {
+            assert_eq!(detect_sticker_kind(bad), None, "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn web_stickers_roundtrip_without_losing_animation() {
+        use base64::Engine as _;
+        let dir = tmp_data("web-stickers");
+        let dest = tmp_data("web-stickers-import");
+        let sources = vec![
+            ("video.WEBM".to_string(), WEBM.to_vec()),
+            ("static.WEBP".to_string(), STATIC_WEBP.to_vec()),
+            ("animated.webp".to_string(), ANIMATED_WEBP.to_vec()),
+        ];
+        let (added, skipped) = import_files(&dir, &sources).unwrap();
+        assert_eq!(added.len(), sources.len());
+        assert!(skipped.is_empty());
+        let (duplicates, skipped) = import_files(&dir, &sources).unwrap();
+        assert!(duplicates.is_empty());
+        assert_eq!(skipped.len(), sources.len());
+
+        for (entry, (_, bytes)) in added.iter().zip(&sources) {
+            let path = emoji_dir(&dir).join(&entry.file);
+            let kind = detect_sticker_kind(bytes).unwrap();
+            assert_eq!(path.extension().unwrap(), kind);
+            assert_eq!(std::fs::read(&path).unwrap(), *bytes);
+            let preview = crate::read_image_data(path.to_string_lossy().into_owned())
+                .await
+                .unwrap();
+            assert_eq!(preview["mime"], mime_for_kind(kind).unwrap());
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(preview["b64"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(decoded, *bytes);
+
+            let (staged, opts) = stage_for_send(&dir, &entry.file, bytes).unwrap();
+            assert_eq!(std::fs::read(&staged).unwrap(), *bytes);
+            assert_eq!(staged.extension().unwrap(), kind);
+            assert_eq!(opts.clip_pos, if kind == "webm" { None } else { Some(0) });
+            let cache_dir = if kind == "webm" {
+                "剪贴板文件"
+            } else {
+                "剪贴板图片"
+            };
+            assert!(staged.starts_with(dir.join(cache_dir)));
+            // 从发送缓存里也能找回收藏源，且反复发送不会覆盖历史缓存。
+            let available = src_available_payload("", staged.file_name().unwrap().to_str(), &dir);
+            assert_eq!(available["ok"], true);
+            let (again, _) = stage_for_send(&dir, &entry.file, bytes).unwrap();
+            assert_ne!(again, staged);
+            assert_eq!(std::fs::read(&staged).unwrap(), *bytes);
+        }
+
+        let pack = dir.join("web-stickers.ipmojis");
+        assert_eq!(export_pack(&dir, &[], &pack, "Web stickers").unwrap(), 3);
+        let inspect = inspect_pack(&dest, &pack).unwrap();
+        assert_eq!(inspect.importable, 3);
+        assert_eq!(inspect.items[0].kind.as_deref(), Some("webm"));
+        assert_eq!(import_pack(&dest, &pack, &[]).unwrap(), (3, vec![]));
+        for (entry, (_, bytes)) in load_emojis(&dest).unwrap().iter().zip(&sources) {
+            assert_eq!(
+                std::fs::read(emoji_dir(&dest).join(&entry.file)).unwrap(),
+                *bytes
+            );
+        }
+        assert_eq!(inspect_pack(&dest, &pack).unwrap().importable, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn webm_import_rejects_oversize_and_fake_files() {
+        let dir = tmp_data("webm-invalid");
+        let mut big = WEBM.to_vec();
+        big.resize((MAX_EMOJI_BYTES + 1) as usize, 0);
+        let (added, skipped) = import_files(
+            &dir,
+            &[
+                ("big.webm".into(), big),
+                ("fake.webm".into(), b"not a video".to_vec()),
+                ("fake.webp".into(), b"not an image".to_vec()),
+            ],
+        )
+        .unwrap();
+        assert!(added.is_empty());
+        assert_eq!(skipped.len(), 3);
+        assert!(skipped[0].1.contains("MB"));
+        assert!(stage_for_send(&dir, "fake.webm", b"not a video").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

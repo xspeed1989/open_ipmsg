@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, emit } from '@tauri-apps/api/event'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
+import { STICKER_EXTS } from './emoji.js'
 
 /** 注册后端事件监听（自动解包 Tauri 事件对象的 payload；返回 unlisten 函数） */
 export const listenEvent = (event, handler) =>
@@ -126,10 +127,10 @@ export const listEmojis = () => invoke('list_emojis')
 export const emojiSrcAvailable = (path, name = '') =>
   invoke('emoji_src_available', { path, name })
 
-/** 读取本地图片为 base64（表情缩略图/聊天内联预览用，超 32MB 拒绝） */
+/** 读取本地图片或 WebM 为 base64（表情/聊天内联预览用，超 32MB 拒绝；保留旧命令名） */
 export const readImageData = (path) => invoke('read_image_data', { path })
 
-/** 从本地图片导入表情（只传路径，读盘与校验都在后端） */
+/** 从本地图片或 WebM 导入表情（只传路径，读盘与校验都在后端） */
 export const importEmoji = (paths) => invoke('import_emoji', { paths })
 
 /** 删除表情（文件 + 索引） */
@@ -141,7 +142,7 @@ export const renameEmoji = (id, name) => invoke('rename_emoji', { id, name })
 /** 按给定 id 顺序重排表情（拖拽排序） */
 export const reorderEmojis = (ids) => invoke('reorder_emojis', { ids })
 
-/** 发送自定义表情（按官方「粘贴图片」协议公告，对端内嵌显示） */
+/** 发送自定义表情（图片走官方贴图协议，WebM 走普通附件） */
 export const sendEmoji = (key, id, text = '') => invoke('send_emoji', { key, id, text })
 
 /** 导出表情包（.ipmojis，标准 zip）；ids 为空 = 全部 */
@@ -155,12 +156,12 @@ export const inspectEmojiPack = (path) => invoke('inspect_emoji_pack', { path })
 export const importEmojiPack = (path, files = []) =>
   invoke('import_emoji_pack', { path, files })
 
-/** 选择本地图片（多选；用于导入表情）。标题交给系统默认，避免在这里引入 i18n 依赖 */
-export const pickImageFiles = () =>
+/** 选择本地表情（图片/WebM，多选）。标题交给系统默认 */
+export const pickStickerFiles = () =>
   openDialog({
     multiple: true,
     directory: false,
-    filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] }],
+    filters: [{ name: 'Stickers', extensions: STICKER_EXTS }],
   })
 
 /** 选择表情包文件（.ipmojis / .zip） */

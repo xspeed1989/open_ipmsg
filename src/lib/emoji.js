@@ -10,8 +10,10 @@ import { describeError, errorCode } from './errors.js'
 /** 单张表情上限，与后端 emoji.rs 的 MAX_EMOJI_BYTES 保持一致（16MB） */
 export const MAX_EMOJI_BYTES = 16 * 1024 * 1024
 
-/** 支持导入的图片扩展名（真正的判定在后端按文件头魔数做） */
+/** 图片格式（WebP 含静态与动态）；真正的判定在后端按文件头做 */
 export const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']
+/** 可收藏的表情格式：图片 + WebM 视频 */
+export const STICKER_EXTS = [...IMAGE_EXTS, 'webm']
 
 /** 包文件名后缀：仍是标准 zip，双击可用系统解压工具打开 */
 export const PACK_EXT = 'ipmojis'
@@ -115,12 +117,25 @@ export function packFileName(date = new Date()) {
   return `表情包-${date.getFullYear()}${p(date.getMonth() + 1)}${p(date.getDate())}.${PACK_EXT}`
 }
 
-/** 文件名（或路径）是否像可导入的图片（真正的判定在后端） */
-export function looksLikeImage(name) {
+function extensionOf(name) {
   const s = String(name ?? '')
   const i = s.lastIndexOf('.')
-  if (i <= 0) return false
-  return IMAGE_EXTS.includes(s.slice(i + 1).toLowerCase())
+  return i > 0 ? s.slice(i + 1).toLowerCase() : ''
+}
+
+/** WebM 必须用 video 渲染，不能交给 img / 图片查看器 */
+export function isVideoSticker(name) {
+  return extensionOf(name) === 'webm'
+}
+
+/** 文件名（或路径）是否像可收藏的表情（真正的判定在后端） */
+export function looksLikeSticker(name) {
+  return STICKER_EXTS.includes(extensionOf(name))
+}
+
+/** 文件名（或路径）是否像可导入的图片（真正的判定在后端） */
+export function looksLikeImage(name) {
+  return IMAGE_EXTS.includes(extensionOf(name))
 }
 
 /**
@@ -141,10 +156,10 @@ export function attachPath(item) {
 /**
  * 从消息附件的下载状态判断「添加到表情」此刻是否可用。
  * 已下载（本地有路径）→ 可直接入库；仅公告未下载 → 需要先下载再收纳。
- * @param {{name?:string,path?:string,state?:string,isDir?:boolean}} file
+ * @param {{name?:string,path?:string,state?:string,isDir?:boolean,dir_entry?:boolean}} file
  */
 export function addToEmojiPlan(file) {
-  if (!file || file.isDir || !looksLikeImage(file.name)) return { ok: false, reason: 'notImage' }
+  if (!file || file.isDir || file.dir_entry || !looksLikeSticker(file.name)) return { ok: false, reason: 'notImage' }
   if (typeof file.path === 'string' && file.path) return { ok: true, needDownload: false }
   if (file.state === 'done') return { ok: false, reason: 'noPath' }
   return { ok: true, needDownload: true }
