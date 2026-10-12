@@ -335,6 +335,7 @@ async fn start_network_impl(
     spawn_tcp_server(ctx.clone());
     spawn_ticker(ctx.clone());
     spawn_retry_loop(ctx.clone());
+    spawn_handshake_loop(ctx.clone());
     spawn_dir_loop(ctx.clone());
     Ok(ctx)
 }
@@ -398,6 +399,68 @@ fn spawn_v6_udp_loop(ctx: Arc<NetCtx>) {
 
 /// 在线消息送达重发循环（官方 §4-12 確認・リトライ）：每秒检查重发队列，
 /// 过期未确认（RETRY_INTERVAL_SECS）的重发同一包号，超过 RETRY_MAX 次放弃。
+/// 预握手重试上限（本轮）：用完就安静停下，等对端下一轮宣告或下一条消息自然重来。
+/// 与 `PLAIN_PROBE_BUDGET` 是两件事 —— 那个判「对端能力」，这个只数重试次数。
+const HANDSHAKE_RETRY_MAX: u32 = 5;
+/// 预握手重发节奏（秒）
+const HANDSHAKE_RETRY_INTERVAL_SECS: u64 = 2;
+
+/// 补发一次 GETPUBKEY。**不计入** `PLAIN_PROBE_BUDGET`：那条线判的是「对端不支持
+/// 加密」，不该由链路丢包决定（计入的话 2s×3 就能把支持加密的对端误标成明文）。
+async fn send_getpubkey_retry(ctx: &NetCtx, target: SocketAddr, cfg: &Config, n: u32) {
+    let capa = entry_caps(cfg) | crypto::CAPA_OUR_SEND;
+    let mut g = proto::Packet::new(cmd::GETPUBKEY);
+    g.extra = format!("{capa:x}").into_bytes();
+    let bytes = g.encode(&my_user(cfg), &my_host());
+    let _ = ctx.sock.send_to(&bytes, target).await;
+    ctx.st
+        .diag(&format!("-> {target} GETPUBKEY 重发（第 {n} 次补发，不计探测预算）"));
+}
+
+/// 扫一遍「宣告了加密、却还没有对方公钥」的对端并补发 GETPUBKEY，返回补发条数。
+///
+/// 以前预握手是**单发无重试**：GETPUBKEY 或 ANSPUBKEY 丢一个包，就只剩「下一轮 45s
+/// 宣告」与「下一次发消息」两条兜底 —— 真机上表现为「首条消息明文发出、加密要等下一轮」，
+/// 自检里那条断言也因此偶发红（实测约 10–20%）。
+pub(crate) async fn handshake_sweep(ctx: &NetCtx) -> usize {
+    let cfg = ctx.st.config();
+    if !cfg.encrypt {
+        return 0;
+    }
+    let pending: Vec<(String, SocketAddr)> = {
+        let peers = ctx.st.peers.lock().unwrap();
+        peers
+            .values()
+            .filter(|p| p.encrypt_announced)
+            .filter(|p| ctx.st.trust.peer_pubkey(&p.key).is_none())
+            .filter(|p| !ctx.st.trust.peer_marked_plain(&p.key))
+            .filter_map(|p| peer_addr(p).map(|a| (p.key.clone(), a)))
+            .collect()
+    };
+    let mut sent = 0usize;
+    for (key, target) in pending {
+        let n = ctx.st.trust.note_handshake_retry(&key);
+        if n > HANDSHAKE_RETRY_MAX {
+            continue; // 本轮到此为止
+        }
+        send_getpubkey_retry(ctx, target, &cfg, n).await;
+        sent += 1;
+    }
+    sent
+}
+
+/// 预握手重试循环：每 `HANDSHAKE_RETRY_INTERVAL_SECS` 扫一遍（见 `handshake_sweep`）。
+fn spawn_handshake_loop(ctx: Arc<NetCtx>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(HANDSHAKE_RETRY_INTERVAL_SECS));
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            handshake_sweep(&ctx).await;
+        }
+    });
+}
+
 fn spawn_retry_loop(ctx: Arc<NetCtx>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -863,6 +926,8 @@ async fn maybe_start_handshake(
     {
         return;
     }
+    // 对端这一轮重新宣告了加密：重试计数按「本轮」重来
+    ctx.st.trust.reset_handshake_retries(key);
     send_getpubkey(ctx, from, cfg).await;
 }
 
@@ -878,6 +943,10 @@ fn maybe_withdraw_peer_key(
     cfg: &Config,
 ) {
     if cfg.encrypt && pkt.command & opt::ENCRYPTOPT == 0 && ctx.st.trust.peer_pubkey(key).is_some() {
+        // 对端这轮不再声明加密：连「宣告过」的标志一起撤，预握手重试不再盯它
+        if let Some(p) = ctx.st.peers.lock().unwrap().get_mut(key) {
+            p.encrypt_announced = false;
+        }
         match ctx.st.trust.forget_peer_key(key) {
             Ok(()) => ctx.st.diag(&format!(
                 "<- {from} 上线通告未声明 ENCRYPTOPT，撤回该对端公钥缓存"
@@ -1162,7 +1231,8 @@ mod inbound {
                 absence: pkt.command & opt::ABSENCEOPT != 0,
                 absence_text: None,
                 vs: info.vs,
-            });
+                encrypt_announced: pkt.command & opt::ENCRYPTOPT != 0,
+});
             // 回应 ANSENTRY（单播），携带自己的昵称\0群组；能力位随总开关一起广告。
             // BR 应答遵循官方：不带 UTF8OPT（BR 系禁用），UTF-8 走 \0\nNN:/GN: 扩展
             let cfg = ctx.st.config();
@@ -1215,7 +1285,8 @@ mod inbound {
                 absence,
                 absence_text: None,
                 vs: info.vs,
-            });
+                encrypt_announced: pkt.command & opt::ENCRYPTOPT != 0,
+});
             ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
             // 不在模式通告（BR_ABSENCE）说明对方状态切换：旧缓存的不在通知文作废
             if base == cmd::BR_ABSENCE {
@@ -1835,7 +1906,8 @@ mod inbound {
                         absence: metadata.status.unwrap_or(0) & opt::ABSENCEOPT != 0,
                         absence_text: None,
                         vs: metadata.client_version,
-                    });
+                        encrypt_announced: enc_meta.is_some(),
+});
                     added
                 } else {
                     false
@@ -1966,7 +2038,8 @@ mod inbound {
                     absence: h.status & opt::ABSENCEOPT != 0,
                     absence_text: None,
                     vs: None,
-                });
+                    encrypt_announced: h.status & opt::ENCRYPTOPT != 0,
+});
                 changed |= add;
             }
             if changed {
@@ -3123,7 +3196,8 @@ fn peer_from_host_dict(d: &crate::ipdict::Dict) -> Option<PeerInfo> {
         absence: status & opt::ABSENCEOPT != 0,
         absence_text: None,
         vs: None,
-    })
+        encrypt_announced: false,
+})
 }
 
 /* ================= 官方 v5 密文消息（EncIPDict） ================= */
@@ -5061,7 +5135,8 @@ mod tests {
                 absence: false,
                 absence_text: None,
                 vs: None,
-            });
+                encrypt_announced: false,
+});
         }
         // 等价于双方已完成 GETPUBKEY/ANSPUBKEY：各自缓存对方公钥
         st_a.trust.remember_peer_key(key, crate::crypto::CAPA_OUR_SEND, &st_b.trust.own_keypair().public_key())
@@ -5244,7 +5319,8 @@ mod tests {
                 absence: false,
                 absence_text: None,
                 vs: None,
-            });
+                encrypt_announced: false,
+});
         }
         // 等价于双方已完成 GETPUBKEY/ANSPUBKEY（加密路径下标志位同样要保住）
         st_a.trust.remember_peer_key(
@@ -5312,7 +5388,8 @@ mod tests {
             absence: false,
             absence_text: None,
             vs: None,
-        });
+            encrypt_announced: false,
+});
     }
 
     fn sent_sendmsg(peer: &std::net::UdpSocket) -> Vec<crate::protocol::Packet> {
@@ -5466,6 +5543,56 @@ mod tests {
         assert_eq!(resent[0].pkt_no, pkt, "重发沿用原包号（对端据此去重）");
         assert_ne!(resent[0].command & opt::FILEATTACHOPT, 0);
         assert_ne!(resent[0].command & opt::SENDCHECKOPT, 0);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    /// 预握手重试：宣告了加密却没有公钥的对端，会被 sweep 补发 GETPUBKEY；到上限后
+    /// 停下（等下一轮宣告/下一条消息按本轮重来），并且**不**消耗探测预算、**不**把对端
+    /// 标记成明文 —— 那条线判的是「对端能力」，不该由链路丢包决定。
+    #[tokio::test]
+    async fn handshake_sweep_retries_until_capped_without_marking_plain() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("handshake-retry").await;
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        let mut cfg = crate::state::Config::default();
+        cfg.encrypt = true;
+        st.set_config(cfg);
+        st.upsert_peer(PeerInfo {
+            key: key.clone(),
+            ip: key.clone(),
+            port: from.port(),
+            nickname: "peer".into(),
+            group: String::new(),
+            host: "h".into(),
+            user: "u".into(),
+            last_seen: now_secs(),
+            absence: false,
+            absence_text: None,
+            vs: None,
+            encrypt_announced: true,
+        });
+
+        let mut sent = 0usize;
+        for _ in 0..HANDSHAKE_RETRY_MAX + 3 {
+            sent += super::handshake_sweep(&ctx).await;
+        }
+        assert_eq!(sent, HANDSHAKE_RETRY_MAX as usize, "补发到上限就停，不无限探测");
+        assert_eq!(st.trust.probe_count(&key), 0, "重试不消耗 PLAIN_PROBE_BUDGET");
+        assert!(
+            !st.trust.peer_marked_plain(&key),
+            "重试不该把支持加密的对端标记成明文"
+        );
+
+        let got = recv_test_packets(&peer)
+            .iter()
+            .filter(|p| p.command & 0xff == crate::protocol::cmd::GETPUBKEY)
+            .count();
+        assert_eq!(got, HANDSHAKE_RETRY_MAX as usize, "GETPUBKEY 真的发出去了");
+
+        // 对端下一轮宣告（或下一条消息）之后按本轮重新计
+        st.trust.reset_handshake_retries(&key);
+        assert_eq!(super::handshake_sweep(&ctx).await, 1, "重新宣告后可以再来一轮");
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -5710,7 +5837,8 @@ mod tests {
             absence: false,
             absence_text: None,
             vs: None,
-        });
+            encrypt_announced: false,
+});
         let mut cfg = crate::state::Config::default();
         cfg.nickname = "daye".into();
         st.set_config(cfg);
@@ -5816,7 +5944,8 @@ mod tests {
             absence: false,
             absence_text: None,
             vs: None,
-        });
+            encrypt_announced: false,
+});
         let mut packet = crate::protocol::Packet::new(
             crate::protocol::cmd::SENDMSG | crate::protocol::opt::BROADCASTOPT,
         ).with_pkt_no(771002);
@@ -6075,7 +6204,8 @@ mod tests {
             absence: false,
             absence_text: None,
             vs: Some("05070000".into()),
-        });
+            encrypt_announced: false,
+});
         st.trust.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &sender.public_key())
             .unwrap();
         st.delete_contact(&key);
@@ -6269,7 +6399,8 @@ mod tests {
             absence: false,
             absence_text: None,
             vs: None,
-        };
+            encrypt_announced: false,
+};
         assert_eq!(
             peer_addr(&p).expect("addr").to_string(),
             "10.0.0.3:50000",

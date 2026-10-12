@@ -214,6 +214,10 @@ pub struct PeerInfo {
     /// 对方不在通知文（GETABSENCEINFO 取到后缓存）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absence_text: Option<String>,
+    /// 对端最近一次上线类报文是否声明了加密能力（ENCRYPTOPT）。
+    /// 预握手重试只看这个标志：宣告了加密却没有公钥，就该补发 GETPUBKEY。
+    #[serde(default)]
+    pub encrypt_announced: bool,
     /// 对方客户端版本串（Entry ulist 扩展 VS: 行）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vs: Option<String>,
@@ -626,6 +630,7 @@ impl AppState {
                 if !info.user.is_empty() {
                     existing.user = info.user;
                 }
+                existing.encrypt_announced = info.encrypt_announced;
                 false
             }
             None => {
@@ -1791,6 +1796,10 @@ pub(crate) mod trust {
         probe_counts: Mutex<HashMap<String, u32>>,
         /// 自愈重握手限频：IP → 最近一次触发时刻（秒）（任一端换钥后自动恢复用）
         rehandshake_at: Mutex<HashMap<String, u64>>,
+        /// 预握手**重试**次数：IP → 已补发次数。与 `probe_counts` 分开是刻意的 ——
+        /// 那个预算判的是「对端能力」（攒够就把对端标成明文），不该由链路丢包决定；
+        /// 这里只数重试，用完就安静停下，等下一次宣告或发消息自然重来。
+        handshake_retries: Mutex<HashMap<String, u32>>,
         /// 本机密钥对：懒加载生成 + ipmsg_key.json 持久化（进程内只生成一次）
         own_key: OnceLock<Arc<KeyPair>>,
     }
@@ -1806,6 +1815,7 @@ pub(crate) mod trust {
                 peer_plain: Mutex::new(HashSet::new()),
                 probe_counts: Mutex::new(HashMap::new()),
                 rehandshake_at: Mutex::new(HashMap::new()),
+                handshake_retries: Mutex::new(HashMap::new()),
                 own_key: OnceLock::new(),
             }
         }
@@ -2281,6 +2291,25 @@ pub(crate) mod trust {
                     true
                 }
             }
+        }
+
+        /// 记一次预握手重发，返回含本次的累计次数
+        pub fn note_handshake_retry(&self, ip: &str) -> u32 {
+            let mut m = self.handshake_retries.lock().unwrap();
+            let c = m.entry(ip.to_string()).or_insert(0);
+            *c += 1;
+            *c
+        }
+
+        /// 对端重新宣告加密（新一轮上线）时把重试计数清零：重试上限是「本轮」的，
+        /// 不是「这台对端」的。
+        pub fn reset_handshake_retries(&self, ip: &str) {
+            self.handshake_retries.lock().unwrap().remove(ip);
+        }
+
+        #[allow(dead_code)] // 测试与诊断用
+        pub fn handshake_retries_of(&self, ip: &str) -> u32 {
+            self.handshake_retries.lock().unwrap().get(ip).copied().unwrap_or(0)
         }
 
         pub fn retire_probe_budget(&self, ip: &str) -> bool {
@@ -3285,7 +3314,8 @@ mod tests {
             absence: false,
             absence_text: None,
             vs: None,
-        }));
+            encrypt_announced: false,
+}));
         let t0 = now_secs();
         assert!(!st.upsert_peer(PeerInfo {
             key: "10.0.0.3:50000".into(),
@@ -3300,7 +3330,8 @@ mod tests {
             absence: false,
             absence_text: None,
             vs: None,
-        }));
+            encrypt_announced: false,
+}));
         let peers = st.peers.lock().unwrap();
         assert_eq!(peers.len(), 1, "同 IP 不同源端口只允许一条记录");
         let p = &peers["10.0.0.3"];

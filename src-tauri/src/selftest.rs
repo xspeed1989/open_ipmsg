@@ -2699,7 +2699,8 @@ async fn extended_protocols() -> bool {
                 absence: false,
                 absence_text: None,
                 vs: None,
-            },
+                encrypt_announced: false,
+},
         );
     }
     let rec_x = net::send_message(&ctx_x, "127.0.0.6", "经代理的消息", vec![])
