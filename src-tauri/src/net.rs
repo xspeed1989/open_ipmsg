@@ -2550,9 +2550,6 @@ pub async fn send_message_opts(
         extra.push(0x07);
     }
 
-    // 文件消息不请求已读回执（减少未知标志组合被对端丢弃的风险）；纯文本消息保留回执
-    let want_rcpt = entries.is_empty();
-
     // 出站加密决策（spec §5/§6）：开关开启且已缓存对方公钥 → 密封完整扩展部
     // （含尾部 \0）。seal_message 内置 UDP 上限保护，超限错误直接抛给前端分段。
     // 尚无缓存且对方未被标明文 → 本次仍明文发送，同时后台触发 GETPUBKEY
@@ -2598,10 +2595,19 @@ pub async fn send_message_opts(
         }
     }
 
+    // SENDCHECKOPT（送达确认）与 READCHECKOPT（已读回执）是两件事：
+    // - SENDCHECKOPT（送达确认，对端收到即回 RECVMSG）：所有消息都要。附件公告
+    //   同样只有一次 UDP 投递机会，不带它就没有任何丢包检测手段——公告丢掉时
+    //   对端连气泡都没有，只能靠人手再发一次（文本一直有重发兜底，附件原先没有）。
+    //   带上它以后未确认的公告会按 4s 重发同一包号（官方 §4-12）。
+    // - READCHECKOPT（已读回执）：仍只给纯文本。界面上的「已读/未读」标签只对
+    //   文本有意义，附件保持既有语义（不在气泡上加标签）。
+    let want_read = entries.is_empty();
+
     let command = cmd::SENDMSG
-        // 官方默认语义：普通在线消息带 SENDCHECKOPT，未确认超时重发（§4-12）
-        | if want_rcpt { opt::SENDCHECKOPT } else { 0 }
-        | if want_rcpt { opt::READCHECKOPT } else { 0 }
+        // 官方默认语义：在线消息带 SENDCHECKOPT，未确认超时重发（§4-12）
+        | opt::SENDCHECKOPT
+        | if want_read { opt::READCHECKOPT } else { 0 }
         | if entries.is_empty() { 0 } else { opt::FILEATTACHOPT }
         | if utf8 { opt::UTF8OPT } else { 0 }
         // 封书 = SECRET|READCHECK（官方 SECRETEXOPT）；密码锁 = PASSWORDOPT
@@ -2672,7 +2678,7 @@ pub async fn send_message_opts(
         "ts": ts,
         "pkt": pkt_no,
         "peer": {"key": peer.key, "nickname": peer.nickname, "host": peer.host, "group": peer.group},
-        "rcpt": want_rcpt,
+        "rcpt": want_read,
         "read": false,
         // 本次实际是否加密发出；我方发出的消息签名恒可核验
         "enc": enc, "sig_ok": true,
@@ -2681,21 +2687,20 @@ pub async fn send_message_opts(
     });
     ctx.st.log_record(key, &rec);
 
-    // 在线纯文本消息登记送达重发（官方 §4-12）：无 RECVMSG 时按 4s 间隔
-    // 重发同一包号，累计 RETRY_MAX 次放弃；附件消息不登记
-    if want_rcpt {
-        ctx.st.enqueue_retry(RetryOut {
-            key: key.to_string(),
-            pkt: pkt_no,
-            text: text.to_string(),
-            paths,
-            entries,
-            secret: flags.secret,
-            password: flags.password,
-            ts,
-            attempts: 0,
-        });
-    }
+    // 在线消息登记送达重发（官方 §4-12）：无 RECVMSG 时按 4s 间隔重发同一包号，
+    // 累计 RETRY_MAX 次放弃。附件与纯文本一视同仁：公告丢包、对端换钥解密失败
+    // 都能在下一轮重发自愈（重发会重新登记文件槽、按当前公钥重新密封）。
+    ctx.st.enqueue_retry(RetryOut {
+        key: key.to_string(),
+        pkt: pkt_no,
+        text: text.to_string(),
+        paths,
+        entries,
+        secret: flags.secret,
+        password: flags.password,
+        ts,
+        attempts: 0,
+    });
     Ok(rec)
 }
 
@@ -5294,6 +5299,77 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
+
+    /// 附件公告同样要送达确认 + 超时重发。
+    ///
+    /// 这里守的是评审发现的缺口：附件公告只有一次 UDP 投递机会。纯文本带
+    /// SENDCHECKOPT，未确认时每 4s 重发同一包号；附件当时既不带 SENDCHECKOPT
+    /// （对端不回 RECVMSG，发送端也无从发现丢包）、也不登记重发项，丢一个包就
+    /// 永久丢失，对端表现为「连图片气泡都没有，再发一次就好」。
+    #[tokio::test]
+    async fn attachment_announcement_is_acked_and_retried() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("attach-retry").await;
+        register_loopback_peer(&st, peer.local_addr().unwrap().port());
+
+        let send_dir = data_dir.join("send");
+        std::fs::create_dir_all(&send_dir).unwrap();
+        let img = send_dir.join("剪贴板图片.png");
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\nfake").unwrap();
+
+        let rec = super::send_message(
+            &ctx,
+            "127.0.0.1",
+            "带图的消息",
+            vec![img.to_string_lossy().into_owned()],
+        )
+        .await
+        .expect("发送附件");
+        let pkt = rec["pkt"].as_u64().unwrap() as u32;
+        // 交付可靠性不该顺手给附件加上「已读回执」标签（界面语义保持不变）
+        assert_eq!(rec["rcpt"], false, "附件仍不请求已读回执");
+
+        // 1) 公告必须请求送达确认，否则对端不会回 RECVMSG，发送端也无从发现丢包
+        let first = sent_sendmsg(&peer);
+        assert_eq!(first.len(), 1, "首投只有一条 SENDMSG");
+        assert_ne!(
+            first[0].command & opt::SENDCHECKOPT,
+            0,
+            "附件公告也要带 SENDCHECKOPT，对端才会回 RECVMSG"
+        );
+        assert_ne!(first[0].command & opt::FILEATTACHOPT, 0);
+        assert_eq!(
+            first[0].command & opt::READCHECKOPT,
+            0,
+            "附件不请求已读回执"
+        );
+
+        // 2) 这一包假设在网络上丢了（测试里不投递给对端）：必须登记了重发项
+        let mut item = st
+            .retry_for("127.0.0.1")
+            .into_iter()
+            .find(|i| i.pkt == pkt)
+            .expect("附件公告必须登记送达重发，否则丢包后对端永远收不到");
+        assert_eq!(item.entries.len(), 1, "重发项要带着附件条目");
+
+        // 3) 到期重发：同包号、同文件 ID、仍然声明 FILEATTACHOPT
+        item.ts = item.ts.saturating_sub(super::RETRY_INTERVAL_SECS + 1);
+        st.enqueue_retry(item);
+        super::retry_pending_for(Arc::new(ctx), "127.0.0.1").await;
+
+        let resent = sent_sendmsg(&peer);
+        assert_eq!(resent.len(), 1, "丢包后必须自动补发一条公告");
+        assert_eq!(resent[0].pkt_no, pkt, "重发沿用原包号（对端据此去重）");
+        assert_ne!(resent[0].command & opt::FILEATTACHOPT, 0);
+        assert_ne!(resent[0].command & opt::SENDCHECKOPT, 0);
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    /// 送达确认（RECVMSG）落成「已送达」中间态，已读仍只由 READMSG 翻转。
+    ///
+    /// 官方 Windows 客户端对普通消息只回 RECVMSG、从不回 READMSG（`recvdlg.cpp`
+    /// 的 READMSG 只在封书开封时发），没有这个中间态，气泡就永远挂在「未读」——
+    /// 真机表现为「给原生客户端发消息，本端无法及时已读」。
 
     /// 对方离线时入队、上线后重投的封书消息同样要保持封书语义
     /// （本地留痕 + 线上标志都不能降级）。

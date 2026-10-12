@@ -61,6 +61,9 @@ struct PeerShared {
     /// 经 GETDIRFILES 取回的目录树：(相对路径, 内容)
     fetched_dirs: Vec<Vec<(String, Vec<u8>)>>,
     receipts: Vec<u32>,
+    /// 假对端**发出**的送达确认（RECVMSG）包编号：真机对带 SENDCHECKOPT 的
+    /// 消息必回（官方 §4-12），夹具跟真机保持一致，发送端才能从重发队列里摘掉。
+    sent_acks: Vec<u32>,
     exit_received: bool,
 }
 
@@ -224,6 +227,20 @@ async fn async_run() -> bool {
     })
     .await;
     log.check("假对端经 TCP 完整取回文件且逐字节一致", fetched_ok);
+
+    // 附件公告也必须进送达确认链路：对端回了 RECVMSG，发送端才把这条从重发
+    // 队列里摘掉（不摘就会每 4s 重发到 RETRY_MAX 放弃，对端还会重复取文件）
+    let file_pkt = rec["pkt"].as_u64().unwrap() as u32;
+    let acked = wait_for(3000, || {
+        shared.lock().unwrap().sent_acks.contains(&file_pkt)
+    })
+    .await;
+    log.check("附件公告收到对端的 RECVMSG 送达确认", acked);
+    let dequeued = wait_for(2000, || {
+        !st.retry_for(&peer_key).iter().any(|i| i.pkt == file_pkt)
+    })
+    .await;
+    log.check("附件公告确认后移出送达重发队列（不再每 4s 重发）", dequeued);
 
     /* ---- 3b. 发送目录（对端经 GETDIRFILES 取回整棵树） ---- */
     let send_dir = data_dir.join("upload_dir");
@@ -1696,6 +1713,15 @@ fn spawn_fake_peer(
                                     ),
                                 }
                             }
+                        }
+                        // 真机对带 SENDCHECKOPT 的消息立刻回 RECVMSG（官方 §4-12）：
+                        // 不回就会让发送端的重发队列空转到 RETRY_MAX 放弃，附件公告
+                        // 还会被重复取回——夹具在这一点上必须像真机。
+                        if pkt.command & opt::SENDCHECKOPT != 0 {
+                            let mut ack = proto::Packet::new(cmd::RECVMSG | opt::AUTORETOPT);
+                            ack.extra = pkt.pkt_no.to_string().into_bytes();
+                            let _ = ps.send_to(&ack.encode("假对端", "fake-host"), from).await;
+                            shared.lock().unwrap().sent_acks.push(pkt.pkt_no);
                         }
                         let mut r = proto::Packet::new(cmd::READMSG | opt::AUTORETOPT);
                         r.extra = pkt.pkt_no.to_string().into_bytes();
