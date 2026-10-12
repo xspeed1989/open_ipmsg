@@ -13,4 +13,13 @@
 - **可读性复核（本次试水的完成判定之一）**：已分两组的依赖现在肉眼可见 —— `retry_pending_for` 里 `st.outbox.retry_for / bump_retry / demote_retry_to_pending` 与 `st.trust.peer_pubkey / own_keypair` 连成读得通的句子（「用我自己的密钥，密封给那个对端的公钥」）。**但**未分组的 `peers` 仍是**裸字段伸手**（`ctx.st.peers.lock().unwrap()`），`config` / `diag` 依旧高频。结论：收益集中在已分的两组，**下一轮最该收的是 `peers`** —— 字段级伸手是最 raw 的一种泄漏，而顶层留 `config`/`diag` 的决定是对的。
 - 持久化随组走：`peer_keys.json` / `ipmsg_key.json` 归 `TrustStore`，`pending_out.json` 归 `OutboxStore`；两条重发队列（`retry_out`）与送达确认计数（`ack_count`）只存内存，保持原样。
 - 测试用的字段与钩子（`peer_key_persistence_test_hooks` 及其内部字段）对测试开 `pub(crate)`；`take_pending` 与 `FileEntry::ext` 标 `#[allow(dead_code)]` —— 两者都只有测试在用，从 `pub` AppState 方法变成 crate 私有后 rustc 才指出。
-- 剩下四组未动：peers/presence、history/log、dir/master、agent/relay。跨组字段的归属仍待定：`offered`（文件槽位）、`dialect`（取文件方言）、`seen_queue/seen_set`（入站去重）都还不清楚该跟 presence 还是跟传输。
+- **已落地的组**（按顺序）：`trust`（对端信任）、`outbox`（重发 + 待投递）、`peers`（对端在线状态）、
+  `transfer`（附件槽 + 取文件方言）。`peers` 那组是全仓裸锁最多的一处（25 处 `lock().unwrap()`），
+  收进 interface 后读一律返回克隆（锁不跨 `await`）、写一律走 `with_peer` 闭包。
+- 归属已定的字段：`offered` + `dialect` → `transfer`（与 presence 零交集，只被取文件路径用）；
+  `peer_absence` → `peers`；`ack_count` → `outbox`。
+- **刻意留顶层**：`seen_queue/seen_set`（入站去重，已封装在 `mark_seen`/`forget_seen` 后面、
+  **零裸泄漏**，与任何领域状态无交集）；`config`/`diag`/`data_dir`/`logs_dir`（基础设施，
+  高频调用）。
+- 剩下三组未动：history/log（含 `hist_lock`/`hidden_contacts`）、dir/master、agent/relay。
+  下一轮建议先 `history/log`（调用面最大：`find_in_record` 26 次）。
