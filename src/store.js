@@ -15,6 +15,9 @@ import {
 } from './lib/sessions'
 import { normalizeEmojis } from './lib/emoji'
 import { sealedPreviewKey } from './lib/secret'
+import {
+  applyFileProgress, bufferFileProgress, replayFileProgress,
+} from './lib/fileprogress'
 import { applyTheme } from './lib/theme'
 import { t, setLocale, detectLocale, dayLabel as i18nDayLabel } from './lib/i18n'
 
@@ -188,6 +191,12 @@ export async function refreshUsers() {
   setTimeout(loadUsers, 600)
 }
 
+/**
+ * 下载进度事件可能早于消息入列到达（见 lib/fileprogress.js 的成因说明）。
+ * 落不下去的事件暂存在这里，等消息真正入列后回放，绝不整条丢弃。
+ */
+const pendingFileProgress = new Map()
+
 export async function ensureChat(key) {
   if (!store.chats[key]) {
     let msgs = []
@@ -201,6 +210,8 @@ export async function ensureChat(key) {
       if (m.ts) store.lastTs[key] = Math.max(store.lastTs[key] || 0, m.ts)
     }
     store.chats[key] = { msgs }
+    // 历史加载是「消息入列」的一条路径：等在这里的完成事件此刻才落得下去
+    replayFileProgress(pendingFileProgress, store.chats[key], key)
   }
   return store.chats[key]
 }
@@ -233,6 +244,8 @@ export function pushMsg(key, msg) {
     }
     if (msg.ts) store.lastTs[key] = Math.max(store.lastTs[key] || 0, msg.ts)
     if (msg.peer) store.peerMeta[key] = msg.peer
+    // 实时入列是另一条路径：回放此前暂存的下载进度（含已完成）
+    replayFileProgress(pendingFileProgress, c, key)
   })
 }
 
@@ -470,26 +483,10 @@ export async function downloadFile(msg, file) {
 }
 
 function onFileProgress(p) {
-  const { key, pkt, file_id: fileId, transferred, total, done, path, error, enc } = p
-  const chat = store.chats[key]
-  if (!chat) return
-  const msg = chat.msgs.find((m) => m.pkt === pkt && m.dir === 'in')
-  if (!msg) return
-  const f = (msg.files || []).find((x) => x.id === fileId)
-  if (!f) return
-  f.transferred = transferred
-  f.total = total || f.size
-  // 加密流下载标记：UI 据此区分「下载中（加密）」与「解密完成」状态
-  if (typeof enc === 'boolean') f.enc = enc
-  if (error) {
-    f.state = 'failed'
-    f.error = error
-    return
-  }
-  if (done) {
-    f.state = 'done'
-    f.path = path || f.path
-  }
+  if (!p?.key) return
+  // 消息还没入列（会话未加载时 msg-in 要先 await getHistory）时不能直接丢弃：
+  // 那条「下载完成」丢了，卡片就永远停在「下载中」，图片再也出不来。
+  if (!applyFileProgress(store.chats[p.key], p)) bufferFileProgress(pendingFileProgress, p)
 }
 
 /* ---------------- 聊天记录搜索 ---------------- */
