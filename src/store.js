@@ -7,17 +7,16 @@ import {
 } from '@tauri-apps/plugin-notification'
 import * as ipc from './lib/ipc.js'
 import { splitDelayedNote } from './lib/text.js'
-import { pickLatestUnread, pickLatestActive, applyUnreadFromSessions } from './lib/unread.js'
-import { unreadReceiptPkts } from './lib/receipts.js'
+import { applyUnreadFromSessions } from './lib/unread.js'
 import { mergeSessions } from './lib/sessions.js'
 import {
   BROADCAST_SESSION_KEY, isBroadcastSession, senderOf, senderIp,
 } from './lib/sessions.js'
 import { normalizeEmojis } from './lib/emoji.js'
 import { sealedPreviewKey } from './lib/secret.js'
-import {
-  applyFileProgress, bufferFileProgress, replayFileProgress,
-} from './lib/fileprogress.js'
+import { replayFileProgress } from './lib/fileprogress.js'
+// 事件驱动的那半边迁移（见 docs/adr/0001）：本文件只负责状态容器、I/O 与用户动作
+import * as transitions from './lib/transitions.js'
 import { applyTheme } from './lib/theme.js'
 import { t, setLocale, detectLocale, dayLabel as i18nDayLabel } from './lib/i18n.js'
 
@@ -40,6 +39,9 @@ export const store = reactive({
 
   /** key -> { msgs: [] }，历史与会话内容 */
   chats: {},
+  /** 早于消息入列到达的下载进度事件（成因见 lib/fileprogress.js）：这是**事件机制
+   *  的状态**，不是界面状态；放进来是因为事件迁移 module 要就地改它 */
+  pendingFileProgress: new Map(),
   peerMeta: {}, // key -> { nickname, host, group } 快照（离线也能显示）
 
   activeKey: null,
@@ -191,12 +193,6 @@ export async function refreshUsers() {
   setTimeout(loadUsers, 600)
 }
 
-/**
- * 下载进度事件可能早于消息入列到达（见 lib/fileprogress.js 的成因说明）。
- * 落不下去的事件暂存在这里，等消息真正入列后回放，绝不整条丢弃。
- */
-const pendingFileProgress = new Map()
-
 export async function ensureChat(key) {
   if (!store.chats[key]) {
     let msgs = []
@@ -211,41 +207,19 @@ export async function ensureChat(key) {
     }
     store.chats[key] = { msgs }
     // 历史加载是「消息入列」的一条路径：等在这里的完成事件此刻才落得下去
-    replayFileProgress(pendingFileProgress, store.chats[key], key)
+    replayFileProgress(store.pendingFileProgress, store.chats[key], key)
   }
   return store.chats[key]
 }
 
+/**
+ * 消息入列（用户动作路径：发送、表情、广播都走这里）。
+ * 合并与保真的数学在 transitions.insertMessage，那边的事件路径用同一个原语，
+ * 不会出现第二份。返回 Promise：调用方需要在消息真正入列后再做已读处理。
+ */
 export function pushMsg(key, msg) {
-  // 返回 Promise：调用方需要在消息真正入列后再做已读处理
-  return ensureChat(key).then((c) => {
-    // 对端"延迟发送"会以相同包号反复重发：原地替换，并保留本地运行时状态
-    // （下载进度/保存路径/已读），既不刷屏也不丢已完成的状态
-    const idx = c.msgs.findIndex((m) => m.dir === msg.dir && m.pkt === msg.pkt)
-    if (idx >= 0) {
-      const old = c.msgs[idx]
-      for (const f of msg.files || []) {
-        // 保留旧卡片的非 pending 状态（下载中/已完成/失败）与本地路径、原因
-        const prev = (old.files || []).find(
-          (x) => x.id === f.id && x.state && x.state !== 'pending'
-        )
-        if (prev) {
-          f.state = prev.state
-          f.path = prev.path ?? f.path
-          f.transferred = prev.transferred
-          f.error = prev.error
-          if (prev.src) f.src = prev.src
-        }
-      }
-      if (old.read && msg.dir === 'in') msg.read = true
-      c.msgs.splice(idx, 1, msg)
-    } else {
-      c.msgs.push(msg)
-    }
-    if (msg.ts) store.lastTs[key] = Math.max(store.lastTs[key] || 0, msg.ts)
-    if (msg.peer) store.peerMeta[key] = msg.peer
-    // 实时入列是另一条路径：回放此前暂存的下载进度（含已完成）
-    replayFileProgress(pendingFileProgress, c, key)
+  return ensureChat(key).then(() => {
+    transitions.insertMessage(store, key, msg)
   })
 }
 
@@ -308,17 +282,9 @@ export async function openChat(key) {
  * 这样 read 标志对所有入站消息都成立，未读数才能和已读状态保持一致。
  */
 export async function markReadFor(key) {
-  if (!key) return 0
-  // 未读数先清零：哪怕这个会话里没有需要回执的消息，提示也该消失
-  if (store.unread[key]) delete store.unread[key]
-  delete store.unreadTs[key]
-
-  const chat = store.chats[key]
-  if (!chat) return 0
-  const unread = chat.msgs.filter((m) => m.dir === 'in' && !m.read)
-  if (!unread.length) return 0
-  const pkts = [...new Set(unread.map((m) => m.pkt))]
-  for (const m of unread) m.read = true // 乐观置位，避免连发时重复回执
+  // 「算什么」在 transitions.markChatRead（事件路径用同一个原语），「发什么」在这里
+  const pkts = transitions.markChatRead(store, key)
+  if (!pkts.length) return 0
   try {
     await ipc.markRead(key, pkts)
   } catch (e) {
@@ -327,31 +293,8 @@ export async function markReadFor(key) {
   return pkts.length
 }
 
-function onMsgRead({ key, pkt }) {
-  const chat = store.chats[key]
-  if (!chat) return
-  // 这是对端回来的 READMSG：被读的是「我方发出」的那条消息
-  const msg = chat.msgs.find((m) => m.pkt === pkt && m.dir === 'out')
-  if (msg) {
-    msg.read = true
-    // 已读蕴含已送达：两条记录状态不自相矛盾（同后端 mark_out_read）
-    msg.delivered = true
-  }
-}
-
-/**
- * 对端送达确认（RECVMSG）：把出站气泡从「未读」翻到「已送达」。
- *
- * 官方 Windows 客户端对普通消息只回 RECVMSG、从不回 READMSG，没有这一档
- * 气泡就永远挂在「未读」（只能等对方回话走兜底）。已读是更强的状态，
- * 这里不反向覆盖 read。
- */
-function onMsgDelivered({ key, pkt }) {
-  const chat = store.chats[key]
-  if (!chat) return
-  const msg = chat.msgs.find((m) => m.pkt === pkt && m.dir === 'out')
-  if (msg) msg.delivered = true
-}
+/* ---- onMsgRead / onMsgDelivered / onFileProgress / isChatVisible 已搬到
+   lib/transitions.js：它们都是「事件到达后状态怎么变」，属于事件迁移的那半边 ---- */
 
 /* ---------------- 系统通知 ---------------- */
 
@@ -388,11 +331,6 @@ export function previewText(msg) {
   const { body, delayed } = splitDelayedNote(msg.text)
   const tip = (body || (delayed !== null ? t('preview.offline') : '')).replace(/\s+/g, ' ')
   return tip.length > 48 ? tip.slice(0, 48) + '…' : tip
-}
-
-/** 消息可见（聊天已打开且窗口聚焦）时视为已读 */
-function isChatVisible(key) {
-  return store.windowFocused && store.activeKey === key
 }
 
 /** 发送文本到指定会话（转发/群发用）；对方离线时后端自动入队，返回的
@@ -500,13 +438,6 @@ export async function downloadFile(msg, file) {
   }
 }
 
-function onFileProgress(p) {
-  if (!p?.key) return
-  // 消息还没入列（会话未加载时 msg-in 要先 await getHistory）时不能直接丢弃：
-  // 那条「下载完成」丢了，卡片就永远停在「下载中」，图片再也出不来。
-  if (!applyFileProgress(store.chats[p.key], p)) bufferFileProgress(pendingFileProgress, p)
-}
-
 /* ---------------- 聊天记录搜索 ---------------- */
 
 let searchTimer = null
@@ -560,7 +491,7 @@ export function totalUnread() {
 
 /** 未读会话中最近收到消息的那个（从托盘唤起时直接跳过去）；都读完了返回空 */
 export function latestUnreadKey() {
-  return pickLatestUnread(store.unread, store.unreadTs, store.lastTs)
+  return transitions.latestUnreadKey(store)
 }
 
 /* ---------------- 自定义表情库 ---------------- */
@@ -591,6 +522,62 @@ export async function sendEmojiTo(key, id, text = '') {
   return list[list.length - 1] || null
 }
 
+/* ---------------- 事件迁移的执行者 ---------------- */
+
+/**
+ * 事件入口：先补齐 I/O 前置（消息类事件得先把历史拉回来，消息才算真正入列），
+ * 再交给 lib/transitions.js 做迁移，最后按顺序执行它返回的 effect 清单。
+ */
+async function dispatchEvent(event, payload) {
+  if (event === 'msg-in' || event === 'msg-out') {
+    if (payload?.key) await ensureChat(payload.key)
+  }
+  const { effects } = transitions.applyEvent(store, event, payload)
+  await runEffects(effects)
+}
+
+/** effect 清单的执行者：IPC 往返、通知、列表重载、窗口动作都在这边 */
+async function runEffects(effects) {
+  for (const e of effects) {
+    if (e.type === 'mark_read') {
+      try {
+        await ipc.markRead(e.key, e.pkts)
+      } catch (err) {
+        console.error('mark_read failed', err)
+      }
+    } else if (e.type === 'mark_out_read') {
+      try {
+        await ipc.markOutRead(e.key, e.pkts)
+      } catch (err) {
+        console.error('mark_out_read failed', err)
+      }
+    } else if (e.type === 'notify') {
+      notify(e.key, displayName(e.key), previewText(e.msg))
+    } else if (e.type === 'reload_people') {
+      loadUsers()
+      loadSessions()
+    } else if (e.type === 'open_chat') {
+      await openChatAndFocus(e.key, e.logLabel)
+    }
+  }
+}
+
+/**
+ * 切会话 + 把窗口弄到前面。**切会话必须先做** —— show/setFocus 抛错不能挡住
+ * openChat（Wayland 重映射后窗口操作偶发异常，open-unread / open-chat 都踩过）。
+ */
+async function openChatAndFocus(key, logLabel) {
+  try {
+    if (key) await openChat(key)
+    const w = getCurrentWindow()
+    await w.show()
+    await w.unminimize()
+    await w.setFocus()
+  } catch (e) {
+    console.error(logLabel, e)
+  }
+}
+
 /* ---------------- 启动 ---------------- */
 
 let bootedOnce = false
@@ -606,102 +593,24 @@ export async function boot() {
 
   // 窗口焦点跟踪：失焦时来消息弹通知；重新聚焦自动标记已读
   getCurrentWindow().onFocusChanged(({ payload: focused }) => {
-    store.windowFocused = focused
-    if (focused && store.activeKey) {
-      markReadFor(store.activeKey)
-    }
+    dispatchEvent(focused ? 'window-focus' : 'window-blur', {})
   })
 
-  await ipc.listenEvent(ipc.EVT.usersUpdated, () => {
-    loadUsers()
-    loadSessions()
-  })
-  await ipc.listenEvent(ipc.EVT.msgIn, async ({ key, msg, resend }) => {
-    if (!key || !msg) return
-    // 对端延迟重发（同包号重复投递）不重复计未读、不重复通知
-    const isRebroadcast =
-      resend ||
-      (store.chats[key]?.msgs || []).some((m) => m.dir === 'in' && m.pkt === msg.pkt)
-    // 等消息真正入列再判断已读，否则 markReadFor 可能看不到这条新消息
-    await pushMsg(key, msg)
-    // 「对方回话即视为已读」兜底：飞秋等实现不会对我们带 READCHECKOPT 的
-    // 消息回 READMSG，出站消息的未读标记会永远挂着。对端既然发来了新消息，
-    // 人就在对话里 —— 把此前要求回执且未读的出站消息翻成已读（本地+落库）。
-    if (msg.dir === 'in' && !isRebroadcast) {
-      const pkts = unreadReceiptPkts(store.chats[key]?.msgs)
-      if (pkts.length) {
-        for (const m of store.chats[key].msgs) {
-          if (pkts.includes(m.pkt)) m.read = true
-        }
-        ipc.markOutRead(key, pkts).catch((e) => console.error('mark_out_read failed', e))
-      }
-    }
-    if (isChatVisible(key)) {
-      await markReadFor(key)
-    } else if (!isRebroadcast) {
-      store.unread[key] = (store.unread[key] || 0) + 1
-      store.unreadTs[key] = msg.ts || Math.floor(Date.now() / 1000)
-      notify(key, displayName(key), previewText(msg))
-    }
-  })
+  // 十一个订阅都走 dispatchEvent：迁移在 lib/transitions.js，这里只补 I/O 前置与执行 effect
+  await ipc.listenEvent(ipc.EVT.usersUpdated, () => dispatchEvent('users-updated', {}))
+  await ipc.listenEvent(ipc.EVT.msgIn, (p) => dispatchEvent('msg-in', p))
   // 广播信箱里「自己发出的广播」：后端已落库，这里只上屏。
   // 不算未读、不弹通知、不标已读 —— 是自己发的，不是对端消息。
-  await ipc.listenEvent(ipc.EVT.msgOut, async ({ key, msg }) => {
-    if (!key || !msg) return
-    await pushMsg(key, msg)
-  })
-
-  // 托盘唤起主窗口：跳到最新未读会话（没有未读就跳到最近活动的会话）。
-  // 切会话必须先做——show/setFocus 抛错不能挡住 openChat（Wayland 重映射后
-  // 窗口操作偶发异常会吞掉后面的代码，open-chat 曾踩过同一个坑）。
-  await ipc.listenEvent(ipc.EVT.openUnread, async () => {
-    try {
-      const key = latestUnreadKey() || pickLatestActive(store.lastTs, store.unreadTs)
-      if (key) await openChat(key)
-      const w = getCurrentWindow()
-      await w.show()
-      await w.unminimize()
-      await w.setFocus()
-    } catch (e) {
-      console.error('open-unread failed', e)
-    }
-  })
-  // 点击系统通知（Linux 原生）：弹出主窗口并切到发出这条消息的会话。
-  // 注意：切会话必须先做——窗口 show/setFocus 若抛错不能挡住 openChat。
-  await ipc.listenEvent(ipc.EVT.openChat, async ({ key }) => {
-    try {
-      if (!key) return
-      await openChat(key)
-      const w = getCurrentWindow()
-      await w.show()
-      await w.unminimize()
-      await w.setFocus()
-    } catch (e) {
-      console.error('open-chat failed', e)
-    }
-  })
-  await ipc.listenEvent(ipc.EVT.msgRead, onMsgRead)
-  await ipc.listenEvent(ipc.EVT.msgDelivered, onMsgDelivered)
-  await ipc.listenEvent(ipc.EVT.fileProgress, onFileProgress)
-  await ipc.listenEvent(ipc.EVT.msgRecalled, ({ key, pkt }) => {
-    const chat = store.chats[key]
-    const m = chat?.msgs.find((x) => x.pkt === pkt)
-    if (m) m.recalled = true
-    delete store.unread[key]
-    delete store.unreadTs[key]
-  })
-  await ipc.listenEvent(ipc.EVT.msgUnlocked, ({ key, pkt }) => {
-    const chat = store.chats[key]
-    const m = chat?.msgs.find((x) => x.pkt === pkt)
-    if (m) {
-      m.unlocked = true
-      m.locked = false
-      m.read = true
-    }
-  })
-  await ipc.listenEvent(ipc.EVT.absenceInfo, ({ key, text }) => {
-    if (store.userMap[key]) store.userMap[key].absence_text = text
-  })
+  await ipc.listenEvent(ipc.EVT.msgOut, (p) => dispatchEvent('msg-out', p))
+  // 托盘唤起主窗口 / 点击系统通知：跳到对应会话（没未读就退到最近活动会话）
+  await ipc.listenEvent(ipc.EVT.openUnread, () => dispatchEvent('open-unread', {}))
+  await ipc.listenEvent(ipc.EVT.openChat, (p) => dispatchEvent('open-chat', p))
+  await ipc.listenEvent(ipc.EVT.msgRead, (p) => dispatchEvent('msg-read', p))
+  await ipc.listenEvent(ipc.EVT.msgDelivered, (p) => dispatchEvent('msg-delivered', p))
+  await ipc.listenEvent(ipc.EVT.fileProgress, (p) => dispatchEvent('file-progress', p))
+  await ipc.listenEvent(ipc.EVT.msgRecalled, (p) => dispatchEvent('msg-recalled', p))
+  await ipc.listenEvent(ipc.EVT.msgUnlocked, (p) => dispatchEvent('msg-unlocked', p))
+  await ipc.listenEvent(ipc.EVT.absenceInfo, (p) => dispatchEvent('absence-info', p))
 
   // 未读总数变化 → 托盘图标在「有新消息（红点角标）」与「无消息」之间切换
   watch(

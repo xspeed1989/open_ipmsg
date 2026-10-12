@@ -69,17 +69,12 @@ test('气泡标签直接用 deliveryState 的返回值当 i18n 后缀与 CSS 类
   }
 })
 
-test('store 收到 msg-delivered 后把出站气泡翻成已送达', () => {
-  const body = storeSource.match(/function onMsgDelivered\(\{ key, pkt \}\) \{([\s\S]*?)\n\}/)[1]
-  const store = { chats: { peer: { msgs: [{ dir: 'out', pkt: 7 }] } } }
-  const apply = new Function('store', `return ({ key, pkt }) => {${body}}`)(store)
-  apply({ key: 'peer', pkt: 7 })
-  assert.equal(store.chats.peer.msgs[0].delivered, true)
-  apply({ key: 'unknown', pkt: 7 }) // 会话未加载：不能抛
-  apply({ key: 'peer', pkt: 999 }) // 没有这条消息：不能抛
-})
-
 test('msg-delivered 事件常量与订阅都在', () => {
   assert.match(ipcSource, /msgDelivered: 'msg-delivered'/)
   assert.match(storeSource, /ipc\.EVT\.msgDelivered/)
 })
+
+// 「收到 msg-delivered 把出站气泡翻成已送达」的旧用例靠正则抠 onMsgDelivered 的函数体，
+// 已退役：该函数搬进 lib/transitions.js，行为改由
+// scripts/store-events.characterization.test.mjs 跨真 store 的 msg-delivered 用例守着。
+// （保留这条注释是为了让下一个看到「少了一条用例」的人知道它是被替掉的，不是丢了。）

@@ -100,6 +100,10 @@ test('open-unread：跳到最近有未读的会话并标已读', async () => {
   assert.equal(h.store.unread[PEER], undefined, '未读清零')
   assert.equal(h.store.chats[PEER].msgs[0].read, true)
   assert.ok(h.countOf('mark_read') >= 1)
+  // 切会话之后要把窗口弄到前面（三个窗口命令都发过）
+  for (const cmd of ['plugin:window|show', 'plugin:window|unminimize', 'plugin:window|set_focus']) {
+    assert.ok(h.countOf(cmd) >= 1, `缺 ${cmd}`)
+  }
 })
 
 test('open-chat：按给定 key 切会话，并补一次标已读', async () => {
@@ -108,6 +112,13 @@ test('open-chat：按给定 key 切会话，并补一次标已读', async () => 
 
   assert.equal(h.store.activeKey, PEER)
   assert.equal(h.store.unread[PEER], undefined)
+  assert.ok(h.countOf('plugin:window|set_focus') >= 1, '窗口要置前')
+})
+
+test('open-chat 没有 key：什么都不做（连窗口动作都不发）', async () => {
+  await h.emit('open-chat', { key: '' })
+  assert.equal(h.store.activeKey, null)
+  assert.equal(h.countOf('plugin:window|set_focus'), 0)
 })
 
 test('msg-read：出站那条翻成已读，并且把已送达一并置上', async () => {
