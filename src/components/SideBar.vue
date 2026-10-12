@@ -1,11 +1,11 @@
 <script setup>
 // 左侧功能栏：头像（点击进设置）+ 底部设置齿轮
-import { store } from '../store'
+import { store, setSettingsOpen } from '../store'
 import { t } from '../lib/i18n'
 import Avatar from './Avatar.vue'
 
 function openSettings() {
-  store.settingsOpen = true
+  setSettingsOpen(true)
 }
 </script>
 

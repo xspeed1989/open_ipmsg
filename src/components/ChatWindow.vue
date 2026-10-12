@@ -7,7 +7,7 @@ import {
   store, sendText, sendFiles, sendFilesTo, downloadFile, clearHistory,
   openChat, displayName, dayLabel, fmtTime, fmtSize, refreshUsers, splitDelayedNote,
   sendTextTo, recallMsg, unlockMsg, broadcastTo, loadEmojiIndex, sendEmojiTo,
-  isBroadcastKey, sessionName, msgSenderName, senderIpOf,
+  isBroadcastKey, sessionName, msgSenderName, senderIpOf, setDragHover, clearLocate,
 } from '../store'
 import { parseFileUris, highlightParts } from '../lib/text'
 import { computePopupPosition } from '../lib/popup'
@@ -826,17 +826,17 @@ onMounted(async () => {
       if (payload.type === 'over') {
         dragOver.value = true
         // 拖动过程中实时更新中栏高亮：悬停到哪个联系人，哪一行亮
-        store.dragHoverKey = keyAtPoint(payload.position)
+        setDragHover(keyAtPoint(payload.position))
         return
       }
       if (payload.type !== 'drop') {
         dragOver.value = false
-        store.dragHoverKey = ''
+        setDragHover('')
         return
       }
       const hoverKey = keyAtPoint(payload.position)
       dragOver.value = false
-      store.dragHoverKey = ''
+      setDragHover('')
       const paths = (payload.paths || []).filter(Boolean)
       if (!paths.length) return
       // 落点在联系人上 → 打开对应会话再附加；其余位置 → 当前会话的待发送列表
@@ -1118,7 +1118,7 @@ watch(
     locatePkt.value = loc.pkt
     await nextTick()
     scrollToPkt(loc.pkt)
-    store.locate = null
+    clearLocate()
   }
 )
 // 切换会话时清掉上一次的定位高亮

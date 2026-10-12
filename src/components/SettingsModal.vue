@@ -1,7 +1,9 @@
 <script setup>
 // 设置弹窗：昵称 / 群组 / 下载目录 / 语言 / 主题 / 开机启动 / 发送编码 / 消息加密 + 本机信息
 import { reactive, watch, computed, ref } from 'vue'
-import { applyTheme, store, refreshConfig, refreshUsers, loadSessions } from '../store'
+import {
+  applyTheme, store, refreshConfig, refreshUsers, loadSessions, setSettingsOpen, setFirstRun,
+} from '../store'
 import * as ipc from '../lib/ipc'
 import { t, SUPPORTED_LANGS, LANG_NAMES, setLocale, detectLocale } from '../lib/i18n'
 import { comboFromEvent, isValidCombo, isWaylandUA } from '../lib/hotkey'
@@ -169,7 +171,7 @@ function close() {
   if (!canClose.value) return
   restoreSavedTheme() // 放弃未保存的改动，主题跟着回退
   restoreSavedLang() // 语言同样回退到已保存的值
-  store.settingsOpen = false
+  setSettingsOpen(false)
 }
 
 async function save() {
@@ -231,8 +233,8 @@ async function save() {
   }
   await refreshConfig()
   await refreshUsers()
-  store.firstRun = false
-  store.settingsOpen = false
+  setFirstRun(false)
+  setSettingsOpen(false)
 }
 </script>
 

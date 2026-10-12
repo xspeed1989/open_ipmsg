@@ -10,7 +10,7 @@ import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { t } from '../lib/i18n'
 import * as ipc from '../lib/ipc'
 import { confirm } from '../lib/dialog'
-import { store } from '../store'
+import { store, setStickerIndex } from '../store'
 import {
   normalizeEmojis, importSummary, packSummary, packItemState, defaultPackSelection,
   packFileName, isVideoSticker,
@@ -144,8 +144,7 @@ async function loadList() {
 }
 
 function syncStore() {
-  store.emojiFiles = emojis.value.map((e) => e.file)
-  store.emojiCacheFiles = emojis.value.map((e) => e.cacheFile).filter(Boolean)
+  setStickerIndex(emojis.value)
 }
 
 /** id → 条目：观察器回调里按 data-eid 找条目，避免每次线性扫描整库 */

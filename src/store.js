@@ -481,7 +481,7 @@ export async function openHit(hit) {
       console.error('getHistory failed', e)
     }
   }
-  store.locate = { key: hit.key, pkt: hit.pkt, query: store.search.trim() }
+  setLocate({ key: hit.key, pkt: hit.pkt, query: store.search.trim() })
 }
 
 /** 未读总数（所有会话相加），驱动托盘图标的闪烁 */
@@ -503,8 +503,7 @@ export function latestUnreadKey() {
  */
 export async function loadEmojiIndex() {
   const list = normalizeEmojis(await ipc.listEmojis())
-  store.emojiFiles = list.map((e) => e.file)
-  store.emojiCacheFiles = list.map((e) => e.cacheFile).filter(Boolean)
+  setStickerIndex(list)
   return list
 }
 
@@ -520,6 +519,48 @@ export async function sendEmojiTo(key, id, text = '') {
   for (const m of list) await pushMsg(key, m)
   await loadEmojiIndex() // 发送会更新「缓存副本名」映射
   return list[list.length - 1] || null
+}
+
+/* ---------------- 界面状态的写侧 ---------------- */
+
+// 组件只读 store，写一律走这里：字段的**形状**于是成了 action 的入参契约，
+// 而不再是「11 个组件都知道那个字段长什么样」。契约由 scripts/store-writes.test.mjs
+// 的源码扫描守着（组件里不许出现 `store.x =`）。
+
+/** 设置面板开关（侧边栏齿轮打开 / 面板自己关） */
+export function setSettingsOpen(on) {
+  store.settingsOpen = on
+}
+
+/** 首次运行标记（首启自动开设置面板，保存后清掉） */
+export function setFirstRun(on) {
+  store.firstRun = on
+}
+
+/** 搜索结果定位请求（openHit 设置，聊天窗口定位完调 clearLocate 收尾） */
+export function setLocate(payload) {
+  store.locate = payload
+}
+
+/** 定位已消费（聊天窗口定位完清空，避免重复滚动） */
+export function clearLocate() {
+  store.locate = null
+}
+
+/** 拖放悬停的会话 key（'' = 不在任何联系人上） */
+export function setDragHover(key) {
+  store.dragHoverKey = key || ''
+}
+
+/**
+ * 表情索引：`list → file / cacheFile` 的映射只在这里做一次。
+ * EmojiPicker 拿到新列表、loadEmojiIndex 拉完索引，都走这里 ——
+ * 之前两处各写一遍同样的 map+filter。
+ */
+export function setStickerIndex(list) {
+  const items = list || []
+  store.emojiFiles = items.map((e) => e.file)
+  store.emojiCacheFiles = items.map((e) => e.cacheFile).filter(Boolean)
 }
 
 /* ---------------- 事件迁移的执行者 ---------------- */
@@ -625,7 +666,7 @@ export async function boot() {
   await loadSessions()
 
   if (!store.config.nickname) store.firstRun = true
-  if (store.firstRun) store.settingsOpen = true
+  if (store.firstRun) setSettingsOpen(true)
 
   store.booted = true
 }
