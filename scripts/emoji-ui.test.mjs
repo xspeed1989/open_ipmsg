@@ -5,6 +5,7 @@
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { WIRE } from '../src/lib/wire.generated.js'
 
 const picker = readFileSync(new URL('../src/components/EmojiPicker.vue', import.meta.url), 'utf8')
 const chat = readFileSync(new URL('../src/components/ChatWindow.vue', import.meta.url), 'utf8')
@@ -243,7 +244,7 @@ test('收纳前先按文件系统实际情况判断，不信任消息上的 stat
   // 自己发出的附件不能再去「向对端下载」：找不到本地文件就如实说明
   assert.match(chat, /if \(m\.dir === 'out'\) throw new Error\(t\('emoji\.srcGone'\)\)/)
   const ipcSrc = readFileSync(new URL('../src/lib/ipc.js', import.meta.url), 'utf8')
-  assert.match(ipcSrc, /invoke\('emoji_src_available', \{ path, name \}\)/)
+  assert.match(ipcSrc, /invoke\(WIRE\.cmd\.emoji_src_available, \{ path, name \}\)/)
   const lib = readFileSync(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8')
   assert.match(lib, /emoji::emoji_src_available/)
 })
@@ -301,19 +302,29 @@ test('图片仍走「粘贴图片」协议，WebM 走普通附件，不新增 wi
   assert.doesNotMatch(rs, /FILE_EMOJI|EMOJIOPT/)
 })
 
-test('ipc 只封装后端已有命令名', () => {
-  for (const cmd of [
-    'list_emojis', 'import_emoji', 'delete_emoji', 'rename_emoji', 'reorder_emojis',
-    'send_emoji', 'export_emoji_pack', 'inspect_emoji_pack', 'import_emoji_pack',
-  ]) {
-    assert.match(ipc, new RegExp(`invoke\\('${cmd}'`), `缺少 ${cmd} 的封装`)
+test('ipc 引用的命令名来自 wire 产物，产物里也没有死条目', () => {
+  // 真源那一跳（wire.rs → generate_handler!）由 Rust 侧的
+  // every_wire_command_is_registered 守着；这里守「JS 只引产物、不手抄名字」。
+  const used = new Set([...ipc.matchAll(/WIRE\.cmd\.([a-z0-9_]+)/g)].map((m) => m[1]))
+  assert.ok(used.size >= 40, `ipc 只引了 ${used.size} 个命令，是不是又手抄了？`)
+
+  const declared = new Set(Object.keys(WIRE.cmd))
+  for (const name of used) {
+    assert.ok(declared.has(name), `WIRE.cmd.${name} 不在产物里（改名后没跑 --dump-wire？）`)
   }
-  // 命令名要与 Rust 侧注册的函数名一致
+  assert.deepEqual(
+    [...declared].filter((n) => !used.has(n)),
+    [],
+    '产物里有没人引用的命令（要么补封装，要么从 wire.rs 删名字）',
+  )
+  // 表情相关的命令既要在 ipc 里封装过，也要注册到 invoke_handler
   const lib = readFileSync(new URL('../src-tauri/src/lib.rs', import.meta.url), 'utf8')
   for (const fn of [
     'list_emojis', 'import_emoji', 'delete_emoji', 'rename_emoji', 'reorder_emojis',
     'send_emoji', 'export_emoji_pack', 'inspect_emoji_pack', 'import_emoji_pack',
   ]) {
+    assert.ok(used.has(fn), `ipc 缺少 ${fn} 的封装`)
+    assert.ok(declared.has(fn), `wire.rs 里没有 ${fn}`)
     assert.match(lib, new RegExp(`emoji::${fn}`), `${fn} 未注册到 invoke_handler`)
   }
 })

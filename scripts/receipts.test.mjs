@@ -69,8 +69,13 @@ test('气泡标签直接用 deliveryState 的返回值当 i18n 后缀与 CSS 类
   }
 })
 
-test('msg-delivered 事件常量与订阅都在', () => {
-  assert.match(ipcSource, /msgDelivered: 'msg-delivered'/)
+test('msg-delivered 事件常量与订阅都在', async () => {
+  // 取值不再手抄：EVT 的每个后端事件都指向 wire 产物里的同一个名字
+  const { EVT } = await import('../src/lib/ipc.js')
+  const { WIRE } = await import('../src/lib/wire.generated.js')
+  assert.equal(EVT.msgDelivered, WIRE.evt['msg-delivered'])
+  assert.equal(EVT.msgIn, WIRE.evt['msg-in'])
+  assert.equal(EVT.fileProgress, WIRE.evt['file-progress'])
   assert.match(storeSource, /ipc\.EVT\.msgDelivered/)
 })
 

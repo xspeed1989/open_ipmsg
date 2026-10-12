@@ -23,6 +23,7 @@ mod screenshot;
 mod selftest;
 mod shortcut;
 mod state;
+mod wire;
 
 pub use state::{AppState, Config, PeerInfo};
 
@@ -110,7 +111,7 @@ fn activate_from_tray(app: &tauri::AppHandle) {
     let _ = app.run_on_main_thread(move || {
         raise_main_window(&app2);
         use tauri::Emitter;
-        let _ = app2.emit("open-unread", ());
+        let _ = app2.emit(wire::evt::OPEN_UNREAD, ());
     });
 }
 
@@ -365,7 +366,7 @@ async fn set_absence(
     net::announce_absence(&ctx).await;
     if old != on {
         // 状态变化也通知前端（列表离开标记）
-        st.emit("users-updated", json!({}));
+        st.emit(wire::evt::USERS_UPDATED, json!({}));
     }
     Ok(())
 }
@@ -441,7 +442,7 @@ async fn clear_history(st: State<'_, SharedState>, key: String) -> Result<usize,
 async fn delete_contact(st: State<'_, SharedState>, key: String) -> Result<usize, String> {
     let n = st.delete_contact(&key);
     // 通知前端刷新列表（在线用户过滤 + 离线会话过滤都由后端做）
-    st.emit("users-updated", json!({}));
+    st.emit(wire::evt::USERS_UPDATED, json!({}));
     Ok(n)
 }
 
@@ -1073,7 +1074,7 @@ fn notify_message(
                         use tauri::Emitter;
                         // payload 用 JSON 对象（与 msg-in 等事件一致）：字符串裸
                         // payload 在事件桥里的序列化路径未经受验证，对象模式最稳
-                        let _ = app2.emit("open-chat", json!({"key": key2}));
+                        let _ = app2.emit(wire::evt::OPEN_CHAT, json!({"key": key2}));
                     });
                 }
             });
@@ -1570,6 +1571,15 @@ pub fn run() {
     // 解析放在最前面，保证后续任何模块（网络栈、托盘、单实例回调）都能看到开关。
     if std::env::args().any(|a| a == "--log") {
         state::set_log_enabled(true);
+    }
+
+    // 生成前端的线上契约产物（名单真源在 wire.rs）：改动命令名/事件名后跑一次，
+    // `wire_artifact_is_current` 会拦住忘记重新生成的情况。
+    if std::env::args().any(|a| a == "--dump-wire") {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/lib/wire.generated.js");
+        std::fs::write(&path, wire::js_artifact()).unwrap_or_else(|e| panic!("写 {}: {e}", path.display()));
+        println!("已写入 {}", path.display());
+        std::process::exit(0);
     }
 
     if std::env::args().any(|a| a == "--selftest") {

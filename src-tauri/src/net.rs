@@ -6,6 +6,7 @@
 use crate::crypto;
 use crate::ipdict::{self as ipd};
 use crate::protocol::{self as proto, cmd, fileattr, opt};
+use crate::wire;
 use crate::state::{
     now_secs, AppState, Config, DirMember, InRecordOutcome, OfferedFile, PeerInfo, PendingOut,
     RetryOut, VerifiedPeerKeyDecision,
@@ -440,7 +441,7 @@ fn spawn_ticker(ctx: Arc<NetCtx>) {
             }
             let stale = ctx.st.prune_stale_peers(30 * 60);
             if !stale.is_empty() {
-                ctx.st.emit("users-updated", json!({}));
+                ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
             }
             // 成员主侧：清理超时未 POLL 的成员
             let cfg = ctx.st.config();
@@ -1231,7 +1232,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             let bytes = ans.encode(&my_user(&cfg), &my_host());
             let _ = ctx.sock.send_to(&bytes, from).await;
             if added {
-                ctx.st.emit("users-updated", json!({}));
+                ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
             }
             maybe_start_handshake(ctx, from, &pkt, &key, &cfg).await;
             maybe_withdraw_peer_key(ctx, from, &pkt, &key, &cfg);
@@ -1256,7 +1257,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                 absence_text: None,
                 vs: info.vs,
             });
-            ctx.st.emit("users-updated", json!({}));
+            ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
             // 不在模式通告（BR_ABSENCE）说明对方状态切换：旧缓存的不在通知文作废
             if base == cmd::BR_ABSENCE {
                 ctx.st.clear_peer_absence(&key);
@@ -1294,7 +1295,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                 hit
             };
             if !removed.is_empty() {
-                ctx.st.emit("users-updated", json!({}));
+                ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
             }
             maybe_forward_entry_event(ctx, &pkt, &key, base).await;
         }
@@ -1316,7 +1317,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                     // 只回 RECVMSG、从不回 READMSG（recvdlg 的 READMSG 只在封书
                     // 开封时发），不记这个中间态，气泡就永远停在「未读」。
                     if ctx.st.mark_out_delivered(&k, c) {
-                        ctx.st.emit("msg-delivered", json!({"key": k, "pkt": c}));
+                        ctx.st.emit(wire::evt::MSG_DELIVERED, json!({"key": k, "pkt": c}));
                     }
                 }
             }
@@ -1416,7 +1417,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                     #[cfg(feature = "net_debug")]
                     oim_log!("[read] key={key} changed={changed}");
                     if changed {
-                        ctx.st.emit("msg-read", json!({"key": key, "pkt": no}));
+                        ctx.st.emit(wire::evt::MSG_READ, json!({"key": key, "pkt": no}));
                     }
                 }
             }
@@ -1439,7 +1440,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                     rec["recalled"] = json!(true);
                 }) {
                     ctx.st.emit(
-                        "msg-recalled",
+                        wire::evt::MSG_RECALLED,
                         json!({"key": k, "pkt": no, "peer": pkt.user}),
                     );
                     ctx.st
@@ -1459,7 +1460,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             if let Some(no) = no {
                 if let Some(k) = resolve_session_key(ctx, from.ip()) {
                     if ctx.st.mark_out_read(&k, no) {
-                        ctx.st.emit("msg-read", json!({"key": k, "pkt": no}));
+                        ctx.st.emit(wire::evt::MSG_READ, json!({"key": k, "pkt": no}));
                     }
                 }
             }
@@ -1485,7 +1486,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
             let text = proto::text_of(&pkt);
             ctx.st.set_peer_absence(&key, &text);
             ctx.st
-                .emit("absence-info", json!({"key": key, "text": text}));
+                .emit(wire::evt::ABSENCE_INFO, json!({"key": key, "text": text}));
         }
         cmd::BR_ISGETLIST => {
             // 主机列表能力探索：我方允许就回 OKGETLIST（官方 MsgBrIsGetList 同款）
@@ -1576,7 +1577,7 @@ async fn handle_datagram(ctx: &NetCtx, data: &[u8], from: SocketAddr) {
                 changed |= add;
             }
             if changed {
-                ctx.st.emit("users-updated", json!({}));
+                ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
             }
             if cont != 0 {
                 let cfg = ctx.st.config();
@@ -2045,7 +2046,7 @@ async fn handle_sendmsg(
             false
         };
         if was_unhidden || metadata_changed {
-            ctx.st.emit("users-updated", json!({}));
+            ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
         }
     }
 
@@ -2065,7 +2066,7 @@ async fn handle_sendmsg(
     }
 
     ctx.st.emit(
-        "msg-in",
+        wire::evt::MSG_IN,
         json!({"key": session_key, "msg": record, "resend": false}),
     );
 
@@ -2797,7 +2798,7 @@ pub async fn recall_message(ctx: &NetCtx, key: &str, pkt: u32) -> Result<(), Str
     let _ = ctx.st.ack_retry(key, pkt);
     let _ = ctx.st.ack_pending(key, pkt);
     ctx.st
-        .emit("msg-recalled", json!({"key": key, "pkt": pkt, "peer": ""}));
+        .emit(wire::evt::MSG_RECALLED, json!({"key": key, "pkt": pkt, "peer": ""}));
     Ok(())
 }
 
@@ -2858,7 +2859,7 @@ pub async fn broadcast_message(ctx: &NetCtx, text: &str) -> Result<(), String> {
             .diag(&format!("-> 广播群发已发出，但本地留痕失败：{error}"));
     } else {
         ctx.st.emit(
-            "msg-out",
+            wire::evt::MSG_OUT,
             json!({"key": crate::state::BROADCAST_SESSION_KEY, "msg": record}),
         );
     }
@@ -2912,7 +2913,7 @@ pub async fn unlock_message(
     });
     // 开封后补已读回执（此前 pending_receipts 已把未开封消息排除）
     let _ = mark_read_and_receipt(ctx, key, &[pkt]).await;
-    ctx.st.emit("msg-unlocked", json!({"key": key, "pkt": pkt}));
+    ctx.st.emit(wire::evt::MSG_UNLOCKED, json!({"key": key, "pkt": pkt}));
     Ok(())
 }
 
@@ -3433,7 +3434,7 @@ async fn handle_dict_datagram(ctx: &NetCtx, dict: &crate::ipdict::Dict, from: So
                 }
             }
             if changed {
-                ctx.st.emit("users-updated", json!({}));
+                ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
             }
             ctx.st
                 .diag(&format!("<- {from} DIR_PACKET：并入 {} 台", hosts.len()));
@@ -3460,7 +3461,7 @@ async fn handle_dict_datagram(ctx: &NetCtx, dict: &crate::ipdict::Dict, from: So
                 }
             }
             if changed {
-                ctx.st.emit("users-updated", json!({}));
+                ctx.st.emit(wire::evt::USERS_UPDATED, json!({}));
             }
             ctx.st
                 .diag(&format!("<- {from} ANSLIST_DICT：并入 {} 台", hosts.len()));
@@ -7300,7 +7301,7 @@ fn emit_download_done(
     total: u64,
 ) {
     ctx.st.emit(
-        "file-progress",
+        wire::evt::FILE_PROGRESS,
         json!({"key": key, "pkt": pkt_no, "file_id": file_id,
                "transferred": total, "total": total, "done": true,
                "path": path.to_string_lossy()}),
@@ -7427,7 +7428,7 @@ async fn download_dir_task(
                 final_path.display()
             ));
             ctx.st.emit(
-                "file-progress",
+                wire::evt::FILE_PROGRESS,
                 json!({"key": key, "pkt": pkt_no, "file_id": file_id,
                        "transferred": total, "total": total, "done": true,
                        "path": final_path.to_string_lossy()}),
@@ -7533,7 +7534,7 @@ async fn fetch_dir_tree(
                 if last_emit.elapsed() >= Duration::from_millis(150) {
                     last_emit = Instant::now();
                     ctx.st.emit(
-                        "file-progress",
+                        wire::evt::FILE_PROGRESS,
                         json!({"key": key, "pkt": pkt_no, "file_id": file_id,
                                "transferred": total, "total": expect_size, "done": false}),
                     );
@@ -7899,7 +7900,7 @@ pub(crate) async fn open_transfer(
 /// 下载失败的统一收尾：推事件 + 回写历史，避免卡片永远停在"下载中"
 fn fail_download(ctx: &NetCtx, key: &str, pkt_no: u32, file_id: u32, err: &str) {
     ctx.st.emit(
-        "file-progress",
+        wire::evt::FILE_PROGRESS,
         json!({"key": key, "pkt": pkt_no, "file_id": file_id,
                "transferred": 0, "total": 0, "done": false, "error": err}),
     );
@@ -7974,7 +7975,7 @@ async fn fetch_to_file(
         if last_emit.elapsed() >= Duration::from_millis(150) {
             last_emit = Instant::now();
             ctx.st.emit(
-                "file-progress",
+                wire::evt::FILE_PROGRESS,
                 json!({"key": key, "pkt": pkt_no, "file_id": file_id,
                        "transferred": total, "total": expect_size, "done": false,
                        "enc": enc}),
