@@ -328,7 +328,7 @@ async fn start_network_impl(
     if announce_start {
         announce(&ctx).await;
         // 启动 2 分钟的主机列表获取窗口（官方 entryStartTime 语义）
-        ctx.st.open_hostlist_window(120);
+        ctx.st.dir.open_hostlist_window(120);
     }
     spawn_udp_loop(ctx.clone());
     spawn_v6_udp_loop(ctx.clone());
@@ -509,7 +509,7 @@ fn spawn_ticker(ctx: Arc<NetCtx>) {
             // 成员主侧：清理超时未 POLL 的成员
             let cfg = ctx.st.config();
             if cfg.dir_mode == "master" {
-                let gone = ctx.st.prune_dir_members(3 * 60);
+                let gone = ctx.st.dir.prune_dir_members(3 * 60);
                 for g in &gone {
                     ctx.st
                         .diag(&format!("dir-master: 成员 {g} 停止 POLL，移除"));
@@ -654,7 +654,7 @@ async fn retry_pending_for(ctx: Arc<NetCtx>, key: &str) {
             .map(|a| a.ip())
             .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let inner_ip: IpAddr = peer.ip.parse().unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        let (wire, send_to) = match ctx.st.relay_agent(key) {
+        let (wire, send_to) = match ctx.st.relay.relay_agent(key) {
             Some(agent) => (
                 wrap_agent_packet(&cfg, &inner_ip, &origin_ip, &bytes),
                 agent,
@@ -1469,7 +1469,7 @@ mod inbound {
 
         pub(crate) async fn okgetlist(ctx: &NetCtx, from: SocketAddr, _pkt: &proto::Packet, _key: &str) {
             // 对方可回主机列表：窗口期（启动/手动刷新后）内发起 GETLIST
-            if ctx.st.hostlist_window_open() {
+            if ctx.st.dir.hostlist_window_open() {
                 let cfg = ctx.st.config();
                 let mut r = proto::Packet::new(cmd::GETLIST);
                 r.extra = b"0".to_vec(); // 起始索引
@@ -2807,7 +2807,7 @@ pub async fn send_message_opts(
         .map(|a| a.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let inner_ip: IpAddr = peer.ip.parse().unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-    let (wire, send_to) = match ctx.st.relay_agent(key) {
+    let (wire, send_to) = match ctx.st.relay.relay_agent(key) {
         Some(agent) => (
             wrap_agent_packet(&cfg, &inner_ip, &origin_ip, &bytes),
             agent,
@@ -3088,7 +3088,7 @@ pub async fn request_absence_info(ctx: &NetCtx, key: &str) -> Result<(), String>
 
 /// 主动发起主机列表交换：广播 BR_ISGETLIST 并打开获取窗口
 pub async fn request_hostlist(ctx: &NetCtx) -> Result<(), String> {
-    ctx.st.open_hostlist_window(30);
+    ctx.st.dir.open_hostlist_window(30);
     let cfg = ctx.st.config();
     let p = proto::Packet::new(cmd::BR_ISGETLIST | opt::RETRYOPT);
     let bytes = p.encode(&my_user(&cfg), &my_host());
@@ -3464,10 +3464,10 @@ async fn handle_dict_datagram(ctx: &NetCtx, dict: &crate::ipdict::Dict, from: So
             // 该网段已有代理就不重复任命；否则给新 POLL 成员发 POLLAGENT+BROADCAST
             let already_agent = ctx
                 .st
-                .dir_members_snapshot()
+                .dir.dir_members_snapshot()
                 .iter()
                 .any(|m| m.seg == seg && m.is_agent);
-            ctx.st.upsert_dir_member(DirMember {
+            ctx.st.dir.upsert_dir_member(DirMember {
                 key: key.clone(),
                 port: from.port(),
                 last_poll: now_secs(),
@@ -3502,13 +3502,13 @@ async fn handle_dict_datagram(ctx: &NetCtx, dict: &crate::ipdict::Dict, from: So
                 .put_str(DICT_HID, dict.get_str(DICT_HID).unwrap_or(""))
                 .put_str(DICT_NCK, dict.get_str(DICT_NCK).unwrap_or(""))
                 .put_str(DICT_GRP, dict.get_str(DICT_GRP).unwrap_or(""));
-            ctx.st.merge_master_hosts(&[hd]);
+            ctx.st.dir.merge_master_hosts(&[hd]);
             push_dir_packet(ctx, "成员 POLL 后广播").await;
         }
         cmd::DIR_POLLAGENT => {
             // 成员侧：自己被任命代理（AGS 生效窗口）
             let ags = dict.get_int(DICT_AGS).unwrap_or(60).max(10) as u64;
-            ctx.st.set_agent_until(&from.ip().to_string(), ags);
+            ctx.st.relay.set_agent_until(&from.ip().to_string(), ags);
             ctx.st
                 .diag(&format!("<- {from} DIR_POLLAGENT：本机成为代理（{ags}s）"));
         }
@@ -3517,7 +3517,7 @@ async fn handle_dict_datagram(ctx: &NetCtx, dict: &crate::ipdict::Dict, from: So
             // DIR_ANSBROAD 回报 master；期间 entry 事件也转发 master（EVBROAD）
             let cfg = ctx.st.config();
             let ags = dict.get_int(DICT_AGS).unwrap_or(60).max(10) as u64;
-            ctx.st.set_agent_until(&from.ip().to_string(), ags);
+            ctx.st.relay.set_agent_until(&from.ip().to_string(), ags);
             announce(ctx).await;
             tokio::time::sleep(Duration::from_millis(4000)).await;
             let hosts: Vec<crate::ipdict::Dict> = {
@@ -3544,7 +3544,7 @@ async fn handle_dict_datagram(ctx: &NetCtx, dict: &crate::ipdict::Dict, from: So
                 return;
             }
             let hosts: Vec<crate::ipdict::Dict> = dict.get_dict_list(DICT_HLST);
-            let changed = ctx.st.merge_master_hosts(&hosts);
+            let changed = ctx.st.dir.merge_master_hosts(&hosts);
             ctx.st.diag(&format!(
                 "<- {from} {}：并入 {}/{} 台（净增 {changed}）",
                 if base == cmd::DIR_ANSBROAD {
@@ -3667,7 +3667,7 @@ pub(crate) async fn dir_tick(ctx: &NetCtx) {
         }
         "master" => {
             // 主侧：周期 push 全网列表 + 清理离线成员
-            let gone = ctx.st.prune_dir_members(3 * 60);
+            let gone = ctx.st.dir.prune_dir_members(3 * 60);
             if !gone.is_empty() {
                 ctx.st.diag(&format!("dir-master: 清理离线成员 {gone:?}"));
             }
@@ -3683,11 +3683,11 @@ pub(crate) async fn push_dir_packet(ctx: &NetCtx, reason: &str) {
     if cfg.dir_mode != "master" {
         return;
     }
-    let members = ctx.st.dir_members_snapshot();
+    let members = ctx.st.dir.dir_members_snapshot();
     if members.is_empty() {
         return;
     }
-    let mut hosts = ctx.st.master_hosts();
+    let mut hosts = ctx.st.dir.master_hosts();
     // 主侧自身恒在列表首位（成员侧据此发现主；自检回环下也用得到真实端口）
     if let Ok(la) = ctx.sock.local_addr() {
         let mut hd = crate::ipdict::Dict::new();
@@ -3812,7 +3812,7 @@ fn is_self_ip(ctx: &NetCtx, ip: IpAddr) -> bool {
 /// 应答投递：对端是经代理中继的会话（relay_agent 命中）时把应答也包成
 /// AGENT_PACKET 走代理；否则直发。
 async fn reply_send(ctx: &NetCtx, key: &str, from: SocketAddr, bytes: &[u8]) -> bool {
-    if let Some(agent) = ctx.st.relay_agent(key) {
+    if let Some(agent) = ctx.st.relay.relay_agent(key) {
         let target: IpAddr = match key.parse() {
             Ok(ip) => ip,
             Err(_) => return false,
@@ -3841,17 +3841,17 @@ async fn handle_agent_packet(ctx: &NetCtx, pkt: &proto::Packet, from: SocketAddr
         inner.len()
     ));
     // 登记来源对端的真实地址（转发目标）
-    ctx.st.remember_relay_peer(&origin.to_string(), from);
+    ctx.st.relay.remember_relay_peer(&origin.to_string(), from);
     // 目标是本机 → 本地解包投递（会话键=来源 IP；应答回包走代理）。
     // 递归经 Box::pin 打破（async 递归限制）
     if is_self_ip(ctx, target) {
-        ctx.st.remember_relay_agent(&origin.to_string(), from);
+        ctx.st.relay.remember_relay_agent(&origin.to_string(), from);
         let orig_addr = SocketAddr::from((origin, 2425));
         Box::pin(handle_datagram(ctx, &inner, orig_addr)).await;
         return;
     }
     // 目标是已知的代理对端 → 用其真实地址转发（AGENT_PACKET 原样第二跳）
-    if let Some(real) = ctx.st.relay_peer(&target.to_string()) {
+    if let Some(real) = ctx.st.relay.relay_peer(&target.to_string()) {
         let cfg = ctx.st.config();
         let bytes = pkt.encode(&my_user(&cfg), &my_host());
         let _ = ctx.sock.send_to(&bytes, real).await;
@@ -3883,7 +3883,7 @@ async fn maybe_forward_entry_event(ctx: &NetCtx, pkt: &proto::Packet, key: &str,
     let Some(master) = cfg_master_addr(&cfg) else {
         return;
     };
-    if !ctx.st.agent_active(&master.ip().to_string()) {
+    if !ctx.st.relay.agent_active(&master.ip().to_string()) {
         return;
     }
     // 自身回声与 master 自身的 entry 不转发
@@ -6114,7 +6114,7 @@ mod tests {
     async fn encipdict_ack_reports_transport_failure() {
         let (ctx, st, _peer, data_dir) = encipdict_test_ctx("ack-failure").await;
         let from = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
-        st.remember_relay_agent(
+        st.relay.remember_relay_agent(
             &from.ip().to_string(),
             "[::1]:9".parse().expect("IPv6 relay address"),
         );

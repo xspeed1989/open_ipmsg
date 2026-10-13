@@ -2573,7 +2573,7 @@ async fn extended_protocols() -> bool {
     /* ---- E7. 主机列表（BR_ISGETLIST/OKGETLIST/GETLIST/ANSLIST） ---- */
     // 手动单播 BR_ISGETLIST 到假对端（广播到不了 127.0.0.1 之外的自检对端）；
     // 先开获取窗口（启动时由 start_network 打开过，但已超时）
-    st.open_hostlist_window(30);
+    st.dir.open_hostlist_window(30);
     let cfg_now = st.config();
     let probe = proto::Packet::new(cmd::BR_ISGETLIST);
     let _ = ctx
@@ -2612,7 +2612,7 @@ async fn extended_protocols() -> bool {
         .expect("user net");
     net::dir_tick(&ctx_u).await; // 成员 POLL
     let member_reg = wait_for(3000, || {
-        st_m.dir_members_snapshot()
+        st_m.dir.dir_members_snapshot()
             .iter()
             .any(|m| m.key == "127.0.0.8")
     })
@@ -2624,12 +2624,12 @@ async fn extended_protocols() -> bool {
     .await;
     log.check("E: 成员收到 DIR_PACKET 全网列表", got_packet);
     // 代理任命（POLLAGENT+BROADCAST）与 AGS 窗口
-    let agent_win = wait_for(3000, || ctx_u.st.agent_active("127.0.0.7")).await;
+    let agent_win = wait_for(3000, || ctx_u.st.relay.agent_active("127.0.0.7")).await;
     log.check("E: 成员被任命代理（AGS 窗口生效）", agent_win);
     net::dir_tick(&ctx_m).await;
     log.check(
         "E: 主侧周期分发不崩",
-        st_m.dir_members_snapshot().len() >= 1,
+        st_m.dir.dir_members_snapshot().len() >= 1,
     );
 
     /* ---- E9. NAT 中继代理（AGENT 协议：X → AG → Y） ---- */
@@ -2677,7 +2677,7 @@ async fn extended_protocols() -> bool {
             .send_to(&hand.encode(&cfg_y.nickname, "y-host"), ag_addr)
             .await;
         // 直连注册完成后，代理应把 127.0.0.6 → Y 的真实地址入库
-        let registered = wait_for(2000, || ctx_ag.st.relay_peer("127.0.0.6").is_some()).await;
+        let registered = wait_for(2000, || ctx_ag.st.relay.relay_peer("127.0.0.6").is_some()).await;
         log.check("E: 代理登记 Y 的真实地址", registered);
     }
     // X 的会话表里手工登记 Y（回环下没有广播发现）

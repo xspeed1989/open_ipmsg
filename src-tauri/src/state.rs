@@ -264,6 +264,7 @@ pub struct DirMember {
     pub port: u16,
     pub last_poll: u64,
     /// 被任命为代理广播的时长（秒，官方 AGS 键）
+#[allow(dead_code)] // 搬迁后无调用方（拆分前是 pub 方法/仅测试用）；待确认是否可删
     pub agent_secs: u64,
     /// 该成员报告的本段网络（ADDR/MASK，如 "192.168.1.0/24"）
     pub seg: String,
@@ -414,21 +415,10 @@ pub struct AppState {
     pub(crate) trust: trust::TrustStore,
     /// 未确认重发与离线待投递（字段、落盘、搬运不变量都在 outbox 里）
     pub(crate) outbox: outbox::OutboxStore,
-    /// 成员主登记（DIR_MASTER 服务端一侧）：成员 IP → 登记
-    dir_members: Mutex<HashMap<String, DirMember>>,
-    /// 主机列表获取窗口（unix 秒截止）：窗口内收到 OKGETLIST 才发起 GETLIST
-    /// （官方 entryStartTime 窗口同款节流；启动与手动刷新时重开窗口）
-    hostlist_window: Mutex<Option<u64>>,
-    /// 成员主（DIR_MASTER）维护的全网主机列表（IPDict 主机字典条目）
-    master_hosts: Mutex<Vec<crate::ipdict::Dict>>,
-    /// 成员侧：作为代理（agent）的有效期截止（master IP → unix 秒；
-    /// DIR_POLLAGENT 的 AGS 秒数；期间本段 entry 事件转发 master）
-    agent_until: Mutex<HashMap<String, u64>>,
-    /// 中继代理（AGENT 协议）两侧登记：
-    /// - 客户端侧：会话 key（NAT 对端 ip）→ 我方向其发应答所用代理地址
-    relay_agent: Mutex<HashMap<String, std::net::SocketAddr>>,
-    /// - 代理侧：来源 ip → 真实对端地址（转发 AGENT_PACKET 的目标）
-    relay_peers: Mutex<HashMap<String, std::net::SocketAddr>>,
+    /// 组见 docs/adr/0003：主机列表与成员主目录
+    pub(crate) dir: dir::DirStore,
+    /// 组见 docs/adr/0003：NAT 中继与代理任命
+    pub(crate) relay: relay::RelayStore,
     pub data_dir: PathBuf,
 }
 
@@ -472,12 +462,8 @@ impl AppState {
             history: history::HistoryStore::new(data_dir.clone()),
             on_event: Mutex::new(None),
             trust: trust::TrustStore::new(data_dir.clone()),
-            dir_members: Mutex::new(HashMap::new()),
-            hostlist_window: Mutex::new(None),
-            master_hosts: Mutex::new(Vec::new()),
-            agent_until: Mutex::new(HashMap::new()),
-            relay_agent: Mutex::new(HashMap::new()),
-            relay_peers: Mutex::new(HashMap::new()),
+            dir: dir::DirStore::new(),
+            relay: relay::RelayStore::new(),
             data_dir,
         }
     }
@@ -594,8 +580,6 @@ impl AppState {
 
     /// 清理超过 TTL 未被领取的文件槽（每次登记新文件时顺带执行）
 
-
-
     /// 清理超时未刷新的用户（默认 30 分钟），返回被移除的 key 列表
 
     /* ---------- 去重（UDP 可能重复投递） ---------- */
@@ -628,92 +612,21 @@ impl AppState {
 
     /* ---------- 端到端加密：本机密钥与对端公钥缓存 ---------- */
 
-
     /* ---------- 离线消息待投递队列 ---------- */
-
 
     /* ---------- 主机列表窗口（BR_ISGETLIST/OKGETLIST/GETLIST/ANSLIST） ---------- */
 
-    pub fn open_hostlist_window(&self, secs: u64) {
-        *self.hostlist_window.lock().unwrap() = Some(now_secs() + secs);
-    }
-
-    pub fn hostlist_window_open(&self) -> bool {
-        match *self.hostlist_window.lock().unwrap() {
-            Some(until) => now_secs() < until,
-            None => false,
-        }
-    }
-
     /* ---------- 成员主（DIR_MASTER）全网主机列表 ---------- */
 
-    pub fn master_hosts(&self) -> Vec<crate::ipdict::Dict> {
-        self.master_hosts.lock().unwrap().clone()
-    }
-
     /// 合并一批评点到的全网主机（按 IPAD 去重替换）；返回变更数
-    pub fn merge_master_hosts(&self, hosts: &[crate::ipdict::Dict]) -> usize {
-        let mut map = self.master_hosts.lock().unwrap();
-        let mut changed = 0;
-        for h in hosts {
-            let ip = h
-                .get_str(crate::ipdict::DICT_IPAD)
-                .unwrap_or("")
-                .to_string();
-            if ip.is_empty() {
-                continue;
-            }
-            let before = map.len();
-            map.retain(|m| m.get_str(crate::ipdict::DICT_IPAD) != Some(ip.as_str()));
-            map.push(h.clone());
-            if map.len() != before || !map.iter().any(|m| m == h) {
-                changed += 1;
-            }
-        }
-        changed
-    }
 
     /* ---------- 成员侧 agent 有效期（DIR_POLLAGENT 的 AGS） ---------- */
-
-    pub fn set_agent_until(&self, master_ip: &str, secs_from_now: u64) {
-        self.agent_until
-            .lock()
-            .unwrap()
-            .insert(master_ip.to_string(), now_secs() + secs_from_now);
-    }
-
-    pub fn agent_active(&self, master_ip: &str) -> bool {
-        match self.agent_until.lock().unwrap().get(master_ip) {
-            Some(until) => now_secs() < *until,
-            None => false,
-        }
-    }
 
     /* ---------- AGENT 中继登记 ---------- */
 
     /// 客户端侧：记下「与 key 会话的应答要走 agent 中转」
-    pub fn remember_relay_agent(&self, key: &str, agent: std::net::SocketAddr) {
-        self.relay_agent
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), agent);
-    }
-
-    pub fn relay_agent(&self, key: &str) -> Option<std::net::SocketAddr> {
-        self.relay_agent.lock().unwrap().get(key).copied()
-    }
 
     /// 代理侧：登记发来 AGENT_PACKET 的真实对端地址（转发目标）
-    pub fn remember_relay_peer(&self, ip: &str, addr: std::net::SocketAddr) {
-        self.relay_peers
-            .lock()
-            .unwrap()
-            .insert(ip.to_string(), addr);
-    }
-
-    pub fn relay_peer(&self, ip: &str) -> Option<std::net::SocketAddr> {
-        self.relay_peers.lock().unwrap().get(ip).copied()
-    }
 
     /* ---------- 不在模式 / 密码 ---------- */
 
@@ -730,50 +643,9 @@ impl AppState {
         old
     }
 
-    /// 缓存对端不在通知文；同 key 覆盖。返回旧值
-
-
-    /// 对端退出（BR_EXIT）或重新通告时（BR_ABSENCE 无不在标记）清除缓存
-
-    /* ---------- 成员主登记（DIR_MASTER） ---------- */
-
-    pub fn upsert_dir_member(&self, m: DirMember) {
-        self.dir_members.lock().unwrap().insert(m.key.clone(), m);
-    }
-
-    pub fn dir_member(&self, key: &str) -> Option<DirMember> {
-        self.dir_members.lock().unwrap().get(key).cloned()
-    }
-
-    pub fn dir_members_snapshot(&self) -> Vec<DirMember> {
-        self.dir_members.lock().unwrap().values().cloned().collect()
-    }
-
-    pub fn remove_dir_member(&self, key: &str) {
-        self.dir_members.lock().unwrap().remove(key);
-    }
-
-    /// 成员主模式下冷超时的 POLL 成员清理（返回被清理的 key）
-    pub fn prune_dir_members(&self, timeout_secs: u64) -> Vec<String> {
-        let now = now_secs();
-        let mut map = self.dir_members.lock().unwrap();
-        let stale: Vec<String> = map
-            .iter()
-            .filter(|(_, m)| now.saturating_sub(m.last_poll) > timeout_secs)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in &stale {
-            map.remove(k);
-        }
-        stale
-    }
-
-    /* ---------- 聊天记录 ---------- */
-
 }
 
 /* ---------------- 单元测试 ---------------- */
-
 
 /// 对端公钥信任与本机密钥（架构评审候选 4 的第一组，见 docs/adr/0003）。
 ///
@@ -1351,7 +1223,6 @@ pub(crate) mod trust {
     }
 }
 
-
 /// 未确认重发与离线待投递两条队列（架构评审候选 4 的第二组，见 docs/adr/0003）。
 ///
 /// 两条队列之间只有一个不变量：`demote_retry_to_pending` —— 对端退场时，未确认的**在线
@@ -1555,7 +1426,6 @@ pub(crate) mod outbox {
     }
 }
 
-
 /// 对端在线状态（架构评审候选 4 的第三组，见 docs/adr/0003）。
 ///
 /// 这是全仓**裸锁最多**的一处：`net.rs` 里 25 处 `st.peers.lock().unwrap()` 直接伸手进来。
@@ -1696,7 +1566,6 @@ pub(crate) mod peers {
     }
 }
 
-
 /// 文件传输的会话级状态（架构评审候选 4 的第四组，见 docs/adr/0003）。
 ///
 /// 两样东西同处一室，因为它们只被「取文件」这一条路径用：
@@ -1783,7 +1652,6 @@ pub(crate) mod transfer {
         }
     }
 }
-
 
 /// 聊天记录与会话可见性（架构评审候选 4 的第五组，见 docs/adr/0003）。
 ///
@@ -2717,6 +2585,168 @@ pub(crate) mod history {
                     rec["delivered"] = true.into();
                 },
             )
+        }
+    }
+}
+
+/// 成员主目录服务与主机列表窗口（架构评审候选 4 的第六组，见 docs/adr/0003）。
+/// 两个成员表（POLL 登记 + 成员主合并来的全网主机）与「主机列表获取窗口」都在这里；
+/// 组外只要几个动作（登记 / 快照 / 清理 / 开关窗口）。
+pub(crate) mod dir {
+    use super::*;
+
+    pub(crate) struct DirStore {
+        /// 成员主登记（DIR_MASTER 服务端一侧）：成员 IP → 登记
+        dir_members: Mutex<HashMap<String, DirMember>>,
+        /// 主机列表获取窗口（unix 秒截止）：窗口内收到 OKGETLIST 才发起 GETLIST
+        /// （官方 entryStartTime 窗口同款节流；启动与手动刷新时重开窗口）
+        hostlist_window: Mutex<Option<u64>>,
+        /// 成员主（DIR_MASTER）维护的全网主机列表（IPDict 主机字典条目）
+        master_hosts: Mutex<Vec<crate::ipdict::Dict>>,
+    }
+
+    impl DirStore {
+        pub(crate) fn new() -> Self {
+            Self {
+                        dir_members: Mutex::new(HashMap::new()),
+
+                        hostlist_window: Mutex::new(None),
+
+                        master_hosts: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn open_hostlist_window(&self, secs: u64) {
+            *self.hostlist_window.lock().unwrap() = Some(now_secs() + secs);
+        }
+
+        pub fn hostlist_window_open(&self) -> bool {
+            match *self.hostlist_window.lock().unwrap() {
+                Some(until) => now_secs() < until,
+                None => false,
+            }
+        }
+
+        pub fn master_hosts(&self) -> Vec<crate::ipdict::Dict> {
+            self.master_hosts.lock().unwrap().clone()
+        }
+
+        pub fn merge_master_hosts(&self, hosts: &[crate::ipdict::Dict]) -> usize {
+            let mut map = self.master_hosts.lock().unwrap();
+            let mut changed = 0;
+            for h in hosts {
+                let ip = h
+                    .get_str(crate::ipdict::DICT_IPAD)
+                    .unwrap_or("")
+                    .to_string();
+                if ip.is_empty() {
+                    continue;
+                }
+                let before = map.len();
+                map.retain(|m| m.get_str(crate::ipdict::DICT_IPAD) != Some(ip.as_str()));
+                map.push(h.clone());
+                if map.len() != before || !map.iter().any(|m| m == h) {
+                    changed += 1;
+                }
+            }
+            changed
+        }
+
+        pub fn upsert_dir_member(&self, m: DirMember) {
+            self.dir_members.lock().unwrap().insert(m.key.clone(), m);
+        }
+
+#[allow(dead_code)] // 搬迁后无调用方（拆分前是 pub 方法/仅测试用）；待确认是否可删
+        pub fn dir_member(&self, key: &str) -> Option<DirMember> {
+            self.dir_members.lock().unwrap().get(key).cloned()
+        }
+
+        pub fn dir_members_snapshot(&self) -> Vec<DirMember> {
+            self.dir_members.lock().unwrap().values().cloned().collect()
+        }
+
+#[allow(dead_code)] // 搬迁后无调用方（拆分前是 pub 方法/仅测试用）；待确认是否可删
+        pub fn remove_dir_member(&self, key: &str) {
+            self.dir_members.lock().unwrap().remove(key);
+        }
+
+        pub fn prune_dir_members(&self, timeout_secs: u64) -> Vec<String> {
+            let now = now_secs();
+            let mut map = self.dir_members.lock().unwrap();
+            let stale: Vec<String> = map
+                .iter()
+                .filter(|(_, m)| now.saturating_sub(m.last_poll) > timeout_secs)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in &stale {
+                map.remove(k);
+            }
+            stale
+        }
+    }
+}
+
+/// NAT 中继代理的登记与被任命状态（架构评审候选 4 的第七组，见 docs/adr/0003）。
+/// 三个表都很小：被任命为代理的截止时间、本会话的中继代理、对端作为中继的地址。
+pub(crate) mod relay {
+    use super::*;
+
+    pub(crate) struct RelayStore {
+        /// 成员侧：作为代理（agent）的有效期截止（master IP → unix 秒；
+        /// DIR_POLLAGENT 的 AGS 秒数；期间本段 entry 事件转发 master）
+        agent_until: Mutex<HashMap<String, u64>>,
+        /// 中继代理（AGENT 协议）两侧登记：
+        /// - 客户端侧：会话 key（NAT 对端 ip）→ 我方向其发应答所用代理地址
+        relay_agent: Mutex<HashMap<String, std::net::SocketAddr>>,
+        /// - 代理侧：来源 ip → 真实对端地址（转发 AGENT_PACKET 的目标）
+        relay_peers: Mutex<HashMap<String, std::net::SocketAddr>>,
+    }
+
+    impl RelayStore {
+        pub(crate) fn new() -> Self {
+            Self {
+                        agent_until: Mutex::new(HashMap::new()),
+
+                        relay_agent: Mutex::new(HashMap::new()),
+
+                        relay_peers: Mutex::new(HashMap::new()),
+            }
+        }
+
+        pub fn set_agent_until(&self, master_ip: &str, secs_from_now: u64) {
+            self.agent_until
+                .lock()
+                .unwrap()
+                .insert(master_ip.to_string(), now_secs() + secs_from_now);
+        }
+
+        pub fn agent_active(&self, master_ip: &str) -> bool {
+            match self.agent_until.lock().unwrap().get(master_ip) {
+                Some(until) => now_secs() < *until,
+                None => false,
+            }
+        }
+
+        pub fn remember_relay_agent(&self, key: &str, agent: std::net::SocketAddr) {
+            self.relay_agent
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), agent);
+        }
+
+        pub fn relay_agent(&self, key: &str) -> Option<std::net::SocketAddr> {
+            self.relay_agent.lock().unwrap().get(key).copied()
+        }
+
+        pub fn remember_relay_peer(&self, ip: &str, addr: std::net::SocketAddr) {
+            self.relay_peers
+                .lock()
+                .unwrap()
+                .insert(ip.to_string(), addr);
+        }
+
+        pub fn relay_peer(&self, ip: &str) -> Option<std::net::SocketAddr> {
+            self.relay_peers.lock().unwrap().get(ip).copied()
         }
     }
 }
