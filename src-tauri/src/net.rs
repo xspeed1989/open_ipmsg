@@ -5529,6 +5529,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
+    /// 接收去重（ADR-0004）：同内容只留一份数据、不同内容各留一份、索引失效当未命中。
+    #[test]
+    fn settle_download_dedups_by_content() {
+        let base = test_data_dir("settle-dedup");
+        let dir = base.join("dl");
+        std::fs::create_dir_all(&dir).unwrap();
+        let transfer = crate::state::transfer::TransferStore::new(base.clone());
+
+        let write_tmp = |name: &str, bytes: &[u8]| {
+            let p = base.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+
+        // 1) 同内容、不同名 → 共享同一份数据（硬链接同 inode；不支持硬链接的回落是同一路径）
+        let a = super::settle_download(&dir, &write_tmp("a.tmp", b"same-bytes"), "one.png", &transfer)
+            .unwrap();
+        let b = super::settle_download(&dir, &write_tmp("b.tmp", b"same-bytes"), "two.png", &transfer)
+            .unwrap();
+        assert!(a.exists() && b.exists());
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&a).unwrap().ino(),
+                std::fs::metadata(&b).unwrap().ino(),
+                "同内容应共享同一 inode（硬链接），而不是复制第二份"
+            );
+        }
+
+        // 2) 不同内容 → 各留一份
+        let c = super::settle_download(&dir, &write_tmp("c.tmp", b"other"), "three.png", &transfer)
+            .unwrap();
+        assert_ne!(std::fs::read(&c).unwrap(), std::fs::read(&a).unwrap());
+
+        // 3) 索引里的路径失效（用户删了文件）→ 当未命中，重新落一份
+        std::fs::remove_file(&a).unwrap();
+        std::fs::remove_file(&b).unwrap();
+        let d = super::settle_download(&dir, &write_tmp("d.tmp", b"same-bytes"), "four.png", &transfer)
+            .unwrap();
+        assert!(d.exists(), "索引失效后应重新落盘，而不是返回一个不存在的路径");
+        assert_eq!(std::fs::read(&d).unwrap(), b"same-bytes");
+
+        // 4) 索引确实落盘了（可重建的缓存，但要真的写上）
+        assert!(base.join("received_files.json").exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// 预握手重试：宣告了加密却没有公钥的对端，会被 sweep 补发 GETPUBKEY；到上限后
     /// 停下（等下一轮宣告/下一条消息按本轮重来），并且**不**消耗探测预算、**不**把对端
     /// 标记成明文 —— 那条线判的是「对端能力」，不该由链路丢包决定。
@@ -7504,6 +7554,8 @@ pub async fn download_file_task(
             // 用这个文件。所以这里先尝试采用已完成的文件，只有确实不完整才判失败。
             if let Some(path) = adopt_completed_download(ctx, &tmp_path, &dir, &safe_name, expect_size)
             {
+                // 抢救路径同样要去重：这份内容可能早就有一份了（ADR-0004）
+                let path = dedup_adopted_download(path, &ctx.st.transfer);
                 ctx.st.diag(&format!(
                     "dl-adopt {key} pkt={pkt_no} id={file_id:x} -> {} ({expect_size}B，对端未回结束信号但文件已完整)",
                     path.display()
@@ -7531,9 +7583,16 @@ pub async fn download_file_task(
             Err(e)
         }
         Ok((total, enc)) => {
-            // 重名判定推迟到落盘瞬间，避免并发下载抢同一个目标名
-            let final_path = unique_path(&dir.join(&safe_name));
-            std::fs::rename(&tmp_path, &final_path).map_err(|e| format!("保存文件失败: {e}"))?;
+            // 重名判定推迟到落盘瞬间，避免并发下载抢同一个目标名；
+            // 先按内容去重（同内容不再落第二份，ADR-0004）
+            let Some(final_path) =
+                settle_download(&dir, &tmp_path, &safe_name, &ctx.st.transfer)
+            else {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                let e = "保存文件失败".to_string();
+                fail_download(ctx, key, pkt_no, file_id, &e);
+                return Err(e);
+            };
             ctx.st.diag(&format!(
                 "dl-done {key} pkt={pkt_no} id={file_id:x} -> {} ({total}B) enc={enc}",
                 final_path.display()
@@ -8221,6 +8280,80 @@ async fn fetch_to_file(
     drop(file);
     oim_log!("[download] 从 {target} 接收完成: {total} 字节 enc={enc}");
     Ok((total, enc))
+}
+
+/// 流式算一份文件的 SHA-256：大文件不能整块读进内存（ADR-0004 的判据）
+fn file_sha256(path: &std::path::Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut f, &mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(crypto::hex_lower(&hasher.finalize()))
+}
+
+/// `adopt_completed_download` 之后补一步去重：它已经把文件落到最终名字了，
+/// 若同内容已有一份，就把刚落的这份删掉、复用老的（ADR-0004）。
+fn dedup_adopted_download(
+    path: PathBuf,
+    transfer: &crate::state::transfer::TransferStore,
+) -> PathBuf {
+    let Ok(size) = std::fs::metadata(&path).map(|m| m.len()) else {
+        return path;
+    };
+    let Some(hash) = file_sha256(&path) else {
+        return path;
+    };
+    if let Some(existing) = transfer.received_lookup(&hash, size) {
+        let _ = std::fs::remove_file(&path);
+        return existing;
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    transfer.received_insert(&hash, &path, size, &name);
+    path
+}
+
+/// 接收收尾：**先按内容判重，再决定怎么落地**（ADR-0004）。
+///
+/// 命中已有同内容 → 硬链接到公告名（同 inode、不额外占空间，磁盘上的名字与消息里一致）；
+/// 文件系统不支持硬链接（FAT32/exFAT、跨卷、权限）→ 复用已有那份的路径。
+/// 未命中 → 照旧 `unique_path` + rename，并记进内容索引。
+/// 返回 `None` 表示落盘失败（调用方按失败收尾）。
+fn settle_download(
+    dir: &std::path::Path,
+    tmp: &std::path::Path,
+    safe_name: &str,
+    transfer: &crate::state::transfer::TransferStore,
+) -> Option<PathBuf> {
+    let size = std::fs::metadata(tmp).ok()?.len();
+    let hash = file_sha256(tmp);
+    if let Some(h) = hash.as_deref() {
+        if let Some(existing) = transfer.received_lookup(h, size) {
+            let target = unique_path(&dir.join(safe_name));
+            if std::fs::hard_link(&existing, &target).is_ok() {
+                let _ = std::fs::remove_file(tmp);
+                return Some(target);
+            }
+            // 硬链接不支持：复用已有那份，不留副本
+            let _ = std::fs::remove_file(tmp);
+            return Some(existing);
+        }
+    }
+    let target = unique_path(&dir.join(safe_name));
+    std::fs::rename(tmp, &target).ok()?;
+    if let Some(h) = hash.as_deref() {
+        transfer.received_insert(h, &target, size, safe_name);
+    }
+    Some(target)
 }
 
 /// 目标路径已存在时追加 (1)/(2)…

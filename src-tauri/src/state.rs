@@ -455,7 +455,7 @@ impl AppState {
         AppState {
             config: Mutex::new(Config::default()),
             peers: peers::PeerStore::new(),
-            transfer: transfer::TransferStore::new(),
+            transfer: transfer::TransferStore::new(data_dir.clone()),
             outbox: outbox::OutboxStore::new(data_dir.clone()),
             seen_queue: Mutex::new(VecDeque::new()),
             seen_set: Mutex::new(HashSet::new()),
@@ -1577,17 +1577,106 @@ pub(crate) mod peers {
 pub(crate) mod transfer {
     use super::*;
 
+    /// 已收到文件的内容索引条目（ADR-0004）：`sha256 → 落在哪`。可丢可重建的缓存。
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    pub(crate) struct ReceivedEntry {
+        pub path: String,
+        pub size: u64,
+        pub name: String,
+        pub ts: u64,
+    }
+
+    /// 索引条目上限：超过就按 ts 淘汰最旧的（顺手清掉路径已失效的）
+    pub(crate) const RECEIVED_INDEX_MAX: usize = 4096;
+    const RECEIVED_INDEX_FILE: &str = "received_files.json";
+
+    fn load_received_index(data_dir: &std::path::Path) -> HashMap<String, ReceivedEntry> {
+        let Ok(txt) = std::fs::read(data_dir.join(RECEIVED_INDEX_FILE)) else {
+            return HashMap::new();
+        };
+        serde_json::from_slice::<HashMap<String, ReceivedEntry>>(&txt).unwrap_or_default()
+    }
+
+    /// 原子写：先写临时文件再 rename。失败由调用方只记诊断，不阻断交付。
+    fn write_received_index(
+        data_dir: &std::path::Path,
+        m: &HashMap<String, ReceivedEntry>,
+    ) -> std::io::Result<()> {
+        let path = data_dir.join(RECEIVED_INDEX_FILE);
+        let tmp = data_dir.join(format!(".{RECEIVED_INDEX_FILE}.tmp"));
+        std::fs::write(&tmp, serde_json::to_vec(m).unwrap_or_default())?;
+        std::fs::rename(&tmp, &path)
+    }
+
     pub(crate) struct TransferStore {
+        data_dir: PathBuf,
         pub offered: Mutex<HashMap<(u32, u32), OfferedFile>>,
         /// 对端 IP → 上次成功取文件用的请求方言下标（见 net::DIALECTS）
         dialect: Mutex<HashMap<String, usize>>,
+        /// 已收到文件的内容索引（ADR-0004）：同内容不再落第二份
+        received: Mutex<HashMap<String, ReceivedEntry>>,
     }
 
     impl TransferStore {
-        pub(crate) fn new() -> Self {
+        pub(crate) fn new(data_dir: PathBuf) -> Self {
+            let received = load_received_index(&data_dir);
             Self {
+                data_dir,
                 offered: Mutex::new(HashMap::new()),
                 dialect: Mutex::new(HashMap::new()),
+                received: Mutex::new(received),
+            }
+        }
+
+        /// 命中一份已收到的同内容文件：**路径仍存在且大小相符**才算命中 ——
+        /// 索引是可丢的缓存，不猜文件被挪到哪去了（ADR-0004）。
+        pub(crate) fn received_lookup(&self, hash: &str, size: u64) -> Option<PathBuf> {
+            let mut m = self.received.lock().unwrap();
+            let hit = m.get(hash).and_then(|e| {
+                let p = PathBuf::from(&e.path);
+                let ok = std::fs::metadata(&p)
+                    .map(|md| md.is_file() && md.len() == size)
+                    .unwrap_or(false);
+                ok.then_some(p)
+            });
+            if hit.is_none() {
+                m.remove(hash); // 失效条目顺手清掉
+            }
+            hit
+        }
+
+        /// 记一条「这份内容在哪」。写失败只记诊断，不阻断交付（用户拿到文件优先）。
+        pub(crate) fn received_insert(
+            &self,
+            hash: &str,
+            path: &std::path::Path,
+            size: u64,
+            name: &str,
+        ) {
+            let snapshot = {
+                let mut m = self.received.lock().unwrap();
+                m.insert(
+                    hash.to_string(),
+                    ReceivedEntry {
+                        path: path.to_string_lossy().into_owned(),
+                        size,
+                        name: name.to_string(),
+                        ts: now_secs(),
+                    },
+                );
+                if m.len() > RECEIVED_INDEX_MAX {
+                    let mut by_age: Vec<(String, u64)> =
+                        m.iter().map(|(k, e)| (k.clone(), e.ts)).collect();
+                    by_age.sort_by_key(|(_, ts)| *ts);
+                    let drop_n = m.len() - RECEIVED_INDEX_MAX;
+                    for (k, _) in by_age.into_iter().take(drop_n) {
+                        m.remove(&k);
+                    }
+                }
+                m.clone()
+            };
+            if let Err(e) = write_received_index(&self.data_dir, &snapshot) {
+                diag_to(&self.data_dir, &format!("received-index 落盘失败（不阻断）: {e}"));
             }
         }
 
