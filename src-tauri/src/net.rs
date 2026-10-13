@@ -5548,17 +5548,29 @@ mod tests {
             .unwrap();
         let b = super::settle_download(&dir, &write_tmp("b.tmp", b"same-bytes"), "two.png", &transfer)
             .unwrap();
-        assert!(a.exists() && b.exists());
-        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            assert_eq!(
-                std::fs::metadata(&a).unwrap().ino(),
-                std::fs::metadata(&b).unwrap().ino(),
-                "同内容应共享同一 inode（硬链接），而不是复制第二份"
-            );
-        }
+        assert!(a.exists());
+        assert_eq!(a, b, "同内容应复用同一路径，不再新建目录入口（跨平台，不依赖硬链接）");
+        assert_eq!(std::fs::read(&a).unwrap(), b"same-bytes");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "同内容、同扩展名发两次：接收目录里只该有一个入口"
+        );
+
+        // 1b) 同内容但扩展名不同 → 不复用（内联预览按扩展名判 MIME，必须保住）
+        let b2 = super::settle_download(
+            &dir,
+            &write_tmp("b2.tmp", b"same-bytes"),
+            "two.bin",
+            &transfer,
+        )
+        .unwrap();
+        assert_ne!(b2, a, "扩展名不同不能复用，否则图片/文本按错的类型渲染");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "扩展名不同的那份另存一个入口"
+        );
 
         // 2) 不同内容 → 各留一份
         let c = super::settle_download(&dir, &write_tmp("c.tmp", b"other"), "three.png", &transfer)
@@ -5567,7 +5579,6 @@ mod tests {
 
         // 3) 索引里的路径失效（用户删了文件）→ 当未命中，重新落一份
         std::fs::remove_file(&a).unwrap();
-        std::fs::remove_file(&b).unwrap();
         let d = super::settle_download(&dir, &write_tmp("d.tmp", b"same-bytes"), "four.png", &transfer)
             .unwrap();
         assert!(d.exists(), "索引失效后应重新落盘，而不是返回一个不存在的路径");
@@ -8322,10 +8333,24 @@ fn dedup_adopted_download(
     path
 }
 
+/// 两者的扩展名是否一致（大小写不敏感）—— 复用已有文件的前提。
+fn same_ext(existing: &std::path::Path, announced_name: &str) -> bool {
+    let a = existing
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let b = std::path::Path::new(announced_name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    a == b
+}
+
 /// 接收收尾：**先按内容判重，再决定怎么落地**（ADR-0004）。
 ///
-/// 命中已有同内容 → 硬链接到公告名（同 inode、不额外占空间，磁盘上的名字与消息里一致）；
-/// 文件系统不支持硬链接（FAT32/exFAT、跨卷、权限）→ 复用已有那份的路径。
+/// 命中已有同内容 → **复用那份的路径**（不新建名字、不做硬链接）：目录入口不增加，
+/// 这才是「下载目录文件过多」的根源；硬链接/inode 不是跨平台的东西（exFAT/FAT32、
+/// 部分网络盘不支持），所以只认路径。
 /// 未命中 → 照旧 `unique_path` + rename，并记进内容索引。
 /// 返回 `None` 表示落盘失败（调用方按失败收尾）。
 fn settle_download(
@@ -8338,14 +8363,12 @@ fn settle_download(
     let hash = file_sha256(tmp);
     if let Some(h) = hash.as_deref() {
         if let Some(existing) = transfer.received_lookup(h, size) {
-            let target = unique_path(&dir.join(safe_name));
-            if std::fs::hard_link(&existing, &target).is_ok() {
+            // 扩展名一致才复用：内联预览（read_image_data）按**路径的扩展名**判 MIME，
+            // 同内容的 `.bin` 与 `.png` 撞一起会让图片不预览 —— 这条保证优先于极限去重。
+            if same_ext(&existing, safe_name) {
                 let _ = std::fs::remove_file(tmp);
-                return Some(target);
+                return Some(existing);
             }
-            // 硬链接不支持：复用已有那份，不留副本
-            let _ = std::fs::remove_file(tmp);
-            return Some(existing);
         }
     }
     let target = unique_path(&dir.join(safe_name));
