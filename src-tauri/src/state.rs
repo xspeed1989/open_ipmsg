@@ -699,6 +699,12 @@ pub(crate) mod trust {
         /// 那个预算判的是「对端能力」（攒够就把对端标成明文），不该由链路丢包决定；
         /// 这里只数重试，用完就安静停下，等下一次宣告或发消息自然重来。
         handshake_retries: Mutex<HashMap<String, u32>>,
+        /// 对端 IP → 上一次「学到/确认这把公钥」的时刻（秒）。钥匙新鲜度判据（ADR-0006）：
+        /// 太久没确认、或进程刚起来不知道（缓存是从磁盘读的）→ 值得重新确认一次。
+        key_seen_at: Mutex<HashMap<String, u64>>,
+        /// 周期性确认的**独立**限频：IP → 上次补发时刻（秒）。与 probe_counts（判对端能力）、
+        /// handshake_retries（数本轮重试）都不共用 —— 这条只判「我方缓存新鲜度」。
+        key_refresh_at: Mutex<HashMap<String, u64>>,
         /// 本机密钥对：懒加载生成 + ipmsg_key.json 持久化（进程内只生成一次）
         own_key: OnceLock<Arc<KeyPair>>,
     }
@@ -715,6 +721,8 @@ pub(crate) mod trust {
                 probe_counts: Mutex::new(HashMap::new()),
                 rehandshake_at: Mutex::new(HashMap::new()),
                 handshake_retries: Mutex::new(HashMap::new()),
+                key_seen_at: Mutex::new(HashMap::new()),
+                key_refresh_at: Mutex::new(HashMap::new()),
                 own_key: OnceLock::new(),
             }
         }
@@ -827,6 +835,9 @@ pub(crate) mod trust {
                 }
                 Some(_) => return Ok(VerifiedPeerKeyDecision::Mismatch),
             };
+            // 除 Mismatch 外都算「确认过对端钥匙」（含用缓存钥匙验签成功的 Current/Previous
+            // 与首次 TOFU）—— 这正是最强的「新鲜」信号；Mismatch 说明缓存钥匙不对，不算确认。
+            self.note_peer_key_seen(ip);
             let mut proposed = peers.clone();
             match decision {
                 VerifiedPeerKeyDecision::TofuStored => {
@@ -920,6 +931,7 @@ pub(crate) mod trust {
                     capa
                 ));
             }
+            self.note_peer_key_seen(ip);
             Ok(())
         }
 
@@ -1209,6 +1221,58 @@ pub(crate) mod trust {
         #[allow(dead_code)] // 测试与诊断用
         pub fn handshake_retries_of(&self, ip: &str) -> u32 {
             self.handshake_retries.lock().unwrap().get(ip).copied().unwrap_or(0)
+        }
+
+        /// 记下「这把缓存公钥是什么时候学到/确认的」（ANSPUBKEY 采纳、上线宣告采纳、
+        /// 以及用缓存钥匙验签成功时都算确认）。钥匙新鲜度的判据就是它。
+        pub fn note_peer_key_seen(&self, ip: &str) {
+            self.key_seen_at
+                .lock()
+                .unwrap()
+                .insert(ip.to_string(), now_secs());
+        }
+
+        /// 距上次学到/确认这把公钥过了多少秒；从未记录返回 None。
+        ///
+        /// None 的含义是「**应当确认**」而不是「刚拿到」：进程重启后缓存是从磁盘读的，
+        /// 我们并不知道对端有没有在停机期间换过钥匙 —— 那正是「原版重启过、我们拿着旧
+        /// 钥匙每条都发不出去」最容易踩的时刻（ADR-0005 / ADR-0006）。
+        pub fn peer_key_age_secs(&self, ip: &str) -> Option<u64> {
+            self.key_seen_at
+                .lock()
+                .unwrap()
+                .get(ip)
+                .map(|t| now_secs().saturating_sub(*t))
+        }
+
+        /// 周期性确认的限频（默认 60s/IP）：返回真表示这次可以补发。
+        /// 独立计数是刻意的，理由见字段注释（ADR-0006）。
+        pub fn try_key_refresh_gate(&self, ip: &str) -> bool {
+            const KEY_REFRESH_MIN_GAP_SECS: u64 = 60;
+            let now = now_secs();
+            let mut m = self.key_refresh_at.lock().unwrap();
+            match m.get(ip) {
+                Some(t) if now.saturating_sub(*t) < KEY_REFRESH_MIN_GAP_SECS => false,
+                _ => {
+                    m.insert(ip.to_string(), now);
+                    true
+                }
+            }
+        }
+
+        /// 测试钩子：抹掉新鲜度记录，模拟「缓存来自磁盘、进程内从未确认过」。
+        #[cfg(test)]
+        pub fn forget_key_seen_for_test(&self, ip: &str) {
+            self.key_seen_at.lock().unwrap().remove(ip);
+        }
+
+        #[allow(dead_code)] // 诊断用
+        pub fn key_refresh_age_secs(&self, ip: &str) -> Option<u64> {
+            self.key_refresh_at
+                .lock()
+                .unwrap()
+                .get(ip)
+                .map(|t| now_secs().saturating_sub(*t))
         }
 
         pub fn retire_probe_budget(&self, ip: &str) -> bool {

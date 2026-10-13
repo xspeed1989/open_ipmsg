@@ -446,6 +446,63 @@ pub(crate) async fn handshake_sweep(ctx: &NetCtx) -> usize {
         send_getpubkey_retry(ctx, target, &cfg, n).await;
         sent += 1;
     }
+    // 第二遍：缓存里有钥匙、但可能已过期的对端（ADR-0006）
+    sent + refresh_stale_peer_keys(ctx, &cfg).await
+}
+
+/// 缓存公钥的**周期性确认**间隔（秒，ADR-0006 第 3 条）。
+///
+/// 为什么需要它：对端换了密钥对、而它的上线宣告在 LAN 上丢了（UDP 丢包很常见）时，我方
+/// 无从得知 —— 要等「每条都发不出去」才会由对端的 DecryptErr 兜回来（ADR-0005）。这里用
+/// **一个 UDP 小包**把「我方缓存是否还新」变成周期性验证。判据只看「多久没确认过」。
+const KEY_REFRESH_INTERVAL_SECS: u64 = 300;
+
+/// 是否该重新确认这把缓存公钥。None = 从未记录（进程刚起来，缓存来自磁盘）→ 该确认。
+fn key_needs_refresh(age_secs: Option<u64>) -> bool {
+    age_secs.map_or(true, |age| age >= KEY_REFRESH_INTERVAL_SECS)
+}
+
+/// 周期性确认用的 GETPUBKEY。**不计入** `PLAIN_PROBE_BUDGET`（与 send_getpubkey_retry
+/// 同一条原则）：那条预算判「对端能力」，攒够会把对端标成明文；这条只判「我方缓存新鲜度」。
+async fn send_getpubkey_maintain(ctx: &NetCtx, target: SocketAddr, cfg: &Config, age: Option<u64>) {
+    let capa = entry_caps(cfg) | crypto::CAPA_OUR_SEND;
+    let mut g = proto::Packet::new(cmd::GETPUBKEY);
+    g.extra = format!("{capa:x}").into_bytes();
+    let bytes = g.encode(&my_user(cfg), &my_host());
+    let _ = ctx.sock.send_to(&bytes, target).await;
+    let age = age.map_or("未知".to_string(), |a| format!("{a}s"));
+    ctx.st.diag(&format!(
+        "-> {target} GETPUBKEY 周期性确认（距上次确认 {age}，不计探测预算）"
+    ));
+}
+
+/// 对**已缓存公钥**的对端做周期性确认，返回补发条数（ADR-0006 第 3 条）。
+///
+/// 与 `handshake_sweep` 的预握手（只挑「缓存为空」的对端）互补：这条覆盖「缓存里有钥匙、
+/// 但可能已过期」—— 后者以前完全没有自愈路径，只能等对端抱怨。
+async fn refresh_stale_peer_keys(ctx: &NetCtx, cfg: &Config) -> usize {
+    let peers = ctx.st.peers.snapshot();
+    let stale: Vec<(String, SocketAddr, Option<u64>)> = peers
+        .iter()
+        .filter(|p| p.encrypt_announced)
+        .filter(|p| ctx.st.trust.peer_pubkey(&p.key).is_some())
+        .filter(|p| !ctx.st.trust.peer_marked_plain(&p.key))
+        .filter_map(|p| {
+            let age = ctx.st.trust.peer_key_age_secs(&p.key);
+            if !key_needs_refresh(age) {
+                return None;
+            }
+            peer_addr(p).map(|a| (p.key.clone(), a, age))
+        })
+        .collect();
+    let mut sent = 0usize;
+    for (key, target, age) in stale {
+        if !ctx.st.trust.try_key_refresh_gate(&key) {
+            continue; // 限频：别把不回应的对端刷爆
+        }
+        send_getpubkey_maintain(ctx, target, cfg, age).await;
+        sent += 1;
+    }
     sent
 }
 
@@ -5704,6 +5761,81 @@ mod tests {
         // 4) 幂等：缓存已空，再来一条不会重复取（避免被对端刷包）
         super::maybe_recover_stale_peer_key(&ctx, from, &key, "AutoReply(DecryptErr)", &cfg).await;
         assert_eq!(getpubkeys(&peer), 0, "撤过一次后不再重复取公钥");
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    /// 周期性确认（ADR-0006 第 3 条）：缓存里有钥匙、但**很久没确认或从未确认**（进程刚起来、
+    /// 缓存来自磁盘）的对端，会被补发 GETPUBKEY 重新确认；有独立限频（不刷爆对端）；
+    /// 并且**不**消耗 PLAIN_PROBE_BUDGET（那条预算判「对端能力」，会把对端标成明文）。
+    #[test]
+    fn key_needs_refresh_only_when_never_confirmed_or_too_old() {
+        assert!(super::key_needs_refresh(None), "从未确认 → 该确认");
+        assert!(!super::key_needs_refresh(Some(0)), "刚确认过 → 不动");
+        assert!(
+            !super::key_needs_refresh(Some(super::KEY_REFRESH_INTERVAL_SECS - 1)),
+            "还没到间隔 → 不动"
+        );
+        assert!(
+            super::key_needs_refresh(Some(super::KEY_REFRESH_INTERVAL_SECS)),
+            "到间隔 → 该确认"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_cached_peer_key_is_refreshed_without_touching_probe_budget() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("key-refresh").await;
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        let mut cfg = crate::state::Config::default();
+        cfg.encrypt = true;
+        st.set_config(cfg);
+        st.peers.upsert_peer(PeerInfo {
+            key: key.clone(),
+            ip: key.clone(),
+            port: from.port(),
+            nickname: "peer".into(),
+            group: String::new(),
+            host: "h".into(),
+            user: "u".into(),
+            last_seen: now_secs(),
+            absence: false,
+            absence_text: None,
+            vs: None,
+            encrypt_announced: true,
+        });
+
+        let (capa, pubk) = crate::crypto::parse_anspubkey(&crate::crypto::build_anspubkey(
+            0,
+            &st.trust.own_keypair(),
+        ))
+        .expect("构造公钥");
+
+        // 1) 钥匙是新鲜的（刚采纳）→ 不该补发（别刷对端）
+        st.trust.remember_peer_key(&key, capa, &pubk).unwrap();
+        assert_eq!(super::handshake_sweep(&ctx).await, 0, "刚确认过的钥匙不重取");
+        assert!(recv_test_packets(&peer).is_empty(), "没有包发出去");
+
+        // 2) 抹掉新鲜度记录（= 缓存来自磁盘、进程内从未确认）→ 补发一条确认
+        st.trust.forget_key_seen_for_test(&key);
+        assert_eq!(super::handshake_sweep(&ctx).await, 1, "未知新鲜度就该确认一次");
+        let got = recv_test_packets(&peer);
+        assert_eq!(
+            got.iter()
+                .filter(|p| p.command & 0xff == crate::protocol::cmd::GETPUBKEY)
+                .count(),
+            1,
+            "补发的正是 GETPUBKEY"
+        );
+        assert_eq!(st.trust.probe_count(&key), 0, "周期确认不消耗探测预算");
+        assert!(
+            !st.trust.peer_marked_plain(&key),
+            "周期确认不该把支持加密的对端标记成明文"
+        );
+
+        // 3) 独立限频：紧接着再扫不会重复补发（避免被不回应的对端刷爆）
+        assert_eq!(super::handshake_sweep(&ctx).await, 0, "限频生效");
+        assert!(recv_test_packets(&peer).is_empty(), "限频后没有新包");
 
         let _ = std::fs::remove_dir_all(data_dir);
     }

@@ -882,13 +882,16 @@ async fn crypto_roundtrip() -> bool {
 
     let discovered = wait_for(2500, || st_a.peers.contains(key_b)).await;
     log.check("发现实例 B（BR_ENTRY→ANSENTRY 注册）", discovered);
-    // B 缓存了 A 的公钥 = B 侧预握手已完成（peer_keys.json 非空且含回环键）
-    let b_cached_a = wait_for(5000, || peer_keys_cached(&dir_b, key)).await;
+    // B 缓存了 A 的公钥 = B 侧预握手已完成（peer_keys.json 非空且含回环键）。
+    // 时限要**罩住预握手重试节奏**（2s 一轮、最多 5 次补发）：原来的 5s 在「首包与一次
+    // 重发都丢」时会误报红（loopback 上偶发，实测约 1/8）—— 那是链路的锅，不是协议的锅。
+    let b_cached_a = wait_for(12000, || peer_keys_cached(&dir_b, key)).await;
     log.check(
         "A 广播声明 ENCRYPTOPT → B 完成预握手并持久化 A 的公钥",
         b_cached_a,
     );
-    let a_cached_b = wait_for(5000, || peer_keys_cached(&dir_a, key_b)).await;
+    // 同上：两侧对称，时限都要罩住重试节奏
+    let a_cached_b = wait_for(12000, || peer_keys_cached(&dir_a, key_b)).await;
     log.check(
         "B 应答声明 ENCRYPTOPT → A 完成预握手并持久化 B 的公钥",
         a_cached_b,
