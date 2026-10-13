@@ -5632,6 +5632,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// 对端密钥轮换的自愈（实测驱动）：原版 IPMsg 解不开密文时会回一条正文含
+    /// `AutoReply(DecryptErr)` 的自动回复。我方若还持有**过期**公钥缓存，预握手就不会再跑
+    /// （它只挑 peer_pubkey 为空的对端），于是变成「每条都发不出去」。
+    /// 断言：收到该回复 → 撤掉缓存 + 补发 GETPUBKEY；同时不误伤、且幂等。
+    #[tokio::test]
+    async fn decrypt_err_autoreply_withdraws_stale_key_and_refetches() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("decrypt-err-recover").await;
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        let mut cfg = crate::state::Config::default();
+        cfg.encrypt = true;
+        st.set_config(cfg.clone());
+
+        // 前置：缓存里有一把（过期的）对端公钥
+        let (capa, pubk) = crate::crypto::parse_anspubkey(&crate::crypto::build_anspubkey(
+            0,
+            &st.trust.own_keypair(),
+        ))
+        .expect("构造公钥");
+        st.trust.remember_peer_key(&key, capa, &pubk).unwrap();
+        assert!(st.trust.peer_pubkey(&key).is_some(), "前置：缓存里有钥匙");
+
+        let getpubkeys = |peer: &std::net::UdpSocket| {
+            recv_test_packets(peer)
+                .iter()
+                .filter(|p| p.command & 0xff == crate::protocol::cmd::GETPUBKEY)
+                .count()
+        };
+
+        // 1) 普通正文：不动缓存
+        super::maybe_recover_stale_peer_key(&ctx, from, &key, "hello", &cfg).await;
+        assert!(st.trust.peer_pubkey(&key).is_some(), "普通正文不该撤缓存");
+        assert_eq!(getpubkeys(&peer), 0, "普通正文不该发 GETPUBKEY");
+
+        // 2) 裸 token（用户可能自己打出来）：也不动
+        super::maybe_recover_stale_peer_key(&ctx, from, &key, "DecryptErr", &cfg).await;
+        assert!(st.trust.peer_pubkey(&key).is_some(), "裸 token 不构成判据");
+
+        // 3) 真正的自动回复：撤缓存 + 补发 GETPUBKEY
+        super::maybe_recover_stale_peer_key(
+            &ctx,
+            from,
+            &key,
+            " ==== AutoReply(DecryptErr) ====\n  My PubKey is updated, I can't",
+            &cfg,
+        )
+        .await;
+        assert!(st.trust.peer_pubkey(&key).is_none(), "过期公钥缓存必须撤掉");
+        assert_eq!(getpubkeys(&peer), 1, "要立刻补发一条 GETPUBKEY 去取新钥匙");
+
+        // 4) 幂等：缓存已空，再来一条不会重复取（避免被对端刷包）
+        super::maybe_recover_stale_peer_key(&ctx, from, &key, "AutoReply(DecryptErr)", &cfg).await;
+        assert_eq!(getpubkeys(&peer), 0, "撤过一次后不再重复取公钥");
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
     /// 预握手重试：宣告了加密却没有公钥的对端，会被 sweep 补发 GETPUBKEY；到上限后
     /// 停下（等下一轮宣告/下一条消息按本轮重来），并且**不**消耗探测预算、**不**把对端
     /// 标记成明文 —— 那条线判的是「对端能力」，不该由链路丢包决定。
