@@ -89,7 +89,15 @@ pub fn run() -> bool {
 ///
 /// 仍有一个极小的 TOCTOU 窗口（这里放掉、稍后真正绑定），但同号双协议同时被抢走的概率远低于
 /// 「只验一半」；真绑不上时下面那段 TCP 服务也会记日志 + 重试，不再静默。
+/// 本进程已经发出去的端口。**必须记**：`free_udp_port` 里的临时 socket 返回即释放，
+/// 那个号又回到内核的临时端口池 —— 连续两次挑号**可能拿到同一个**，于是先起的实例绑住
+/// TCP 服务端口，后一个实例的 TCP 绑定就 EADDRINUSE（真机上就是这么红的：日志
+/// `[tcp] bind 44928 failed` → 取文件 `Connection refused`）。
+static HANDED_OUT_PORTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+    std::sync::OnceLock::new();
+
 async fn free_udp_port() -> u16 {
+    let used = HANDED_OUT_PORTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     for _ in 0..64 {
         let Ok(s) = UdpSocket::bind(("127.0.0.1", 0)).await else {
             continue;
@@ -98,11 +106,16 @@ async fn free_udp_port() -> u16 {
             continue;
         };
         // 同号 TCP 也试一下：绑得上就立刻放掉（关掉的监听不进 TIME_WAIT）
-        if TcpListener::bind(("127.0.0.1", port)).await.is_ok() {
+        if TcpListener::bind(("127.0.0.1", port)).await.is_err() {
+            continue;
+        }
+        // 号没发过才认：重复发号会让两个实例撞在同一个端口上
+        let mut guard = used.lock().unwrap();
+        if guard.insert(port) {
             return port;
         }
     }
-    panic!("找不到 UDP/TCP 都空闲的回环端口");
+    panic!("找不到 UDP/TCP 都空闲、且没发过的回环端口");
 }
 
 async fn wait_for(ms: u64, mut f: impl FnMut() -> bool) -> bool {
