@@ -187,7 +187,7 @@ pub fn import_ipmsg_db(st: &AppState, path: &Path) -> Result<ImportReport, Strin
         .unwrap_or_else(|| "ipmsg".into());
 
     // 导入前已存在的会话，用于统计「新增会话数」
-    let known_before: HashSet<String> = st.list_sessions().into_iter().map(|s| s.key).collect();
+    let known_before: HashSet<String> = st.history.list_sessions().into_iter().map(|s| s.key).collect();
 
     // 会话身份登记表：(昵称, 主机) → 会话 key。
     // 种子：本应用既有会话（离线历史）与在线用户 —— 导入的同名同机记录
@@ -195,10 +195,10 @@ pub fn import_ipmsg_db(st: &AppState, path: &Path) -> Result<ImportReport, Strin
     // 同一身份出现多个会话时按优先级取：在线用户 > 有实时对话的会话 >
     // 纯导入残留（后者稍后会被 consolidate 归并掉）。
     let mut seeds: Vec<((String, String), String, bool)> = Vec::new();
-    for s in st.list_sessions() {
+    for s in st.history.list_sessions() {
         if let Some(id) = ident_key(&s.nickname, &s.host) {
             let live = st
-                .read_history(&s.key, usize::MAX)
+                .history.read_history(&s.key, usize::MAX)
                 .iter()
                 .any(|r| r.get("imp").is_none());
             seeds.push((id, s.key, live));
@@ -251,7 +251,7 @@ pub fn import_ipmsg_db(st: &AppState, path: &Path) -> Result<ImportReport, Strin
             // 同一 (昵称, 主机) 的多个 IP 归并到同一个会话，避免列表出现同名联系人
             let key = resolve_key(&mut ident_map, tnick, thost, taddr);
             let seen = seen_ids.entry(key.clone()).or_insert_with(|| {
-                st.read_history(&key, usize::MAX)
+                st.history.read_history(&key, usize::MAX)
                     .iter()
                     .filter_map(|r| {
                         r.get("imp")
@@ -297,7 +297,7 @@ pub fn import_ipmsg_db(st: &AppState, path: &Path) -> Result<ImportReport, Strin
                     .collect::<Vec<_>>());
             }
 
-            st.log_record(&key, &rec);
+            st.history.log_record(&key, &rec);
             touched.insert(key);
             rep.imported += 1;
         }
@@ -327,7 +327,7 @@ fn consolidate_imported_sessions(
     // 第一遍：快照出可归并的源文件与目标 key（list_sessions 内部要拿
     // hist_lock，这里不能先持锁，否则自锁死）
     let mut moves: Vec<(String, String)> = Vec::new();
-    for s in st.list_sessions() {
+    for s in st.history.list_sessions() {
         let Some(id) = ident_key(&s.nickname, &s.host) else {
             continue;
         };
@@ -337,7 +337,7 @@ fn consolidate_imported_sessions(
         if *target == s.key {
             continue;
         }
-        let path = st.log_path(&s.key);
+        let path = st.history.log_path(&s.key);
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -361,7 +361,7 @@ fn consolidate_imported_sessions(
     // 间隙落进即将被删除的源文件而被一起丢掉。此段只做直接文件 I/O，
     // 不再调用任何会取 hist_lock 的 AppState 方法。
     // 唯一的持锁例外：整段归并（读源/写目标/删源）必须原子完成（见 AppState::history_lock_for_merge）
-    let _g = st.history_lock_for_merge();
+    let _g = st.history.history_lock_for_merge();
     let mut merged = 0usize;
     // 每个目标会话已见到的 imp.id（跨多个源文件累计，避免重复搬入）
     let mut seen_targets: HashMap<String, HashSet<u64>> = HashMap::new();
@@ -376,7 +376,7 @@ fn consolidate_imported_sessions(
         if target == *src {
             continue;
         }
-        let spath = st.log_path(src);
+        let spath = st.history.log_path(src);
         let Ok(content) = std::fs::read_to_string(&spath) else {
             continue;
         };
@@ -402,7 +402,7 @@ fn consolidate_imported_sessions(
             continue;
         }
         let seen = seen_targets.entry(target.clone()).or_insert_with(|| {
-            let tpath = st.log_path(&target);
+            let tpath = st.history.log_path(&target);
             std::fs::read_to_string(&tpath)
                 .ok()
                 .map(|c| {
@@ -445,7 +445,7 @@ fn consolidate_imported_sessions(
         if append.is_empty() {
             continue;
         }
-        let tpath = st.log_path(&target);
+        let tpath = st.history.log_path(&target);
         if let Some(dir) = tpath.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -580,7 +580,7 @@ mod tests {
         let rep = import_ipmsg_db(&st, &db).unwrap();
         assert_eq!(rep.imported, 7, "6 条正常消息 + 1 条带附件");
 
-        let hist = st.read_history("192.168.1.11", 100);
+        let hist = st.history.read_history("192.168.1.11", 100);
         // 收到 Alice 的第一条
         let first = hist
             .iter()
@@ -613,7 +613,7 @@ mod tests {
 
         for key in ["192.168.1.11", "10.0.0.5"] {
             let hit = st
-                .read_history(key, 100)
+                .history.read_history(key, 100)
                 .iter()
                 .any(|r| r["text"] == "周会改到三点" && r["dir"] == "out");
             assert!(hit, "群发消息应出现在 {key} 的会话里");
@@ -629,11 +629,11 @@ mod tests {
         import_ipmsg_db(&st, &db).unwrap();
 
         let in_alice = st
-            .read_history("192.168.1.11", 100)
+            .history.read_history("192.168.1.11", 100)
             .iter()
             .any(|r| r["text"] == "全员注意");
         let in_bob = st
-            .read_history("10.0.0.5", 100)
+            .history.read_history("10.0.0.5", 100)
             .iter()
             .any(|r| r["text"] == "全员注意");
         assert!(in_alice, "组播归发件人会话");
@@ -649,9 +649,9 @@ mod tests {
         let rep = import_ipmsg_db(&st, &db).unwrap();
         assert_eq!(rep.skipped, 1, "备忘录计入 skipped");
         let leaked = st
-            .read_history("@localhost", 100)
+            .history.read_history("@localhost", 100)
             .iter()
-            .chain(st.read_history("localhost", 100).iter())
+            .chain(st.history.read_history("localhost", 100).iter())
             .any(|r| r["text"] == "待办事项");
         assert!(!leaked, "备忘录不应落入任何会话");
         let _ = std::fs::remove_dir_all(&st.data_dir);
@@ -663,7 +663,7 @@ mod tests {
         let db = st.data_dir.join("sample.db");
         make_db(&db);
         import_ipmsg_db(&st, &db).unwrap();
-        let hist = st.read_history("@CAROL-PC", 100);
+        let hist = st.history.read_history("@CAROL-PC", 100);
         assert_eq!(hist.len(), 1);
         assert_eq!(hist[0]["text"], "我在内网深处");
         assert_eq!(hist[0]["dir"], "in");
@@ -678,7 +678,7 @@ mod tests {
         import_ipmsg_db(&st, &db).unwrap();
 
         let rec = st
-            .read_history("192.168.1.11", 100)
+            .history.read_history("192.168.1.11", 100)
             .into_iter()
             .find(|r| r["kind"] == "file")
             .expect("附件消息应为 file 类型");
@@ -707,7 +707,7 @@ mod tests {
         // 每条消息按目标会话各跳过一次：6 条单会话 + 群发的 2 个会话 = 8
         assert_eq!(second.skipped, 8, "全部按已存在跳过");
 
-        let total = st.read_history("192.168.1.11", 100).len();
+        let total = st.history.read_history("192.168.1.11", 100).len();
         assert_eq!(total, 5, "会话记录数不变（收3 + 群发1 + 附件1）");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
@@ -737,12 +737,12 @@ mod tests {
         assert_eq!(rep.imported, 2);
         assert_eq!(rep.sessions_new, 1, "两个 IP 只算一个新会话");
 
-        let hist = st.read_history("192.168.1.11", 10);
+        let hist = st.history.read_history("192.168.1.11", 10);
         assert_eq!(hist.len(), 2, "两个 IP 的消息并入同一个会话");
         assert_eq!(hist[0]["text"], "第一条（老 IP）");
         assert_eq!(hist[1]["text"], "第二条（新 IP）");
         assert!(
-            !st.list_sessions().iter().any(|s| s.key == "192.168.1.99"),
+            !st.history.list_sessions().iter().any(|s| s.key == "192.168.1.99"),
             "不应按新 IP 另开会话"
         );
         assert!(
@@ -756,7 +756,7 @@ mod tests {
     fn imports_merge_into_existing_session_and_consolidate_old_files() {
         let st = temp_state("mergeexisting");
         // 现有会话：本应用的实时记录（无 imp），IP 192.168.1.50
-        st.log_record(
+        st.history.log_record(
             "192.168.1.50",
             &serde_json::json!({
                 "dir": "in", "kind": "text", "text": "现在用的地址", "pkt": 1, "ts": 1_700_000_001,
@@ -764,7 +764,7 @@ mod tests {
             }),
         );
         // 旧版本导入产生的「纯导入」残留：Alice 换过 IP 的另一个文件，只含 imp 记录
-        st.log_record(
+        st.history.log_record(
             "192.168.1.77",
             &serde_json::json!({
                 "dir": "in", "kind": "text", "text": "旧地址的历史", "ts": 1_700_000_002,
@@ -779,14 +779,14 @@ mod tests {
         assert!(rep.merged_sessions >= 1, "旧导入文件应按身份归并");
 
         // Alice 的导入消息并入同名同机的现有会话
-        let hist = st.read_history("192.168.1.50", 100);
+        let hist = st.history.read_history("192.168.1.50", 100);
         assert!(
             hist.iter().any(|r| r["text"] == "你好"),
             "导入消息并入现有会话而非按新 IP 另开"
         );
         // 旧导入文件被并入目标会话并删除
         assert!(
-            !st.list_sessions().iter().any(|s| s.key == "192.168.1.77"),
+            !st.history.list_sessions().iter().any(|s| s.key == "192.168.1.77"),
             "旧导入文件已归并删除"
         );
         assert!(
@@ -805,7 +805,7 @@ mod tests {
     fn live_sessions_are_never_consolidated() {
         let st = temp_state("nomerge-live");
         // 192.168.1.60：真实会话（记录无 imp），归并目标只能往这里追加
-        st.log_record("192.168.1.60", &serde_json::json!({
+        st.history.log_record("192.168.1.60", &serde_json::json!({
             "dir": "out", "kind": "text", "text": "发给 Bob 的话", "pkt": 1, "ts": 1_700_000_001,
             "peer": {"key": "192.168.1.60", "nickname": "Bob", "host": "PC-BOB"},
         }));
@@ -814,10 +814,10 @@ mod tests {
         let rep = import_ipmsg_db(&st, &db).unwrap();
         assert_eq!(rep.merged_sessions, 0, "真实会话文件不许被归并删除");
 
-        let keys: Vec<String> = st.list_sessions().iter().map(|s| s.key.clone()).collect();
+        let keys: Vec<String> = st.history.list_sessions().iter().map(|s| s.key.clone()).collect();
         assert!(keys.contains(&"192.168.1.60".to_string()), "真实会话保留");
         // Bob 的导入消息并入现有同名同机会话
-        let hist = st.read_history("192.168.1.60", 100);
+        let hist = st.history.read_history("192.168.1.60", 100);
         assert!(
             hist.iter().any(|r| r["text"] == "周会改到三点"),
             "导入的 Bob 消息并入他的现有会话"
@@ -862,8 +862,8 @@ mod tests {
         assert!(rep.imported > 0, "真实样本应有消息可导");
 
         // 全库记录健全性：时间合理、方向合法、无备忘录泄漏
-        for sess in st.list_sessions() {
-            for rec in st.read_history(&sess.key, usize::MAX) {
+        for sess in st.history.list_sessions() {
+            for rec in st.history.read_history(&sess.key, usize::MAX) {
                 assert!(
                     rec["ts"].as_u64().unwrap_or(0) > 100_000_000,
                     "ts 应为合理 unix 秒"
@@ -900,7 +900,7 @@ mod tests {
         .unwrap();
         let rep = import_ipmsg_db(&st, &db).unwrap();
         assert_eq!(rep.imported, 1);
-        assert_eq!(st.read_history("172.16.0.9", 10)[0]["text"], "老版本");
+        assert_eq!(st.history.read_history("172.16.0.9", 10)[0]["text"], "老版本");
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 }

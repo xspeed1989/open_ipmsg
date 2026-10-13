@@ -336,7 +336,7 @@ async fn get_users(st: State<'_, SharedState>) -> Result<Vec<PeerInfo>, String> 
         .peers
         .snapshot()
         .into_iter()
-        .filter(|p| !st.is_hidden(&p.key))
+        .filter(|p| !st.history.is_hidden(&p.key))
         .collect();
     users.sort_by(|a, b| {
         a.group
@@ -415,7 +415,7 @@ async fn get_history(
     key: String,
     limit: Option<usize>,
 ) -> Result<Vec<Value>, String> {
-    Ok(st.read_history(&key, limit.unwrap_or(300)))
+    Ok(st.history.read_history(&key, limit.unwrap_or(300)))
 }
 
 /// 全文搜索聊天记录；key 省略则搜索全部会话
@@ -426,20 +426,20 @@ async fn search_history(
     key: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<Value>, String> {
-    Ok(st.search_history(&query, key.as_deref(), limit.unwrap_or(80)))
+    Ok(st.history.search_history(&query, key.as_deref(), limit.unwrap_or(80)))
 }
 
 /// 清空某会话的聊天记录（仅本地，不影响对方）
 #[tauri::command]
 async fn clear_history(st: State<'_, SharedState>, key: String) -> Result<usize, String> {
-    Ok(st.clear_history(&key))
+    Ok(st.history.clear_history(&key))
 }
 
 /// 删除某会话（微信式）：清掉本地记录并把联系人从列表隐藏，
 /// 对端再发消息时自动恢复。返回被删掉的记录条数。
 #[tauri::command]
 async fn delete_contact(st: State<'_, SharedState>, key: String) -> Result<usize, String> {
-    let n = st.delete_contact(&key);
+    let n = st.history.delete_contact(&key);
     // 通知前端刷新列表（在线用户过滤 + 离线会话过滤都由后端做）
     st.emit(wire::evt::USERS_UPDATED, json!({}));
     Ok(n)
@@ -1504,7 +1504,7 @@ fn mark_out_read(st: State<'_, SharedState>, key: String, pkts: Vec<u32>) -> Res
     let st = st.inner().clone();
     let mut changed = 0;
     for p in pkts {
-        if st.mark_out_read(&key, p) {
+        if st.history.mark_out_read(&key, p) {
             changed += 1;
         }
     }
@@ -1514,7 +1514,7 @@ fn mark_out_read(st: State<'_, SharedState>, key: String, pkts: Vec<u32>) -> Res
 /// 全部历史会话摘要（含离线的，中栏展示用）
 #[tauri::command]
 fn list_sessions(st: State<'_, SharedState>) -> Result<Vec<state::SessionInfo>, String> {
-    Ok(st.inner().list_sessions())
+    Ok(st.inner().history.list_sessions())
 }
 
 /// 从官方 IP Messenger 的日志库（v4.5+ 的 ipmsg.db，SQLite）导入聊天记录。
@@ -1801,12 +1801,12 @@ pub fn run() {
             st.trust.load_peer_keys();
             // 会话键从 ip:port 归一化为纯 IP：把旧命名的 `<ip>_<端口>.jsonl`
             // 迁移成 `<ip>.jsonl`，并改写记录内的 peer.key 快照
-            let migrated = st.migrate_legacy_history_keys();
+            let migrated = st.history.migrate_legacy_history_keys();
             if migrated > 0 {
                 st.diag(&format!("history-migrate 迁移旧会话文件 {migrated} 个"));
             }
             // 一次性修复旧版本遗留的历史文件（重投副本堆积 / 并发写入的坏行）
-            let (merged, dropped) = st.compact_histories();
+            let (merged, dropped) = st.history.compact_histories();
             if merged > 0 || dropped > 0 {
                 st.diag(&format!("history-compact 合并重复 {merged} 条，丢弃坏行 {dropped} 行"));
             }

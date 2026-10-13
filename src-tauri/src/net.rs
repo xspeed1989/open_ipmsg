@@ -1357,7 +1357,7 @@ mod inbound {
                     // 送达确认同时落一条「已送达」：官方 Windows 客户端对普通消息
                     // 只回 RECVMSG、从不回 READMSG（recvdlg 的 READMSG 只在封书
                     // 开封时发），不记这个中间态，气泡就永远停在「未读」。
-                    if ctx.st.mark_out_delivered(&k, c) {
+                    if ctx.st.history.mark_out_delivered(&k, c) {
                         ctx.st.emit(wire::evt::MSG_DELIVERED, json!({"key": k, "pkt": c}));
                     }
                 }
@@ -1377,7 +1377,7 @@ mod inbound {
             oim_log!("[read] READMSG from {from} no={no:?}");
             if let Some(no) = no {
                 if let Some(key) = resolve_session_key(ctx, from.ip()) {
-                    let changed = ctx.st.mark_out_read(&key, no);
+                    let changed = ctx.st.history.mark_out_read(&key, no);
                     #[cfg(feature = "net_debug")]
                     oim_log!("[read] key={key} changed={changed}");
                     if changed {
@@ -1401,7 +1401,7 @@ mod inbound {
                     Some(k) => k,
                     None => from.ip().to_string(), // 离线会话也可能被撤回
                 };
-                if ctx.st.update_history_pkt(&k, no, |rec| {
+                if ctx.st.history.update_history_pkt(&k, no, |rec| {
                     rec["recalled"] = json!(true);
                 }) {
                     ctx.st.emit(
@@ -1425,7 +1425,7 @@ mod inbound {
                 .ok();
             if let Some(no) = no {
                 if let Some(k) = resolve_session_key(ctx, from.ip()) {
-                    if ctx.st.mark_out_read(&k, no) {
+                    if ctx.st.history.mark_out_read(&k, no) {
                         ctx.st.emit(wire::evt::MSG_READ, json!({"key": k, "pkt": no}));
                     }
                 }
@@ -1698,7 +1698,7 @@ mod inbound {
                 .unwrap_or(pkt.extra.len());
             let text = proto::decode_for_command(&pkt.extra[..text_end], pkt.command);
 
-            let prior = ctx.st.find_in_record(session_key, pkt.pkt_no);
+            let prior = ctx.st.history.find_in_record(session_key, pkt.pkt_no);
             let prior = prior.filter(|record| {
                 let field = if verified_payload {
                     "payload_id"
@@ -1833,7 +1833,7 @@ mod inbound {
 
             let outcome = ctx
                 .st
-                .upsert_in_record_fallible(session_key, &record)
+                .history.upsert_in_record_fallible(session_key, &record)
                 .map_err(|error| format!("E_PERSIST_FAILED|{error}"))?;
             if outcome == InRecordOutcome::Duplicate {
                 return Ok(outcome);
@@ -1841,7 +1841,7 @@ mod inbound {
 
             // 从这里往后持久化已确认成功；UI、自动下载、联系人恢复和自动应答等副作用
             // 一律放在这个边界之后。
-            let was_unhidden = !is_broadcast && ctx.st.unhide_contact(key);
+            let was_unhidden = !is_broadcast && ctx.st.history.unhide_contact(key);
 
             if !is_broadcast {
                 let no_add_list = pkt.command & opt::NOADDLISTOPT != 0;
@@ -2538,7 +2538,7 @@ fn offline_enqueue_record(
         "secret": flags.secret,
         "locked": flags.password,
     });
-    ctx.st.log_record(key, &rec);
+    ctx.st.history.log_record(key, &rec);
     Ok(rec)
 }
 
@@ -2849,7 +2849,7 @@ pub async fn send_message_opts(
         "secret": flags.secret,
         "locked": flags.password,
     });
-    ctx.st.log_record(key, &rec);
+    ctx.st.history.log_record(key, &rec);
 
     // 在线消息登记送达重发（官方 §4-12）：无 RECVMSG 时按 4s 间隔重发同一包号，
     // 累计 RETRY_MAX 次放弃。附件与纯文本一视同仁：公告丢包、对端换钥解密失败
@@ -2888,8 +2888,8 @@ pub async fn mark_read_and_receipt(ctx: &NetCtx, key: &str, pkts: &[u32]) -> Res
     }
     // 只对「要求回执且历史里仍未读」的消息发回执：前端可能因窗口焦点变化
     // 反复请求，对端的重发副本也会再次触发，这里做最后一道去重
-    let todo = ctx.st.pending_receipts(key, pkts);
-    ctx.st.mark_in_read(key, pkts);
+    let todo = ctx.st.history.pending_receipts(key, pkts);
+    ctx.st.history.mark_in_read(key, pkts);
     if todo.is_empty() {
         return Ok(0);
     }
@@ -2922,7 +2922,7 @@ pub async fn mark_read_and_receipt(ctx: &NetCtx, key: &str, pkts: &[u32]) -> Res
 /// 向对端发 DELMSG(原包号)，并把本地记录标记为「已撤回」。
 pub async fn recall_message(ctx: &NetCtx, key: &str, pkt: u32) -> Result<(), String> {
     // 只允许撤回我方发出的文本消息（附件消息撤回后对端无法再取，禁止）
-    let rec = ctx.st.find_history_any(key, pkt);
+    let rec = ctx.st.history.find_history_any(key, pkt);
     let Some(rec) = rec else {
         return Err("E_RECALL_NOT_FOUND|找不到该消息".into());
     };
@@ -2943,7 +2943,7 @@ pub async fn recall_message(ctx: &NetCtx, key: &str, pkt: u32) -> Result<(), Str
             let _ = ctx.sock.send_to(&bytes, target).await;
         }
     }
-    ctx.st.update_history_pkt(key, pkt, |r| {
+    ctx.st.history.update_history_pkt(key, pkt, |r| {
         r["recalled"] = json!(true);
     });
     // 撤回后无需重发/回执跟踪
@@ -3003,7 +3003,7 @@ pub async fn broadcast_message(ctx: &NetCtx, text: &str) -> Result<(), String> {
     });
     if let Err(error) = ctx
         .st
-        .log_record_fallible(crate::state::BROADCAST_SESSION_KEY, &record)
+        .history.log_record_fallible(crate::state::BROADCAST_SESSION_KEY, &record)
     {
         // 发包已经成功：落库失败只影响本机留痕，不能让整个发送报错
         ctx.st
@@ -3027,11 +3027,11 @@ pub async fn unlock_message(
     pkt: u32,
     password: Option<String>,
 ) -> Result<(), String> {
-    let Some(rec) = ctx.st.find_history_pkt(key, pkt) else {
+    let Some(rec) = ctx.st.history.find_history_pkt(key, pkt) else {
         // 只有入站消息才有「开封」一说：自己的记录没有 unlocked 字段，
         // 旧版前端把出站封书也画成信封并来点这里 —— 记录明明在本地，
         // 却回「找不到该消息」是误导。出站直接当已开封（正文本来就是我写的）。
-        return match ctx.st.find_history_any(key, pkt) {
+        return match ctx.st.history.find_history_any(key, pkt) {
             Some(rec) if rec.get("dir").and_then(|v| v.as_str()) == Some("out") => Ok(()),
             _ => Err("E_UNLOCK_NOT_FOUND|找不到该消息".into()),
         };
@@ -3051,7 +3051,7 @@ pub async fn unlock_message(
             return Err("E_UNLOCK_BAD_PASSWORD|密码错误".into());
         }
     }
-    ctx.st.update_history_pkt(key, pkt, |r| {
+    ctx.st.history.update_history_pkt(key, pkt, |r| {
         r["unlocked"] = json!(true);
         r["locked"] = json!(false);
         // 开封才计已读：清掉旧标记，让补发回执走 standard 去重通道
@@ -4217,7 +4217,7 @@ mod tests {
 
         super::handle_encipdict(&ctx, &outer, from).await;
 
-        assert!(st.find_in_record(&from.ip().to_string(), 665500).is_none());
+        assert!(st.history.find_in_record(&from.ip().to_string(), 665500).is_none());
         assert!(st.trust.peer_pubkey(&from.ip().to_string()).is_none());
         assert!(peer.recv_from(&mut [0u8; 2048]).is_err(), "不能回 ACK");
         let _ = std::fs::remove_dir_all(data_dir);
@@ -4236,7 +4236,7 @@ mod tests {
 
         super::handle_encipdict(&ctx, &outer, from).await;
 
-        assert!(st.find_in_record(&from.ip().to_string(), 665500).is_none());
+        assert!(st.history.find_in_record(&from.ip().to_string(), 665500).is_none());
         assert!(st.trust.peer_pubkey(&from.ip().to_string()).is_none());
         assert!(peer.recv_from(&mut [0u8; 2048]).is_err(), "不能回 ACK");
         let _ = std::fs::remove_dir_all(data_dir);
@@ -4258,7 +4258,7 @@ mod tests {
             Some(sender.public_key())
         );
         assert_eq!(
-            st.find_in_record(&from.ip().to_string(), 665500).unwrap()["text"],
+            st.history.find_in_record(&from.ip().to_string(), 665500).unwrap()["text"],
             "tofu"
         );
         let _ = std::fs::remove_dir_all(data_dir);
@@ -4273,8 +4273,8 @@ mod tests {
         let inner = official_sendmsg_dict("must-not-dispatch", crate::protocol::opt::SENDCHECKOPT);
         let outer =
             crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &sender, &inner).unwrap();
-        std::fs::create_dir_all(&st.logs_dir).unwrap();
-        std::fs::write(st.logs_dir.join("writable-probe"), b"ok").unwrap();
+        std::fs::create_dir_all(st.history.logs_dir()).unwrap();
+        std::fs::write(st.history.logs_dir().join("writable-probe"), b"ok").unwrap();
         std::fs::create_dir(data_dir.join("peer_keys.json")).unwrap();
         let from = peer.local_addr().unwrap();
         let key = from.ip().to_string();
@@ -4292,7 +4292,7 @@ mod tests {
             st.trust.peer_pubkey(&key).is_none(),
             "failed TOFU must not publish memory state"
         );
-        assert!(st.find_in_record(&key, 665500).is_none());
+        assert!(st.history.find_in_record(&key, 665500).is_none());
         assert_eq!(emitted.load(Ordering::SeqCst), 0);
         assert!(recv_test_packets(&peer)
             .iter()
@@ -4329,7 +4329,7 @@ mod tests {
         let reloaded = AppState::new(data_dir.clone());
         reloaded.trust.load_peer_keys();
         assert_eq!(reloaded.trust.peer_pubkey(&key), Some(sender_public));
-        assert!(st.find_in_record(&key, 665500).is_none());
+        assert!(st.history.find_in_record(&key, 665500).is_none());
         assert_eq!(emitted.load(Ordering::SeqCst), 0);
         assert!(recv_test_packets(&peer)
             .iter()
@@ -4353,7 +4353,7 @@ mod tests {
 
         assert_eq!(st.trust.peer_pubkey(&key), Some(sender.public_key()));
         assert_eq!(
-            st.find_in_record(&key, 665500).unwrap()["text"],
+            st.history.find_in_record(&key, 665500).unwrap()["text"],
             "known-current"
         );
         let _ = std::fs::remove_dir_all(data_dir);
@@ -4388,7 +4388,7 @@ mod tests {
         super::handle_encipdict(&ctx, &attacker_outer, from).await;
 
         assert_eq!(st.trust.peer_pubkey(&key), Some(trusted.public_key()));
-        assert!(st.find_in_record(&key, 665500).is_none());
+        assert!(st.history.find_in_record(&key, 665500).is_none());
         assert_eq!(emitted.load(Ordering::SeqCst), 0);
         let responses = recv_test_packets(&peer);
         assert!(responses
@@ -4403,7 +4403,7 @@ mod tests {
             crate::crypto::seal_encipdict(&st.trust.own_keypair().public_key(), &trusted, &trusted_inner)
                 .unwrap();
         super::handle_encipdict(&ctx, &trusted_outer, from).await;
-        assert_eq!(st.find_in_record(&key, 665500).unwrap()["text"], "trusted");
+        assert_eq!(st.history.find_in_record(&key, 665500).unwrap()["text"], "trusted");
         assert_eq!(
             emitted.load(Ordering::SeqCst),
             1,
@@ -4446,7 +4446,7 @@ mod tests {
         );
 
         assert_eq!(st.trust.peer_pubkey(&key), Some(trusted));
-        assert!(st.find_in_record(&key, 665500).is_none());
+        assert!(st.history.find_in_record(&key, 665500).is_none());
         assert_eq!(emitted.load(Ordering::SeqCst), 0);
         let responses = recv_test_packets(&peer);
         assert!(responses
@@ -4481,7 +4481,7 @@ mod tests {
         super::handle_encipdict(&ctx, &outer, from).await;
 
         assert_eq!(
-            st.find_in_record(&key, 665500).unwrap()["text"],
+            st.history.find_in_record(&key, 665500).unwrap()["text"],
             "previous-key"
         );
         assert_eq!(st.trust.peer_pubkey(&key), Some(current.public_key()));
@@ -4524,7 +4524,7 @@ mod tests {
         super::set_encipdict_after_verify_hook(&data_dir, None);
 
         assert_eq!(
-            st.find_in_record(&key, 665500).unwrap()["text"],
+            st.history.find_in_record(&key, 665500).unwrap()["text"],
             "stale-current"
         );
         assert_eq!(st.trust.peer_pubkey(&key), Some(rotated_current.public_key()));
@@ -4555,7 +4555,7 @@ mod tests {
         st.set_event(Box::new(move |event, _| {
             if event == "msg-in" {
                 let persisted = st_in_event
-                    .find_in_record(&from.ip().to_string(), 665500)
+                    .history.find_in_record(&from.ip().to_string(), 665500)
                     .is_some();
                 let ack_absent = peer_in_event.recv_from(&mut [0u8; 2048]).is_err();
                 observations_in_event
@@ -4628,7 +4628,7 @@ mod tests {
         super::handle_encipdict(&restarted_ctx, &outer, from).await;
 
         assert_eq!(emitted.load(Ordering::SeqCst), 0);
-        assert_eq!(restarted.read_history(&key, 50).len(), 1);
+        assert_eq!(restarted.history.read_history(&key, 50).len(), 1);
         assert_eq!(
             recv_test_packets(&peer)
                 .iter()
@@ -4692,7 +4692,7 @@ mod tests {
             super::handle_encipdict(&ctx, &outer, from),
         );
 
-        assert_eq!(st.read_history(&key, 50).len(), 1);
+        assert_eq!(st.history.read_history(&key, 50).len(), 1);
         assert_eq!(emitted.load(Ordering::SeqCst), 1);
         server.await.unwrap();
         assert_eq!(
@@ -4736,12 +4736,12 @@ mod tests {
         super::handle_encipdict(&ctx, &first_outer, from).await;
         super::handle_encipdict(&ctx, &second_outer, from).await;
 
-        let record = st.find_in_record(&key, 665500).unwrap();
+        let record = st.history.find_in_record(&key, 665500).unwrap();
         assert_eq!(record["text"], "payload-two");
         assert!(record["payload_id"].as_str().is_some());
         assert_eq!(record["read"], false);
         assert_eq!(emitted.load(Ordering::SeqCst), 2);
-        assert_eq!(st.read_history(&key, 50).len(), 1);
+        assert_eq!(st.history.read_history(&key, 50).len(), 1);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -4756,7 +4756,7 @@ mod tests {
 
         super::handle_datagram(&ctx, &outer.pack(), from).await;
 
-        assert!(st.find_in_record(&from.ip().to_string(), 665500).is_some());
+        assert!(st.history.find_in_record(&from.ip().to_string(), 665500).is_some());
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -4942,10 +4942,10 @@ mod tests {
         replacement.extra = b"replacement password payload".to_vec();
 
         super::handle_datagram(&ctx, &first.encode("sender", "classic-host"), from).await;
-        st.mark_in_read(&key, &[pkt_no]);
+        st.history.mark_in_read(&key, &[pkt_no]);
         super::handle_datagram(&ctx, &replacement.encode("sender", "classic-host"), from).await;
 
-        let record = st.find_in_record(&key, pkt_no).unwrap();
+        let record = st.history.find_in_record(&key, pkt_no).unwrap();
         assert_eq!(record["text"], "replacement password payload");
         assert_eq!(record["read"], false);
         assert_eq!(record["locked"], true);
@@ -4981,7 +4981,7 @@ mod tests {
         super::handle_datagram(&ctx, &wire, from).await;
         super::handle_datagram(&ctx, &wire, from).await;
 
-        assert_eq!(st.read_history(&key, 50).len(), 1);
+        assert_eq!(st.history.read_history(&key, 50).len(), 1);
         assert_eq!(emitted.load(Ordering::SeqCst), 1);
         assert_eq!(
             recv_test_packets(&peer)
@@ -5019,7 +5019,7 @@ mod tests {
         .with_pkt_no(pkt_no);
         invalid.extra = b"not-a-classic-encrypted-message".to_vec();
         super::handle_datagram(&ctx, &invalid.encode("sender", "classic-host"), from).await;
-        assert!(st.find_in_record(&key, pkt_no).is_none());
+        assert!(st.history.find_in_record(&key, pkt_no).is_none());
         let _ = recv_test_packets(&peer);
 
         st.trust.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &sender.public_key())
@@ -5041,7 +5041,7 @@ mod tests {
         super::handle_datagram(&ctx, &valid.encode("sender", "classic-host"), from).await;
 
         assert_eq!(
-            st.find_in_record(&key, pkt_no).unwrap()["text"],
+            st.history.find_in_record(&key, pkt_no).unwrap()["text"],
             "valid retry"
         );
         assert_eq!(emitted.load(Ordering::SeqCst), 1);
@@ -5157,7 +5157,7 @@ mod tests {
         super::handle_datagram(&ctx_b, &buf[..n], from).await;
 
         let rec = st_b
-            .find_in_record(key, pkt_no)
+            .history.find_in_record(key, pkt_no)
             .expect("B 应把封书落库（这正是「对方没收到」会失败的地方）");
         assert_eq!(rec["text"], "封书正文");
         assert_eq!(rec["secret"], true);
@@ -5188,7 +5188,7 @@ mod tests {
         super::unlock_message(&ctx_b, key, pkt_no, None)
             .await
             .expect("无密码封书应可直接开封");
-        let rec = st_b.find_in_record(key, pkt_no).expect("开封后记录仍在");
+        let rec = st_b.history.find_in_record(key, pkt_no).expect("开封后记录仍在");
         assert_eq!(rec["unlocked"], true, "开封后正文可见");
         assert_eq!(rec["read"], true, "开封即视为已读");
 
@@ -5235,7 +5235,7 @@ mod tests {
             .await
             .unwrap();
 
-        let record = st.find_in_record(&key, pkt_no).expect("封书应落库");
+        let record = st.history.find_in_record(&key, pkt_no).expect("封书应落库");
         assert_eq!(
             record["unlocked"], true,
             "默认开启自动打开：入站封书落库时就该是已开封"
@@ -5345,7 +5345,7 @@ mod tests {
         );
         super::handle_datagram(&ctx_b, &buf[..n], from).await;
 
-        let rec = st_b.find_in_record(key, pkt_no).expect("B 应落库");
+        let rec = st_b.history.find_in_record(key, pkt_no).expect("B 应落库");
         assert_eq!(
             rec["locked"], true,
             "密码锁消息在收件人侧必须是未开封状态，否则对方直接能看"
@@ -5403,7 +5403,7 @@ mod tests {
         let pkt = records[0]["pkt"].as_u64().unwrap() as u32;
         assert_eq!(records[0]["secret"], true);
         assert!(
-            st.find_history_any("127.0.0.1", pkt).is_some(),
+            st.history.find_history_any("127.0.0.1", pkt).is_some(),
             "记录确实在本地历史里"
         );
 
@@ -5654,7 +5654,7 @@ mod tests {
         // 4~7) 回执与撤回都要求历史里有对应记录。**一条记录只喂一种回执**：
         // READMSG 会顺带把 delivered 置上，共用一条会让后面的 RECVMSG 不再翻转、不发事件。
         for pkt in [501u32, 502, 503] {
-            st.log_record(
+            st.history.log_record(
                 &key,
                 &json!({"dir": "out", "kind": "text", "text": "x", "files": [], "ts": now_secs(),
                         "pkt": pkt, "peer": {"key": key}, "rcpt": true, "read": false,
@@ -5672,7 +5672,7 @@ mod tests {
             check(&seen, expect);
         }
         // 开封只轮得到入站消息（自己的记录没有「开封」一说）
-        st.log_record(
+        st.history.log_record(
             &key,
             &json!({"dir": "in", "kind": "text", "text": "x", "files": [], "ts": now_secs(),
                     "pkt": 504, "peer": {"key": key}, "need_read": false, "read": false,
@@ -5758,8 +5758,8 @@ mod tests {
         super::inbound::sendmsg::handle_sendmsg(&ctx, from, &first, &key, None, &first_identity, false, None)
             .await
             .unwrap();
-        st.mark_in_read(&key, &[pkt_no]);
-        st.update_history_file(&key, pkt_no, 10, |file| {
+        st.history.mark_in_read(&key, &[pkt_no]);
+        st.history.update_history_file(&key, pkt_no, 10, |file| {
             file["state"] = "done".into();
             file["path"] = "/tmp/old-report.txt".into();
             file["error"] = "old runtime error".into();
@@ -5769,7 +5769,7 @@ mod tests {
         super::unlock_message(&ctx, &key, pkt_no, None)
             .await
             .unwrap();
-        assert_eq!(st.find_in_record(&key, pkt_no).unwrap()["unlocked"], true);
+        assert_eq!(st.history.find_in_record(&key, pkt_no).unwrap()["unlocked"], true);
 
         let mut replacement = first.clone();
         replacement.command |= crate::protocol::opt::PASSWORDOPT;
@@ -5788,7 +5788,7 @@ mod tests {
         .await
         .unwrap();
 
-        let record = st.find_in_record(&key, pkt_no).unwrap();
+        let record = st.history.find_in_record(&key, pkt_no).unwrap();
         assert_eq!(record["read"], false);
         assert_eq!(record["locked"], true);
         assert_eq!(record["unlocked"], false);
@@ -5846,7 +5846,7 @@ mod tests {
 
         // 且落进「广播」信箱，方向是 out、带着自己的身份，界面才能显示在右侧
         let record = st
-            .find_history_any(crate::state::BROADCAST_SESSION_KEY, pkt.pkt_no)
+            .history.find_history_any(crate::state::BROADCAST_SESSION_KEY, pkt.pkt_no)
             .expect("自己发的广播也要留在广播信箱里");
         assert_eq!(record["dir"].as_str(), Some("out"));
         assert_eq!(record["broadcast"].as_bool(), Some(true));
@@ -5857,7 +5857,7 @@ mod tests {
         assert_eq!(events.len(), 1, "应发出一条出站事件");
         assert_eq!(events[0]["key"].as_str(), Some(crate::state::BROADCAST_SESSION_KEY));
         let session = st
-            .list_sessions()
+            .history.list_sessions()
             .into_iter()
             .find(|s| s.key == crate::state::BROADCAST_SESSION_KEY)
             .expect("广播信箱常驻");
@@ -5888,7 +5888,7 @@ mod tests {
 
         // 进「广播」信箱，但记录里留着真实发送方，气泡才显示得出是谁发的
         let record = st
-            .find_history_pkt(crate::state::BROADCAST_SESSION_KEY, pkt_no)
+            .history.find_history_pkt(crate::state::BROADCAST_SESSION_KEY, pkt_no)
             .expect("广播记录应落在广播信箱");
         assert_eq!(record["broadcast"].as_bool(), Some(true));
         assert_eq!(record["peer"]["ip"].as_str(), Some("192.168.2.115"));
@@ -5898,7 +5898,7 @@ mod tests {
 
         // 中栏：广播信箱常驻且置顶，但条目本身不挂发送方身份（固定显示「广播」）
         let session = st
-            .list_sessions()
+            .history.list_sessions()
             .into_iter()
             .find(|s| s.key == crate::state::BROADCAST_SESSION_KEY)
             .expect("广播信箱常驻");
@@ -5937,7 +5937,7 @@ mod tests {
         super::inbound::sendmsg::handle_sendmsg(&ctx, from, &packet, &key, None, &identity, false, None)
             .await
             .unwrap();
-        let record = st.find_history_pkt(crate::state::BROADCAST_SESSION_KEY, 771002)
+        let record = st.history.find_history_pkt(crate::state::BROADCAST_SESSION_KEY, 771002)
             .expect("广播记录应落在广播信箱");
         assert_eq!(record["peer"]["nickname"].as_str(), Some("张三"));
         assert_eq!(record["peer"]["ip"].as_str(), Some(key.as_str()));
@@ -5968,7 +5968,7 @@ mod tests {
             .await
             .unwrap();
 
-        let record = st.find_history_pkt(&key, pkt_no).expect("password record");
+        let record = st.history.find_history_pkt(&key, pkt_no).expect("password record");
         assert_eq!(record["secret"].as_bool(), Some(true));
         assert_eq!(record["locked"].as_bool(), Some(true));
         assert_eq!(record["unlocked"].as_bool(), Some(false));
@@ -5977,7 +5977,7 @@ mod tests {
             .expect_err("disabled local password verification must not unlock PASSWORDOPT");
         assert!(err.contains("未启用密码验证"));
         let record = st
-            .find_history_pkt(&key, pkt_no)
+            .history.find_history_pkt(&key, pkt_no)
             .expect("password record remains");
         assert_eq!(record["locked"].as_bool(), Some(true));
         assert_eq!(record["unlocked"].as_bool(), Some(false));
@@ -6011,7 +6011,7 @@ mod tests {
             .await
             .expect_err("empty configured password must not unlock PASSWORDOPT");
         assert!(err.contains("未启用密码验证"));
-        let record = st.find_history_pkt(&key, pkt_no).unwrap();
+        let record = st.history.find_history_pkt(&key, pkt_no).unwrap();
         assert_eq!(record["locked"], true);
         assert_eq!(record["unlocked"], false);
         let _ = std::fs::remove_dir_all(data_dir);
@@ -6047,11 +6047,11 @@ mod tests {
         super::unlock_message(&ctx, &key, 665500, Some("local-secret".into()))
             .await
             .unwrap();
-        assert_eq!(st.find_in_record(&key, 665500).unwrap()["unlocked"], true);
+        assert_eq!(st.history.find_in_record(&key, 665500).unwrap()["unlocked"], true);
 
         super::handle_encipdict(&ctx, &second_outer, from).await;
 
-        let replacement = st.find_in_record(&key, 665500).unwrap();
+        let replacement = st.history.find_in_record(&key, 665500).unwrap();
         assert_eq!(replacement["text"], "second password payload");
         assert_eq!(replacement["read"], false);
         assert_eq!(replacement["locked"], true);
@@ -6103,7 +6103,7 @@ mod tests {
         super::handle_encipdict(&ctx, &outer, from).await;
 
         assert_eq!(emitted.load(Ordering::SeqCst), 0);
-        assert!(st.find_in_record(&from.ip().to_string(), 665500).is_none());
+        assert!(st.history.find_in_record(&from.ip().to_string(), 665500).is_none());
         assert!(recv_test_packets(&peer)
             .iter()
             .all(|packet| packet.command & 0xff != crate::protocol::cmd::RECVMSG));
@@ -6161,7 +6161,7 @@ mod tests {
         assert_eq!(peer_info.vs.as_deref(), Some("05080006"));
         assert!(peer_info.absence);
         drop(peers);
-        let record = st.find_in_record(&key, 665500).unwrap();
+        let record = st.history.find_in_record(&key, 665500).unwrap();
         assert_eq!(record["peer"]["nickname"], "Display Name");
         assert_eq!(record["peer"]["group"], "Research");
         let _ = std::fs::remove_dir_all(data_dir);
@@ -6191,8 +6191,8 @@ mod tests {
 });
         st.trust.remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &sender.public_key())
             .unwrap();
-        st.delete_contact(&key);
-        assert!(st.is_hidden(&key));
+        st.history.delete_contact(&key);
+        assert!(st.history.is_hidden(&key));
         let users_updated = Arc::new(AtomicUsize::new(0));
         let users_updated_in_event = users_updated.clone();
         st.set_event(Box::new(move |event, _| {
@@ -6229,7 +6229,7 @@ mod tests {
                 "one-shot IP2 source port is not a delivery port"
             );
         }
-        assert!(!st.is_hidden(&key));
+        assert!(!st.history.is_hidden(&key));
         assert_eq!(users_updated.load(Ordering::SeqCst), 1);
         users_updated.store(0, Ordering::SeqCst);
 
@@ -6268,7 +6268,7 @@ mod tests {
         super::handle_encipdict(&ctx, &outer, from).await;
 
         assert!(!st.peers.contains(&key));
-        assert!(st.find_in_record(&key, 665500).is_some());
+        assert!(st.history.find_in_record(&key, 665500).is_some());
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -6298,7 +6298,7 @@ mod tests {
 
         super::handle_datagram(&ctx, &outer.pack(), from).await;
 
-        let record = st.find_in_record(&key, 665500).unwrap();
+        let record = st.history.find_in_record(&key, 665500).unwrap();
         assert_eq!(record["kind"], "file");
         assert_eq!(record["files"][0]["id"], 7);
         assert_eq!(record["files"][0]["name"], "report.txt");
@@ -6588,7 +6588,7 @@ mod tests {
         // 1) 十进制包号的 RECVMSG（官方 %ld/%d 写法）
         super::handle_datagram(&ctx, &recvmsg(&pkt.to_string()).encode("peer", "peer-host"), from)
             .await;
-        let after = st.find_history_any(&key, pkt).unwrap();
+        let after = st.history.find_history_any(&key, pkt).unwrap();
         assert_eq!(after["delivered"], true, "RECVMSG 要落成已送达");
         assert_eq!(after["read"], false, "送达不等于已读");
         assert_eq!(count("msg-delivered"), 1, "要推一条 msg-delivered 供前端翻状态");
@@ -6611,7 +6611,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            st.find_history_any(&key, pkt2).unwrap()["delivered"],
+            st.history.find_history_any(&key, pkt2).unwrap()["delivered"],
             true,
             "十六进制包号的送达确认也要认"
         );
@@ -6622,7 +6622,7 @@ mod tests {
         );
         read.extra = pkt.to_string().into_bytes();
         super::handle_datagram(&ctx, &read.encode("peer", "peer-host"), from).await;
-        let after_read = st.find_history_any(&key, pkt).unwrap();
+        let after_read = st.history.find_history_any(&key, pkt).unwrap();
         assert_eq!(after_read["read"], true, "READMSG 落已读");
         assert_eq!(after_read["delivered"], true);
         assert_eq!(count("msg-read"), 1);
@@ -7566,7 +7566,7 @@ fn emit_download_done(
                "transferred": total, "total": total, "done": true,
                "path": path.to_string_lossy()}),
     );
-    ctx.st.update_history_file(key, pkt_no, file_id, |f| {
+    ctx.st.history.update_history_file(key, pkt_no, file_id, |f| {
         f["state"] = "done".into();
         f["path"] = Value::String(path.to_string_lossy().into_owned());
     });
@@ -7693,7 +7693,7 @@ async fn download_dir_task(
                        "transferred": total, "total": total, "done": true,
                        "path": final_path.to_string_lossy()}),
             );
-            ctx.st.update_history_file(key, pkt_no, file_id, |f| {
+            ctx.st.history.update_history_file(key, pkt_no, file_id, |f| {
                 f["state"] = "done".into();
                 f["path"] = Value::String(final_path.to_string_lossy().into_owned());
             });
@@ -8139,7 +8139,7 @@ fn fail_download(ctx: &NetCtx, key: &str, pkt_no: u32, file_id: u32, err: &str) 
         json!({"key": key, "pkt": pkt_no, "file_id": file_id,
                "transferred": 0, "total": 0, "done": false, "error": err}),
     );
-    ctx.st.update_history_file(key, pkt_no, file_id, |f| {
+    ctx.st.history.update_history_file(key, pkt_no, file_id, |f| {
         // 半截文件不留：曾经出现过「追踪状态 failed，但文件其实完整躺在下载目录里」
         // 的自相矛盾记录（2026-09 真机），界面上既看不到重试入口、又不敢用这个文件。
         // 清掉落盘结果后，重试下载会重新拉一份完整文件。

@@ -195,7 +195,7 @@ async fn async_run() -> bool {
     .await;
     log.check("收到陌生来源消息：注册用户+落库+事件通知", in_evt);
 
-    let hist = st.read_history(&peer_key, 50);
+    let hist = st.history.read_history(&peer_key, 50);
     log.check(
         "JSONL 会话历史包含双向记录",
         hist.iter().any(|r| r["dir"] == "in") && hist.iter().any(|r| r["dir"] == "out"),
@@ -336,7 +336,7 @@ async fn async_run() -> bool {
             Ok(path) => {
                 let saved = std::fs::read(&path).unwrap_or_default();
                 log.check("下载完成且逐字节一致", saved == fake_content);
-                let hist = st.read_history(&peer_key, 20);
+                let hist = st.history.read_history(&peer_key, 20);
                 let state_ok = hist
                     .iter()
                     .rev()
@@ -394,7 +394,7 @@ async fn async_run() -> bool {
                     .map(|m| m.len())
                     .unwrap_or(u64::MAX);
                 log.check("空文件下载成功且落盘为 0 字节", len == 0);
-                let hist = st.read_history(&peer_key, 30);
+                let hist = st.history.read_history(&peer_key, 30);
                 let state_ok = hist
                     .iter()
                     .rev()
@@ -440,7 +440,7 @@ async fn async_run() -> bool {
 
     /* ---- 4c. 入站图片自动接收（无需用户点下载，直接内联显示） ---- */
     let img_auto = wait_for(8000, || {
-        let hist = st.read_history(&peer_key, 50);
+        let hist = st.history.read_history(&peer_key, 50);
         hist.iter().any(|r| {
             r["pkt"].as_u64() == Some(img_pkt_no as u64)
                 && r["files"][0]["state"] == "done"
@@ -450,7 +450,7 @@ async fn async_run() -> bool {
     .await;
     log.check("入站图片自动接收完成（state=done）", img_auto);
     if img_auto {
-        let hist = st.read_history(&peer_key, 50);
+        let hist = st.history.read_history(&peer_key, 50);
         let saved = hist
             .iter()
             .find(|r| r["pkt"].as_u64() == Some(img_pkt_no as u64))
@@ -469,7 +469,7 @@ async fn async_run() -> bool {
 
     /* ---- 4c2. 官方「粘贴图片」（FILEATTACHOPT+attr=0x20+ipmsgclip_s_*.png）自动接收 ---- */
     let clip_seen = wait_for(8000, || {
-        st.read_history(&peer_key, 80).iter().any(|r| {
+        st.history.read_history(&peer_key, 80).iter().any(|r| {
             r["pkt"].as_u64() == Some(clip_pkt_no as u64)
                 && r["files"].as_array().is_some_and(|a| a.len() == 1)
                 && r["files"][0]["state"] == "done"
@@ -482,7 +482,7 @@ async fn async_run() -> bool {
     );
     if clip_seen {
         let r = st
-            .read_history(&peer_key, 80)
+            .history.read_history(&peer_key, 80)
             .into_iter()
             .find(|r| r["pkt"].as_u64() == Some(clip_pkt_no as u64))
             .unwrap_or_default();
@@ -570,7 +570,7 @@ async fn async_run() -> bool {
     // 从不回 READMSG（它的 READMSG 只在封书开封时发），没有这一档气泡就永远
     // 挂在「未读」。假对端现在像真机一样按 SENDCHECKOPT 回 RECVMSG。
     let delivered = wait_for(3000, || {
-        st.read_history(&peer_key, 50)
+        st.history.read_history(&peer_key, 50)
             .iter()
             .find(|r| r["dir"] == "out" && r["text"] == "你好，假对端！")
             .and_then(|r| r.get("delivered"))
@@ -584,7 +584,7 @@ async fn async_run() -> bool {
     // 注意：read_history 只保留末尾 limit 条，前面的新增记录（如空文件公告）会
     // 把最早的消息挤出窗口 —— 这里按文本找最早的出站消息，limit 必须足够大
     let out_read = wait_for(3000, || {
-        st.read_history(&peer_key, 50)
+        st.history.read_history(&peer_key, 50)
             .iter()
             .find(|r| r["dir"] == "out" && r["text"] == "你好，假对端！")
             .and_then(|r| r.get("read"))
@@ -602,7 +602,7 @@ async fn async_run() -> bool {
     let receipt_seen = wait_for(2500, || shared.lock().unwrap().receipts.contains(&777123)).await;
     log.check("假对端收到 READMSG 回执", receipt_seen);
     let in_marked = wait_for(1500, || {
-        st.read_history(&peer_key, 20)
+        st.history.read_history(&peer_key, 20)
             .iter()
             .find(|r| r["pkt"].as_u64() == Some(777123))
             .and_then(|r| r.get("read"))
@@ -616,7 +616,7 @@ async fn async_run() -> bool {
     // 前端"用户正在看这个会话"时会把所有未读入站消息都提交标记已读（未读数才能清零），
     // 后端必须只对带 READCHECKOPT 的那些回 READMSG。
     let greet_pkt = st
-        .read_history(&peer_key, 50)
+        .history.read_history(&peer_key, 50)
         .iter()
         .find(|r| r["dir"] == "in" && r["text"] == "你好，我是假对端")
         .and_then(|r| r["pkt"].as_u64())
@@ -634,7 +634,7 @@ async fn async_run() -> bool {
             );
             log.check(
                 "该消息在历史中仍被标记为已读（未读数据以此为准）",
-                st.read_history(&peer_key, 50)
+                st.history.read_history(&peer_key, 50)
                     .iter()
                     .find(|r| r["pkt"].as_u64() == Some(pkt as u64))
                     .and_then(|r| r["read"].as_bool())
@@ -681,7 +681,7 @@ async fn async_run() -> bool {
     .await;
     log.check("重启后处理对端重投的延迟消息（再次回 RECVMSG）", resent);
 
-    let hist = st2.read_history(&peer_key, 200);
+    let hist = st2.history.read_history(&peer_key, 200);
     let copies = hist
         .iter()
         .filter(|r| r["dir"] == "in" && r["pkt"].as_u64() == Some(777123))
@@ -725,7 +725,7 @@ async fn async_run() -> bool {
 
     /* ---- 5b-2. 已确认送达的消息，重启后不再被重投 ---- */
     let copies_456 = st2
-        .read_history(&peer_key, 200)
+        .history.read_history(&peer_key, 200)
         .iter()
         .filter(|r| r["dir"] == "in" && r["pkt"].as_u64() == Some(777456))
         .count();
@@ -751,8 +751,8 @@ async fn async_run() -> bool {
     // 历史记录里的持久化 read 标志一致：重投继承已读的 777123 不得再计。
     let mut sess_ok = false;
     let mut sess_snap = String::new();
-    if let Some(s) = st2.list_sessions().into_iter().find(|s| s.key == peer_key) {
-        let hist = st2.read_history(&peer_key, 500);
+    if let Some(s) = st2.history.list_sessions().into_iter().find(|s| s.key == peer_key) {
+        let hist = st2.history.read_history(&peer_key, 500);
         let expect = hist
             .iter()
             .filter(|r| r["dir"] == "in" && !r["read"].as_bool().unwrap_or(false))
@@ -775,20 +775,20 @@ async fn async_run() -> bool {
     );
 
     /* ---- 5c. 清空会话聊天记录 ---- */
-    let before = st2.read_history(&peer_key, 500).len();
-    let removed = st2.clear_history(&peer_key);
+    let before = st2.history.read_history(&peer_key, 500).len();
+    let removed = st2.history.clear_history(&peer_key);
     log.check(
         &format!("清空聊天记录（{before} 条 → 删除 {removed} 条）"),
-        before > 0 && removed == before && st2.read_history(&peer_key, 500).is_empty(),
+        before > 0 && removed == before && st2.history.read_history(&peer_key, 500).is_empty(),
     );
     // 清空之后会话仍然可用：新消息照常落库
-    st2.log_record(
+    st2.history.log_record(
         &peer_key,
         &serde_json::json!({"dir": "out", "kind": "text", "text": "清空后的新消息", "pkt": 1, "ts": 1}),
     );
     log.check(
         "清空后会话仍可继续记录新消息",
-        st2.read_history(&peer_key, 10).len() == 1,
+        st2.history.read_history(&peer_key, 10).len() == 1,
     );
 
     /* ---- 6. 下线广播 ---- */
@@ -910,7 +910,7 @@ async fn crypto_roundtrip() -> bool {
         }
     }
     let got_in_b = wait_for(4000, || {
-        st_b.read_history(key, 50).iter().any(|r| {
+        st_b.history.read_history(key, 50).iter().any(|r| {
             r["dir"] == "in" && r["text"] == text_ab && r["enc"] == true && r["sig_ok"] == true
         })
     })
@@ -941,7 +941,7 @@ async fn crypto_roundtrip() -> bool {
     }
     let got_long_b = wait_for(4000, || {
         let incoming: Vec<String> = st_b
-            .read_history(key, 100)
+            .history.read_history(key, 100)
             .iter()
             .filter(|r| r["dir"] == "in" && r["enc"] == true)
             .filter_map(|r| r["text"].as_str().map(String::from))
@@ -990,7 +990,7 @@ async fn crypto_roundtrip() -> bool {
         .and_then(|r| r["pkt"].as_u64())
         .unwrap_or(0) as u32;
     let got_attach_b = wait_for(4000, || {
-        let hist = st_b.read_history(key, 100);
+        let hist = st_b.history.read_history(key, 100);
         let has_announce = hist.iter().any(|r| {
             r["dir"] == "in"
                 && r["pkt"].as_u64() == Some(attach_pkt as u64)
@@ -1024,7 +1024,7 @@ async fn crypto_roundtrip() -> bool {
         }
     }
     let got_in_a = wait_for(4000, || {
-        st_a.read_history(key_b, 50).iter().any(|r| {
+        st_a.history.read_history(key_b, 50).iter().any(|r| {
             r["dir"] == "in" && r["text"] == text_ba && r["enc"] == true && r["sig_ok"] == true
         })
     })
@@ -1068,7 +1068,7 @@ async fn crypto_roundtrip() -> bool {
         .and_then(|r| r["files"][0]["id"].as_u64())
         .unwrap_or(0) as u32;
     let registered_at_b = wait_for(4000, || {
-        st_b.read_history(key, 50)
+        st_b.history.read_history(key, 50)
             .iter()
             .any(|r| r["dir"] == "in" && r["pkt"].as_u64() == Some(ab_pkt as u64))
     })
@@ -1178,7 +1178,7 @@ async fn crypto_roundtrip() -> bool {
         let ba_pkt = rec["pkt"].as_u64().unwrap_or(0) as u32;
         let ba_id = rec["files"][0]["id"].as_u64().unwrap_or(0) as u32;
         let registered_at_a = wait_for(4000, || {
-            st_a.read_history(key_b, 50)
+            st_a.history.read_history(key_b, 50)
                 .iter()
                 .any(|r| r["dir"] == "in" && r["pkt"].as_u64() == Some(ba_pkt as u64))
         })
@@ -1256,7 +1256,7 @@ async fn crypto_roundtrip() -> bool {
     }
     let plain_at_c = wait_for(4000, || {
         // C 的会话键 = A 的 IP（127.0.0.1），与 C 自己绑在哪个地址无关
-        st_c.read_history(key, 50)
+        st_c.history.read_history(key, 50)
             .iter()
             .any(|r| r["dir"] == "in" && r["text"] == text_plain && r["enc"] == false)
     })
@@ -1385,7 +1385,7 @@ async fn offline_file_delivery() -> bool {
     // 对方在线的瞬间由上线应答触发重投（flush_pending_for），
     // B 落库的记录应带延迟尾注与文件条目
     let delivered = wait_for(5000, || {
-        st_b.read_history(key_a, 50).iter().any(|r| {
+        st_b.history.read_history(key_a, 50).iter().any(|r| {
             r["dir"] == "in"
                 && r["kind"] == "file"
                 && r["text"]
@@ -1400,7 +1400,7 @@ async fn offline_file_delivery() -> bool {
 
     /* ---- 4. B 从重投公告取回附件（验证重投时登记的文件槽可用） ---- */
     let mut fetched_ok = false;
-    if let Some(rec) = st_b.read_history(key_a, 50).into_iter().find(|r| {
+    if let Some(rec) = st_b.history.read_history(key_a, 50).into_iter().find(|r| {
         r["dir"] == "in"
             && r["kind"] == "file"
             && r["text"]
@@ -2245,7 +2245,7 @@ async fn extended_protocols() -> bool {
     // 本地记录标记已撤回
     log.check(
         "E: 本地记录标记 recalled",
-        st.find_history_any(&peer_key, pkt_no)
+        st.history.find_history_any(&peer_key, pkt_no)
             .map(|r| r["recalled"].as_bool().unwrap_or(false))
             .unwrap_or(false),
     );
@@ -2383,7 +2383,7 @@ async fn extended_protocols() -> bool {
     log.check("E: 未开封时标记已读仍不回 READMSG", sent_locked == 0);
     log.check(
         "E: 未开封时标记已读不改写 unlocked",
-        st.find_history_pkt(&peer_key, secret_pkt)
+        st.history.find_history_pkt(&peer_key, secret_pkt)
             .map(|r| r["unlocked"].as_bool() == Some(false))
             .unwrap_or(false),
     );
@@ -2418,7 +2418,7 @@ async fn extended_protocols() -> bool {
     );
     log.check(
         "E: 开封后记录 unlocked 且已读",
-        st.find_history_pkt(&peer_key, secret_pkt)
+        st.history.find_history_pkt(&peer_key, secret_pkt)
             .map(|r| {
                 r["secret"].as_bool() == Some(true)
                     && r["locked"].as_bool() == Some(false)
@@ -2491,7 +2491,7 @@ async fn extended_protocols() -> bool {
     log.check("E: 错误密码拒绝开封", bad.is_err());
     log.check(
         "E: 错误密码后消息仍锁定",
-        st.find_history_pkt(&peer_key, pass_pkt)
+        st.history.find_history_pkt(&peer_key, pass_pkt)
             .map(|r| r["locked"].as_bool() == Some(true) && r["unlocked"].as_bool() == Some(false))
             .unwrap_or(false),
     );
@@ -2499,7 +2499,7 @@ async fn extended_protocols() -> bool {
     log.check("E: 正确密码开封成功", good.is_ok());
     log.check(
         "E: 正确密码后消息解锁",
-        st.find_history_pkt(&peer_key, pass_pkt)
+        st.history.find_history_pkt(&peer_key, pass_pkt)
             .map(|r| r["locked"].as_bool() == Some(false) && r["unlocked"].as_bool() == Some(true))
             .unwrap_or(false),
     );
@@ -2543,7 +2543,7 @@ async fn extended_protocols() -> bool {
     );
     log.check(
         "E: 被拒绝后 PASSWORDOPT 记录仍锁定",
-        st.find_history_pkt(&peer_key, disabled_pass_pkt)
+        st.history.find_history_pkt(&peer_key, disabled_pass_pkt)
             .map(|r| r["locked"].as_bool() == Some(true) && r["unlocked"].as_bool() == Some(false))
             .unwrap_or(false),
     );
@@ -2701,14 +2701,14 @@ async fn extended_protocols() -> bool {
         .await
         .expect("send via agent");
     let mut y_got = wait_for(4000, || {
-        st_y.history_contains_text("127.0.0.5", "经代理的消息")
+        st_y.history.history_contains_text("127.0.0.5", "经代理的消息")
     })
     .await;
     if !y_got {
         // 与真实客户端同款重试语义：未达则再发一次（同包号，后端去重）
         let _ = net::send_message(&ctx_x, "127.0.0.6", "经代理的消息", vec![]).await;
         y_got = wait_for(4000, || {
-            st_y.history_contains_text("127.0.0.5", "经代理的消息")
+            st_y.history.history_contains_text("127.0.0.5", "经代理的消息")
         })
         .await;
     }
@@ -2799,7 +2799,7 @@ async fn extended_protocols() -> bool {
             .count();
         log.check("E: 64-NUL 重投不重复 emit", matching_events == 1);
         let matching_records = st
-            .read_history(&peer_key, 200)
+            .history.read_history(&peer_key, 200)
             .iter()
             .filter(|record| {
                 record["dir"] == "in" && record["pkt"].as_u64() == Some(enc_pkt as u64)
@@ -2846,7 +2846,7 @@ async fn extended_protocols() -> bool {
         );
         log.check(
             "E: EncIPDict 封书历史保留 secret=true 且未开封",
-            st.read_history(&peer_key, 200).iter().any(|record| {
+            st.history.read_history(&peer_key, 200).iter().any(|record| {
                 record["dir"] == "in"
                     && record["pkt"].as_u64() == Some(secret_pkt as u64)
                     && record["secret"].as_bool() == Some(true)
