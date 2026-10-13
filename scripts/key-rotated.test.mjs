@@ -8,11 +8,13 @@ const i18n = readFileSync(new URL('../src/lib/i18n.js', import.meta.url), 'utf8'
 // 对端密钥轮换（原版 IPMsg 的 DecryptErr 自动回复）：后端 net.rs 用同一个协议级 token
 // 触发自愈（撤缓存 + 重取公钥），前端只负责按语言设置换成本地化提示 + 重发。
 
-test('识别完整包装 AutoReply(DecryptErr)，且只对入站消息生效', () => {
-  assert.match(
-    chat,
-    /function isPeerKeyRotated\(m\) \{[\s\S]*?return m\.dir === 'in' && typeof m\.text === 'string' && m\.text\.includes\('AutoReply\(DecryptErr\)'\)/
-  )
+test('前端只读后端标记，不再自己判文本（判据收在后端一处）', () => {
+  const fn = chat.slice(chat.indexOf('function isPeerKeyRotated'))
+  const body = fn.slice(0, fn.indexOf('\n}'))
+  assert.match(body, /m\.dir === 'in'/)
+  assert.match(body, /m\.key_rotated === true/)
+  assert.doesNotMatch(body, /AutoReply\(DecryptErr\)/, '前端不该再出现文本判据')
+  assert.doesNotMatch(body, /\.text\.includes/, '前端不该再判正文')
 })
 
 test('提示分支必须排在通用正文分支之前（否则原文先命中）', () => {

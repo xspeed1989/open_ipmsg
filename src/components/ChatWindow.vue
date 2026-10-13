@@ -75,13 +75,14 @@ function dayChanged(a, b) {
 }
 
 /* ---------- 对端密钥轮换（DecryptErr 自动回复） ----------
-   原版 IPMsg 解不开我方密文时，会回一条正文含 `AutoReply(DecryptErr)` 的自动回复。
+   原版 IPMsg 解不开我方密文时，会回一条正文含 `AutoReply(DecryptErr)` 的自动回复；
+   后端判出来后给记录打 `key_rotated` 标记（同时触发撤缓存 + 重取公钥）。
    后端（net.rs 的 maybe_recover_stale_peer_key）用同一个 token 触发「撤缓存 + 重新取
    公钥」的自愈；这里只负责呈现：按 config.lang 换成本地化提示 + 一个重发按钮。 */
 function isPeerKeyRotated(m) {
-  // 与后端 net.rs 同一个判据：匹配完整包装 `AutoReply(DecryptErr)`，不匹配裸 token
-  // —— 否则用户自己在聊天里打出 "DecryptErr" 也会被换成本地化提示。
-  return m.dir === 'in' && typeof m.text === 'string' && m.text.includes('AutoReply(DecryptErr)')
+  // 判据在**后端一处**（net.rs 的 is_decrypt_err_autoreply）：它给记录打 key_rotated 标记，
+  // 前端只读标记 —— 不在前端做文本判断，避免「改了后端忘了前端」的漂移。
+  return m.dir === 'in' && m.key_rotated === true
 }
 
 /** 重发这条提示之前、我自己发出的最后一条文本消息（密钥已重新取好，重发即可送达）。 */

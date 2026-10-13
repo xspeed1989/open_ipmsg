@@ -927,6 +927,15 @@ async fn maybe_start_handshake(
     send_getpubkey(ctx, from, cfg).await;
 }
 
+/// 原版 IPMsg 解不开我方密文时的自动回复判据。
+///
+/// 匹配**完整包装** `AutoReply(DecryptErr)` 而不是裸 token `DecryptErr`：后者对「用户
+/// 自己在聊天里打出这串字」也成立。这是**后端唯一**的判据来源 —— 自愈（撤缓存 + 重取公钥）
+/// 与记录标记（`key_rotated`）都用它，前端不再做文本判断（见 ChatWindow 的 isPeerKeyRotated）。
+fn is_decrypt_err_autoreply(text: &str) -> bool {
+    text.contains("AutoReply(DecryptErr)")
+}
+
 /// 对端密钥轮换后的自愈（实测驱动，spec 之外）：原版 IPMsg 在「对端换了密钥、解不开
 /// 你发去的密文」时会回一条正文含 `DecryptErr` 的自动回复（协议级 token 嵌在人类可读
 /// 文本里）。我方**还持有旧公钥缓存**时，会变成每条都发不出去 —— 这比「缓存为空」更糟，
@@ -945,7 +954,7 @@ async fn maybe_recover_stale_peer_key(
     // 匹配**完整包装** `AutoReply(DecryptErr)` 而不是裸 token `DecryptErr`：
     // 后者对「用户自己在聊天里打出这串字」也成立（后端会白跑一次撤缓存 + 重取，
     // 前端还会把人家的话替换成提示）。原版发的是 `==== AutoReply(DecryptErr) ====`。
-    if !cfg.encrypt || !text.contains("AutoReply(DecryptErr)") {
+    if !cfg.encrypt || !is_decrypt_err_autoreply(text) {
         return;
     }
     if ctx.st.trust.peer_pubkey(key).is_none() {
@@ -1965,6 +1974,16 @@ mod inbound {
                 }
             }
 
+            // 对端密钥轮换标记：前端据此渲染本地化提示，不再自己判文本（判据在上面的
+            // is_decrypt_err_autoreply）。记录是 serde_json::Value、msg 嵌套在 payload 里，
+            // 所以加这个字段既不动线上契约也不需要迁移（老记录没有 = 假）。
+            let mut record = record;
+            if let Some(obj) = record.as_object_mut() {
+                obj.insert(
+                    "key_rotated".into(),
+                    serde_json::Value::Bool(is_decrypt_err_autoreply(&text)),
+                );
+            }
             ctx.st.emit(
                 wire::evt::MSG_IN,
                 json!({"key": session_key, "msg": record, "resend": false}),
