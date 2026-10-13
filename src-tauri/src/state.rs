@@ -695,9 +695,10 @@ pub(crate) mod trust {
         /// 对端 IP → 上一次「学到/确认这把公钥」的时刻（秒）。钥匙新鲜度判据（ADR-0006）：
         /// 太久没确认、或进程刚起来不知道（缓存是从磁盘读的）→ 值得重新确认一次。
         key_seen_at: Mutex<HashMap<String, u64>>,
-        /// 周期性确认的**独立**限频：IP → 上次补发时刻（秒）。与 probe_counts（判对端能力）、
-        /// handshake_retries（数本轮重试）都不共用 —— 这条只判「我方缓存新鲜度」。
-        key_refresh_at: Mutex<HashMap<String, u64>>,
+        /// 补发 GETPUBKEY 的限频：IP → 上次补发时刻（秒）。快节奏与慢节奏**共用这一张表**
+        /// （慢节奏才用它判间隔；快节奏由本轮次数上限兜住）。
+        /// 与 `probe_counts` 仍然分开：那条判「对端能力」，攒够会把对端标成明文。
+        key_ping_at: Mutex<HashMap<String, u64>>,
         /// 本机密钥对：懒加载生成 + ipmsg_key.json 持久化（进程内只生成一次）
         own_key: OnceLock<Arc<KeyPair>>,
     }
@@ -715,7 +716,7 @@ pub(crate) mod trust {
                 rehandshake_at: Mutex::new(HashMap::new()),
                 handshake_retries: Mutex::new(HashMap::new()),
                 key_seen_at: Mutex::new(HashMap::new()),
-                key_refresh_at: Mutex::new(HashMap::new()),
+                key_ping_at: Mutex::new(HashMap::new()),
                 own_key: OnceLock::new(),
             }
         }
@@ -1198,6 +1199,16 @@ pub(crate) mod trust {
         }
 
         /// 记一次预握手重发，返回含本次的累计次数
+        /// 读本轮已补发次数（不改状态）：扫描据此决定「快节奏还是慢节奏」。
+        pub fn handshake_retry_count(&self, ip: &str) -> u32 {
+            self.handshake_retries
+                .lock()
+                .unwrap()
+                .get(ip)
+                .copied()
+                .unwrap_or(0)
+        }
+
         pub fn note_handshake_retry(&self, ip: &str) -> u32 {
             let mut m = self.handshake_retries.lock().unwrap();
             let c = m.entry(ip.to_string()).or_insert(0);
@@ -1233,14 +1244,13 @@ pub(crate) mod trust {
                 .map(|t| now_secs().saturating_sub(*t))
         }
 
-        /// 周期性确认的限频（默认 60s/IP）：返回真表示这次可以补发。
-        /// 独立计数是刻意的，理由见字段注释（ADR-0006）。
-        pub fn try_key_refresh_gate(&self, ip: &str) -> bool {
-            const KEY_REFRESH_MIN_GAP_SECS: u64 = 60;
+        /// 慢节奏补发的限频：距上次补发不足 `gap_secs` 就返回假（不刷对端）。
+        /// 快节奏路径不调它 —— 那条由「本轮次数上限」兜住，与墙钟无关（测试要能连发）。
+        pub fn allow_key_ping_at(&self, ip: &str, gap_secs: u64) -> bool {
             let now = now_secs();
-            let mut m = self.key_refresh_at.lock().unwrap();
+            let mut m = self.key_ping_at.lock().unwrap();
             match m.get(ip) {
-                Some(t) if now.saturating_sub(*t) < KEY_REFRESH_MIN_GAP_SECS => false,
+                Some(t) if now.saturating_sub(*t) < gap_secs => false,
                 _ => {
                     m.insert(ip.to_string(), now);
                     true

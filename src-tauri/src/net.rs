@@ -399,58 +399,56 @@ fn spawn_v6_udp_loop(ctx: Arc<NetCtx>) {
 
 /// 在线消息送达重发循环（官方 §4-12 確認・リトライ）：每秒检查重发队列，
 /// 过期未确认（RETRY_INTERVAL_SECS）的重发同一包号，超过 RETRY_MAX 次放弃。
-/// 预握手重试上限（本轮）：用完就安静停下，等对端下一轮宣告或下一条消息自然重来。
-/// 与 `PLAIN_PROBE_BUDGET` 是两件事 —— 那个判「对端能力」，这个只数重试次数。
+/// 预握手**快节奏**的次数上限（本轮）：用完之后**不是停下**，而是降到慢节奏继续 ——
+/// 「丢一个包就等到下一轮 45s 宣告」当年表现为「首条消息明文发出、加密要等下一轮」。
+/// 与 `PLAIN_PROBE_BUDGET` 是两件事：那个判「对端能力」，这个只决定补发节奏。
 const HANDSHAKE_RETRY_MAX: u32 = 5;
-/// 预握手重发节奏（秒）
+/// 快节奏（秒）：也是扫描周期本身
 const HANDSHAKE_RETRY_INTERVAL_SECS: u64 = 2;
+/// 慢节奏（秒）：预握手用满快节奏上限之后，以及「已有钥匙待确认」那条
+const PEER_KEY_SLOW_RETRY_SECS: u64 = 60;
 
-/// 补发一次 GETPUBKEY。**不计入** `PLAIN_PROBE_BUDGET`：那条线判的是「对端不支持
-/// 加密」，不该由链路丢包决定（计入的话 2s×3 就能把支持加密的对端误标成明文）。
-async fn send_getpubkey_retry(ctx: &NetCtx, target: SocketAddr, cfg: &Config, n: u32) {
+/// 一次补发的节奏（纯计算，便于单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyPing {
+    /// 快节奏：跟扫描周期走，不加墙钟限频（由本轮次数上限兜住）
+    Fast,
+    /// 慢节奏：`PEER_KEY_SLOW_RETRY_SECS` 内不重复发
+    Slow,
+}
+
+/// 「该不该给这个对端补发 GETPUBKEY」—— **合并后唯一的判据处**（ADR-0006）。
+///
+/// - 还没有公钥（预握手）：本轮前 `HANDSHAKE_RETRY_MAX` 次快节奏，之后慢节奏；
+/// - 已有公钥：只有「太久没确认」（`KEY_REFRESH_INTERVAL_SECS`）或「从未确认」
+///   （进程刚起来、缓存来自磁盘）才确认一次，且走慢节奏。
+///
+/// 返回 None = 这次不发。
+fn key_ping_plan(has_key: bool, retries: u32, age_secs: Option<u64>) -> Option<KeyPing> {
+    if has_key {
+        return key_needs_refresh(age_secs).then_some(KeyPing::Slow);
+    }
+    Some(if retries < HANDSHAKE_RETRY_MAX {
+        KeyPing::Fast
+    } else {
+        KeyPing::Slow
+    })
+}
+
+/// 补发一次 GETPUBKEY。**不计入** `PLAIN_PROBE_BUDGET`：那条线判的是「对端不支持加密」，
+/// 不该由链路丢包或「我方缓存新不新」决定（计入的话 2s×3 就能把支持加密的对端误标成明文）。
+/// `note` 只进日志，说明这次是快节奏、慢节奏还是周期性确认。
+async fn send_getpubkey_ping(ctx: &NetCtx, target: SocketAddr, cfg: &Config, note: &str) {
     let capa = entry_caps(cfg) | crypto::CAPA_OUR_SEND;
     let mut g = proto::Packet::new(cmd::GETPUBKEY);
     g.extra = format!("{capa:x}").into_bytes();
     let bytes = g.encode(&my_user(cfg), &my_host());
     let _ = ctx.sock.send_to(&bytes, target).await;
     ctx.st
-        .diag(&format!("-> {target} GETPUBKEY 重发（第 {n} 次补发，不计探测预算）"));
+        .diag(&format!("-> {target} GETPUBKEY {note}（不计探测预算）"));
 }
 
-/// 扫一遍「宣告了加密、却还没有对方公钥」的对端并补发 GETPUBKEY，返回补发条数。
-///
-/// 以前预握手是**单发无重试**：GETPUBKEY 或 ANSPUBKEY 丢一个包，就只剩「下一轮 45s
-/// 宣告」与「下一次发消息」两条兜底 —— 真机上表现为「首条消息明文发出、加密要等下一轮」，
-/// 自检里那条断言也因此偶发红（实测约 10–20%）。
-pub(crate) async fn handshake_sweep(ctx: &NetCtx) -> usize {
-    let cfg = ctx.st.config();
-    if !cfg.encrypt {
-        return 0;
-    }
-    let pending: Vec<(String, SocketAddr)> = {
-        let peers = ctx.st.peers.snapshot();
-        peers
-            .iter()
-            .filter(|p| p.encrypt_announced)
-            .filter(|p| ctx.st.trust.peer_pubkey(&p.key).is_none())
-            .filter(|p| !ctx.st.trust.peer_marked_plain(&p.key))
-            .filter_map(|p| peer_addr(p).map(|a| (p.key.clone(), a)))
-            .collect()
-    };
-    let mut sent = 0usize;
-    for (key, target) in pending {
-        let n = ctx.st.trust.note_handshake_retry(&key);
-        if n > HANDSHAKE_RETRY_MAX {
-            continue; // 本轮到此为止
-        }
-        send_getpubkey_retry(ctx, target, &cfg, n).await;
-        sent += 1;
-    }
-    // 第二遍：缓存里有钥匙、但可能已过期的对端（ADR-0006）
-    sent + refresh_stale_peer_keys(ctx, &cfg).await
-}
-
-/// 缓存公钥的**周期性确认**间隔（秒，ADR-0006 第 3 条）。
+/// 缓存公钥的**周期性确认**间隔（秒，ADR-0006 第 3 条）：多久没确认算「太久」。
 ///
 /// 为什么需要它：对端换了密钥对、而它的上线宣告在 LAN 上丢了（UDP 丢包很常见）时，我方
 /// 无从得知 —— 要等「每条都发不出去」才会由对端的 DecryptErr 兜回来（ADR-0005）。这里用
@@ -462,45 +460,60 @@ fn key_needs_refresh(age_secs: Option<u64>) -> bool {
     age_secs.map_or(true, |age| age >= KEY_REFRESH_INTERVAL_SECS)
 }
 
-/// 周期性确认用的 GETPUBKEY。**不计入** `PLAIN_PROBE_BUDGET`（与 send_getpubkey_retry
-/// 同一条原则）：那条预算判「对端能力」，攒够会把对端标成明文；这条只判「我方缓存新鲜度」。
-async fn send_getpubkey_maintain(ctx: &NetCtx, target: SocketAddr, cfg: &Config, age: Option<u64>) {
-    let capa = entry_caps(cfg) | crypto::CAPA_OUR_SEND;
-    let mut g = proto::Packet::new(cmd::GETPUBKEY);
-    g.extra = format!("{capa:x}").into_bytes();
-    let bytes = g.encode(&my_user(cfg), &my_host());
-    let _ = ctx.sock.send_to(&bytes, target).await;
-    let age = age.map_or("未知".to_string(), |a| format!("{a}s"));
-    ctx.st.diag(&format!(
-        "-> {target} GETPUBKEY 周期性确认（距上次确认 {age}，不计探测预算）"
-    ));
-}
-
-/// 对**已缓存公钥**的对端做周期性确认，返回补发条数（ADR-0006 第 3 条）。
+/// 对端公钥的维护扫描（每 `HANDSHAKE_RETRY_INTERVAL_SECS` 一次），返回补发条数。
 ///
-/// 与 `handshake_sweep` 的预握手（只挑「缓存为空」的对端）互补：这条覆盖「缓存里有钥匙、
-/// 但可能已过期」—— 后者以前完全没有自愈路径，只能等对端抱怨。
-async fn refresh_stale_peer_keys(ctx: &NetCtx, cfg: &Config) -> usize {
-    let peers = ctx.st.peers.snapshot();
-    let stale: Vec<(String, SocketAddr, Option<u64>)> = peers
+/// 一次扫描处理两件事，判据都在 `key_ping_plan` 里（合并前是两遍独立扫描、两套限频、
+/// 两份判据）：**还没有公钥**（预握手，快节奏到上限后转慢节奏）与**已有公钥但该确认了**
+/// （周期性确认）。
+///
+/// 历史：预握手原本是**单发无重试** —— GETPUBKEY 或 ANSPUBKEY 丢一个包，就只剩「下一轮 45s
+/// 宣告」与「下一次发消息」两条兜底，真机上表现为「首条消息明文发出、加密要等下一轮」，
+/// 自检那条断言也因此偶发红（约 10–20%）。后来补了快节奏重试，但那版「到上限就彻底停下」；
+/// 现在到上限改走慢节奏 —— 丢掉的是频率，不是这件事本身。
+pub(crate) async fn handshake_sweep(ctx: &NetCtx) -> usize {
+    let cfg = ctx.st.config();
+    if !cfg.encrypt {
+        return 0;
+    }
+    let targets: Vec<(String, SocketAddr, KeyPing, Option<u64>)> = ctx
+        .st
+        .peers
+        .snapshot()
         .iter()
         .filter(|p| p.encrypt_announced)
-        .filter(|p| ctx.st.trust.peer_pubkey(&p.key).is_some())
         .filter(|p| !ctx.st.trust.peer_marked_plain(&p.key))
         .filter_map(|p| {
+            let has_key = ctx.st.trust.peer_pubkey(&p.key).is_some();
             let age = ctx.st.trust.peer_key_age_secs(&p.key);
-            if !key_needs_refresh(age) {
-                return None;
-            }
-            peer_addr(p).map(|a| (p.key.clone(), a, age))
+            let retries = ctx.st.trust.handshake_retry_count(&p.key);
+            let plan = key_ping_plan(has_key, retries, age)?;
+            let target = peer_addr(p)?;
+            Some((p.key.clone(), target, plan, age))
         })
         .collect();
+
     let mut sent = 0usize;
-    for (key, target, age) in stale {
-        if !ctx.st.trust.try_key_refresh_gate(&key) {
-            continue; // 限频：别把不回应的对端刷爆
+    for (key, target, plan, age) in targets {
+        // 两种节奏都记一次补发时刻（fast 的间隔是 0 = 不看墙钟，由次数上限兜住；
+        // 记下来是为了「快节奏用满之后」的第一次慢节奏会等满 gap，而不是紧接着再来一发）
+        let gap = match plan {
+            KeyPing::Fast => 0,
+            KeyPing::Slow => PEER_KEY_SLOW_RETRY_SECS,
+        };
+        if !ctx.st.trust.allow_key_ping_at(&key, gap) {
+            continue; // 慢节奏限频：别把不回应的对端刷爆
         }
-        send_getpubkey_maintain(ctx, target, cfg, age).await;
+        let note = match plan {
+            KeyPing::Fast => {
+                let n = ctx.st.trust.note_handshake_retry(&key);
+                format!("预握手补发（第 {n} 次，快节奏）")
+            }
+            KeyPing::Slow => {
+                let age = age.map_or("从未确认".to_string(), |a| format!("距上次确认 {a}s"));
+                format!("慢节奏补发（{age}）")
+            }
+        };
+        send_getpubkey_ping(ctx, target, &cfg, &note).await;
         sent += 1;
     }
     sent
@@ -5702,6 +5715,32 @@ mod tests {
         assert!(base.join("received_files.json").exists());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 补发节奏的判据（合并后唯一一处）：预握手快节奏到上限转慢节奏、已有钥匙只在
+    /// 「太久没确认/从未确认」时慢节奏确认一次。纯函数，覆盖得快也改得放心。
+    #[test]
+    fn key_ping_plan_covers_fast_slow_and_refresh() {
+        use super::{key_ping_plan, KeyPing, KEY_REFRESH_INTERVAL_SECS, HANDSHAKE_RETRY_MAX};
+
+        // 还没有钥匙：前 MAX 次快节奏，之后慢节奏（不是停下）
+        for n in 0..HANDSHAKE_RETRY_MAX {
+            assert_eq!(key_ping_plan(false, n, None), Some(KeyPing::Fast), "第 {n} 次应快节奏");
+        }
+        assert_eq!(
+            key_ping_plan(false, HANDSHAKE_RETRY_MAX, None),
+            Some(KeyPing::Slow),
+            "用满上限后转慢节奏，不再彻底停下"
+        );
+
+        // 已有钥匙：只有「太久没确认」或「从未确认」才确认一次
+        assert_eq!(key_ping_plan(true, 99, None), Some(KeyPing::Slow), "从未确认 → 该确认");
+        assert_eq!(key_ping_plan(true, 99, Some(0)), None, "刚确认过 → 不动");
+        assert_eq!(key_ping_plan(true, 99, Some(KEY_REFRESH_INTERVAL_SECS - 1)), None);
+        assert_eq!(
+            key_ping_plan(true, 99, Some(KEY_REFRESH_INTERVAL_SECS)),
+            Some(KeyPing::Slow)
+        );
     }
 
     /// 对端密钥轮换的自愈（实测驱动）：原版 IPMsg 解不开密文时会回一条正文含
