@@ -33,6 +33,10 @@ notify-rust = "4.18"
 # RegQueryValueExW / RegDeleteValueW（RegCreateKeyExW 因 0.61.2 尚缺
 # Win32_System_Security 特性，在 autostart.rs 里就地声明）。
 [target.'cfg(target_os = "windows")'.dependencies]
+# Windows toast 的「点击」回调（on_activated）在本进程内触发 —— 用来做
+# 「点通知 → 弹窗口 + 切会话」。版本与 tauri-plugin-notification 的传递依赖保持一致，
+# 避免同一套 winrt 绑定出现两份。
+tauri-winrt-notification = "0.7"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",

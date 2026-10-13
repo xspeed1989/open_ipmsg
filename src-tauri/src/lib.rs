@@ -1039,8 +1039,11 @@ async fn set_unread(app: tauri::AppHandle, total: u32) -> Result<(), String> {
 /// 回调，点了没反应。这里直接用 notify-rust 发 DBus 通知 —— 通知守护进程
 /// 会把点击作为 ActionInvoked 送回（KDE/XFCE 点正文触发 default 动作；
 /// GNOME 不支持 default 动作，但「打开」按钮同样可用）。
-/// 仅 Linux 提供点击能力；Windows/macOS 的通知仍由前端走插件，不去抢
-/// 各自系统的通知注册（如 Windows 的 toast AUMID）。
+/// Windows 侧用 tauri-winrt-notification 发 toast：它的 `on_activated` 回调在**本进程内**
+/// 触发，所以不需要「重启进程 + 单实例 argv 转发」那套；app_id 与 tauri-plugin-notification
+/// 一致（都用 app identifier），系统里显示为同一个应用。点正文时回调参数是 `None`
+/// （与 Linux 的 default 动作对应），带按钮时才是按钮的 action 串。
+/// macOS 的通知仍由前端走插件 —— 那边没有等价的点击回调。
 #[tauri::command]
 fn notify_message(
     app: tauri::AppHandle,
@@ -1079,7 +1082,33 @@ fn notify_message(
             });
         });
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        let app_id = app.config().identifier.clone();
+        let (app2, key2) = (app.clone(), key.clone());
+        tauri_winrt_notification::Toast::new(&app_id)
+            .title(&title)
+            .text1(&body)
+            // 与 Linux 一样给一个「打开」按钮；点正文（回调参数 None）与点按钮（"open"）
+            // 走同一段处理，不必区分
+            .add_button(&ui_str(&lang, "打开", "Open"), "open")
+            .on_activated(move |action| {
+                oim_log!("[notify] clicked action={action:?} key={key2}");
+                let (app3, key3) = (app2.clone(), key2.clone());
+                let app4 = app3.clone(); // run_on_main_thread 的闭包不能再捕获 app3 本身
+                let _ = app3.run_on_main_thread(move || {
+                    raise_main_window(&app4);
+                    use tauri::Emitter;
+                    // 与 Linux 同一条路：payload 用 JSON 对象，事件桥最稳
+                    let _ = app4.emit(wire::evt::OPEN_CHAT, json!({"key": key3}));
+                });
+                Ok(())
+            })
+            .show()
+            .map_err(|e| format!("通知发送失败: {e}"))?;
+        oim_log!("[notify] shown key={} (windows toast)", key);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = (&app, &key, &title, &body, &lang);
     }

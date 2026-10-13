@@ -300,9 +300,10 @@ export async function markReadFor(key) {
 
 async function notify(key, title, body) {
   try {
-    // Linux：走原生可点击通知（点击通知 → open-chat 事件 → 弹窗切到对应会话）。
-    // DBus 通知无需权限申请，绕开插件的权限检查直接发
-    if (/linux/i.test(navigator.userAgent)) {
+    // Linux/Windows：走原生可点击通知（点击通知 → open-chat 事件 → 弹窗切到对应会话）。
+    // 两边的原生通知都无需权限申请，绕开插件的权限检查直接发；
+    // macOS 仍走下面的插件路径（没有等价的点击回调）。
+    if (/linux|windows/i.test(navigator.userAgent)) {
       await ipc.notifyMessage(key, title, body, store.config?.lang || '')
       return
     }

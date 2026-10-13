@@ -78,7 +78,7 @@ export const sendFiles = (key, paths, text = '', secret = false, password = fals
 export const setUnread = (total) => invoke(WIRE.cmd.set_unread, { total })
 
 /** Linux 原生可点击通知：点击通知（正文/「打开」按钮）→ open-chat 事件 →
- *  弹出主窗口并切到对应会话。Windows/macOS 仍走插件 sendNotification */
+ *  弹出主窗口并切到对应会话。macOS 仍走插件 sendNotification */
 export const notifyMessage = (key, title, body, lang) =>
   invoke(WIRE.cmd.notify_message, { key, title, body, lang })
 
