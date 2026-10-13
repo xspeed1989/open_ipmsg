@@ -21,5 +21,34 @@
 - **刻意留顶层**：`seen_queue/seen_set`（入站去重，已封装在 `mark_seen`/`forget_seen` 后面、
   **零裸泄漏**，与任何领域状态无交集）；`config`/`diag`/`data_dir`/`logs_dir`（基础设施，
   高频调用）。
-- 剩下三组未动：history/log（含 `hist_lock`/`hidden_contacts`）、dir/master、agent/relay。
-  下一轮建议先 `history/log`（调用面最大：`find_in_record` 26 次）。
+- 剩下三组未动：history/log、dir/master、agent/relay。下一组做 `history`（调用面最大）。
+
+## 下一组：history/log 的边界（已定，实现待做）
+
+边界与口径（第五轮问答定的）：
+
+- **`logs_dir` 进组**：组自己从 `data_dir` 派生 `logs/`（与 `peer_keys.json` 随 trust、
+  `pending_out.json` 随 outbox 一致）。外部只有 net.rs 测试里一处可写性探针用到它。
+- **`hidden_contacts` 跟 history**：微信式「删除会话」＝删记录 + 隐藏，是同一条路径上的两个
+  动作；`list_sessions` / `delete_contact` / `unhide_contact` / `is_hidden` 都在这组。
+- **`hist_lock` 用闭包式持锁**：组暴露 `with_history_lock(f)`，守卫不外流 ——
+  `ipmsg_import.rs` 那处「整段导入归并要在锁内」改成把逻辑放进闭包。把导入整段搬进组更干净，
+  但工程量大（那文件 900 行），另开一轮。
+- 提交切法：**一个提交**（调用面大但全是机械改名，拆开只会多一个红的中间态）。
+
+事实锚点（行号会烂，用命令当场复现）：
+
+```bash
+# 字段与外部访问面
+grep -n "hist_lock:\|hidden_contacts:\|logs_dir:" src-tauri/src/state.rs
+grep -rn "st\.hist_lock\|st\.logs_dir" src-tauri/src/*.rs   # 1 处（ipmsg_import）+ 2 处（net.rs 测试）
+
+# 组内方法清单（22 个 pub + 私有助手 append_record_locked / rewrite_records_locked /
+# rewrite_history / persist_hidden / log_path + 自由函数 load_hidden_contacts）
+grep -n "pub fn \(log_record\|upsert_in_record\|search_history\|list_sessions\|clear_history\|is_hidden\|delete_contact\|unhide_contact\|compact_histories\|pending_receipts\|read_history\|update_history_file\|update_history_pkt\|find_history_pkt\|history_contains_text\|mark_in_read\|find_in_record\|find_history_any\|mark_out_read\|mark_out_delivered\|migrate_legacy_history_keys\)" src-tauri/src/state.rs
+
+# 外部调用面（约 47 处）：net.rs 最大是 find_in_record 26 次，ipmsg_import.rs 是 read_history 10 次
+for m in find_in_record find_history_any update_history_file log_record read_history; do
+  grep -c "st\.$m(" src-tauri/src/net.rs src-tauri/src/lib.rs src-tauri/src/ipmsg_import.rs
+done
+```
