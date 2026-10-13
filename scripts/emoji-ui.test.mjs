@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { WIRE } from '../src/lib/wire.generated.js'
+import { normalizeEmojis } from '../src/lib/emoji.js'
 
 const picker = readFileSync(new URL('../src/components/EmojiPicker.vue', import.meta.url), 'utf8')
 const chat = readFileSync(new URL('../src/components/ChatWindow.vue', import.meta.url), 'utf8')
@@ -327,4 +328,29 @@ test('ipc 引用的命令名来自 wire 产物，产物里也没有死条目', (
     assert.ok(declared.has(fn), `wire.rs 里没有 ${fn}`)
     assert.match(lib, new RegExp(`emoji::${fn}`), `${fn} 未注册到 invoke_handler`)
   }
+})
+
+/* ---------------- 缓存副本名（连发两条表情的大小问题） ---------------- */
+
+test('归一化把「历史缓存副本名」带进来（否则只有最新那条能缩略）', () => {
+  const list = normalizeEmojis([
+    {
+      id: 'a',
+      file: 'a.png',
+      cache_file: 'clip_2.png',
+      cache_files: ['clip_2.png', 'clip_1.png'],
+    },
+    { id: 'b', file: 'b.png' },
+  ])
+  assert.deepEqual(list[0].cacheFiles, ['clip_2.png', 'clip_1.png'], '历史副本名要带上')
+  assert.deepEqual(list[1].cacheFiles, [], '没有历史时是空数组，不是 undefined')
+})
+
+test('store 把「最近一次 + 历史」并成一张映射表', () => {
+  const store = readFileSync(new URL('../src/store.js', import.meta.url), 'utf8')
+  assert.match(
+    store,
+    /flatMap\(\(e\) => \[e\.cacheFile, \.\.\.\(e\.cacheFiles \|\| \[\]\)\]\)/,
+    '只取最近一次会导致第二条发出后第一条不再缩略'
+  )
 })

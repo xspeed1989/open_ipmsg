@@ -79,9 +79,23 @@ pub struct EmojiEntry {
     /// 最近一次发送时缓存目录里的副本名（图片为 ipmsgclip_s_*.ext，WebM 为普通附件名）。
     /// 前端据此把「自己发出的这条消息」认成表情并按缩略渲染 —— 缓存副本是
     /// 逐字节复制，但文件名与库内文件名不同，只能记下映射。
+    ///
+    /// 保留**最近一次**是为了兼容旧注册表（新代码同时写 `cache_files`）。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cache_file: String,
+    /// **历史**缓存副本名（最近 `CACHE_FILES_KEEP` 个，最新在前）。
+    ///
+    /// 每次发送都会生成**新的**副本名（见 `stage_for_send`：刻意不覆盖历史副本，
+    /// 免得把还在传输中的那份改掉），所以只记「最近一次」的话，前端那张映射表
+    /// 第二次发送后就不再认得第一条消息 → 同一个表情连发两条，一条缩略、一条
+    /// 全尺寸（真机反馈）。这里把历史一起交给前端，让**所有**已发出的消息都能
+    /// 认出来；上限是为了这张表不无限长。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_files: Vec<String>,
 }
+
+/// 每个表情保留的历史缓存副本名上限（只影响「认成表情」的映射，不影响磁盘文件）。
+const CACHE_FILES_KEEP: usize = 8;
 
 /// 索引文件
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -350,6 +364,7 @@ fn import_sources(
             sha,
             added_at: now_secs(),
             cache_file: String::new(),
+            cache_files: Vec::new(),
         };
         // 立刻进内存态：同一批里的重复项、后续批次的去重都靠它
         reg.emojis.push(entry.clone());
@@ -818,6 +833,17 @@ fn stage_for_send(
     }
 }
 
+/// 记下一次发送用的缓存副本名：最近一次（`cache_file`）+ 有界历史（`cache_files`，
+/// 去重、最新在前）。历史是必需的 —— 每次发送都会生成**新的**副本名（`stage_for_send`
+/// 刻意不覆盖历史副本），只记最近一次的话前端映射表第二次发送后就不再认得第一条消息，
+/// 表现为「同一个表情连发两条、一条缩略一条全尺寸」。
+fn note_cache_file(entry: &mut EmojiEntry, staged: &str) {
+    entry.cache_file = staged.to_string();
+    entry.cache_files.retain(|n| n != staged);
+    entry.cache_files.insert(0, staged.to_string());
+    entry.cache_files.truncate(CACHE_FILES_KEEP);
+}
+
 /// 发送自定义表情：图片走官方贴图，WebM 走普通附件。
 /// 返回送出的消息记录数组（与 send_files 一致）。
 pub async fn send_one(
@@ -842,7 +868,7 @@ pub async fn send_one(
         let mut reg = read_registry(&st.data_dir);
         for e in reg.emojis.iter_mut() {
             if e.id == id {
-                e.cache_file = staged.to_string();
+                note_cache_file(e, staged);
             }
         }
         let _ = write_registry(&st.data_dir, &reg);
@@ -1516,6 +1542,35 @@ mod tests {
             gif_bytes()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 缓存副本名的历史：最新在前、去重、有上限。上限存在的意义只是别让这张映射表
+    /// 无限长（磁盘上的历史副本仍然保留）。
+    #[test]
+    fn cache_file_history_is_recent_first_deduped_and_capped() {
+        let mut e = EmojiEntry {
+            id: "x".into(),
+            name: "x".into(),
+            file: "x.png".into(),
+            size: 0,
+            sha: String::new(),
+            added_at: 0,
+            cache_file: String::new(),
+            cache_files: Vec::new(),
+        };
+        for i in 0..(CACHE_FILES_KEEP + 3) {
+            super::note_cache_file(&mut e, &format!("clip_{i}.png"));
+        }
+        let newest = format!("clip_{}.png", CACHE_FILES_KEEP + 2);
+        assert_eq!(e.cache_file, newest, "最近一次单独记着（兼容旧字段）");
+        assert_eq!(e.cache_files.len(), CACHE_FILES_KEEP, "历史有上限");
+        assert_eq!(e.cache_files[0], newest, "最新在前");
+
+        // 同一份再发一次：不在历史里堆叠，且仍在最前
+        let again = e.cache_files[0].clone();
+        super::note_cache_file(&mut e, &again);
+        assert_eq!(e.cache_files.len(), CACHE_FILES_KEEP, "重复副本名不堆叠");
+        assert_eq!(e.cache_files[0], newest);
     }
 
     #[test]
