@@ -927,6 +927,43 @@ async fn maybe_start_handshake(
     send_getpubkey(ctx, from, cfg).await;
 }
 
+/// 对端密钥轮换后的自愈（实测驱动，spec 之外）：原版 IPMsg 在「对端换了密钥、解不开
+/// 你发去的密文」时会回一条正文含 `DecryptErr` 的自动回复（协议级 token 嵌在人类可读
+/// 文本里）。我方**还持有旧公钥缓存**时，会变成每条都发不出去 —— 这比「缓存为空」更糟，
+/// 因为预握手只在缓存为空时才跑（见 maybe_start_handshake）。
+///
+/// 所以把这条回复当作结构化信号处理：撤回过期缓存 + 立刻重新取公钥；并把
+/// `encrypt_announced` 置回真，让预握手重试（HANDSHAKE_RETRY_MAX）继续兜丢包。
+/// 撤过一次后 `peer_pubkey()` 为空，后续再来 DecryptErr 不会重复动作。
+async fn maybe_recover_stale_peer_key(
+    ctx: &NetCtx,
+    from: SocketAddr,
+    key: &str,
+    text: &str,
+    cfg: &Config,
+) {
+    if !cfg.encrypt || !text.contains("DecryptErr") {
+        return;
+    }
+    if ctx.st.trust.peer_pubkey(key).is_none() {
+        // 本来就没缓存（或上一轮已撤过）：不重复动作
+        return;
+    }
+    ctx.st
+        .peers
+        .with_peer(key, |p| p.encrypt_announced = true);
+    match ctx.st.trust.forget_peer_key(key) {
+        Ok(()) => {
+            ctx.st.diag(&format!(
+                "<- {from} 对端回 DecryptErr：我方缓存公钥已过期，撤回并重新取公钥"
+            ));
+            ctx.st.trust.reset_handshake_retries(key);
+            send_getpubkey(ctx, from, cfg).await;
+        }
+        Err(error) => ctx.st.diag(&format!("<- {from} 撤回过期公钥缓存失败：{error}")),
+    }
+}
+
 /// 能力撤回（与 maybe_start_handshake 互补，spec §7 补充）：对端此前广告过
 /// 加密能力、我方已缓存其公钥，如今上线类报文却不再声明 ENCRYPTOPT ——
 /// 说明对方已关闭加密。继续持有缓存会让我方向它发送密文（永远解不开），
@@ -1697,6 +1734,8 @@ mod inbound {
                 .position(|&byte| byte == 0)
                 .unwrap_or(pkt.extra.len());
             let text = proto::decode_for_command(&pkt.extra[..text_end], pkt.command);
+            // 对端回「解不开」（DecryptErr 自动回复）= 我方缓存公钥过期 → 撤回重取
+            maybe_recover_stale_peer_key(ctx, from, key, &text, &ctx.st.config()).await;
 
             let prior = ctx.st.history.find_in_record(session_key, pkt.pkt_no);
             let prior = prior.filter(|record| {
