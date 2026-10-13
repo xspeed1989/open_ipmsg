@@ -1382,12 +1382,12 @@ watch(
                 <!-- 图片/WebM：本地已有内容时内联预览；WebM 静音循环，点击用系统播放器打开。
                      自定义表情（命中表情库）按缩略尺寸渲染，不占满气泡 -->
                 <div v-if="looksLikeSticker(f.name) && f.src && !f._previewFailed" class="img-wrap" :class="{ 'sticker-wrap': isSticker(f) }">
-                  <video v-if="isVideoSticker(f.name)" :src="f.src" class="chat-img" :class="{ 'emoji-sticker': isSticker(f) }"
+                  <video v-if="isVideoSticker(f.name)" :src="f.src" class="chat-img"
                     :title="t('chat.open')" :aria-label="f.name" autoplay loop muted playsinline
                     @click="selMode ? toggleSel(v.m) : openFile(f.path)"
                     @contextmenu.prevent="openCtx(v.m, $event)" @loadeddata="scrollBottom(true)"
                     @error="f._previewFailed = true" />
-                  <img v-else :src="f.src" class="chat-img" :class="{ 'emoji-sticker': isSticker(f) }"
+                  <img v-else :src="f.src" class="chat-img"
                     :title="t('chat.viewImg')" @click="selMode ? toggleSel(v.m) : viewImage(f)"
                     @contextmenu.prevent="openCtx(v.m, $event)" @error="f._previewFailed = true" />
                 </div>
@@ -2055,16 +2055,14 @@ video.chat-img {
   object-fit: contain;
   cursor: pointer;
 }
-/* 自定义表情：不加白底衬垫，最长边限制在 150px（与 lib/emoji.js 的
-   STICKER_DISPLAY_MAX 同值），避免 16MB 大图把气泡撑满 */
+/* 自定义表情：只去掉白底衬垫（透明 PNG 套个白框很怪）。
+   **尺寸不再单独限制** —— 图片就是图片，一律走上面 .chat-img 那条（保比例、上限 260×200）；
+   想看清就点一下，交给系统看图器（viewImage → openImageViewer）。
+   以前这里另有一条 150px 上限，判据是「附件名是否在表情库里」：既会误判（别人当普通图片发来
+   的同一张图会被缩小），又会因副本改名而漂移（同一个表情连发两条，一缩略一全尺寸）。 */
 .img-wrap.sticker-wrap {
   background: transparent;
   padding: 0;
-}
-.chat-img.emoji-sticker {
-  max-width: 150px;
-  max-height: 150px;
-  border-radius: 6px;
 }
 
 

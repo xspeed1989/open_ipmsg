@@ -168,8 +168,6 @@ export function addToEmojiPlan(file) {
   return { ok: true, needDownload: true }
 }
 
-/** 表情缩略显示阈值（聊天气泡内最长边上限，CSS 里 .emoji-sticker 同值） */
-export const STICKER_DISPLAY_MAX = 150
 
 /**
  * 判断一条消息里的某个附件是否应按「自定义表情」缩略渲染：

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import {
   MAX_EMOJI_BYTES, normalizeEmojis, importSummary, packItemState,
   packSummary, defaultPackSelection, packFileName, looksLikeImage, attachPath,
-  addToEmojiPlan, isStickerFile, STICKER_DISPLAY_MAX, PACK_EXT,
+  addToEmojiPlan, isStickerFile, PACK_EXT,
 } from '../src/lib/emoji.js'
 // 命名空间形式：用来确认「已经删掉的常量」没有再被加回来
 import * as emojiLib from '../src/lib/emoji.js'
@@ -218,7 +218,6 @@ test('isStickerFile 命中表情库文件名（含已发出的缓存副本名）
 
 test('常量与后端/样式保持一致', () => {
   assert.equal(MAX_EMOJI_BYTES, 16 * 1024 * 1024)
-  assert.equal(STICKER_DISPLAY_MAX, 150, '改这里要同步 ChatWindow 的 .emoji-sticker max-width')
 })
 
 test('表情数量不设上限：入库多少就渲染多少，也没有批次上限', () => {

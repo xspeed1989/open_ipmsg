@@ -1,6 +1,6 @@
 // node --test scripts/ —— 自定义表情包界面契约（源码级断言，不依赖浏览器运行时）
 //
-// 这些断言锁的是「不能被误改掉的行为」：面板结构、缩略尺寸上限、
+// 这些断言锁的是「不能被误改掉的行为」：面板结构、图片尺寸统一、
 // 右键收纳入口、发送链路与协议复用。改动这些地方时必须同步改测试。
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
@@ -260,13 +260,21 @@ test('下载失败时清掉落盘的半截文件，不留「状态 failed 但文
   assert.match(body, /f\["state"\] = "failed"\.into\(\)/)
 })
 
-test('表情在气泡里按缩略尺寸渲染：150px 上限 + 去掉白底衬垫', () => {
+test('图片一律同一套尺寸；表情不再差异化（只去掉白底衬垫）', () => {
   const css = cssOf(chat)
-  const sticker = declarations(css, '.chat-img.emoji-sticker')
-  assert.match(sticker, /max-width\s*:\s*150px/)
-  assert.match(sticker, /max-height\s*:\s*150px/)
+  // 尺寸只有一条规则：图片就是图片，按比例、上限 260×200。以前表情另有一条 150px 上限，
+  // 判据是「附件名是否在表情库里」—— 会误判、也会因副本改名漂移（连发两条尺寸不一）。
+  const img = declarations(css, '.chat-img')
+  assert.match(img, /max-width\s*:\s*min\(260px, 100%\)/)
+  assert.match(img, /max-height\s*:\s*200px/)
+  assert.equal(
+    declarations(css, '.chat-img.emoji-sticker'),
+    '',
+    '不该再有表情专属尺寸规则；要改尺寸就改 .chat-img 这条'
+  )
+  assert.doesNotMatch(chat, /'emoji-sticker'/, '模板里也不该再有这个类')
+  // 透明 PNG 不套白底衬垫这条保留（与尺寸无关）
   assert.match(declarations(css, '.img-wrap.sticker-wrap'), /background\s*:\s*transparent/)
-  assert.match(chat, /:class="\{ 'emoji-sticker': isSticker\(f\) \}"/)
 })
 
 test('面板定位会把高度夹进窗口内（面板接近半屏高，小窗口不能溢出）', () => {
