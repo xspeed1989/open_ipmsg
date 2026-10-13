@@ -22,6 +22,7 @@ import { pendingImgFromB64, b64ToBytes } from '../lib/clipimg'
 import {
   addToEmojiPlan, attachPath, importSummary, isStickerFile, looksLikeSticker, isVideoSticker,
 } from '../lib/emoji'
+import { fitMedia } from '../lib/media'
 import { t } from '../lib/i18n'
 import { toast, confirm, prompt as promptDialog } from '../lib/dialog'
 import { describeError, errorCode } from '../lib/errors'
@@ -102,6 +103,28 @@ async function resendLastOwn(m) {
   } catch (e) {
     toast(describeError(e, 'chat.alertSendFailed'), { kind: 'error' })
   }
+}
+
+/* ---------- 媒体显示尺寸 ----------
+   图片/视频的显示尺寸**算出来写进元素属性**：气泡是收缩宽度，图片的 max-content 按原始像素
+   参与计算（表情图常见 1506px），只靠 CSS 的 max-width/max-height 会让「布局按 1506、显示按
+   248」错位 —— 气泡被撑到 62% 上限、图片右边空一大块。算法见 lib/media.js（纯函数，有用例）。 */
+function onImgLoad(f, e) {
+  const fit = fitMedia(e?.target?.naturalWidth, e?.target?.naturalHeight)
+  if (fit) {
+    f._dw = fit.w
+    f._dh = fit.h
+  }
+  scrollBottom(true) // 图片撑开高度后补定位
+}
+
+function onVideoLoad(f, e) {
+  const fit = fitMedia(e?.target?.videoWidth, e?.target?.videoHeight)
+  if (fit) {
+    f._dw = fit.w
+    f._dh = fit.h
+  }
+  scrollBottom(true)
 }
 
 /* ---------- 滚动控制 ---------- */
@@ -1383,12 +1406,14 @@ watch(
                      自定义表情（命中表情库）按缩略尺寸渲染，不占满气泡 -->
                 <div v-if="looksLikeSticker(f.name) && f.src && !f._previewFailed" class="img-wrap" :class="{ 'sticker-wrap': isSticker(f) }">
                   <video v-if="isVideoSticker(f.name)" :src="f.src" class="chat-img"
+                    :width="f._dw" :height="f._dh"
                     :title="t('chat.open')" :aria-label="f.name" autoplay loop muted playsinline
                     @click="selMode ? toggleSel(v.m) : openFile(f.path)"
-                    @contextmenu.prevent="openCtx(v.m, $event)" @loadeddata="scrollBottom(true)"
+                    @contextmenu.prevent="openCtx(v.m, $event)" @loadeddata="onVideoLoad(f, $event)"
                     @error="f._previewFailed = true" />
-                  <img v-else :src="f.src" class="chat-img"
+                  <img v-else :src="f.src" class="chat-img" :width="f._dw" :height="f._dh"
                     :title="t('chat.viewImg')" @click="selMode ? toggleSel(v.m) : viewImage(f)"
+                    @load="onImgLoad(f, $event)"
                     @contextmenu.prevent="openCtx(v.m, $event)" @error="f._previewFailed = true" />
                 </div>
                 <!-- 无预览时显示文件卡片（下载中/失败/非图片/超大图） -->
@@ -2043,9 +2068,17 @@ watch(
   background: var(--c-card);
   border-radius: 6px;
   padding: 3px;
+  /* 首帧兜底：尺寸写进元素属性之前，别让气泡被原始像素撑开。
+     真正定尺寸的是 onImgLoad → lib/media.js 的 fitMedia（布局与显示同一个数）。 */
+  max-width: 266px;
 }
 .chat-img {
   display: block;
+  /* 上限是「定值的 260px」+ 窄面板时按 100% 收窄。
+     注意外层 .img-wrap 必须再给一个**定值** max-width：气泡是收缩宽度（shrink-to-fit），
+     而图片的 max-content 是按**原始像素**参与计算的（这里 1506px），`min(260px, 100%)` 里的
+     百分比对内在尺寸计算是「不定值」→ 钳不住 → 气泡会被撑到 .bubble-wrap 的 62% 上限，
+     表现为「气泡比图片宽一大块、右边空绿」。px 定值才能钳住它。 */
   max-width: min(260px, 100%);
   max-height: 200px;
   border-radius: 4px;

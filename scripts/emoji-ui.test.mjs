@@ -336,3 +336,13 @@ test('ipc 引用的命令名来自 wire 产物，产物里也没有死条目', (
     assert.match(lib, new RegExp(`emoji::${fn}`), `${fn} 未注册到 invoke_handler`)
   }
 })
+
+test('图片容器必须给「定值」max-width，否则大气泡把图包住（右边空一块）', () => {
+  const css = cssOf(chat)
+  // 气泡是收缩宽度：图片的 max-content 按原始像素算（真机上是 1506px 的表情图）。
+  // `.chat-img` 的 min(260px, 100%) 里含百分比 → 对内在尺寸计算是不定值，钳不住；
+  // 容器这条 px 定值才是真正生效的那道闸。缺了它，气泡会被撑到 .bubble-wrap 的 62% 上限。
+  const wrap = declarations(css, '.img-wrap')
+  assert.match(wrap, /max-width\s*:\s*266px/, '定值，别写成百分比或 min()')
+  assert.doesNotMatch(wrap, /max-width[^;]*%/, '百分比在内在尺寸计算里钳不住气泡')
+})
