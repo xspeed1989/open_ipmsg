@@ -200,6 +200,9 @@ const zh = {
   'chat.reedit': '重新编辑',
   'chat.secretSend': '封书（需对方点开查看）',
   'chat.secretSealed': '封书：对方发来的保密消息',
+    'chat.peerKeyRotated': '对方已更新密钥，刚才那条没送到。密钥已自动重新获取，请再发一次。',
+    'chat.resend': '重发',
+    'chat.resendUnavailable': '没找到可重发的上一条消息，请手动再发一次',
   // 时间行上的封书标记：收发两端都标（封书是这条消息本身的属性），
   // 尤其让寄件人一眼看出「这条是按封书发出去的」
   'chat.secretTag': '封书',
@@ -552,6 +555,10 @@ const en = {
   'chat.reedit': 'Re-edit',
   'chat.secretSend': 'Sealed message (receiver must open)',
   'chat.secretSealed': 'Sealed message from peer',
+    'chat.peerKeyRotated':
+      'The peer rotated its key, so that message did not get through. The key was refreshed automatically — please send it again.',
+    'chat.resend': 'Resend',
+    'chat.resendUnavailable': 'No previous message found to resend — please send it manually',
   'chat.secretTag': 'Sealed',
   'chat.pwdLock': 'Password lock (receiver needs local password)',
   'chat.pwdLocked': 'Password-protected message',

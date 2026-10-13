@@ -74,6 +74,33 @@ function dayChanged(a, b) {
   return new Date(a.ts * 1000).toDateString() !== new Date(b.ts * 1000).toDateString()
 }
 
+/* ---------- 对端密钥轮换（DecryptErr 自动回复） ----------
+   原版 IPMsg 解不开我方密文时，会回一条正文含协议级 token `DecryptErr` 的自动回复。
+   后端（net.rs 的 maybe_recover_stale_peer_key）用同一个 token 触发「撤缓存 + 重新取
+   公钥」的自愈；这里只负责呈现：按 config.lang 换成本地化提示 + 一个重发按钮。 */
+function isPeerKeyRotated(m) {
+  return m.dir === 'in' && typeof m.text === 'string' && m.text.includes('DecryptErr')
+}
+
+/** 重发这条提示之前、我自己发出的最后一条文本消息（密钥已重新取好，重发即可送达）。 */
+async function resendLastOwn(m) {
+  const list = msgs.value
+  const i = list.indexOf(m)
+  const prev =
+    i > 0 ? [...list.slice(0, i)].reverse().find((x) => x.dir === 'out' && x.text) : null
+  if (!prev) {
+    toast(t('chat.resendUnavailable'))
+    return
+  }
+  try {
+    await sendTextTo(store.activeKey, prev.text, false, false)
+    autoBottom = true
+    scrollBottom()
+  } catch (e) {
+    toast(describeError(e, 'chat.alertSendFailed'), { kind: 'error' })
+  }
+}
+
 /* ---------- 滚动控制 ---------- */
 const scroller = ref(null)
 let autoBottom = true
@@ -1333,6 +1360,14 @@ watch(
                 <template v-if="isPasswordEnvelope(v.m)">{{ t('chat.pwdLocked') }}</template>
                 <template v-else>{{ t('chat.secretSealed') }}</template>
                 <button class="unlock-btn" @click.stop="doUnlock(v.m)">{{ t('chat.unlock') }}</button>
+              </div>
+              <!-- 对端密钥轮换（原版 IPMsg 的 DecryptErr 自动回复）：换成本地化提示 + 重发。
+                   原文不再占地方；后端 net.rs 用同一个 token 触发「撤缓存 + 重取公钥」 -->
+              <div v-else-if="isPeerKeyRotated(v.m)" class="b-text key-rotated">
+                <div class="kr-text">{{ t('chat.peerKeyRotated') }}</div>
+                <button class="unlock-btn" @click.stop="resendLastOwn(v.m)">
+                  {{ t('chat.resend') }}
+                </button>
               </div>
               <div v-else-if="bodyOf(v.m)" class="b-text">
                 <template v-if="hlQuery">
