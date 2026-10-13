@@ -28,6 +28,20 @@ test('打开会话重置历史浏览状态，窗口恢复布局后补做滚动',
   assert.match(chatSource, /onCleanup\(\(\) => observer\.disconnect\(\)\)/)
 })
 
+test('窗口回前台补定位；滚动有界重试；stale 布局不关掉自动到底', () => {
+  // 唤起路径里 openChat()（触发滚动）先跑、w.show() 后跑，滚动落在窗口还没真正可见、
+  // scrollHeight 还是 stale 的时刻 —— 靠「窗口聚焦」这一路补回来
+  assert.match(
+    chatSource,
+    /watch\(\(\) => store\.windowFocused, \(focused\) => \{\s*if \(!focused\) return\s*autoBottom = true\s*scrollBottom\(\)/
+  )
+  // 布局没恢复时滚了也白滚：滚完校验是否真到底，没到底下一帧再补（有界，最多 3 帧）
+  assert.match(chatSource, /if \(off > 2 && \+\+tries < 3\) requestAnimationFrame\(pin\)/)
+  // 内容不溢出 = stale 布局，此时「离底部距离」是假的，不能拿它把 autoBottom 打成 false，
+  // 否则之后每一次补定位都会被静默跳过
+  assert.match(chatSource, /if \(el\.scrollHeight <= el\.clientHeight \+ 1\) return/)
+})
+
 // 「托盘和通知入口均通过 openChat 发出定位请求」那条源码正则断言已退役：
 // 两个入口现在都走 dispatchEvent → open_chat effect，行为改由
 // scripts/store-events.characterization.test.mjs 的 open-unread / open-chat 用例守着

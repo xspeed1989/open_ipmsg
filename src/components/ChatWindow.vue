@@ -80,13 +80,27 @@ let autoBottom = true
 function onScroll() {
   const el = scroller.value
   if (!el) return
+  // 内容不溢出 = 布局还没恢复（隐藏窗口的典型特征），此时算出的「离底部距离」是假的。
+  // 不掐掉这条，stale 的 scroll 事件会把 autoBottom 打成 false，之后所有补定位都静默失效。
+  if (el.scrollHeight <= el.clientHeight + 1) return
   autoBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 90
 }
 function scrollBottom(smooth = false) {
   nextTick(() => {
-    const el = scroller.value
-    if (!el || !autoBottom) return
-    el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
+    // 有界重试：唤起时布局往往还没恢复，滚完校验是否真到底，没到底下一帧再补（最多 3 帧）。
+    // 每帧重查 autoBottom，用户中途滚上去就立刻让位。
+    let tries = 0
+    const pin = () => {
+      const el = scroller.value
+      if (!el || !autoBottom) return
+      el.scrollTo({
+        top: el.scrollHeight,
+        behavior: smooth && tries === 0 ? 'smooth' : 'auto',
+      })
+      const off = el.scrollHeight - el.scrollTop - el.clientHeight
+      if (off > 2 && ++tries < 3) requestAnimationFrame(pin)
+    }
+    pin()
   })
 }
 watch(() => [store.activeKey, store.chatOpenVersion], () => {
@@ -94,6 +108,14 @@ watch(() => [store.activeKey, store.chatOpenVersion], () => {
   scrollBottom()
 })
 watch(() => msgs.value.length, () => scrollBottom(true))
+// 窗口回到前台再补一次定位：唤起路径里 openChat()（触发滚动）先跑、w.show() 后跑，
+// 滚动落在窗口还没真正可见、scrollHeight 还是 stale 的时刻，之后没人补这一下。
+// 隐藏期间 rAF 不跑，所以这次补定位正是重试循环等不到的那一下。
+watch(() => store.windowFocused, (focused) => {
+  if (!focused) return
+  autoBottom = true
+  scrollBottom()
+})
 
 // 隐藏/最小化时布局可能尚未恢复，容器重新获得尺寸后补做定位。
 watch(scroller, (el, _previous, onCleanup) => {
