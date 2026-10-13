@@ -942,7 +942,10 @@ async fn maybe_recover_stale_peer_key(
     text: &str,
     cfg: &Config,
 ) {
-    if !cfg.encrypt || !text.contains("DecryptErr") {
+    // 匹配**完整包装** `AutoReply(DecryptErr)` 而不是裸 token `DecryptErr`：
+    // 后者对「用户自己在聊天里打出这串字」也成立（后端会白跑一次撤缓存 + 重取，
+    // 前端还会把人家的话替换成提示）。原版发的是 `==== AutoReply(DecryptErr) ====`。
+    if !cfg.encrypt || !text.contains("AutoReply(DecryptErr)") {
         return;
     }
     if ctx.st.trust.peer_pubkey(key).is_none() {

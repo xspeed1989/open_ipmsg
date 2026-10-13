@@ -8,10 +8,10 @@ const i18n = readFileSync(new URL('../src/lib/i18n.js', import.meta.url), 'utf8'
 // 对端密钥轮换（原版 IPMsg 的 DecryptErr 自动回复）：后端 net.rs 用同一个协议级 token
 // 触发自愈（撤缓存 + 重取公钥），前端只负责按语言设置换成本地化提示 + 重发。
 
-test('识别协议级 token，且只对入站消息生效', () => {
+test('识别完整包装 AutoReply(DecryptErr)，且只对入站消息生效', () => {
   assert.match(
     chat,
-    /function isPeerKeyRotated\(m\) \{\s*return m\.dir === 'in' && typeof m\.text === 'string' && m\.text\.includes\('DecryptErr'\)/
+    /function isPeerKeyRotated\(m\) \{[\s\S]*?return m\.dir === 'in' && typeof m\.text === 'string' && m\.text\.includes\('AutoReply\(DecryptErr\)'\)/
   )
 })
 
