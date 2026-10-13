@@ -80,9 +80,29 @@ pub fn run() -> bool {
     plain_ok && crypto_ok && offline_ok && extended_ok
 }
 
+/// 挑一个 **UDP 与 TCP 都空着** 的回环端口。
+///
+/// 只验 UDP 不够：自检里这些端口同时兼任 TCP 文件服务端口，而 UDP 空闲不代表同号 TCP 空闲
+/// （别的进程占了、或处于 TIME_WAIT）。真机上就因此偶发红过一次 —— TCP 监听绑不上、那个任务
+/// 静默返回，随后表现为「A 取文件 Connection refused」+ 两条断言红（2026-10 发版时采样 1/10）。
+/// 这里逐个试到**双协议都绑得上**为止。
+///
+/// 仍有一个极小的 TOCTOU 窗口（这里放掉、稍后真正绑定），但同号双协议同时被抢走的概率远低于
+/// 「只验一半」；真绑不上时下面那段 TCP 服务也会记日志 + 重试，不再静默。
 async fn free_udp_port() -> u16 {
-    let s = UdpSocket::bind(("127.0.0.1", 0)).await.expect("bind :0");
-    s.local_addr().expect("local_addr").port()
+    for _ in 0..64 {
+        let Ok(s) = UdpSocket::bind(("127.0.0.1", 0)).await else {
+            continue;
+        };
+        let Ok(port) = s.local_addr().map(|a| a.port()) else {
+            continue;
+        };
+        // 同号 TCP 也试一下：绑得上就立刻放掉（关掉的监听不进 TIME_WAIT）
+        if TcpListener::bind(("127.0.0.1", port)).await.is_ok() {
+            return port;
+        }
+    }
+    panic!("找不到 UDP/TCP 都空闲的回环端口");
 }
 
 async fn wait_for(ms: u64, mut f: impl FnMut() -> bool) -> bool {
@@ -1791,9 +1811,23 @@ fn spawn_fake_peer(
 
     /* -- TCP 服务：向应用的下载请求回传内容（严格按官方十六进制方言校验） -- */
     tasks.push(tokio::spawn(async move {
-        let listener = match TcpListener::bind(("127.0.0.1", port_peer)).await {
-            Ok(l) => l,
-            Err(_) => return,
+        // 绑不上不再静默 return：那会让后面「取文件」表现为 Connection refused，
+        // 看不出真正原因。短暂重试（TIME_WAIT），最终失败也留下可诊断的一行。
+        let mut bound = None;
+        for _ in 0..5 {
+            match TcpListener::bind(("127.0.0.1", port_peer)).await {
+                Ok(l) => {
+                    bound = Some(l);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
+        }
+        let Some(listener) = bound else {
+            println!(
+                "[tcp] bind 127.0.0.1:{port_peer} 连续失败：假对端的文件服务不可用，取文件相关断言会红"
+            );
+            return;
         };
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
