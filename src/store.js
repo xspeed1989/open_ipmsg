@@ -561,10 +561,7 @@ export function setDragHover(key) {
 export function setStickerIndex(list) {
   const items = list || []
   store.emojiFiles = items.map((e) => e.file)
-  // 缓存副本名：最近一次 + 历史（见 lib/emoji.js 的 cacheFiles 注释）
-  store.emojiCacheFiles = items
-    .flatMap((e) => [e.cacheFile, ...(e.cacheFiles || [])])
-    .filter(Boolean)
+  store.emojiCacheFiles = items.map((e) => e.cacheFile).filter(Boolean)
 }
 
 /* ---------------- 事件迁移的执行者 ---------------- */

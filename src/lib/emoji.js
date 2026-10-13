@@ -52,9 +52,6 @@ export function normalizeEmojis(raw, fallbackName = '表情') {
       file,
       abs: String(it.abs ?? ''),
       cacheFile: String(it.cache_file ?? ''),
-      // 历史副本名（最近若干个）：每次发送都会生成**新的**副本名，只认最近一次的话
-      // 第二次发送后第一条消息就不再是「表情」了（连发两条大小不一）
-      cacheFiles: Array.isArray(it.cache_files) ? it.cache_files.map(String) : [],
       size: Number.isFinite(Number(it.size)) ? Math.max(0, Number(it.size)) : 0,
       addedAt: Number.isFinite(Number(it.added_at)) ? Number(it.added_at) : 0,
     })
