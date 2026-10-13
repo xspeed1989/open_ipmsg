@@ -360,7 +360,8 @@ fn consolidate_imported_sessions(
     // 第二遍：持锁执行归并——读源、写目标、删源一气呵成，避免实时消息在
     // 间隙落进即将被删除的源文件而被一起丢掉。此段只做直接文件 I/O，
     // 不再调用任何会取 hist_lock 的 AppState 方法。
-    let _g = st.hist_lock.lock().unwrap();
+    // 唯一的持锁例外：整段归并（读源/写目标/删源）必须原子完成（见 AppState::history_lock_for_merge）
+    let _g = st.history_lock_for_merge();
     let mut merged = 0usize;
     // 每个目标会话已见到的 imp.id（跨多个源文件累计，避免重复搬入）
     let mut seen_targets: HashMap<String, HashSet<u64>> = HashMap::new();

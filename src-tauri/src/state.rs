@@ -1559,6 +1559,16 @@ impl AppState {
         self.find_in_record(key, pkt)
     }
 
+    /// 历史读写锁的**具名例外**：交出守卫，供 `ipmsg_import` 的会话归并跨整段持锁。
+    ///
+    /// ADR-0003 定的口径是「守卫不外流、用闭包」；这一处例外是刻意留的 ——
+    /// 归并要在锁内做 100 行「读源 / 写目标 / 删源」的直接文件 I/O，把它们塞进闭包
+    /// 只为了不交守卫，收益不抵重排缩进的风险。**除这里之外不要再新增使用者**：
+    /// 其它路径一律走各自的接口方法（它们内部自己取锁）。
+    pub(crate) fn history_lock_for_merge(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.hist_lock.lock().unwrap()
+    }
+
     /// 历史里是否存在包含指定文本的记录（自检断言用）
     pub fn history_contains_text(&self, key: &str, text: &str) -> bool {
         self.read_history(key, 500).iter().any(|r| {
