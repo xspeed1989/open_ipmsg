@@ -103,7 +103,7 @@ impl Dict {
     }
 
     /// dict 值只包含内容段；完整 IP2 外壳属于单独的 ipdict 值类型。
-#[allow(dead_code)] // 搬迁后无调用方（拆分前是 pub 方法/仅测试用）；待确认是否可删
+    #[cfg(test)] // 只服务编解码测试（官方 dict 全 API，生产只读实际用到的键）
     pub fn put_dict(&mut self, key: &str, sub: &Dict) -> &mut Self {
         self.set_raw(key, sub.pack_content_prefix(sub.items.len()))
     }
@@ -145,7 +145,7 @@ impl Dict {
     }
 
     /// Read a nested full `IP2:...:Z` value and require exact consumption.
-#[allow(dead_code)] // 搬迁后无调用方（拆分前是 pub 方法/仅测试用）；待确认是否可删
+    #[cfg(test)] // 只服务编解码测试（官方 dict 全 API，生产只读实际用到的键）
     pub fn get_ipdict(&self, key: &str) -> Option<Dict> {
         let raw = self.get(key)?;
         let (dict, used) = Dict::unpack(raw)?;
@@ -172,12 +172,12 @@ impl Dict {
             .map(Some)
     }
 
-#[allow(dead_code)] // 搬迁后无调用方（拆分前是 pub 方法/仅测试用）；待确认是否可删
+    #[cfg(test)] // 只服务编解码测试（官方 dict 全 API，生产只读实际用到的键）
     pub fn try_get_int_list(&self, key: &str) -> Result<Option<Vec<i64>>, String> {
         self.try_get_list(key, "整数", parse_int)
     }
 
-#[allow(dead_code)] // 搬迁后无调用方（仅测试/预留）；待确认是否可删
+    #[cfg(test)] // 只服务编解码测试（官方 dict 全 API，生产只读实际用到的键）
     pub fn get_int_list(&self, key: &str) -> Vec<i64> {
         self.try_get_int_list(key)
             .ok()
@@ -185,14 +185,14 @@ impl Dict {
             .unwrap_or_default()
     }
 
-#[allow(dead_code)] // 仅测试/预留：搬迁后无调用方；待确认是否可删
+    #[cfg(test)] // 只服务编解码测试（官方 dict 全 API，生产只读实际用到的键）
     pub fn try_get_str_list(&self, key: &str) -> Result<Option<Vec<String>>, String> {
         self.try_get_list(key, "字符串", |raw| {
             std::str::from_utf8(raw).ok().map(str::to_string)
         })
     }
 
-#[allow(dead_code)] // 仅测试/预留：搬迁后无调用方；待确认是否可删
+    #[cfg(test)] // 只服务编解码测试（官方 dict 全 API，生产只读实际用到的键）
     pub fn get_str_list(&self, key: &str) -> Vec<String> {
         self.try_get_str_list(key)
             .ok()
@@ -200,12 +200,12 @@ impl Dict {
             .unwrap_or_default()
     }
 
-#[allow(dead_code)] // 仅测试/预留：搬迁后无调用方；待确认是否可删
+    #[cfg(test)] // 只服务编解码测试（官方 dict 全 API，生产只读实际用到的键）
     pub fn try_get_bytes_list(&self, key: &str) -> Result<Option<Vec<Vec<u8>>>, String> {
         self.try_get_list(key, "字节", |raw| Some(raw.to_vec()))
     }
 
-#[allow(dead_code)] // 仅测试/预留：搬迁后无调用方；待确认是否可删
+    #[cfg(test)] // 只服务编解码测试（官方 dict 全 API，生产只读实际用到的键）
     pub fn get_bytes_list(&self, key: &str) -> Vec<Vec<u8>> {
         self.try_get_bytes_list(key)
             .ok()
@@ -224,7 +224,7 @@ impl Dict {
             .unwrap_or_default()
     }
 
-#[allow(dead_code)] // 仅测试/预留：搬迁后无调用方；待确认是否可删
+    #[cfg(test)] // 只服务编解码测试（官方 dict 全 API，生产只读实际用到的键）
     pub fn try_get_ipdict_list(&self, key: &str) -> Result<Option<Vec<Dict>>, String> {
         self.try_get_list(key, "IPDict", |raw| {
             let (dict, used) = Dict::unpack(raw)?;
@@ -232,7 +232,7 @@ impl Dict {
         })
     }
 
-#[allow(dead_code)] // 仅测试/预留：搬迁后无调用方；待确认是否可删
+    #[cfg(test)] // 只服务编解码测试（官方 dict 全 API，生产只读实际用到的键）
     pub fn get_ipdict_list(&self, key: &str) -> Vec<Dict> {
         self.try_get_ipdict_list(key)
             .ok()

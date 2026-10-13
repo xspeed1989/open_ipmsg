@@ -231,10 +231,6 @@ pub struct OfferedFile {
     pub is_dir: bool,
     /// 登记时刻，用于过期清理
     pub ts: u64,
-    /// 公告是否按 UTF-8 发出：对端取文件请求应带 UTF8OPT（官方 §3-9），
-    /// 目录流内的文件名编码据此决定
-    #[allow(dead_code)] // 拆分前就没人读（当时是 pub 字段所以不报死代码）；保留待确认
-    pub utf8: bool,
 }
 
 /// 在线消息的送达重发队列项（官方 §4-12「確認・リトライ」：
@@ -263,9 +259,6 @@ pub struct DirMember {
     /// 成员最近一次 POLL 的源端口（DIR_PACKET 分发目标）
     pub port: u16,
     pub last_poll: u64,
-    /// 被任命为代理广播的时长（秒，官方 AGS 键）
-#[allow(dead_code)] // 搬迁后无调用方（拆分前是 pub 方法/仅测试用）；待确认是否可删
-    pub agent_secs: u64,
     /// 该成员报告的本段网络（ADDR/MASK，如 "192.168.1.0/24"）
     pub seg: String,
     /// 是否已被任命为代理广播（DIR_BROADCAST 已发出）
@@ -1218,11 +1211,6 @@ pub(crate) mod trust {
             self.handshake_retries.lock().unwrap().remove(ip);
         }
 
-        #[allow(dead_code)] // 测试与诊断用
-        pub fn handshake_retries_of(&self, ip: &str) -> u32 {
-            self.handshake_retries.lock().unwrap().get(ip).copied().unwrap_or(0)
-        }
-
         /// 记下「这把缓存公钥是什么时候学到/确认的」（ANSPUBKEY 采纳、上线宣告采纳、
         /// 以及用缓存钥匙验签成功时都算确认）。钥匙新鲜度的判据就是它。
         pub fn note_peer_key_seen(&self, ip: &str) {
@@ -1264,15 +1252,6 @@ pub(crate) mod trust {
         #[cfg(test)]
         pub fn forget_key_seen_for_test(&self, ip: &str) {
             self.key_seen_at.lock().unwrap().remove(ip);
-        }
-
-        #[allow(dead_code)] // 诊断用
-        pub fn key_refresh_age_secs(&self, ip: &str) -> Option<u64> {
-            self.key_refresh_at
-                .lock()
-                .unwrap()
-                .get(ip)
-                .map(|t| now_secs().saturating_sub(*t))
         }
 
         pub fn retire_probe_budget(&self, ip: &str) -> bool {
@@ -1379,7 +1358,7 @@ pub(crate) mod outbox {
         }
 
         /// 取出某会话全部待投递并清空（当前仅测试用；线上投递走 ack 出队）
-        #[allow(dead_code)] // 生产路径走 ack_pending 出队；「取走整条队列」只有测试用
+        #[cfg(test)] // 只有测试用（生产走 documented 的那条路径）
         pub fn take_pending(&self, key: &str) -> Vec<PendingOut> {
             let mut map = self.pending_out.lock().unwrap();
             let taken = map.remove(key).unwrap_or_default();
@@ -1541,7 +1520,7 @@ pub(crate) mod peers {
             self.peers.lock().unwrap().keys().cloned().collect()
         }
 
-        #[allow(dead_code)] // 只有测试用
+        #[cfg(test)] // 只有测试断言「新状态没有对端」用；生产路径不查空
         pub(crate) fn is_empty(&self) -> bool {
             self.peers.lock().unwrap().is_empty()
         }
@@ -1591,13 +1570,6 @@ pub(crate) mod peers {
             self.peers.lock().unwrap().remove(key)
         }
 
-        #[allow(dead_code)] // 暂无调用方（拆分前是 pub 方法，不报死代码）
-        pub fn touch_peer(&self, key: &str) {
-            if let Some(p) = self.peers.lock().unwrap().get_mut(key) {
-                p.last_seen = now_secs();
-            }
-        }
-
         pub fn prune_stale_peers(&self, timeout_secs: u64) -> Vec<String> {
             let cutoff = now_secs().saturating_sub(timeout_secs);
             let mut peers = self.peers.lock().unwrap();
@@ -1617,11 +1589,6 @@ pub(crate) mod peers {
                 .lock()
                 .unwrap()
                 .insert(key.to_string(), text.to_string())
-        }
-
-        #[allow(dead_code)] // 暂无调用方（同上；留给不在文案的读取）
-        pub fn peer_absence_of(&self, key: &str) -> Option<String> {
-            self.peer_absence.lock().unwrap().get(key).cloned()
         }
 
         pub fn clear_peer_absence(&self, key: &str) {
@@ -1809,8 +1776,9 @@ pub(crate) mod transfer {
 /// 聊天记录与会话可见性（架构评审候选 4 的第五组，见 docs/adr/0003）。
 ///
 /// 历史文件是 `logs/<会话 key>.jsonl`，**所有读-改-写都在同一把锁内**做原子替换
-/// （`hist_lock`）。锁的出口只有两个：`with_history_lock(闭包)`（守卫不外流）与
-/// 一个具名例外 `history_lock_for_merge()`（`ipmsg_import` 的整段归并）。
+/// （`hist_lock`）。锁的出口只有一个：**具名例外** `history_lock_for_merge()`
+/// （`ipmsg_import` 的整段归并）—— 原先还预留了一个闭包式出口 `with_history_lock`，
+/// 落地后确认没有使用场景，已删（清理 dead_code 那轮）。
 ///
 /// `hidden_contacts` 跟这组走：微信式「删除会话」＝删记录 + 隐藏，是同一条路径上的两个动作，
 /// 拆开会让这个语义动作横跨两组。`logs_dir` 也在这里（只被本组用），从 `data_dir` 派生。
@@ -1851,15 +1819,8 @@ pub(crate) mod history {
             }
         }
 
-        /// 聊天记录文件的读-改-写互斥：守卫不外流，调用方把要原子完成的一整段放进闭包。
-        #[allow(dead_code)] // ADR-0003 的首选出口（守卫不外流）；当前唯一的跨段持锁走具名例外 history_lock_for_merge
-        pub(crate) fn with_history_lock<R>(&self, f: impl FnOnce() -> R) -> R {
-            let _g = self.hist_lock.lock().unwrap();
-            f()
-        }
-
         /// 历史文件所在目录（诊断与可写性探针用）
-        #[allow(dead_code)] // 只有测试的可写性探针用
+        #[cfg(test)] // 只有测试用（生产走 documented 的那条路径）
         pub(crate) fn logs_dir(&self) -> &std::path::Path {
             &self.logs_dir
         }
@@ -2082,7 +2043,7 @@ pub(crate) mod history {
 
         /// 兼容封装：只有新追加包返回 true；需要真实 I/O 状态或冲突详情的调用方
         /// 必须使用可失败接口。
-        #[allow(dead_code)] // 只有测试用（生产走 upsert_in_record_fallible 以拿到 I/O 状态）
+        #[cfg(test)] // 只有测试用（生产走 documented 的那条路径）
         pub fn upsert_in_record(&self, key: &str, rec: &serde_json::Value) -> bool {
             matches!(
                 self.upsert_in_record_fallible(key, rec),
@@ -2809,18 +2770,8 @@ pub(crate) mod dir {
             self.dir_members.lock().unwrap().insert(m.key.clone(), m);
         }
 
-#[allow(dead_code)] // 搬迁后无调用方（拆分前是 pub 方法/仅测试用）；待确认是否可删
-        pub fn dir_member(&self, key: &str) -> Option<DirMember> {
-            self.dir_members.lock().unwrap().get(key).cloned()
-        }
-
         pub fn dir_members_snapshot(&self) -> Vec<DirMember> {
             self.dir_members.lock().unwrap().values().cloned().collect()
-        }
-
-#[allow(dead_code)] // 搬迁后无调用方（拆分前是 pub 方法/仅测试用）；待确认是否可删
-        pub fn remove_dir_member(&self, key: &str) {
-            self.dir_members.lock().unwrap().remove(key);
         }
 
         pub fn prune_dir_members(&self, timeout_secs: u64) -> Vec<String> {

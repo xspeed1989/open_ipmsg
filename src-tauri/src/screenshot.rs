@@ -60,7 +60,7 @@ pub fn slice_for_monitor(logical: Rect, bounds: Rect, k: f64) -> Rect {
 /// 行 stride 对齐、通道顺序这些坑（下面 `bgra_to_rgba_*` 那几条用例）正是靠本地
 /// 测试守住的。为消一条 dead_code 告警把它塞进 Windows 模块，等于把这些验证挪到
 /// 本机跑不到的目标上，不划算。
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))] // 只有 Windows 的 BitBlt 抓屏会调
 pub fn bgra_to_rgba(src: &[u8], w: u32, h: u32, stride: usize) -> Vec<u8> {
     let mut out = vec![0u8; (w * h * 4) as usize];
     for y in 0..h as usize {

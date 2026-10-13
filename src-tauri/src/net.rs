@@ -646,7 +646,6 @@ async fn retry_pending_for(ctx: Arc<NetCtx>, key: &str) {
                     size: e.size,
                     is_dir: e.attr & 0xFF == fileattr::DIR,
                     ts: now_secs(),
-                    utf8,
                 },
             );
         }
@@ -764,7 +763,7 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
         // 文件已丢失/不可读 → 该条无法投递，出队并记诊断（否则无限重试）。
         let mut entries: Vec<proto::FileEntry> = Vec::new();
         if !item.paths.is_empty() {
-            match register_offer_files(ctx, item.pkt, &item.paths, utf8) {
+            match register_offer_files(ctx, item.pkt, &item.paths) {
                 Ok((es, _)) => entries = es,
                 Err(e) => {
                     ctx.st.diag(&format!(
@@ -2576,7 +2575,6 @@ fn register_offer_files(
     ctx: &NetCtx,
     pkt_no: u32,
     paths: &[String],
-    utf8: bool,
 ) -> Result<(Vec<proto::FileEntry>, Vec<(u32, u32)>), String> {
     let stats = stat_file_entries(paths)?;
     ctx.st.transfer.prune_offered();
@@ -2591,7 +2589,6 @@ fn register_offer_files(
                 size: e.size,
                 is_dir: e.attr & 0xFF == fileattr::DIR,
                 ts: now_secs(),
-                utf8,
             });
         entries.push(e);
         inserted.push((pkt_no, id));
@@ -2811,7 +2808,7 @@ pub async fn send_message_opts(
     let (mut entries, inserted) = if paths.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        register_offer_files(ctx, pkt_no, &paths, utf8)?
+        register_offer_files(ctx, pkt_no, &paths)?
     };
     // 官方「粘贴图片」公告格式：首条附件 attr=FILE_CLIPBOARD(0x20) +
     // CLIPBOARDPOS=插入位置 扩展段（官方 share.cpp EncodeMsg 同款）
@@ -3589,7 +3586,6 @@ async fn handle_dict_datagram(ctx: &NetCtx, dict: &crate::ipdict::Dict, from: So
                 key: key.clone(),
                 port: from.port(),
                 last_poll: now_secs(),
-                agent_secs: if already_agent { 0 } else { 300 },
                 seg,
                 is_agent: !already_agent,
             });

@@ -40,6 +40,8 @@
 `logs_dir`）+ `data_dir` 搬进 `mod history::HistoryStore`，区域 864 行（22 个 pub 方法 + 私有
 助手 + `load_hidden_contacts`）。锁的出口两个：`with_history_lock(闭包)`（首选，守卫不外流）与
 **具名例外** `history_lock_for_merge()`；调用点改名约 210 处。
+> 修订（清理 dead_code 那轮）：`with_history_lock` 落地后确认**没有使用场景**（唯一的跨段持锁走具名
+> 例外），已删 —— 所以现在出口只有一个。留这段记录是为了说明「首选出口」这个念头被真实代码否掉过。
 
 **那条口径的修订**：ADR 先写的是「`hist_lock` 一律闭包式持锁」。真做时卡在
 `ipmsg_import::consolidate_imported_sessions` —— 那是 100 行「读源 / 写目标 / 删源」的直接

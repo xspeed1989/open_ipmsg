@@ -14,6 +14,7 @@
 
 /// 目录流条目的类型（低 8 位；官方 ipmsg.h 的类型值）。
 pub mod attr {
+    // 官方属性全表：只用其子集，其余留作对账依据
     #![allow(dead_code)]
     pub const REGULAR: u32 = 1;
     pub const ENTER: u32 = 2;

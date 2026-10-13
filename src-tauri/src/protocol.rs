@@ -15,6 +15,8 @@ pub const DEFAULT_PORT: u16 = 2425;
 
 /// 基本命令（低 16 位）——逐项对照官方 ipmsg.h Ver4.50
 pub mod cmd {
+    // 官方全表（逐项对照 ipmsg.h）：我们用其子集，其余是文档与对账依据 ——
+    // 补齐这里能少一次翻协议规范。整块豁免 dead_code，别逐条加。
     #![allow(dead_code)]
     pub const NOOPERATION: u32 = 0x0000_0000;
     pub const BR_ENTRY: u32 = 0x0000_0001;
@@ -73,6 +75,8 @@ pub mod cmd {
 /// 选项标志（高位）—— 数值逐项对照官方 ipmsg.h Ver 4.50
 /// （github.com/shirouzu/ipmsg），勿凭记忆修改
 pub mod opt {
+    // 官方全表（逐项对照 ipmsg.h）：我们用其子集，其余是文档与对账依据 ——
+    // 补齐这里能少一次翻协议规范。整块豁免 dead_code，别逐条加。
     #![allow(dead_code)]
     /// 0x100 在上线类报文里表示「离开模式」，在 SENDMSG 里表示
     /// 「请回送达确认」(IPMSG_SENDCHECKOPT)，同值不同义，按命令区分
@@ -123,6 +127,8 @@ pub mod opt {
 
 /// 文件类型属性（fileattr 低 8 位，官方 ipmsg.h L152–L160）
 pub mod fileattr {
+    // 官方文件类型属性全表（ipmsg.h L152–L160）：本客户端只用 REGULAR/DIR/CLIPBOARD 等子集，
+    // 其余留作对账依据。整块豁免。
     #![allow(dead_code)]
     pub const REGULAR: u32 = 0x0000_0001;
     /// 官方值：目录为 2（非 REGULAR|PERM）
@@ -148,6 +154,7 @@ pub mod fileattr {
 /// 附件扩展属性类型（文件项尾段 `extend-attr=val` 的 attr 编号，官方 ipmsg.h
 /// L170–L187）。本客户端主要使用 CLIPBOARDPOS（贴图插入位置）与解析兜底。
 pub mod extattr {
+    // 官方附件扩展属性全表（ipmsg.h L170–L187）：实际主要用 CLIPBOARDPOS，其余留作解析兜底对照。
     #![allow(dead_code)]
     pub const UID: u32 = 0x01;
     pub const USERNAME: u32 = 0x02;
@@ -319,8 +326,8 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
-    /// 取指定编号的扩展属性值（首个匹配）
-    #[allow(dead_code)] // 只有测试读它：生产侧直接用 ext_attrs 字段
+    /// 取指定编号的扩展属性值（首个匹配）。只有编解码测试读它。
+    #[cfg(test)]
     pub fn ext(&self, id: u32) -> Option<&str> {
         self.ext_attrs
             .iter()

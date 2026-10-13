@@ -8,9 +8,9 @@ pub enum Backend {
     Plugin,
     /// Wayland portal GlobalShortcuts
     ///
+    #[allow(dead_code)] // 只作为接口语义保留（理由见下）
     /// 只作为接口语义保留：Wayland 分支现在进监听循环、不再返回（成功与否由
     /// bind_and_listen 自己打日志），因此没有构造点。
-    #[allow(dead_code)]
     Portal,
     /// 未注册（热键为空或平台不支持）
     Disabled(&'static str),
@@ -20,7 +20,7 @@ pub enum Backend {
 ///
 /// 只有 Linux 的 portal 分支会调它（Windows/macOS 走插件，那条路径已被 cfg 摘掉），
 /// 补一条 allow 让 Task 12/13 的构建保持零 warning。
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // 只有 Linux 的 portal 分支会调
 pub fn to_portal_trigger(combo: &str) -> Option<String> {
     let parts: Vec<&str> = combo.split('+').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     if parts.len() < 2 {

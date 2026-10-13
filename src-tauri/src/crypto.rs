@@ -3,8 +3,10 @@
 
 // 能力位常量与部分方法由后续任务（Task 2+）按计划接入，本任务先行定义骨架，
 // 暂时压制 dead_code 提示；后续任务接入后可移除。
-#![allow(dead_code)]
 
+// 协议全表的未用变体：RSA1024 能力位、Blowfish 零 IV 等（我们用其子集，
+// 保留作对账依据，与 protocol.rs 的全表同一口径）。
+#![allow(dead_code)]
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use ctr::cipher::{StreamCipher, StreamCipherSeek};
