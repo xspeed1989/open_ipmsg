@@ -127,3 +127,53 @@ export function comboFromEvent(e) {
 export function isWaylandUA(ua = '') {
   return /wayland/i.test(ua)
 }
+
+/**
+ * 应用内快捷键命中判定：配置里的规范形与本次按键的规范形相等才算命中。
+ *
+ * 与全局热键不同，应用内快捷键只在窗口收到 keydown 时有意义，所以直接比较
+ * 规范化后的字符串即可；空串/不可用组合、取不到主键的按键一律返回 false。
+ * 复用 comboFromEvent（它已处理 macOS 的 Option 合成字符与物理键位）。
+ */
+export function matchesLocalCombo(combo, e) {
+  const target = normalizeCombo(combo)
+  if (!target) return false
+  const pressed = comboFromEvent(e)
+  return !!pressed && pressed === target
+}
+
+/**
+ * 保存前的快捷键冲突判定：找出 `fields`（形如 `[{ field, combo }, ...]`）里
+ * **规范化后相等**的第一对，返回 `{ a, b }`（a 是先出现的字段，b 是撞上它的字段）；
+ * 无冲突返回 null。空串/不可用组合不参与比较（空串 = 该项禁用，两个禁用不算冲突）。
+ *
+ * 只做纯判定：翻译提示、中止保存由调用方（设置页）负责 —— 这样这段「哪些值不能共存」
+ * 的规则可以用真实输入直接测，而不是靠读源码文本。
+ */
+export function findHotkeyConflict(fields) {
+  const seen = new Map() // 规范化组合 -> 先出现它的字段
+  for (const { field, combo } of fields) {
+    // 只比较**可用**的全局热键：空串（禁用）、缺修饰键、未知键名都跳过。
+    // 不可用值永远不会生效，两个不可用值不能算「冲突」，否则会误报。
+    if (!isValidCombo(combo)) continue
+    const norm = normalizeCombo(combo)
+    const other = seen.get(norm)
+    if (other !== undefined) return { a: other, b: field }
+    seen.set(norm, field)
+  }
+  return null
+}
+
+/**
+ * 「本次运行实际生效的关闭窗口快捷键」的冻结规则（纯函数）。
+ *
+ * 关闭快捷键与三个全局热键一样，改配置不重启不换绑；App 的 keydown 处理器读的就是
+ * 这个冻结值。`prev === null` 是「本进程还没加载过配置」的哨兵，此时采用本次加载值；
+ * 一旦冻结（`prev` 是字符串）就不再被后续 `refreshConfig()` 覆盖。
+ *
+ * 用 `null` 而不是空串做哨兵：空串是「禁用」的**有效值**，必须原样保留，
+ * 绝不能回退成默认 Ctrl+W。
+ */
+export function resolveRuntimeCloseHotkey(prev, loaded) {
+  return prev !== null ? prev : loaded
+}

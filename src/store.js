@@ -13,6 +13,7 @@ import {
   BROADCAST_SESSION_KEY, isBroadcastSession, senderOf, senderIp,
 } from './lib/sessions.js'
 import { normalizeEmojis } from './lib/emoji.js'
+import { resolveRuntimeCloseHotkey } from './lib/hotkey.js'
 import { sealedPreviewKey } from './lib/secret.js'
 import { replayFileProgress } from './lib/fileprogress.js'
 // 事件驱动的那半边迁移（见 docs/adr/0001）：本文件只负责状态容器、I/O 与用户动作
@@ -28,6 +29,13 @@ export const store = reactive({
 
   /** 本机配置（nickname/group/download_dir/encoding/encrypt/hostname/ips/key_fp） */
   config: null,
+
+  /**
+   * 本次运行**实际生效**的关闭窗口快捷键（规范形；`null` = 配置尚未加载，空串 = 禁用）。
+   * 快捷键一律改配置不重启不换绑：首次成功加载配置后由 refreshConfig 冻结一次，
+   * 之后不再覆盖；App 的 keydown 处理器读它（见 resolveRuntimeCloseHotkey）。
+   */
+  runtimeCloseHotkey: null,
 
   /** 在线用户 PeerInfo[] 与 key->PeerInfo 映射 */
   users: [],
@@ -117,6 +125,12 @@ export function displayName(key) {
 
 export async function refreshConfig() {
   store.config = await ipc.getConfig()
+  // 关闭窗口快捷键：本次运行只冻结一次（首次成功加载配置后），改配置不重启不换绑。
+  // null=尚未加载 → 采用本次加载值；空串=禁用，原样保留，不回落默认 Ctrl+W。
+  store.runtimeCloseHotkey = resolveRuntimeCloseHotkey(
+    store.runtimeCloseHotkey,
+    store.config?.close_hotkey ?? ''
+  )
   // 配置里的主题立刻生效（首屏与保存设置后都走这里）
   applyTheme(store.config?.theme)
   // 界面语言：config.lang 未设置（空串 = 跟随系统）时按系统语言探测

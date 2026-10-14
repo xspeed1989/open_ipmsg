@@ -70,7 +70,7 @@ fn show_main_window(app: &tauri::AppHandle) {
 /// （KWin/GNOME 的 Wayland 实现行为一致，KDE Wayland 上实测有效），代价至多
 /// 一帧闪烁。仅限 Wayland 会话（按 WAYLAND_DISPLAY 判定，对任何合成器生效）；
 /// X11 的 present 提层、Windows/macOS 路径完全不受影响。
-fn raise_main_window(app: &tauri::AppHandle) {
+pub(crate) fn raise_main_window(app: &tauri::AppHandle) {
     #[cfg(target_os = "linux")]
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         if let Some(w) = app.get_webview_window("main") {
@@ -84,7 +84,7 @@ fn raise_main_window(app: &tauri::AppHandle) {
 
 /// 界面文案二选一（config.lang 为空时按系统语言探测，与前端一致）：
 /// 托盘菜单、最小化提示等原生 UI 字符串走这里。
-fn ui_str(lang: &str, zh: &str, en: &str) -> String {
+pub(crate) fn ui_str(lang: &str, zh: &str, en: &str) -> String {
     let use_en = if lang.eq_ignore_ascii_case("en") {
         true
     } else if lang.is_empty() {
@@ -162,6 +162,12 @@ struct ConfigPatch {
     /// 截图全局热键（规范形）；空串=不注册全局热键
     #[serde(default)]
     shot_hotkey: Option<String>,
+    /// 关闭窗口快捷键（**应用内**，前端处理）；空串=禁用
+    #[serde(default)]
+    close_hotkey: Option<String>,
+    /// 打开窗口全局热键；空串=禁用
+    #[serde(default)]
+    open_hotkey: Option<String>,
     /// 截图确认后自动复制到剪贴板
     #[serde(default)]
     shot_copy_clipboard: Option<bool>,
@@ -191,6 +197,10 @@ fn config_view(cfg: Config, hostname: String, ips: Vec<String>, key_fp: String) 
         "encrypt": cfg.encrypt,
         // 截图设置：前端设置页回填 + 确认后是否自动复制（ChatWindow 直接读它）
         "shot_hotkey": cfg.shot_hotkey,
+        // 窗口快捷键：close=应用内（前端 keydown 用），open=全局热键（后端注册）；
+        // 白名单漏了这两行 → 设置页读不到、保存时会被默认值覆盖
+        "close_hotkey": cfg.close_hotkey,
+        "open_hotkey": cfg.open_hotkey,
         "shot_copy_clipboard": cfg.shot_copy_clipboard,
         // 不在模式：设置页回填「不在」开关与通知文
         "absence_enabled": cfg.absence_enabled,
@@ -282,6 +292,9 @@ fn apply_config_patch(prev: Config, patch: ConfigPatch) -> Result<Config, String
         v6_mcast: patch.v6_mcast.unwrap_or(prev.v6_mcast),
         // 截图热键：补丁未携带保留现值；空串视为「不注册全局热键」
         shot_hotkey: patch.shot_hotkey.unwrap_or(prev.shot_hotkey),
+        // 窗口快捷键：补丁未携带保留现值；空串视为禁用
+        close_hotkey: patch.close_hotkey.unwrap_or(prev.close_hotkey),
+        open_hotkey: patch.open_hotkey.unwrap_or(prev.open_hotkey),
         shot_copy_clipboard: patch
             .shot_copy_clipboard
             .unwrap_or(prev.shot_copy_clipboard),
@@ -1388,6 +1401,8 @@ mod tests {
             dir_mode: "user".into(),
             v6_mcast: false,
             shot_hotkey: "Ctrl+Shift+A".into(),
+            close_hotkey: "Alt+W".into(),
+            open_hotkey: "Ctrl+Shift+O".into(),
             shot_copy_clipboard: false,
             auto_open_secret: false,
             autostart: true,
@@ -1910,15 +1925,20 @@ pub fn run() {
             // 截图会话缓存（单槽：新截图立刻让旧遮罩失效）
             app.manage(screenshot::ShotState::default());
 
-            // 全局热键：Windows/macOS/X11 走插件，Wayland 走 portal（首次会弹系统确认）。
+            // 全局热键：截图（Screenshot）与打开主窗口（ShowWindow）一起注册。
+            // 关闭窗口快捷键是**应用内**快捷键（前端在窗口 keydown 里处理），不进这里。
             // 单独起线程：portal 的 CreateSession/BindShortcuts 要阻塞等用户点确认框，
             // 而 setup 还在主线程上、事件循环尚未启动 —— 阻塞在这里窗口不会出现，
             // 单实例回调（--screenshot 兜底入口）也永远排不上主线程。
-            let combo = app.state::<SharedState>().config().shot_hotkey.clone();
+            let hk_cfg = app.state::<SharedState>().config();
+            let hk_items = vec![
+                (hk_cfg.shot_hotkey.clone(), shortcut::Action::Screenshot),
+                (hk_cfg.open_hotkey.clone(), shortcut::Action::ShowWindow),
+            ];
+            let hk_lang = hk_cfg.lang.clone();
             let hk_handle = handle.clone();
             std::thread::spawn(move || {
-                let backend = shortcut::register(&hk_handle, &combo);
-                oim_log!("[shot] 全局热键后端：{backend:?}（{combo}）");
+                shortcut::register_all(&hk_handle, &hk_lang, &hk_items);
             });
 
             // 首次启动（没有别的实例在跑）时也要支持 --screenshot：等界面起来再抓屏，

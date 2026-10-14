@@ -139,3 +139,62 @@ test('常规区有「开机启动」开关：默认不勾、可回填、保存�
   assert.match(source, /autostart:\s*!!form\.autostart/, '保存补丁漏了该字段')
 })
 
+test('窗口快捷键：两个只读录制框 + ?? 回填 + 保存前冲突检测', () => {
+  // 两个录制框都在，且是独立的 readonly 控件（不做自由文本输入）
+  assert.match(source, /id="close-hotkey"/, '缺少关闭窗口快捷键录制框')
+  assert.match(source, /id="open-hotkey"/, '缺少打开窗口快捷键录制框')
+  assert.match(source, /close_hotkey:\s*''/, '表单初值漏了 close_hotkey')
+  assert.match(source, /open_hotkey:\s*''/, '表单初值漏了 open_hotkey')
+  // 回填用 ?? 而不是 ||：空串是「禁用」的有效值，不能被默认值顶回
+  assert.match(
+    source,
+    /form\.close_hotkey\s*=\s*store\.config\.close_hotkey\s*\?\?/,
+    '关闭快捷键回填必须用 ??（空串=禁用，不能被默认值覆盖）'
+  )
+  assert.match(
+    source,
+    /form\.open_hotkey\s*=\s*store\.config\.open_hotkey\s*\?\?/,
+    '打开快捷键回填必须用 ??（空串=禁用，不能被默认值覆盖）'
+  )
+  // 保存补丁必须带上这两个字段（后端 apply_config_patch 按 Option 合并）
+  assert.match(source, /close_hotkey:\s*form\.close_hotkey/, '保存补丁漏了 close_hotkey')
+  assert.match(source, /open_hotkey:\s*form\.open_hotkey/, '保存补丁漏了 open_hotkey')
+  // 录制必须 stopPropagation：否则录 Ctrl+W 会被别处的 window 监听当成真的命令
+  assert.match(source, /stopPropagation\(\)/, '录制框必须 stopPropagation')
+  // 保存前两两冲突检测：规则抽到 lib/hotkey.js 的纯函数里（真实输入的行为测试见
+  // hotkey.test.mjs），这里只验证设置页确实复用它并报明确译文
+  assert.match(source, /findHotkeyConflict\(/, '冲突检测必须复用 findHotkeyConflict 纯函数')
+  assert.match(source, /t\('settings\.hotkeyConflict'/, '冲突时必须报明确错误译文')
+})
+
+test('三个录制框都带 data-hotkey-recorder 标记（App 捕获阶段靠它跳过）', () => {
+  // App.vue 的关闭快捷键挂在 window 捕获阶段，早于录制框自己的 target 阶段监听；
+  // 没有这个显式标记，在设置页录 Ctrl+W 就会把主窗口关掉。
+  const marks = source.match(/^\s*data-hotkey-recorder\s*$/gm) || []
+  assert.equal(marks.length, 3, '截图/关闭/打开三个录制框都必须带 data-hotkey-recorder')
+  for (const id of ['shot-hotkey', 'close-hotkey', 'open-hotkey']) {
+    assert.match(
+      source,
+      new RegExp(`id="${id}"[\\s\\S]{0,200}data-hotkey-recorder`),
+      `${id} 录制框缺 data-hotkey-recorder（录 Ctrl+W 会关窗）`
+    )
+  }
+})
+
+test('保存前冲突检测复用纯函数，且在写配置之前拦下', () => {
+  const saveFn = source.match(/async function save\(\)[\s\S]*?\n\}/)?.[0] || ''
+  assert.ok(saveFn, '应当能从源码里抽出 save()')
+  // 规则本体在 lib/hotkey.js 的 findHotkeyConflict（真实输入的行为测试见 hotkey.test.mjs）；
+  // SettingsModal 只负责复用 + 翻译提示 + 中止保存
+  assert.match(saveFn, /findHotkeyConflict\(/, '保存前必须调用 findHotkeyConflict')
+  assert.match(saveFn, /t\('settings\.hotkeyConflict'/, '冲突时要报明确冲突译文')
+  // 必须在写配置之前拦下：放到 saveConfig 之后就已经落盘了
+  assert.ok(
+    saveFn.indexOf('findHotkeyConflict') < saveFn.indexOf('await ipc.saveConfig('),
+    '冲突检测必须在 saveConfig 之前'
+  )
+  // 上一轮为「重启后才换绑」写的 activeGlobalHotkeys 配置快照已删：它记的是配置值
+  // 而不是注册结果，会误报；现在统一「重启后生效」，不再需要这类拦截。
+  assert.doesNotMatch(source, /activeGlobalHotkeys/, '不应再依赖 activeGlobalHotkeys 快照')
+  assert.doesNotMatch(source, /hotkeyConflictActive/, '不再需要「旧全局绑定仍生效」的专属冲突译文')
+})

@@ -6,7 +6,7 @@ import {
 } from '../store'
 import * as ipc from '../lib/ipc'
 import { t, SUPPORTED_LANGS, LANG_NAMES, setLocale, detectLocale } from '../lib/i18n'
-import { comboFromEvent, isValidCombo, isWaylandUA } from '../lib/hotkey'
+import { comboFromEvent, isValidCombo, isWaylandUA, findHotkeyConflict } from '../lib/hotkey'
 import { toast, alert as showAlert } from '../lib/dialog'
 import { describeError } from '../lib/errors'
 import { open as pickDialog } from '@tauri-apps/plugin-dialog'
@@ -33,6 +33,10 @@ const form = reactive({
   // 截图热键（规范形，空串 = 不注册全局热键）与「确认后复制到剪贴板」
   shot_hotkey: '',
   shot_copy_clipboard: true,
+  // 窗口快捷键（规范形，空串 = 禁用）：close 是应用内快捷键（前端处理），
+  // open 是全局热键（后端注册，改后需重启）
+  close_hotkey: '',
+  open_hotkey: '',
   // 自动打开封书：收到的无密码封书直接显示正文（默认选中，与后端默认一致）
   auto_open_secret: true,
   // 开机启动（系统登录自启条目；默认不勾，由用户显式选择）
@@ -61,6 +65,9 @@ watch(
       form.dir_mode = store.config.dir_mode || 'off'
       form.v6_mcast = store.config.v6_mcast !== false
       form.shot_hotkey = store.config.shot_hotkey || ''
+      // 窗口快捷键：回填用 ?? 而不是 ||，空串是「禁用」的有效值，不能被默认值顶回
+      form.close_hotkey = store.config.close_hotkey ?? ''
+      form.open_hotkey = store.config.open_hotkey ?? ''
       form.shot_copy_clipboard = store.config.shot_copy_clipboard !== false
       form.auto_open_secret = store.config.auto_open_secret !== false
       form.autostart = !!store.config.autostart
@@ -71,18 +78,33 @@ watch(
 
 const canClose = computed(() => !store.firstRun)
 
-/** 录制：按下的组合键直接写进表单；Esc 清空（= 不注册全局热键） */
-function onHotkeyKeydown(e) {
+/** 录制：按下的组合键直接写进指定字段；Esc 清空（= 禁用该项） */
+function recordHotkey(e, field) {
   // 裸 Tab 与 Shift+Tab 都放行：否则 preventDefault 会把焦点困在录制框里（键盘用户出不去）；
   // 带修饰键的 Ctrl/Alt+Tab 仍按普通组合键录制
   if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) return
   e.preventDefault()
+  // 阻止冒泡：录制框自己的 keydown 不该被别处的快捷键监听（如 ChatWindow 的 Ctrl+F）
+  // 当成真命令；App 的关闭快捷键在捕获阶段靠 data-hotkey-recorder 标记跳过（见 App.vue）。
+  e.stopPropagation()
   if (e.key === 'Escape') {
-    form.shot_hotkey = ''
+    form[field] = ''
     return
   }
   const combo = comboFromEvent(e)
-  if (combo) form.shot_hotkey = combo
+  if (combo) form[field] = combo
+}
+
+// 三个录制框的模板绑定：把字段名写在这里，模板里只引用函数名
+// （SFC 模板校验会把动态属性值里的字符串字面量当标识符扫描）。
+function recordShotHotkey(e) {
+  recordHotkey(e, 'shot_hotkey')
+}
+function recordCloseHotkey(e) {
+  recordHotkey(e, 'close_hotkey')
+}
+function recordOpenHotkey(e) {
+  recordHotkey(e, 'open_hotkey')
 }
 
 /** 配置里可能存着一个不可用的值（手改配置 / 跨平台拷贝）—— 明确告诉用户它不会生效 */
@@ -91,6 +113,20 @@ const hotkeyHint = computed(() => {
   return isWaylandUA(navigator.userAgent)
     ? t('settings.shotHotkeyWayland')
     : t('settings.shotHotkeyHint')
+})
+
+/** 关闭窗口快捷键：应用内快捷键，但与全局热键一样「改配置不重启不换绑」 */
+const closeHotkeyHint = computed(() => {
+  if (form.close_hotkey && !isValidCombo(form.close_hotkey)) return t('settings.closeHotkeyInvalid')
+  return t('settings.closeHotkeyHint')
+})
+
+/** 打开窗口快捷键：全局热键，与截图热键一样重启后生效；Wayland 由 portal 接管 */
+const openHotkeyHint = computed(() => {
+  if (form.open_hotkey && !isValidCombo(form.open_hotkey)) return t('settings.openHotkeyInvalid')
+  return isWaylandUA(navigator.userAgent)
+    ? t('settings.openHotkeyWayland')
+    : t('settings.openHotkeyHint')
 })
 
 // 点击指纹行 → 复制本机密钥指纹（复用 ipc.copyText 的原生剪贴板通道）
@@ -179,6 +215,24 @@ async function save() {
     toast(t('settings.alertNickname'), { kind: 'error' })
     return
   }
+  // 三个快捷键两两冲突检测：同一个组合不可能既关闭又截图又打开，规范化后相等就是
+  // 冲突。规则在 lib/hotkey.js 的纯函数里（用真实输入测），这里只负责翻译提示并中止。
+  const conflict = findHotkeyConflict([
+    { field: 'close_hotkey', combo: form.close_hotkey },
+    { field: 'open_hotkey', combo: form.open_hotkey },
+    { field: 'shot_hotkey', combo: form.shot_hotkey },
+  ])
+  if (conflict) {
+    const names = {
+      close_hotkey: t('settings.closeHotkey'),
+      open_hotkey: t('settings.openHotkey'),
+      shot_hotkey: t('settings.shotHotkey'),
+    }
+    toast(t('settings.hotkeyConflict', { a: names[conflict.a], b: names[conflict.b] }), {
+      kind: 'error',
+    })
+    return
+  }
   // 开机启动是唯一会写到应用之外的开关（注册表 / LaunchAgent / autostart 条目）：
   // 先改系统、成功后再落盘配置 —— 平台写入失败时这一次保存整体不生效，
   // 不会出现「设置里显示已开、系统里其实没有」的假象。
@@ -211,6 +265,8 @@ async function save() {
     dir_mode: form.dir_mode,
     v6_mcast: !!form.v6_mcast,
     shot_hotkey: form.shot_hotkey,
+    close_hotkey: form.close_hotkey,
+    open_hotkey: form.open_hotkey,
     shot_copy_clipboard: !!form.shot_copy_clipboard,
     auto_open_secret: !!form.auto_open_secret,
     // 用户的选择：系统条目已在上面的 ipc.setAutostart 里改好，这里只落盘偏好
@@ -411,10 +467,11 @@ async function save() {
             <input
               id="shot-hotkey"
               class="hotkey-input"
+              data-hotkey-recorder
               readonly
               :value="form.shot_hotkey || ''"
               :placeholder="t('settings.shotHotkeyPh')"
-              @keydown="onHotkeyKeydown"
+              @keydown="recordShotHotkey"
             />
           </div>
           <div class="si-row">
@@ -422,6 +479,36 @@ async function save() {
             <input id="shot-copy" type="checkbox" v-model="form.shot_copy_clipboard" />
           </div>
           <p class="import-hint">{{ hotkeyHint }}</p>
+        </div>
+
+        <div class="selfinfo">
+          <div class="si-title">{{ t('settings.windowHotkeys') }}</div>
+          <div class="si-row">
+            <label class="lab" for="close-hotkey">{{ t('settings.closeHotkey') }}</label>
+            <input
+              id="close-hotkey"
+              class="hotkey-input"
+              data-hotkey-recorder
+              readonly
+              :value="form.close_hotkey ?? ''"
+              :placeholder="t('settings.shotHotkeyPh')"
+              @keydown="recordCloseHotkey"
+            />
+          </div>
+          <p class="import-hint">{{ closeHotkeyHint }}</p>
+          <div class="si-row">
+            <label class="lab" for="open-hotkey">{{ t('settings.openHotkey') }}</label>
+            <input
+              id="open-hotkey"
+              class="hotkey-input"
+              data-hotkey-recorder
+              readonly
+              :value="form.open_hotkey ?? ''"
+              :placeholder="t('settings.shotHotkeyPh')"
+              @keydown="recordOpenHotkey"
+            />
+          </div>
+          <p class="import-hint">{{ openHotkeyHint }}</p>
         </div>
 
         <div class="selfinfo">

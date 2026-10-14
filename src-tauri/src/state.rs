@@ -66,6 +66,14 @@ pub struct Config {
     /// 截图全局热键（规范形，如 "Alt+A"）；Wayland 下作为 portal 的首选触发器
     #[serde(default = "default_shot_hotkey")]
     pub shot_hotkey: String,
+    /// 关闭窗口快捷键（**应用内**快捷键，规范形如 "Ctrl+W"）：窗口在前台时按下
+    /// 等价于点自绘标题栏的 X（隐藏到托盘，不退出）；空串=禁用。不注册为全局热键。
+    #[serde(default = "default_close_hotkey")]
+    pub close_hotkey: String,
+    /// 打开窗口全局热键（规范形如 "Ctrl+Alt+Z"）：系统任意位置按下即显示并置前
+    /// 主窗口；空串=禁用。与截图热键一样，改后需重启应用才生效。
+    #[serde(default = "default_open_hotkey")]
+    pub open_hotkey: String,
     /// 截图确认后是否自动复制到剪贴板（微信习惯：默认开）
     #[serde(default = "default_true")]
     pub shot_copy_clipboard: bool,
@@ -87,6 +95,14 @@ fn default_absence_text() -> String {
 
 fn default_shot_hotkey() -> String {
     "Alt+A".into()
+}
+
+fn default_close_hotkey() -> String {
+    "Ctrl+W".into()
+}
+
+fn default_open_hotkey() -> String {
+    "Ctrl+Alt+Z".into()
 }
 
 fn default_true() -> bool {
@@ -128,6 +144,8 @@ impl Default for Config {
             dir_mode: String::new(),
             v6_mcast: default_true(),
             shot_hotkey: default_shot_hotkey(),
+            close_hotkey: default_close_hotkey(),
+            open_hotkey: default_open_hotkey(),
             shot_copy_clipboard: default_true(),
             auto_open_secret: default_true(),
             autostart: false,
@@ -2920,6 +2938,9 @@ mod tests {
         let c = crate::state::Config::default();
         assert_eq!(c.shot_hotkey, "Alt+A");
         assert!(c.shot_copy_clipboard);
+        // 窗口快捷键默认值：关闭=应用内 Ctrl+W，打开=全局 Ctrl+Alt+Z
+        assert_eq!(c.close_hotkey, "Ctrl+W");
+        assert_eq!(c.open_hotkey, "Ctrl+Alt+Z");
     }
 
     #[test]
@@ -2937,6 +2958,8 @@ mod tests {
         cfg.group = "G1".into();
         cfg.lang = "en".into();
         cfg.shot_hotkey = "Ctrl+Shift+X".into();
+        cfg.close_hotkey = "Ctrl+Shift+W".into();
+        cfg.open_hotkey = "Ctrl+Shift+Z".into();
         cfg.shot_copy_clipboard = false;
         st.set_config(cfg);
         st.persist_config().unwrap();
@@ -2947,12 +2970,24 @@ mod tests {
         assert_eq!(st2.config().group, "G1");
         assert_eq!(st2.config().lang, "en", "界面语言持久化");
         assert_eq!(st2.config().shot_hotkey, "Ctrl+Shift+X", "截图热键持久化");
+        assert_eq!(
+            st2.config().close_hotkey,
+            "Ctrl+Shift+W",
+            "关闭窗口快捷键持久化"
+        );
+        assert_eq!(
+            st2.config().open_hotkey,
+            "Ctrl+Shift+Z",
+            "打开窗口热键持久化"
+        );
         assert!(!st2.config().shot_copy_clipboard, "截图自动复制开关持久化");
 
-        // 空串是「不注册全局热键」的有效值（设置页 Esc 清空）：原样落盘，
-        // 不能被 serde 默认值顶回 "Alt+A" —— Task 11 启动时按空串跳过注册
+        // 空串是「禁用」的有效值（设置页 Esc 清空）：原样落盘，
+        // 不能被 serde 默认值顶回 "Ctrl+W" / "Ctrl+Alt+Z"
         let mut cleared = st2.config();
         cleared.shot_hotkey = String::new();
+        cleared.close_hotkey = String::new();
+        cleared.open_hotkey = String::new();
         st2.set_config(cleared);
         st2.persist_config().unwrap();
         let st4 = AppState::new(st.data_dir.clone());
@@ -2960,6 +2995,14 @@ mod tests {
         assert!(
             st4.config().shot_hotkey.is_empty(),
             "空热键原样持久化（= 不注册全局热键）"
+        );
+        assert!(
+            st4.config().close_hotkey.is_empty(),
+            "空关闭快捷键原样持久化（= 禁用）"
+        );
+        assert!(
+            st4.config().open_hotkey.is_empty(),
+            "空打开热键原样持久化（= 禁用）"
         );
 
         // 旧版配置文件没有 lang 字段：回落空串（前端按系统语言探测）
@@ -2971,12 +3014,25 @@ mod tests {
         // 而不是变成空串或关闭 —— 跨版本升级的行为契约
         v.as_object_mut().unwrap().remove("shot_hotkey");
         v.as_object_mut().unwrap().remove("shot_copy_clipboard");
+        // 窗口快捷键同理：老配置缺字段必须回落默认（Ctrl+W / Ctrl+Alt+Z）
+        v.as_object_mut().unwrap().remove("close_hotkey");
+        v.as_object_mut().unwrap().remove("open_hotkey");
         std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
         let st3 = AppState::new(st.data_dir.clone());
         st3.load_config();
         assert!(st3.config().lang.is_empty(), "缺失字段回落空串（跟随系统）");
         assert_eq!(st3.config().shot_hotkey, "Alt+A", "缺失字段回落默认热键");
         assert!(st3.config().shot_copy_clipboard, "缺失字段回落默认开启");
+        assert_eq!(
+            st3.config().close_hotkey,
+            "Ctrl+W",
+            "缺失字段回落默认关闭快捷键"
+        );
+        assert_eq!(
+            st3.config().open_hotkey,
+            "Ctrl+Alt+Z",
+            "缺失字段回落默认打开热键"
+        );
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
