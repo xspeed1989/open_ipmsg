@@ -1,0 +1,14 @@
+# 线上契约产物：真源是 src-tauri/src/wire.rs 的 `js_artifact()`，测试
+# `wire::tests::wire_artifact_is_current` 要求它与仓里这份**逐字节一致**（这是它存在的
+# 意义：改了命令/事件名却忘了 `--dump-wire`，那条断言就红）。
+#
+# 真源只产出 LF。而 Windows 检出默认 `core.autocrlf=true`，会把文本文件转成 CRLF ——
+# 于是同一条断言在 Windows CI 上**必定**红：实测 left 是 85 个 CRLF、right 是 LF，
+# CRLF→LF 之后完全相等（run 38412211031 / 38407552188，v0.1.10 起每次都红）。
+#
+# 这里显式钉死 LF。gitattributes 的 `eol` **优先于 `core.autocrlf` 与 `core.eol`**，
+# 所以无论检出机器怎么配，工作区拿到的就是真源那份字节 —— 断言保持严格，不归一化、
+# 不弱化，也不需要跳过任何测试。
+#
+# 以后新增「生成物 + 逐字节比对」的文件，必须在这里登记一行，否则会重现同一类红。
+src/lib/wire.generated.js text eol=lf
