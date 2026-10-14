@@ -2935,7 +2935,7 @@ dependencies = [
 
 [[package]]
 name = "open-ipmsg"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "aes",
  "base64 0.22.1",
