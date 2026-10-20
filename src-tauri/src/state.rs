@@ -153,9 +153,25 @@ impl Default for Config {
     }
 }
 
+// 旧队列没有投递次数，无法判断已投递过多少次；保留记录，暂停自动补投。
+fn legacy_pending_attempts() -> u32 {
+    crate::net::RETRY_MAX + 1
+}
+
 /// 待投递的离线消息（对方上线后自动发送，官方 IPMsg 语义）
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PendingOut {
+    /// 曾经密封发送的消息必须继续密封，撤钥/关闭加密也不能降级。
+    #[serde(default)]
+    pub require_encryption: bool,
+    /// 跨重启保留投递预算；旧队列保留待用户决定，不重放积压消息。
+    #[serde(default = "legacy_pending_attempts")]
+    pub attempts: u32,
+    #[serde(default)]
+    pub last_sent: u64,
+    /// 原附件条目：同包号重投必须沿用文件 ID、元数据和贴图属性。
+    #[serde(default)]
+    pub entries: Vec<crate::protocol::FileEntry>,
     /// 对方会话 key（IP）
     pub key: String,
     /// 原包号：重投用同一包号，对端按 (IP, pkt) 去重
@@ -255,6 +271,7 @@ pub struct OfferedFile {
 /// 带 SENDCHECKOPT 的消息在确认超时后重发同一包号，累计若干次后放弃）。
 #[derive(Clone, Debug)]
 pub struct RetryOut {
+    pub require_encryption: bool,
     pub key: String,
     pub pkt: u32,
     pub text: String,
@@ -1342,14 +1359,16 @@ pub(crate) mod outbox {
             self.data_dir.join("pending_out.json")
         }
 
-        fn persist_pending(&self) {
+        fn persist_pending(&self) -> bool {
             let data = self.pending_out.lock().unwrap();
-            let bytes = serde_json::to_vec(&*data).unwrap_or_default();
-            drop(data);
+            let Ok(bytes) = serde_json::to_vec(&*data) else {
+                return false;
+            };
+            // 持锁直到写完，避免并发持久化把较旧的投递预算写回。
             if let Some(dir) = self.pending_path().parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let _ = std::fs::write(self.pending_path(), bytes);
+            std::fs::write(self.pending_path(), bytes).is_ok()
         }
 
         /// 启动时从磁盘恢复待投递队列（重启不丢，官方 IPMsg 语义）
@@ -1415,8 +1434,8 @@ pub(crate) mod outbox {
 
         /* ---------- 在线消息送达重发（官方 §4-12 確認・リトライ） ---------- */
 
-        /// 登记一条在线发送、等待 RECVMSG 确认的消息（仅纯文本，附件重发语义
-        /// 复杂且公告/槽位需一致，暂不重发附件）。
+        /// 登记一条在线发送、等待 RECVMSG 确认的消息（文本和附件均保留原包号，
+        /// 附件公告与文件槽沿用原文件 ID）。
         pub fn enqueue_retry(&self, item: RetryOut) {
             let mut map = self.retry_out.lock().unwrap();
             map.insert((item.key.clone(), item.pkt), item);
@@ -1439,16 +1458,79 @@ pub(crate) mod outbox {
             map.remove(&(key.to_string(), pkt)).is_some()
         }
 
-        /// 重发次数 +1；超过上限返回 false（调用方出队放弃）
-        pub fn bump_retry(&self, key: &str, pkt: u32) -> bool {
+        /// 发包前原子占用一次重发预算；超限出队，不把失败当作送达。
+        pub fn claim_retry(&self, key: &str, pkt: u32, now: u64, encrypted: bool) -> bool {
             let mut map = self.retry_out.lock().unwrap();
-            match map.get_mut(&(key.to_string(), pkt)) {
-                Some(item) => {
-                    item.attempts += 1;
-                    item.attempts <= crate::net::RETRY_MAX
-                }
-                None => false,
+            let id = (key.to_string(), pkt);
+            let Some(item) = map.get_mut(&id) else {
+                return false;
+            };
+            if item.ts.saturating_add(crate::net::RETRY_INTERVAL_SECS) > now {
+                return false;
             }
+            if item.attempts >= crate::net::RETRY_MAX {
+                map.remove(&id);
+                return false;
+            }
+            if item.require_encryption && !encrypted {
+                return false;
+            }
+            item.attempts += 1;
+            item.ts = now;
+            item.require_encryption |= encrypted;
+            true
+        }
+
+        /// 离线补投也有总预算和间隔；保留超限消息，只有真 RECVMSG 才确认出队。
+        pub fn claim_pending(&self, key: &str, pkt: u32, now: u64, encrypted: bool) -> bool {
+            let mut map = self.pending_out.lock().unwrap();
+            let Some(item) = map
+                .get_mut(key)
+                .and_then(|q| q.iter_mut().find(|p| p.pkt == pkt))
+            else {
+                return false;
+            };
+            if item.attempts > crate::net::RETRY_MAX
+                || item
+                    .last_sent
+                    .saturating_add(crate::net::RETRY_INTERVAL_SECS)
+                    > now
+                || (item.require_encryption && !encrypted)
+            {
+                return false;
+            }
+            item.attempts += 1;
+            item.last_sent = now;
+            item.require_encryption |= encrypted;
+            drop(map);
+            self.persist_pending()
+        }
+
+        pub fn requires_encryption(&self, key: &str) -> bool {
+            self.retry_for(key)
+                .iter()
+                .any(|item| item.require_encryption)
+                || self
+                    .pending_for(key)
+                    .iter()
+                    .any(|item| item.require_encryption)
+        }
+
+        /// DecryptErr 没有原包号，只能为该会话尚未确认的消息锁住加密要求。
+        pub fn require_encryption(&self, key: &str) {
+            for ((k, _), item) in self.retry_out.lock().unwrap().iter_mut() {
+                if k == key {
+                    item.require_encryption = true;
+                }
+            }
+            let mut map = self.pending_out.lock().unwrap();
+            if let Some(items) = map.get_mut(key) {
+                for item in items {
+                    item.require_encryption = true;
+                }
+            }
+            drop(map);
+            self.persist_pending();
         }
 
         /// 清理某会话全部重发项（对端离线/退场时）
@@ -1466,14 +1548,6 @@ pub(crate) mod outbox {
             keys
         }
 
-        /// 更新重发项的最近发送时刻（timestamp 复用 ts 字段）
-        pub fn touch_retry_sent(&self, key: &str, pkt: u32, now: u64) {
-            let mut map = self.retry_out.lock().unwrap();
-            if let Some(item) = map.get_mut(&(key.to_string(), pkt)) {
-                item.ts = now;
-            }
-        }
-
         /// 对端离线（BR_EXIT）：未确认的在线消息转入待投递队列（对方回来补投）
         pub fn demote_retry_to_pending(&self, key: &str) {
             let items: Vec<RetryOut> = self.retry_for(key);
@@ -1482,6 +1556,10 @@ pub(crate) mod outbox {
             }
             for it in items {
                 self.enqueue_pending(PendingOut {
+                    require_encryption: it.require_encryption,
+                    attempts: it.attempts.saturating_add(1),
+                    last_sent: it.ts,
+                    entries: it.entries.clone(),
                     key: key.to_string(),
                     pkt: it.pkt,
                     text: it.text.clone(),
@@ -3508,10 +3586,88 @@ mod tests {
     }
 
     #[test]
+    fn pending_delivery_budget_survives_restart_and_plaintext_is_rejected() {
+        let st = temp_state("pending-budget");
+        let key = "10.0.0.9";
+        st.outbox.enqueue_pending(PendingOut {
+            key: key.into(),
+            pkt: 99,
+            text: "private".into(),
+            ts: 1,
+            paths: vec![],
+            secret: false,
+            password: false,
+            entries: vec![],
+            require_encryption: true,
+            attempts: 0,
+            last_sent: 0,
+        });
+        assert!(!st.outbox.claim_pending(key, 99, 100, false));
+        for i in 0..=crate::net::RETRY_MAX {
+            let now = 100 + u64::from(i) * crate::net::RETRY_INTERVAL_SECS;
+            assert!(st.outbox.claim_pending(key, 99, now, true));
+            assert!(
+                !st.outbox.claim_pending(key, 99, now, true),
+                "concurrent announcements share the same budget"
+            );
+            st.outbox.load_pending();
+        }
+        assert!(!st.outbox.claim_pending(key, 99, 1000, true));
+        st.outbox.load_pending();
+        assert!(!st.outbox.claim_pending(key, 99, 2000, true));
+        assert_eq!(
+            st.outbox.pending_for(key).len(),
+            1,
+            "exhaustion retains the unsent record"
+        );
+        assert!(
+            st.outbox.ack_pending(key, 99),
+            "only a real acknowledgement removes the record"
+        );
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
+    fn online_delivery_budget_is_preserved_when_demoted_to_pending() {
+        let st = temp_state("demote-budget");
+        let key = "10.0.0.9";
+        st.outbox.enqueue_retry(RetryOut {
+            key: key.into(),
+            pkt: 100,
+            text: "private".into(),
+            paths: vec![],
+            entries: vec![],
+            require_encryption: true,
+            secret: true,
+            password: false,
+            ts: 1,
+            attempts: 0,
+        });
+        assert!(!st.outbox.claim_retry(key, 100, 100, false));
+        assert!(st.outbox.claim_retry(key, 100, 100, true));
+        assert!(!st.outbox.claim_retry(key, 100, 100, true));
+        st.outbox.demote_retry_to_pending(key);
+        st.outbox.load_pending();
+        let pending = st.outbox.pending_for(key).pop().unwrap();
+        assert!(pending.require_encryption && pending.secret);
+        assert_eq!(
+            pending.attempts, 2,
+            "initial delivery and retry both count toward the lifetime limit"
+        );
+        assert_eq!(pending.last_sent, 100);
+        assert!(st.outbox.retry_for(key).is_empty());
+        let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    #[test]
     fn pending_out_queue_roundtrip_and_ack() {
         let st = temp_state("pending");
         // 离线人发消息：入队并持久化
         assert!(st.outbox.enqueue_pending(PendingOut {
+            require_encryption: false,
+            attempts: 0,
+            last_sent: 0,
+            entries: vec![],
             key: "10.0.0.9".into(),
             pkt: 777,
             text: "等你上线".into(),
@@ -3563,6 +3719,11 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].pkt, 1);
         assert!(list[0].paths.is_empty(), "旧记录无附件字段，补空");
+        assert_eq!(list[0].attempts, crate::net::RETRY_MAX + 1);
+        assert!(
+            !st.outbox.claim_pending("10.0.0.9", 1, now_secs(), true),
+            "legacy backlog must not be replayed on upgrade"
+        );
         let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
@@ -3571,6 +3732,10 @@ mod tests {
         let st = temp_state("pending-drop");
         for pkt in [1u32, 2, 3] {
             st.outbox.enqueue_pending(PendingOut {
+                require_encryption: false,
+                attempts: 0,
+                last_sent: 0,
+                entries: vec![],
                 key: "10.0.0.9".into(),
                 pkt,
                 text: "x".into(),

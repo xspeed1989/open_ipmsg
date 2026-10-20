@@ -606,12 +606,18 @@ async fn retry_pending_for(ctx: Arc<NetCtx>, key: &str) {
         if item.ts + RETRY_INTERVAL_SECS > now {
             continue; // 未到重发点
         }
-        // 独占计数：超限即放弃（该条消息保持「已发送」状态）
-        if !ctx.st.outbox.bump_retry(key, item.pkt) {
+        if item.attempts >= RETRY_MAX {
+            ctx.st.outbox.claim_retry(key, item.pkt, now, false);
             ctx.st.diag(&format!(
-                "-> {key} pkt={} 重发 {} 次未确认，放弃",
-                item.pkt, RETRY_MAX
+                "-> {key} pkt={} 重发达到上限，停止自动投递",
+                item.pkt
             ));
+            continue;
+        }
+        // 旧公钥撤回期间等待新钥匙，不得退回明文。
+        if item.require_encryption
+            && (!ctx.st.config().encrypt || ctx.st.trust.peer_pubkey(key).is_none())
+        {
             continue;
         }
         // 对方离线：整体转入待投递队列（对方回来时补投）
@@ -736,11 +742,15 @@ async fn retry_pending_for(ctx: Arc<NetCtx>, key: &str) {
                 None => (bytes, target),
             },
         };
+        // 发送前复查：并发刷新/确认/重发不能绕过预算或把已加密消息降级。
+        if !ctx.st.outbox.claim_retry(key, item.pkt, now, enc) {
+            continue;
+        }
         if ctx.sock.send_to(&wire, send_to).await.is_ok() {
-            ctx.st.outbox.touch_retry_sent(key, item.pkt, now);
             ctx.st.diag(&format!(
                 "-> {key} 在线消息重发 pkt={}（第 {} 次）",
-                item.pkt, item.attempts
+                item.pkt,
+                item.attempts + 1
             ));
         }
     }
@@ -772,12 +782,34 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
     let cfg = ctx.st.config();
     let utf8 = proto::is_utf8_mode(&cfg.encoding);
     for item in ctx.st.outbox.pending_for(key) {
+        let now = now_secs();
+        if item.attempts > RETRY_MAX || item.last_sent.saturating_add(RETRY_INTERVAL_SECS) > now {
+            continue;
+        }
+        if item.require_encryption && (!cfg.encrypt || ctx.st.trust.peer_pubkey(key).is_none()) {
+            continue;
+        }
         // 附件消息：重投前重新校验文件并登记文件槽（复用直发路径）。
         // 文件已丢失/不可读 → 该条无法投递，出队并记诊断（否则无限重试）。
         let mut entries: Vec<proto::FileEntry> = Vec::new();
         if !item.paths.is_empty() {
-            match register_offer_files(ctx, item.pkt, &item.paths) {
-                Ok((es, _)) => entries = es,
+            match stat_file_entries(&item.paths) {
+                Ok(stats) if stats.len() == item.entries.len() => {
+                    entries = item.entries.clone();
+                    for (entry, path) in entries.iter().zip(&item.paths) {
+                        ctx.st.transfer.offer_slot(
+                            item.pkt,
+                            entry.id,
+                            OfferedFile {
+                                path: PathBuf::from(path),
+                                size: entry.size,
+                                is_dir: entry.attr & 0xff == fileattr::DIR,
+                                ts: now,
+                            },
+                        );
+                    }
+                }
+                Ok(_) => continue,
                 Err(e) => {
                     ctx.st.diag(&format!(
                         "-> {key} 离线附件消息 pkt={} 文件不可用，丢弃：{e}",
@@ -799,10 +831,7 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
             plain.extend_from_slice(joined.join("\u{7}").as_bytes());
             plain.push(0x07);
         }
-        // 重投时套用与直发一致的加密决策：此刻已缓存对方公钥就密封，
-        // 否则保守明文。这里不触发握手、绝不阻塞重投——对方上线广播后
-        // 预握手通常已完成，后续消息自然恢复加密。密封意外失败（如加注
-        // 尾注后超限）同样降级明文并记诊断，保证离线留言最终可达。
+        // 重新按当前公钥密封；加密失败或等待换钥时保留待发，不降级明文。
         let mut enc = false;
         let wire_extra = match if cfg.encrypt {
             ctx.st.trust.peer_pubkey(key)
@@ -817,10 +846,10 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
                     }
                     Err(e) => {
                         ctx.st.diag(&format!(
-                            "-> {key} 离线重投加密失败（pkt={}），降级明文：{e}",
+                            "-> {key} 离线重投加密失败（pkt={}），保留待发：{e}",
                             item.pkt
                         ));
-                        plain
+                        continue;
                     }
                 }
             }
@@ -843,6 +872,9 @@ async fn flush_pending_for(ctx: &NetCtx, key: &str) {
             ..pkt
         };
         let bytes = pkt.encode(&my_user(&cfg), &my_host());
+        if !ctx.st.outbox.claim_pending(key, item.pkt, now, enc) {
+            continue;
+        }
         if ctx.sock.send_to(&bytes, target).await.is_ok() {
             ctx.st.diag(&format!(
                 "-> {key} 离线消息重投 pkt={}（{} 附件项，待 RECVMSG 确认）",
@@ -1026,6 +1058,7 @@ async fn maybe_recover_stale_peer_key(
     if !cfg.encrypt || !is_decrypt_err_autoreply(text) {
         return;
     }
+    ctx.st.outbox.require_encryption(key);
     if ctx.st.trust.peer_pubkey(key).is_none() {
         // 本来就没缓存（或上一轮已撤过）：不重复动作
         return;
@@ -1815,9 +1848,6 @@ mod inbound {
                 .position(|&byte| byte == 0)
                 .unwrap_or(pkt.extra.len());
             let text = proto::decode_for_command(&pkt.extra[..text_end], pkt.command);
-            // 对端回「解不开」（DecryptErr 自动回复）= 我方缓存公钥过期 → 撤回重取
-            maybe_recover_stale_peer_key(ctx, from, key, &text, &ctx.st.config()).await;
-
             let prior = ctx.st.history.find_in_record(session_key, pkt.pkt_no);
             let prior = prior.filter(|record| {
                 let field = if verified_payload {
@@ -1961,6 +1991,10 @@ mod inbound {
 
             // 从这里往后持久化已确认成功；UI、自动下载、联系人恢复和自动应答等副作用
             // 一律放在这个边界之后。
+            // 去重并持久化之后才处理换钥；重传的旧错误回复不能撤销刚取回的新公钥。
+            if !is_broadcast {
+                maybe_recover_stale_peer_key(ctx, from, key, &text, &ctx.st.config()).await;
+            }
             let was_unhidden = !is_broadcast && ctx.st.history.unhide_contact(key);
 
             if !is_broadcast {
@@ -2629,6 +2663,10 @@ fn offline_enqueue_record(
         }
     }
     if ctx.st.outbox.enqueue_pending(PendingOut {
+        require_encryption: ctx.st.config().encrypt && ctx.st.trust.peer_pubkey(key).is_some(),
+        attempts: 0,
+        last_sent: 0,
+        entries: entries.clone(),
         key: key.to_string(),
         pkt: pkt_no,
         text: text.to_string(),
@@ -2808,8 +2846,8 @@ pub async fn send_message_opts(
     let peer = ctx.st.peers.get(key);
     let Some(peer) = peer else {
         // 对方不在线：文本与附件都进待投递队列（官方 IPMsg 语义，上线后自动
-        // 重投，以原包号发送并带延迟尾注）。队列只存本地路径，文件槽与公告
-        // ID 在重投时重新校验并登记（flush_pending_for）。
+        // 重投，以原包号发送并带延迟尾注）。队列保留路径与公告条目，
+        // 重投复用原文件 ID 并重新登记槽位（flush_pending_for）。
         return offline_enqueue_record(ctx, key, pkt_no, ts, text, &paths, flags);
     };
     let target = peer_addr(&peer).ok_or("无效的对方地址")?;
@@ -2840,6 +2878,18 @@ pub async fn send_message_opts(
         extra.push(0x07);
     }
 
+    let peer_key = if cfg.encrypt {
+        ctx.st.trust.peer_pubkey(key)
+    } else {
+        None
+    };
+    if cfg.encrypt && peer_key.is_none() && ctx.st.outbox.requires_encryption(key) {
+        for slot in &inserted {
+            ctx.st.transfer.release_slot(slot.0, slot.1);
+        }
+        return Err("对端公钥正在刷新，请稍后重发".into());
+    }
+
     // 出站加密决策（spec §5/§6）：开关开启且已缓存对方公钥 → 密封完整扩展部
     // （含尾部 \0）。seal_message 内置 UDP 上限保护，超限错误直接抛给前端分段。
     // 尚无缓存且对方未被标明文 → 本次仍明文发送，同时后台触发 GETPUBKEY
@@ -2850,7 +2900,7 @@ pub async fn send_message_opts(
     let mut enc = false;
     let mut wire_extra = extra.clone();
     if cfg.encrypt {
-        if let Some(pubk) = ctx.st.trust.peer_pubkey(key) {
+        if let Some(pubk) = peer_key {
             // 现场诊断（2026-08 官方客户端互通排查）：出站加密前落盘实际
             // 公告明文（含分隔与尾部 \0），用于与官方规范逐字节比对
             let plain = plain_payload(&extra);
@@ -2983,6 +3033,7 @@ pub async fn send_message_opts(
     // 累计 RETRY_MAX 次放弃。附件与纯文本一视同仁：公告丢包、对端换钥解密失败
     // 都能在下一轮重发自愈（重发会重新登记文件槽、按当前公钥重新密封）。
     ctx.st.outbox.enqueue_retry(RetryOut {
+        require_encryption: enc,
         key: key.to_string(),
         pkt: pkt_no,
         text: text.to_string(),
@@ -5741,6 +5792,239 @@ mod tests {
             key_ping_plan(true, 99, Some(KEY_REFRESH_INTERVAL_SECS)),
             Some(KeyPing::Slow)
         );
+    }
+
+    #[tokio::test]
+    async fn decrypt_err_pending_attachment_reencrypts_with_stable_packet_and_file_id() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("decrypt-err-offline").await;
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        let mut cfg = st.config();
+        cfg.encrypt = true;
+        st.set_config(cfg);
+        let old = st.trust.own_keypair();
+        st.trust
+            .remember_peer_key(&key, crate::crypto::CAPA_OUR_SEND, &old.public_key())
+            .unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let attachment = data_dir.join("note.txt");
+        std::fs::write(&attachment, b"test attachment").unwrap();
+        let record = super::send_message(
+            &ctx,
+            &key,
+            "offline private",
+            vec![attachment.to_string_lossy().into_owned()],
+        )
+        .await
+        .unwrap();
+        let packet_no = record["pkt"].as_u64().unwrap() as u32;
+        register_loopback_peer(&st, from.port());
+        super::flush_pending_for(&ctx, &key).await;
+        let first = sent_sendmsg(&peer).pop().unwrap();
+        let first_plain = crate::crypto::open_message(
+            &old,
+            std::str::from_utf8(&first.extra).unwrap(),
+            &[old.public_key()],
+            packet_no,
+        )
+        .unwrap()
+        .plain;
+        assert_eq!(st.outbox.pending_for(&key)[0].attempts, 1);
+        // Repeated presence announcements cannot immediately duplicate a delivery.
+        super::flush_pending_for(&ctx, &key).await;
+        assert!(sent_sendmsg(&peer).is_empty());
+        let mut error = crate::protocol::Packet::new(crate::protocol::cmd::SENDMSG);
+        error.extra = b"==== AutoReply(DecryptErr) ====\nMy PubKey is updated".to_vec();
+        handle_datagram(&ctx, &error.encode("peer", "peer-host"), from).await;
+        recv_test_packets(&peer);
+        let mut item = st.outbox.take_pending(&key).pop().unwrap();
+        item.last_sent = 0;
+        st.outbox.enqueue_pending(item);
+        super::flush_pending_for(&ctx, &key).await;
+        assert!(
+            sent_sendmsg(&peer).is_empty(),
+            "pending encrypted messages must wait for the replacement key"
+        );
+        // Reload persisted state to cover restart during the handshake.
+        st.outbox.load_pending();
+        assert!(st.outbox.pending_for(&key)[0].require_encryption);
+        let fresh = crate::crypto::KeyPair::generate().unwrap();
+        let mut answer = crate::protocol::Packet::new(crate::protocol::cmd::ANSPUBKEY);
+        answer.extra =
+            crate::crypto::build_anspubkey(crate::crypto::CAPA_OUR_SEND, &fresh).into_bytes();
+        handle_datagram(&ctx, &answer.encode("peer", "peer-host"), from).await;
+        super::flush_pending_for(&ctx, &key).await;
+        let second = sent_sendmsg(&peer).pop().unwrap();
+        assert_eq!(second.pkt_no, packet_no);
+        let second_plain = crate::crypto::open_message(
+            &fresh,
+            std::str::from_utf8(&second.extra).unwrap(),
+            &[old.public_key()],
+            packet_no,
+        )
+        .unwrap()
+        .plain;
+        assert_eq!(
+            first_plain, second_plain,
+            "attachment IDs and delayed footer must remain stable through rotation and restart"
+        );
+        assert_ne!(
+            st.history.find_history_any(&key, packet_no).unwrap()["delivered"],
+            true
+        );
+        let mut ack = crate::protocol::Packet::new(crate::protocol::cmd::RECVMSG);
+        ack.extra = packet_no.to_string().into_bytes();
+        handle_datagram(&ctx, &ack.encode("peer", "peer-host"), from).await;
+        assert!(st.outbox.pending_for(&key).is_empty());
+        assert_eq!(
+            st.history.find_history_any(&key, packet_no).unwrap()["delivered"],
+            true
+        );
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn offline_sealing_failure_keeps_pending_without_plaintext_fallback() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("offline-seal-fail").await;
+        let key = "127.0.0.1";
+        let mut cfg = st.config();
+        cfg.encrypt = true;
+        st.set_config(cfg);
+        st.trust
+            .remember_peer_key(
+                key,
+                crate::crypto::CAPA_OUR_SEND,
+                &st.trust.own_keypair().public_key(),
+            )
+            .unwrap();
+        super::send_message(&ctx, key, &"private".repeat(1000), vec![])
+            .await
+            .unwrap();
+        register_loopback_peer(&st, peer.local_addr().unwrap().port());
+        super::flush_pending_for(&ctx, key).await;
+        assert!(sent_sendmsg(&peer).is_empty());
+        assert_eq!(st.outbox.pending_for(key).len(), 1);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn exhausted_online_retry_stops_without_false_delivery_or_offline_requeue() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("retry-exhausted").await;
+        let key = "127.0.0.1";
+        register_loopback_peer(&st, peer.local_addr().unwrap().port());
+        let record = super::send_message(&ctx, key, "unacknowledged", vec![])
+            .await
+            .unwrap();
+        sent_sendmsg(&peer);
+        let mut item = st.outbox.retry_for(key).pop().unwrap();
+        item.attempts = super::RETRY_MAX;
+        item.ts = 0;
+        st.outbox.enqueue_retry(item);
+        super::retry_pending_for(Arc::new(ctx), key).await;
+        assert!(sent_sendmsg(&peer).is_empty());
+        assert!(st.outbox.retry_for(key).is_empty());
+        st.outbox.demote_retry_to_pending(key);
+        assert!(st.outbox.pending_for(key).is_empty());
+        assert_ne!(
+            st.history
+                .find_history_any(key, record["pkt"].as_u64().unwrap() as u32)
+                .unwrap()["delivered"],
+            true
+        );
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn decrypt_err_retry_waits_for_new_key_without_plaintext_or_false_delivery() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("decrypt-err-outbox").await;
+        let from = peer.local_addr().unwrap();
+        let key = from.ip().to_string();
+        register_loopback_peer(&st, from.port());
+        let mut cfg = st.config();
+        cfg.encrypt = true;
+        st.set_config(cfg);
+        st.trust
+            .remember_peer_key(
+                &key,
+                crate::crypto::CAPA_OUR_SEND,
+                &st.trust.own_keypair().public_key(),
+            )
+            .unwrap();
+        let record = super::send_message(&ctx, &key, "private retry", vec![])
+            .await
+            .unwrap();
+        let packet_no = record["pkt"].as_u64().unwrap() as u32;
+        assert_ne!(
+            sent_sendmsg(&peer)[0].command & crate::protocol::opt::ENCRYPTOPT,
+            0
+        );
+        let mut error = crate::protocol::Packet::new(
+            crate::protocol::cmd::SENDMSG | crate::protocol::opt::SENDCHECKOPT,
+        );
+        error.extra = b"==== AutoReply(DecryptErr) ====\nMy PubKey is updated".to_vec();
+        let wire = error.encode("peer", "peer-host");
+        handle_datagram(&ctx, &wire, from).await;
+        recv_test_packets(&peer);
+        assert!(st.trust.peer_pubkey(&key).is_none());
+        let mut item = st.outbox.retry_for(&key).pop().unwrap();
+        item.ts = 0;
+        st.outbox.enqueue_retry(item);
+        let ctx = Arc::new(ctx);
+        super::retry_pending_for(ctx.clone(), &key).await;
+        assert!(
+            sent_sendmsg(&peer).is_empty(),
+            "missing replacement key must never expose plaintext"
+        );
+        assert!(
+            super::send_message(&ctx, &key, "another private message", vec![])
+                .await
+                .is_err()
+        );
+        assert!(
+            sent_sendmsg(&peer).is_empty(),
+            "new messages must not bypass an active key refresh"
+        );
+        assert_ne!(
+            st.history.find_history_any(&key, packet_no).unwrap()["delivered"],
+            true
+        );
+        let fresh = crate::crypto::KeyPair::generate().unwrap();
+        let mut answer = crate::protocol::Packet::new(crate::protocol::cmd::ANSPUBKEY);
+        answer.extra =
+            crate::crypto::build_anspubkey(crate::crypto::CAPA_OUR_SEND, &fresh).into_bytes();
+        handle_datagram(&ctx, &answer.encode("peer", "peer-host"), from).await;
+        // A retransmitted error report must not evict the replacement key.
+        handle_datagram(&ctx, &wire, from).await;
+        assert_eq!(st.trust.peer_pubkey(&key), Some(fresh.public_key()));
+        let mut item = st.outbox.retry_for(&key).pop().unwrap();
+        item.ts = 0;
+        st.outbox.enqueue_retry(item);
+        super::retry_pending_for(ctx.clone(), &key).await;
+        let resent = sent_sendmsg(&peer);
+        assert_eq!(resent.len(), 1);
+        assert_eq!(resent[0].pkt_no, packet_no);
+        assert_ne!(resent[0].command & crate::protocol::opt::ENCRYPTOPT, 0);
+        let opened = crate::crypto::open_message(
+            &fresh,
+            std::str::from_utf8(&resent[0].extra).unwrap(),
+            &[st.trust.own_keypair().public_key()],
+            packet_no,
+        )
+        .unwrap();
+        assert_eq!(opened.plain, b"private retry");
+        assert_ne!(
+            st.history.find_history_any(&key, packet_no).unwrap()["delivered"],
+            true
+        );
+        let mut ack = crate::protocol::Packet::new(crate::protocol::cmd::RECVMSG);
+        ack.extra = packet_no.to_string().into_bytes();
+        handle_datagram(&ctx, &ack.encode("peer", "peer-host"), from).await;
+        assert!(st.outbox.retry_for(&key).is_empty());
+        assert_eq!(
+            st.history.find_history_any(&key, packet_no).unwrap()["delivered"],
+            true
+        );
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     /// 对端密钥轮换的自愈（实测驱动）：原版 IPMsg 解不开密文时会回一条正文含

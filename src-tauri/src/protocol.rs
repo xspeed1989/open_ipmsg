@@ -6,7 +6,7 @@
 //! - 附加数据中消息体与其后的文件列表以 `\0` 分隔，多个文件项以 `\a`(0x07) 分隔
 //! - 文件项：`ID:文件名:大小:mtime:属性[:扩展属性...]`
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -307,12 +307,12 @@ pub fn text_of(pkt: &Packet) -> String {
 
 /* ---------------- 文件项 ---------------- */
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
     pub id: u32,
     /// 对端公告中的原始 ID 字符串。各客户端进制约定不一（官方十六进制、
     /// 飞秋等十进制），回传 GETFILEDATA 请求时必须原样使用，禁止重新编码。
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub raw_id: String,
     pub name: String,
     pub size: u64,
@@ -321,7 +321,7 @@ pub struct FileEntry {
     /// 扩展属性段（官方 spec §3-5 extend-attr）：`attr 编号 → 值字符串`。
     /// 常见：CLIPBOARDPOS(8)=插入位置（贴图）、PERM/UID/MTIME 等。
     /// 解析端透传；发送端仅贴图带 CLIPBOARDPOS。
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ext_attrs: Vec<(u32, String)>,
 }
 
