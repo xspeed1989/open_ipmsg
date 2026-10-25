@@ -25,8 +25,8 @@ export function pickLatestUnread(unread = {}, unreadTs = {}, lastTs = {}) {
 }
 
 /**
- * 挑出「最近有消息活动」的会话（不限未读）：托盘双击时若没有未读，
- * 就退到它——保证双击托盘总能切到一个会话，而不是什么都不发生。
+ * 挑出「最近有消息活动」的会话（不限未读）：点托盘时若没有未读，
+ * 就退到它——保证单击托盘总能切到一个会话，而不是什么都不发生。
  * @returns {string} 会话 key；完全没有历史时返回空串
  */
 export function pickLatestActive(lastTs = {}, unreadTs = {}) {

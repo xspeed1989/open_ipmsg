@@ -40,10 +40,7 @@ use tauri::{
 };
 // Linux 回退托盘（GTK）不投递任何点击事件，事件类型只在 Windows/macOS 用到
 #[cfg(not(target_os = "linux"))]
-use tauri::tray::{MouseButton, TrayIconEvent};
-// MouseButtonState 只有 macOS 的手动双击判定用（Windows 走原生 DoubleClick）
-#[cfg(target_os = "macos")]
-use tauri::tray::MouseButtonState;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 
 pub(crate) type SharedState = Arc<AppState>;
 pub(crate) type SharedCtx = Arc<net::NetCtx>;
@@ -634,102 +631,6 @@ async fn copy_file_as(source: String, dest: String) -> Result<(), String> {
     Ok(())
 }
 
-/* ================= 托盘「双击」判定（SNI / macOS 没有双击事件） ================= */
-
-/// 两次单击判定为一次双击的最大间隔（毫秒）。
-/// 仅 SNI / macOS 模拟双击用；Windows 走原生 DoubleClick 事件，不编译
-#[cfg(not(target_os = "windows"))]
-const DOUBLE_CLICK_WINDOW_MS: u128 = 350;
-
-/// 单击 → 双击判定器：`feed(now)` 返回这次单击是否构成一次双击。
-///
-/// 需要模拟双击的平台：Linux SNI（StatusNotifierItem 协议只有 Activate
-/// 单击信号，没有双击）与 macOS 托盘（tray-icon 0.24 不投递 DoubleClick）。
-/// Windows 有原生 WM_LBUTTONDBLCLK，不走这里。
-///
-/// 语义（微信式）：单击本身没有任何动作，350ms 内连续两次单击才算双击。
-/// 判定成功后清空状态，避免三连击拆成「双击 + 单击」后残留旧时间戳。
-#[cfg(not(target_os = "windows"))]
-pub(crate) struct DoubleClickGate {
-    last: Option<std::time::Instant>,
-}
-
-#[cfg(not(target_os = "windows"))]
-impl DoubleClickGate {
-    pub(crate) const fn new() -> Self {
-        Self { last: None }
-    }
-
-    /// 送入一次单击的时间点。返回是否构成双击（是则重置状态，可作为
-    /// 下一组双击的第一次单击）。
-    pub(crate) fn feed(&mut self, now: std::time::Instant) -> bool {
-        let double = match self.last {
-            Some(prev) => now.saturating_duration_since(prev).as_millis() <= DOUBLE_CLICK_WINDOW_MS,
-            None => false,
-        };
-        self.last = if double { None } else { Some(now) };
-        double
-    }
-}
-
-/// 全局双击判定器：SNI 的回调跑在 DBus 线程、macOS 托盘事件跑在主线程，
-/// 用 Mutex 串行化（判定不依赖顺序，只依赖时间差）。
-#[cfg(not(target_os = "windows"))]
-static DOUBLE_CLICK_GATE: std::sync::Mutex<DoubleClickGate> =
-    std::sync::Mutex::new(DoubleClickGate::new());
-
-#[cfg(all(test, not(target_os = "windows")))]
-mod gate_tests {
-    use super::*;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn single_clicks_never_open() {
-        let mut g = DoubleClickGate::new();
-        let t = Instant::now();
-        assert!(!g.feed(t), "第一次单击不构成双击");
-        assert!(
-            !g.feed(t + Duration::from_millis(400)),
-            "间隔超窗的单击不算双击"
-        );
-        // 400ms 后的那次单击已成为新的「第一次」，再来一次相隔 400ms 的仍是单击
-        let t2 = t + Duration::from_millis(800);
-        assert!(!g.feed(t2));
-    }
-
-    #[test]
-    fn double_click_detected_and_resets() {
-        let mut g = DoubleClickGate::new();
-        let t = Instant::now();
-        assert!(!g.feed(t));
-        assert!(
-            g.feed(t + Duration::from_millis(200)),
-            "350ms 内第二次单击 = 双击"
-        );
-        // 判定成功后状态清空：1s 后的单击是下一组的第一下
-        assert!(!g.feed(t + Duration::from_millis(1000)));
-        assert!(
-            g.feed(t + Duration::from_millis(1200)),
-            "第二组双击仍能识别"
-        );
-    }
-
-    #[test]
-    fn window_boundary_is_inclusive() {
-        let mut g = DoubleClickGate::new();
-        let t = Instant::now();
-        assert!(!g.feed(t));
-        assert!(g.feed(t + Duration::from_millis(350)), "恰好在窗口内算双击");
-
-        let mut g2 = DoubleClickGate::new();
-        assert!(!g2.feed(t));
-        assert!(
-            !g2.feed(t + Duration::from_millis(351)),
-            "超过窗口 1ms 不算"
-        );
-    }
-}
-
 /* ================= Linux 托盘（自实现 StatusNotifierItem） =================
 
 Tauri 在 Linux 用的是 libappindicator：它只有菜单，**不投递任何点击事件**
@@ -738,11 +639,16 @@ Tauri 在 Linux 用的是 libappindicator：它只有菜单，**不投递任何�
 StatusNotifierItem —— KDE/XFCE 等宿主会对该对象调用 Activate。
 
 这里在 Linux 上同样自己注册 SNI（ksni），于是拿到了：
-  - 左键单击 → Activate：协议里没有双击信号，用两次单击的间隔自己判定
-    （≤350ms 视为双击，唤起主窗口并跳到最新未读会话；单击无动作，微信式）
+  - 左键单击 → Activate：唤起主窗口并跳到最新未读会话（微信就是单击唤起）。
+    **必须单击就生效**：SNI 协议只有单击 Activate，没有双击信号，而托盘宿主
+    （Omarchy/quickshell 的抽屉、GNOME 的 AppIndicator 等）单击只派发一次
+    Activate —— 早期版本「单击无动作、350ms 内两下才算双击」的做法在真实
+    托盘上几乎点不出来：抽屉是悬停展开的，图标在 600ms 动画里一直移动，
+    悬停 400ms 后还会弹出 tooltip 浮层抢走指针，第二下根本落不到图标上。
+    表现就是「单击、双击都没反应」，而微信单击就能跳窗口。
   - 悬停提示（含未读条数），libappindicator 下本来是没有的
   - 图标闪烁（更新图标即可）
-Windows 走 tray-icon 的原生 DoubleClick 事件；macOS 用单击间隔模拟（同上）。
+Windows/macOS 同样按单击处理（Windows 取左键抬起，避免按下/抬起各触发一次）。
 SNI 注册失败（桌面没有 SNI 宿主，如部分 X11 轻量桌面）时回退到 Tauri 自带
 托盘：GTK 托盘连点击事件都没有，只能靠右键菜单。 */
 #[cfg(target_os = "linux")]
@@ -802,19 +708,13 @@ mod linux_tray {
                 ..Default::default()
             }
         }
-        /// 左键单击：SNI 协议里没有双击信号，用两次 activate 的间隔自己判定
-        /// （双击判定器见 DOUBLE_CLICK_GATE）。微信式：单击无动作，双击才唤起。
+        /// 左键单击：直接唤起（微信式）。SNI 没有双击信号，宿主也不会为一次
+        /// 点击连发两次 Activate，所以唤起不能依赖「两下」——详见模块头注释。
         fn activate(&mut self, _x: i32, _y: i32) {
-            if super::DOUBLE_CLICK_GATE
-                .lock()
-                .unwrap()
-                .feed(std::time::Instant::now())
-            {
-                activate_from_tray(&self.app);
-            }
+            activate_from_tray(&self.app);
         }
         fn secondary_activate(&mut self, _x: i32, _y: i32) {
-            // 中键单击：快捷唤起（不属于左键连击，不参与双击判定）
+            // 中键单击：同样是快捷唤起
             activate_from_tray(&self.app);
         }
         fn menu(&self) -> Vec<MenuItem<Self>> {
@@ -2009,32 +1909,18 @@ pub fn run() {
                     _ => {}
                 })
                 .on_tray_icon_event(|_tray, event| {
-                    // 双击唤起主窗口（并跳到最新的未读会话），微信式：单击无动作。
-                    // Windows 有原生 DoubleClick 事件；macOS 的 tray-icon 只投递
-                    // 单击，用两次单击的间隔自己判定（见 DOUBLE_CLICK_GATE）。
-                    // Linux 回退托盘（GTK）不投递任何点击事件，双击判定在 SNI 里做。
-                    #[cfg(target_os = "windows")]
-                    if let TrayIconEvent::DoubleClick {
-                        button: MouseButton::Left,
-                        ..
-                    } = event
-                    {
-                        activate_from_tray(_tray.app_handle());
-                    }
-                    #[cfg(target_os = "macos")]
+                    // 左键单击唤起主窗口（并跳到最新的未读会话），微信式。
+                    // 只认「抬起」：Windows/macOS 的 tray-icon 按下和抬起各投递
+                    // 一次 Click，两处都处理会唤起两遍（Wayland 上等于闪一下）。
+                    // Linux 走 SNI（见 linux_tray），回退托盘（GTK）不投递点击。
+                    #[cfg(not(target_os = "linux"))]
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
                         ..
                     } = event
                     {
-                        if DOUBLE_CLICK_GATE
-                            .lock()
-                            .unwrap()
-                            .feed(std::time::Instant::now())
-                        {
-                            activate_from_tray(_tray.app_handle());
-                        }
+                        activate_from_tray(_tray.app_handle());
                     }
                     #[cfg(target_os = "linux")]
                     let _ = event;
