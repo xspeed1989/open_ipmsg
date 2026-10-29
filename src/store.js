@@ -283,6 +283,9 @@ export async function openChat(key) {
   store.activeKey = key
   store.chatOpenVersion += 1
   await markReadFor(key)
+  // 会话激活 = 卡片显形的那一刻：先把「已保存」核对一遍，免得显示一条
+  // 指向已被删掉文件的「打开」。批量问一次，不按文件逐个问。
+  await refreshLocalFiles(key)
 }
 
 /* ---------------- 已读回执 ---------------- */
@@ -453,6 +456,57 @@ export async function downloadFile(msg, file) {
   }
 }
 
+/* ---------------- 收件附件的本地存在性 ---------------- */
+
+/** 会话里「已保存」的收件附件（state=done 且有落盘路径）。
+ *  只有它们需要核对磁盘：还没有 path 的（下载中/失败）本来就没有「已保存」可谈。 */
+export function savedIncomingFiles(key) {
+  const out = []
+  for (const m of store.chats[key]?.msgs || []) {
+    if (m.dir !== 'in') continue
+    for (const f of m.files || []) {
+      if (f.state === 'done' && f.path) out.push(f)
+    }
+  }
+  return out
+}
+
+/**
+ * 让磁盘说话：核对会话里「已保存」的收件附件是否还在本地，缺失的标 f.missing。
+ *
+ * 为什么需要：记录里的 state/path 是**下载成功那一刻**的事实。用户在文件管理器里
+ * 把文件删掉，记录不会跟着变 —— 卡片照样显示「已保存 / 打开 / 所在文件夹」，点开的
+ * 是一条已经不存在的路径，而界面上没有任何重新下载的入口（真机问题：删了就再也下不
+ * 回来）。所以显示「已保存」之前先问一次磁盘。
+ *
+ * 有界：一次 invoke 问整批（不是每个文件一次），也不挂轮询定时器 —— 用户删文件不产生
+ * 任何事件，能问的时机只有「会话激活时」与「下载完成时」这两个。
+ *
+ * 问不到（IPC 失败）时一律当「还在」：把用户没删的文件标成已删除、进而藏起「打开」，
+ * 比多显示一次旧状态糟糕得多。
+ *
+ * @returns {Promise<number>} 被标成缺失的条数
+ */
+export async function refreshLocalFiles(key) {
+  const files = savedIncomingFiles(key)
+  if (!files.length) return 0
+  let existed = []
+  try {
+    existed = await ipc.localFilesExist(files.map((f) => f.path))
+  } catch (e) {
+    console.error('local_files_exist failed', e)
+    return 0
+  }
+  let missing = 0
+  files.forEach((f, i) => {
+    // 答案缺失（后端少回一项）按「还在」算，理由同上
+    const gone = existed?.[i] === false
+    f.missing = gone
+    if (gone) missing += 1
+  })
+  return missing
+}
+
 /* ---------------- 聊天记录搜索 ---------------- */
 
 let searchTimer = null
@@ -612,6 +666,8 @@ async function runEffects(effects) {
     } else if (e.type === 'reload_people') {
       loadUsers()
       loadSessions()
+    } else if (e.type === 'refresh_local_files') {
+      await refreshLocalFiles(e.key)
     } else if (e.type === 'open_chat') {
       await openChatAndFocus(e.key, e.logLabel)
     }

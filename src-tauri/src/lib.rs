@@ -545,6 +545,25 @@ async fn download_file(
     Ok(())
 }
 
+/// 批量问「这些本地路径还在不在」，与入参逐项对齐。
+///
+/// 为什么需要它：收件卡片上的「已保存」是从历史记录里读出来的 `state=done + path`，
+/// 那是**当初下载成功那一刻**的事实。用户在文件管理器里把文件删掉之后记录不会变，
+/// 卡片照样显示「已保存 / 打开 / 所在文件夹」—— 点开的是一条已经不存在的路径，
+/// 而界面上没有任何重新下载的入口（真机问题：删了就再也下不回来）。所以显示
+/// 「已保存」之前先让磁盘说话。
+///
+/// 批量而不是逐个：一个会话里可能几十个附件，每个文件一次 IPC 会在打开会话时
+/// 打一串往返。判据用 `exists()` 而不是 `is_file()`：目录附件（`dir_entry`）
+/// 的落盘结果本来就是一个目录。
+#[tauri::command]
+async fn local_files_exist(paths: Vec<String>) -> Vec<bool> {
+    paths
+        .iter()
+        .map(|p| !p.is_empty() && std::path::Path::new(p).exists())
+        .collect()
+}
+
 /// 发送剪贴板图片：先落盘到数据目录下的缓存目录，再按普通附件公告出去。
 /// IPMsg 协议没有独立的"图片"报文，图片就是一个附件；对端（含官方客户端）
 /// 按文件接收，本客户端则会自动接收并在聊天里内联显示。
@@ -1979,6 +1998,7 @@ pub fn run() {
             set_unread,
             notify_message,
             download_file,
+            local_files_exist,
             read_image_data,
             copy_file_as,
             open_image_viewer,

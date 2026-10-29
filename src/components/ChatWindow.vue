@@ -1455,9 +1455,21 @@ watch(
                           <i v-if="f.total" class="bar"><i :style="{ width: pct(f) + '%' }"></i></i>
                         </template>
                         <template v-else-if="f.state === 'done'">
-                          <span class="ok">{{ f.enc ? t('chat.decrypted') : (f.dir_entry ? t('chat.folderSaved') : t('chat.saved')) }}</span>
-                          <a @click.prevent="openFile(f.path)">{{ t('chat.open') }}</a>
-                          <a @click.prevent="revealFile(f.path)">{{ t('chat.revealDir') }}</a>
+                          <!-- 本地那份已经被删掉（后端核对过磁盘）：不能再说「已保存」，
+                               也不给「打开 / 所在文件夹」—— 点开是一条不存在的路径，
+                               只剩重新下载这一条出路 -->
+                          <template v-if="f.missing">
+                            <span class="err">{{ t('chat.localDeleted') }}</span>
+                          </template>
+                          <template v-else>
+                            <span class="ok">{{ f.enc ? t('chat.decrypted') : (f.dir_entry ? t('chat.folderSaved') : t('chat.saved')) }}</span>
+                            <a @click.prevent="openFile(f.path)">{{ t('chat.open') }}</a>
+                            <a @click.prevent="revealFile(f.path)">{{ t('chat.revealDir') }}</a>
+                          </template>
+                          <!-- 「重新下载」永远在，不只在文件丢了时：它同时是「下载下来的
+                               那份坏了」的逃生口。重复下载不会造副本 —— 落盘前按内容哈希判重，
+                               同内容复用同一份（docs/adr/0004） -->
+                          <a class="redownload" @click.prevent="downloadFile(v.m, f)">{{ t('chat.redownload') }}</a>
                         </template>
                         <template v-else-if="f.state === 'failed'">
                           <span class="err">{{ t('chat.failed') }}</span>

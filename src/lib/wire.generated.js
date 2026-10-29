@@ -38,6 +38,7 @@ export const WIRE = {
     set_unread: 'set_unread',
     notify_message: 'notify_message',
     download_file: 'download_file',
+    local_files_exist: 'local_files_exist',
     read_image_data: 'read_image_data',
     copy_file_as: 'copy_file_as',
     open_image_viewer: 'open_image_viewer',
