@@ -188,7 +188,12 @@ function onFileProgress(state, p) {
   // 那条「下载完成」丢了，卡片就永远停在「下载中」。暂存，入列后回放。
   if (!applyFileProgress(state.chats[p.key], p)) {
     bufferFileProgress(state.pendingFileProgress, p)
+    return { effects: [] }
   }
+  // 下载刚完成 → 这条卡片上的「本地文件已删除」必须立刻消掉（重新下载成功就是
+  // 它存在的意义）。但显示「已保存」得以磁盘为准，所以重新问一次而不是就地抹标：
+  // 一次批量 invoke，不是每个文件一条。
+  if (p.done && p.path) return { effects: [{ type: 'refresh_local_files', key: p.key }] }
   return { effects: [] }
 }
 

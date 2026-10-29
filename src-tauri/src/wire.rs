@@ -63,6 +63,7 @@ wire_names!(
     SET_UNREAD => "set_unread",
     NOTIFY_MESSAGE => "notify_message",
     DOWNLOAD_FILE => "download_file",
+    LOCAL_FILES_EXIST => "local_files_exist",
     READ_IMAGE_DATA => "read_image_data",
     COPY_FILE_AS => "copy_file_as",
     OPEN_IMAGE_VIEWER => "open_image_viewer",

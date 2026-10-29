@@ -106,6 +106,10 @@ export const sendClipboardImage = (key, text, b64, mime) =>
 export const downloadFile = (key, pktNo, fileId, name, rid, size, isDir) =>
   invoke(WIRE.cmd.download_file, { key, pktNo, fileId, name, rid, size, isDir })
 
+/** 批量问这些本地路径还在不在（收件卡片的「已保存」是否仍然成立）。
+ *  一次 invoke 问一整批：一个会话里可能几十个附件，逐个问会在打开会话时打一串往返 */
+export const localFilesExist = (paths) => invoke(WIRE.cmd.local_files_exist, { paths })
+
 /** 标记入站消息已读，并对要求回执的消息发送 READMSG；返回发出的回执数 */
 export const markRead = (key, pkts) => invoke(WIRE.cmd.mark_read, { key, pkts })
 

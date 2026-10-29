@@ -5767,6 +5767,192 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+    /// 收件「删了本地那份就再也下不回来」的后端那一半：重复下载必须被允许，
+    /// 且历史里的 path 要跟着指向**这一次**落盘的那份。
+    ///
+    /// 真机问题（2026-10）：对端发来的文件下载过，用户把接收目录里那份删掉之后，
+    /// 界面上既没有入口、卡片还显示「已保存」—— 前端那一半是 store.js 的
+    /// refreshLocalFiles 与 ChatWindow 里的重新下载链接。后端本来就没有「下过一次
+    /// 就拒绝」的门（`download_file_task` 不看历史里的 state），这条用例把它钉住：
+    /// 同一（包号, 附件编号）再下第二次要成功，且不造副本（ADR-0004 的内容索引）。
+    #[tokio::test]
+    async fn redownload_after_local_copy_deleted_succeeds() {
+        const BODY: &[u8] = b"quarter-report-v1";
+        let (ctx, st, _peer, data_dir) = encipdict_test_ctx("redownload").await;
+        let key = "127.0.0.1";
+
+        // 假对端：每接一个连接就吐整份内容再关写端（方言重试可能多连几次）
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = [0u8; 2048];
+                let _ = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut req)).await;
+                let _ = stream.write_all(BODY).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        register_loopback_peer(&st, target.port());
+        st.history.log_record(
+            key,
+            &json!({
+                "dir": "in", "kind": "file", "text": "", "ts": now_secs(), "pkt": 601,
+                "peer": {"key": key}, "need_read": false, "read": false,
+                "files": [{"id": 7, "name": "报表.txt", "size": BODY.len(), "state": "downloading"}],
+            }),
+        );
+
+        // 1) 第一次下载：落盘 + 历史回写 path
+        let first = super::download_file_task(
+            &ctx, key, 601, 7, "报表.txt", "7", BODY.len() as u64, false,
+        )
+        .await
+        .expect("第一次下载应当成功");
+        assert_eq!(std::fs::read(&first).unwrap(), BODY);
+        let rec = st
+            .history
+            .find_history_pkt(key, 601)
+            .expect("历史里应有这条收件记录");
+        assert_eq!(rec["files"][0]["state"], json!("done"));
+        assert_eq!(
+            rec["files"][0]["path"].as_str(),
+            Some(first.to_string_lossy().as_ref())
+        );
+
+        // 2) 用户把接收目录里那份删掉（界面上就变成了「本地文件已删除」）
+        std::fs::remove_file(&first).unwrap();
+        assert!(!first.exists());
+
+        // 3) 再下一遍：必须成功，历史 path 指向新落盘的那份
+        let second = super::download_file_task(
+            &ctx, key, 601, 7, "报表.txt", "7", BODY.len() as u64, false,
+        )
+        .await
+        .expect("删掉本地那份之后必须还能再下一次");
+        assert!(second.exists(), "重新下载要真的落盘");
+        assert_eq!(std::fs::read(&second).unwrap(), BODY);
+        let rec = st.history.find_history_pkt(key, 601).unwrap();
+        assert_eq!(rec["files"][0]["state"], json!("done"));
+        assert_eq!(
+            rec["files"][0]["path"].as_str(),
+            Some(second.to_string_lossy().as_ref()),
+            "历史要指向新文件，否则卡片会指回那条死路径"
+        );
+        assert_eq!(
+            std::fs::read_dir(data_dir.join("接收文件")).unwrap().count(),
+            1,
+            "重复下载不该造副本：同内容复用同一份（ADR-0004）"
+        );
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    /// 对端不在线时点重新下载：后端必须推一条 file-progress 失败事件，并把历史
+    /// 回写成 failed —— 否则前端卡片会永远停在「下载中」（那两个早退分支以前只写
+    /// 日志就 return Err，界面既没有失败提示、也没有重试入口）。
+    #[tokio::test]
+    async fn download_failure_when_peer_offline_reaches_frontend() {
+        use std::sync::Mutex;
+
+        let (ctx, st, _peer, data_dir) = encipdict_test_ctx("dl-offline").await;
+        let seen: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_in = seen.clone();
+        st.set_event(Box::new(move |e, v| {
+            seen_in.lock().unwrap().push((e.to_string(), v));
+        }));
+
+        let key = "192.0.2.77"; // 从没上线过的对端
+        st.history.log_record(
+            key,
+            &json!({
+                "dir": "in", "kind": "file", "text": "", "ts": now_secs(), "pkt": 702,
+                "peer": {"key": key}, "need_read": false, "read": false,
+                "files": [{"id": 8, "name": "x.txt", "size": 10, "state": "downloading"}],
+            }),
+        );
+
+        let err = super::download_file_task(&ctx, key, 702, 8, "x.txt", "8", 10, false)
+            .await
+            .expect_err("对端不在线必须报错");
+        assert_eq!(err, "对方不在线");
+
+        let events = std::mem::take(&mut *seen.lock().unwrap());
+        let failed: Vec<&Value> = events
+            .iter()
+            .filter(|(e, _)| e == wire::evt::FILE_PROGRESS)
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            failed.len(),
+            1,
+            "必须推一条失败事件：前端卡片据此落到 failed + 可重试"
+        );
+        assert_eq!(failed[0]["error"], json!("对方不在线"));
+        assert_eq!(failed[0]["done"], json!(false));
+        assert_eq!(failed[0]["pkt"], json!(702));
+        assert_eq!(failed[0]["file_id"], json!(8));
+
+        let rec = st.history.find_history_pkt(key, 702).unwrap();
+        assert_eq!(
+            rec["files"][0]["state"],
+            json!("failed"),
+            "历史也要落到 failed，重开会话不能又显示下载中"
+        );
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    /// 「接收目录建不出来」同样要收尾：卡片落到 failed，不是挂在下载中。
+    #[tokio::test]
+    async fn download_failure_when_download_dir_unusable_reaches_frontend() {
+        use std::sync::Mutex;
+
+        let (ctx, st, _peer, data_dir) = encipdict_test_ctx("dl-nodir").await;
+        std::fs::create_dir_all(&data_dir).unwrap();
+        // 让 mkdir 必然失败：下载目录的父路径是一个普通文件
+        let blocker = data_dir.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut cfg = st.config();
+        cfg.download_dir = blocker.join("dl").to_string_lossy().into_owned();
+        st.set_config(cfg);
+
+        let seen: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_in = seen.clone();
+        st.set_event(Box::new(move |e, v| {
+            seen_in.lock().unwrap().push((e.to_string(), v));
+        }));
+        register_loopback_peer(&st, 2425); // 对端有地址：失败点只在建目录
+
+        let err = super::download_file_task(&ctx, "127.0.0.1", 703, 9, "y.txt", "9", 5, false)
+            .await
+            .expect_err("目录建不出来必须报错");
+        assert!(
+            err.contains("创建接收目录失败"),
+            "失败原因要原样带出来，实际：{err}"
+        );
+
+        let events = std::mem::take(&mut *seen.lock().unwrap());
+        let failed: Vec<&Value> = events
+            .iter()
+            .filter(|(e, _)| e == wire::evt::FILE_PROGRESS)
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(failed.len(), 1, "建不出目录也要推失败事件");
+        assert_eq!(failed[0]["done"], json!(false));
+        assert!(
+            failed[0]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("创建接收目录失败")
+        );
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
 
     /// 补发节奏的判据（合并后唯一一处）：预握手快节奏到上限转慢节奏、已有钥匙只在
     /// 「太久没确认/从未确认」时慢节奏确认一次。纯函数，覆盖得快也改得放心。
@@ -8028,12 +8214,16 @@ pub async fn download_file_task(
     expect_size: u64,
     is_dir: bool,
 ) -> Result<PathBuf, String> {
-    let peer = ctx
-        .st
-        .peers
-        .get(key)
-        .ok_or_else(|| "对方不在线".to_string())?;
-    let target = peer_addr(&peer).ok_or("无效的对方地址")?;
+    // 三个早退分支以前直接 `?` 返回：只有 command 层记一条日志，没有 file-progress
+    // 失败事件 —— 而前端在点下载的那一刻就把卡片置成了「下载中」。于是「对端不在线」
+    // 时点重新下载，卡片会永远挂在「下载中」：既看不到失败提示，也没有重试入口。
+    // 走 fail_download 才让界面落到 failed + 可重试。
+    let Some(peer) = ctx.st.peers.get(key) else {
+        return fail_download_early(ctx, key, pkt_no, file_id, "对方不在线");
+    };
+    let Some(target) = peer_addr(&peer) else {
+        return fail_download_early(ctx, key, pkt_no, file_id, "无效的对方地址");
+    };
 
     let cfg = ctx.st.config();
     let dir = PathBuf::from(if cfg.download_dir.is_empty() {
@@ -8045,7 +8235,9 @@ pub async fn download_file_task(
     } else {
         cfg.download_dir.clone()
     });
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建接收目录失败: {e}"))?;
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return fail_download_early(ctx, key, pkt_no, file_id, &format!("创建接收目录失败: {e}"));
+    }
 
     let mut safe_name: String = name
         .chars()
@@ -8321,7 +8513,11 @@ async fn download_dir_task(
         Ok(Some(total)) => {
             // 落盘瞬间才定名，避免并发接收抢同一个目录名
             let final_path = unique_path(&parent.join(safe_name));
-            std::fs::rename(tmp_root, &final_path).map_err(|e| format!("保存目录失败: {e}"))?;
+            // 同款收尾：改名失败（目标被占、跨设备、权限）也必须推失败事件，
+            // 否则目录卡片同样会永远停在「下载中」
+            if let Err(e) = std::fs::rename(tmp_root, &final_path) {
+                return fail_download_early(ctx, key, pkt_no, file_id, &format!("保存目录失败: {e}"));
+            }
             ctx.st.diag(&format!(
                 "dl-dir-done {key} pkt={pkt_no} id={file_id:x} -> {} ({total}B)",
                 final_path.display()
@@ -8769,6 +8965,22 @@ pub(crate) async fn open_transfer(
         },
         enc.is_some(), // 是否加密流（UI 区分「下载/解密」状态）
     ))
+}
+
+/// 早退分支出错时的收尾：先 `fail_download`，再返回同一个原因的 Err。
+///
+/// 与 `?` 的差别就是那个事件：`fail_download` 让前端卡片落到 failed（可重试），
+/// 只写日志的 Err 会让卡片永远停在「下载中」—— 真机上「对端离线时点重新下载，
+/// 一直转圈」就是这么来的。
+fn fail_download_early<T>(
+    ctx: &NetCtx,
+    key: &str,
+    pkt_no: u32,
+    file_id: u32,
+    err: &str,
+) -> Result<T, String> {
+    fail_download(ctx, key, pkt_no, file_id, err);
+    Err(err.to_string())
 }
 
 /// 下载失败的统一收尾：推事件 + 回写历史，避免卡片永远停在"下载中"
