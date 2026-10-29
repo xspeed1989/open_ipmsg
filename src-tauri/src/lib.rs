@@ -964,13 +964,26 @@ async fn set_unread(app: tauri::AppHandle, total: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Linux 通知注册的动作标识符。
+///
+/// default 是 D-Bus 规范里的「点正文」标识符：GNOME、KDE，以及 Omarchy 的 quickshell
+/// 守护进程都只在存在 default 动作时才把点击转成 ActionInvoked；缺了它，quickshell
+/// 退化成「按 appname 找 Hyprland 窗口并聚焦」，而 appname（Open IPMsg）与窗口 class
+/// 不同名，于是什么也不会发生 —— 这就是「点通知没反应」的根因。
+/// open 是显式按钮，供能渲染动作按钮的守护进程使用（default 的文案不会被显示）。
+#[cfg(target_os = "linux")]
+fn linux_notify_action_ids() -> Vec<&'static str> {
+    vec!["default", "open"]
+}
+
 /// Linux 原生「可点击」消息通知：点击通知（正文或「打开」按钮）→ 前端收到
 /// open-chat 事件 → 弹出主窗口并切到对应会话。
 ///
 /// 为什么不用 tauri-plugin-notification：它的 JS/Rust API 都没有「点击通知」
 /// 回调，点了没反应。这里直接用 notify-rust 发 DBus 通知 —— 通知守护进程
-/// 会把点击作为 ActionInvoked 送回（KDE/XFCE 点正文触发 default 动作；
-/// GNOME 不支持 default 动作，但「打开」按钮同样可用）。
+/// 会把点击作为 ActionInvoked 送回。但守护进程只把「点正文」翻译成动作，而且一律
+/// 只认标识符 default（GNOME / KDE / Omarchy 的 quickshell 都是这样）—— 所以动作
+/// 列表必须把 default 注册上，否则点击被静默吞掉（见 linux_notify_action_ids）。
 /// Windows 侧用 tauri-winrt-notification 发 toast：它的 `on_activated` 回调在**本进程内**
 /// 触发，所以不需要「重启进程 + 单实例 argv 转发」那套；app_id 与 tauri-plugin-notification
 /// 一致（都用 app identifier），系统里显示为同一个应用。点正文时回调参数是 `None`
@@ -986,12 +999,16 @@ fn notify_message(
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
+        let label = ui_str(&lang, "打开", "Open");
         let mut n = notify_rust::Notification::new();
         n.appname("Open IPMsg")
             .icon("open-ipmsg")
             .summary(&title)
-            .body(&body)
-            .action("open", &ui_str(&lang, "打开", "Open"));
+            .body(&body);
+        // default 必须在：见 linux_notify_action_ids 的注释
+        for id in linux_notify_action_ids() {
+            n.action(id, &label);
+        }
         let handle = n.show().map_err(|e| format!("通知发送失败: {e}"))?;
         oim_log!("[notify] shown id={} key={}", handle.id(), key);
         // wait_for_action 会阻塞到通知被点击或关闭（守护进程超时/手动关掉也会
@@ -1280,6 +1297,17 @@ mod tests {
         );
         assert_eq!(file_uri_to_path("http://example.com/a"), None);
         assert_eq!(file_uri_to_path("file://"), None);
+    }
+
+    /// 通知动作里必须有 default：缺了它，Omarchy（quickshell）/ GNOME 下点通知不会
+    /// 发出 ActionInvoked，只会被当成「点了条没有动作的消息」静默丢掉。
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_notify_actions_include_default() {
+        use super::linux_notify_action_ids;
+        let ids = linux_notify_action_ids();
+        assert!(ids.contains(&"default"), "缺 default，点正文不会有任何回调");
+        assert!(ids.contains(&"open"), "显式按钮的标识符");
     }
 
     #[test]
