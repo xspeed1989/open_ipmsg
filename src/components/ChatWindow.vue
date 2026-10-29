@@ -1473,6 +1473,15 @@ watch(
                         </template>
                         <template v-else-if="f.state === 'failed'">
                           <span class="err">{{ t('chat.failed') }}</span>
+                          <!-- 「失败」说的是这一次下载，不是本地有没有：重新下载一个早就
+                               落好盘的文件、恰好碰上对端离线时，历史会落到 failed，但 path
+                               与字节都还在。这时把「打开 / 所在文件夹」收走，就是另一种
+                               「界面说的不是本地真相」—— 手里有完好的文件反而打不开。
+                               所以磁盘上有就照样给，没有才只留失败与重试。 -->
+                          <template v-if="f.path && !f.missing">
+                            <a @click.prevent="openFile(f.path)">{{ t('chat.open') }}</a>
+                            <a @click.prevent="revealFile(f.path)">{{ t('chat.revealDir') }}</a>
+                          </template>
                           <a @click.prevent="downloadFile(v.m, f)">{{ t('chat.retry') }}</a>
                         </template>
                       </template>
