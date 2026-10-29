@@ -207,13 +207,28 @@ export async function refreshUsers() {
   setTimeout(loadUsers, 600)
 }
 
-export async function ensureChat(key) {
+/**
+ * 确保会话在内存里（没加载过就从后端拉历史）。返回该会话对象。
+ *
+ * exclude 是给事件路径用的：后端**先落库再发事件**（src-tauri/src/net.rs:2091），
+ * 所以「刚到的这条」一定也在历史里。把它从历史里剔掉 —— 事件载荷才是权威副本，
+ * transitions.insertMessage 会把它并入（并保留历史里的已读/附件状态）。不剔的话，
+ * 同一包号在 msgs 里先出现一次，onMsgIn 的去重就把真消息当成「重投」，
+ * 未读与通知一起丢：某个会话在本进程里收到的第一条消息永远不会提醒。
+ *
+ * @param {string} key
+ * @param {{exclude?: {dir?: string, pkt?: number}}} [opts]
+ */
+export async function ensureChat(key, { exclude } = {}) {
   if (!store.chats[key]) {
     let msgs = []
     try {
       msgs = await ipc.getHistory(key)
     } catch (e) {
       console.error('getHistory failed', e)
+    }
+    if (exclude) {
+      msgs = msgs.filter((m) => !(m.dir === exclude.dir && m.pkt === exclude.pkt))
     }
     for (const m of msgs) {
       if (m.peer) store.peerMeta[key] = m.peer
@@ -646,7 +661,8 @@ export function setStickerIndex(list) {
  */
 async function dispatchEvent(event, payload) {
   if (event === 'msg-in' || event === 'msg-out') {
-    if (payload?.key) await ensureChat(payload.key)
+    // 排除正在投递的这条：历史里那份是后端先落库留下的，不是重投（见 ensureChat）
+    if (payload?.key) await ensureChat(payload.key, { exclude: payload.msg })
   }
   const { effects } = transitions.applyEvent(store, event, payload)
   await runEffects(effects)
