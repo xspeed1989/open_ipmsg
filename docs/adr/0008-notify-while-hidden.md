@@ -49,8 +49,12 @@ true 且焦点只由焦点事件恢复、四种决策分支都写一行日志且
 并留痕且不影响未读记账。
 
 `cargo test --lib` 覆盖：分 scope 日志默认开启（`--log` 关着也写）、一行一条（换行被压平）、
-超 256KB 轮转且只留两份、超长 detail 截断、scope 名写不穿目录；`hide_then_show` 在
-MockRuntime 上真 emit，断言两发且以 `true` 收尾、payload 键名与 `wire.rs` 声明一致；
+超 256KB 轮转且只留两份、超长 detail 截断、scope 名写不穿目录；窗口可见性的两个不变量
+**不用 `tauri/test` 特性**验证（该 feature 在 Windows 上会让测试二进制因 0xc0000139
+STATUS_ENTRYPOINT_NOT_FOUND 起不来，见 `src-tauri/Cargo.toml` 的说明）：帧序列由纯函数
+`visibility_frames` 单测钉住（was-visible → `[false, true]`，now-visible → `[true]`，
+收尾恒为 `true`），发射点 `push_visibility_frames` 用注入的收集器断言「帧真的被 emit、
+事件名等于 `wire::evt::WINDOW_VISIBILITY`、payload 键名等于 `wire::fields::WINDOW_VISIBILITY`」；
 发送超时不阻塞调用方（假发送器睡 300ms、上限 50ms，断言耗时可测地短）；失败重试一次并把
 两次 attempt 都写进 `logs/notify.log`。
 

@@ -59,19 +59,67 @@ static HIDE_NOTIFIED: AtomicBool = AtomicBool::new(false);
 ///
 /// 每次 hide/show 都发一次（不去重）：这是状态同步，不是变化流 —— 漏一次
 /// 就可能永久停在错的那一侧，宁可多发。
+///
+/// 单发版本（关窗到托盘等只发生一次状态变化的调用点用）；hide→show 的
+/// 两连击走 `emit_visibility_frames`，帧序列由纯函数 `visibility_frames` 决定。
 fn emit_window_visibility<R: tauri::Runtime>(app: &tauri::AppHandle<R>, visible: bool) {
-    use tauri::Emitter;
-    // 顺带留证据：出问题时能看出「吞通知那一刻窗口到底是不是可见」
-    if let Some(st) = app.try_state::<SharedState>() {
-        st.diag_scope(
-            "window",
-            &format!(
-                "visibility visible={}",
-                if visible { "true" } else { "false" }
-            ),
-        );
+    emit_visibility_frames(app, &[visible]);
+}
+
+/// 一次「用户意图」该发哪几发 window-visibility —— **不变量在这里，且在这里可测**。
+///
+/// 纯函数、不碰 Tauri：这条不变量是「必须以 true 收尾」（停在 false 就等于把
+/// 之后所有通知都吞掉，可见性是前端唯一允许不打扰的理由）。抽出来是为了用普通
+/// 单测钉死它，而不是为了一条断言去引 `tauri/test` 特性 —— 那样做的代价见
+/// `Cargo.toml` 里「本 crate 不声明任何 dev-dependency」那段注释
+/// （Windows 测试二进制 0xc0000139）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn visibility_frames(was_visible: bool) -> &'static [bool] {
+    if was_visible {
+        // 先如实报「藏起来了」，紧接着报回 true（Wayland 重映射的两连击）
+        &[false, true]
+    } else {
+        // 本来就没显示：只有 show 这一半，一发生效
+        &[true]
     }
-    let _ = app.emit(wire::evt::WINDOW_VISIBILITY, visibility_payload(visible));
+}
+
+/// window-visibility 的**唯一发射点**：逐帧 emit + 逐帧留证据。
+///
+/// `emit` / `diag` 两个参数是给单测留的接缝（不为测试改行为：生产路径见
+/// `emit_visibility_frames`，传的就是 Tauri 的 `emit` 与 state 的 `diag_scope`）。
+/// 事件名与 payload 形状写死在这里，所以测试可以拿着收集器断言「生产路径用的
+/// 就是这条函数、事件名仍是 `wire::evt::WINDOW_VISIBILITY`、payload 键名没漂」——
+/// 这些是纯函数自证不了的（窗口动作在 Tauri 那侧，可见性却必须发到前端）。
+fn push_visibility_frames<E, D>(frames: &[bool], mut emit: E, mut diag: D)
+where
+    E: FnMut(&str, Value),
+    D: FnMut(&str, &str),
+{
+    for &visible in frames {
+        // 顺带留证据：出问题时能看出「吞通知那一刻窗口到底是不是可见」
+        diag(
+            "window",
+            &format!("visibility visible={}", if visible { "true" } else { "false" }),
+        );
+        emit(wire::evt::WINDOW_VISIBILITY, visibility_payload(visible));
+    }
+}
+
+/// 把帧序列接到 Tauri 的 emit 与 state 的诊断日志上（生产路径）。
+fn emit_visibility_frames<R: tauri::Runtime>(app: &tauri::AppHandle<R>, frames: &[bool]) {
+    use tauri::Emitter;
+    push_visibility_frames(
+        frames,
+        |event, payload| {
+            let _ = app.emit(event, payload);
+        },
+        |scope, detail| {
+            if let Some(st) = app.try_state::<SharedState>() {
+                st.diag_scope(scope, detail);
+            }
+        },
+    );
 }
 
 /// window-visibility 的 payload。单独成函数是为了让测试能直接断言
@@ -80,12 +128,26 @@ fn visibility_payload(visible: bool) -> Value {
     json!({ "visible": visible })
 }
 
-fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+/// 只碰窗口：藏起来（不发事件，帧由调用方按 `visibility_frames` 决定）。
+/// 只有 Wayland 重映射会隐藏窗口，非 Linux 平台没有调用点。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn hide_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+}
+
+/// 只碰窗口：显示 + 取消最小化 + 聚焦（不发事件，同上）。
+fn bring_main_window_up<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
+}
+
+fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    bring_main_window_up(app);
     // 收尾必须是 visible=true：hide→show 是同一次用户意图，中途停 false 就会
     // 把之后所有通知都吞掉（raise_main_window 的 Wayland 重映射正是这种两连击）
     emit_window_visibility(app, true);
@@ -112,20 +174,28 @@ pub(crate) fn raise_main_window(app: &tauri::AppHandle) {
 
 /// Wayland 重映射：可见的窗口先 hide 再 show（理由见 raise_main_window 的长注释）。
 ///
-/// 抽成独立函数是为了能在 MockRuntime 上验证「两发事件、且以 visible=true 收尾」——
-/// 停在 false 就等于把之后所有通知都吞掉，这个不变量值得有一条测试盯着。
+/// 事件序列由纯函数 `visibility_frames` 给出（「两发、以 true 收尾」的不变量在
+/// 那里单测钉住），这里只做窗口动作 + 照单发射 —— 两半共用同一个真源，
+/// 不会出现「测试验的序列」与「生产发的序列」各写一份。
 /// 非 Linux 平台没有调用点，所以那边允许 dead_code。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn hide_then_show<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    if let Some(w) = app.get_webview_window("main") {
-        if w.is_visible().unwrap_or(false) {
-            let _ = w.hide();
-            // 先如实报「藏起来了」，紧接着 show_main_window 会报回 true。
-            // 两发都发是为了让前端状态与窗口同步跟住，而不是只在最后一次收敛。
-            emit_window_visibility(app, false);
-        }
+    let was_visible = app
+        .get_webview_window("main")
+        .map(|w| w.is_visible().unwrap_or(false))
+        .unwrap_or(false);
+    let frames = visibility_frames(was_visible);
+    // 帧与窗口动作严格交替（与修复前的顺序一致）：先 hide、立刻如实报出去，
+    // 再 show、再报「回来了」。帧序列本身来自 visibility_frames，「前半」的长度
+    // 就是「是否真的 hide 过」—— 两半不会各写一份序列。
+    let (hide_half, show_half) = frames.split_at(usize::from(was_visible));
+    if was_visible {
+        hide_main_window(app);
     }
-    show_main_window(app);
+    // 两发都发是为了让前端状态与窗口同步跟住，而不是只在最后一次收敛
+    emit_visibility_frames(app, hide_half);
+    bring_main_window_up(app);
+    emit_visibility_frames(app, show_half);
 }
 
 /// 界面文案二选一（config.lang 为空时按系统语言探测，与前端一致）：
@@ -1482,6 +1552,7 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::urlencode;
+    use serde_json::Value;
 
     #[test]
     #[cfg(target_os = "linux")]
@@ -1508,43 +1579,102 @@ mod tests {
         assert_eq!(file_uri_to_path("file://"), None);
     }
 
-    /// 主窗口 hide/show 必须发 window-visibility，且 hide→show 最终停在 visible=true。
+    /// 「hide→show 必须以 true 收尾」：纯函数，不依赖 tauri 的任何运行时。
     ///
     /// 这条盯的是「卡在 false」：窗口藏起来是前端唯一允许吞通知的理由，一旦
     /// 重映射（Wayland 的 hide→show 两连击）停在 false，之后所有通知都会被
     /// 标已读吞掉 —— 用户报的「偶发几条完全不弹」正是这个形状。
-    /// 用 MockRuntime 起一个真 App（不建真窗口、不碰显示器），事件走真 emit 链路。
     #[test]
-    fn hide_then_show_emits_visibility_ending_true() {
-        use super::{hide_then_show, visibility_payload, wire};
-        use tauri::Listener;
+    fn visibility_frames_always_end_visible() {
+        use super::visibility_frames;
 
-        let app = tauri::test::mock_builder()
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .unwrap();
-        let _webview =
-            tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+        // 本来可见：先如实报 hide，再报 show 收尾
+        assert_eq!(visibility_frames(true), [false, true].as_slice());
+        // 本来不可见：只有 show 这一半，一发生效
+        assert_eq!(visibility_frames(false), [true].as_slice());
 
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
-        let sink = seen.clone();
-        app.listen(wire::evt::WINDOW_VISIBILITY, move |e| {
-            let v: serde_json::Value = serde_json::from_str(e.payload()).unwrap();
-            sink.lock().unwrap().push(v["visible"].as_bool().unwrap());
-        });
+        // 收尾恒为 true（无论起点如何）—— 停 false 就是「吞通知」的开关
+        for was_visible in [false, true] {
+            assert_eq!(
+                visibility_frames(was_visible).last().copied(),
+                Some(true),
+                "was_visible={was_visible} 的帧序列必须以 visible=true 收尾"
+            );
+        }
 
-        hide_then_show(app.handle());
-        let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen, vec![false, true], "hide→show 要两发，且以 true 收尾");
+        // hide_then_show 用 split_at(usize::from(was_visible)) 把序列切成
+        // 「hide 之后发的」与「show 之后发的」两半：没 hide 过就绝不能出现 false
+        // （否则前端会先被误告知「窗口不见了」，那一瞬间进来的消息就不弹了）。
+        for was_visible in [false, true] {
+            let (after_hide, after_show) =
+                visibility_frames(was_visible).split_at(usize::from(was_visible));
+            assert_eq!(
+                after_hide,
+                if was_visible { [false].as_slice() } else { [].as_slice() },
+                "hide 这一半：was_visible={was_visible}"
+            );
+            assert_eq!(after_show, [true].as_slice(), "show 这一半只能是 true");
+        }
+    }
 
-        // payload 只有一个键，且键名就是 wire.rs 声明的那一个（手抄键名会漂）
-        let payload = visibility_payload(true);
-        let keys: Vec<&str> = payload
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(|k| k.as_str())
-            .collect();
-        assert_eq!(keys, wire::fields::WINDOW_VISIBILITY.to_vec());
+    /// 光有纯函数只是自证：这条钉住「帧真的会被 emit 出去，且发的是线上市名」。
+    ///
+    /// 用两个收集器替换接缝（生产路径 `emit_visibility_frames` 传的是 Tauri 的
+    /// `emit` 与 state 的 `diag_scope`），断言：走的确实是同一个发射函数、
+    /// 事件名等于 `wire::evt::WINDOW_VISIBILITY`、payload 只有一个键且键名等于
+    /// `wire::fields::WINDOW_VISIBILITY`（手抄键名会漂，这里对着声明核）。
+    #[test]
+    fn visibility_emit_is_wired_to_the_frames() {
+        use super::{push_visibility_frames, visibility_frames, visibility_payload, wire};
+
+        let mut sent: Vec<(String, Value)> = Vec::new();
+        let mut diag: Vec<(String, String)> = Vec::new();
+        push_visibility_frames(
+            visibility_frames(true),
+            |event, payload| sent.push((event.to_string(), payload)),
+            |scope, detail| diag.push((scope.to_string(), detail.to_string())),
+        );
+
+        // 两发、事件名都是线上那一个、以 true 收尾
+        assert_eq!(sent.len(), 2, "hide→show 要两发");
+        for (event, _) in &sent {
+            assert_eq!(event, wire::evt::WINDOW_VISIBILITY, "事件名必须用 wire.rs 的常量");
+        }
+        assert_eq!(sent[0].1, visibility_payload(false));
+        assert_eq!(sent[1].1, visibility_payload(true));
+        assert_eq!(sent[1].1["visible"], Value::Bool(true), "最后一发必须是 visible=true");
+
+        // payload 只有一个键，且键名就是 wire.rs 声明的那一个
+        for (_, payload) in &sent {
+            let keys: Vec<&str> =
+                payload.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+            assert_eq!(keys, wire::fields::WINDOW_VISIBILITY.to_vec());
+        }
+
+        // 取证日志与事件同源：几发事件就几行 window.log，值对得上
+        assert_eq!(
+            diag,
+            vec![
+                ("window".to_string(), "visibility visible=false".to_string()),
+                ("window".to_string(), "visibility visible=true".to_string()),
+            ]
+        );
+
+        // 生产路径没有旁路：非测试代码里「帧 → 发射」只走 push_visibility_frames 一处，
+        // 且没有任何别处直接 emit 这个事件（hide_then_show / show_main_window 都从
+        // emit_visibility_frames 出去）。绕开接缝就等于第二处，这条会红。
+        let src = include_str!("lib.rs");
+        let code = src.split("mod tests").next().unwrap_or(src);
+        assert_eq!(
+            code.matches("push_visibility_frames(").count(),
+            1,
+            "window-visibility 只允许有一个发射点（push_visibility_frames）"
+        );
+        assert_eq!(
+            code.matches("emit(wire::evt::WINDOW_VISIBILITY").count(),
+            1,
+            "window-visibility 不许在发射点之外再 emit 一次（那样这条测试就白测了）"
+        );
     }
 
     /// 发送超时必须按失败返回，不能把调用方挂住。
