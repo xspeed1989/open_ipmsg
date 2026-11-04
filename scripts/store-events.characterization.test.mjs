@@ -19,15 +19,15 @@ beforeEach(async () => { await h.reset() })
 
 /* ---------------- 接线 ---------------- */
 
-test('启动：11 个后端事件订阅 + 窗口焦点两条都注册了', () => {
+test('启动：12 个后端事件订阅 + 窗口焦点两条都注册了', () => {
   assert.deepEqual([...h.listeners.keys()].sort(), [
     'absence-info', 'file-progress', 'msg-delivered', 'msg-in', 'msg-out',
     'msg-read', 'msg-recalled', 'msg-unlocked', 'open-chat', 'open-unread',
-    'tauri://blur', 'tauri://focus', 'users-updated',
+    'tauri://blur', 'tauri://focus', 'users-updated', 'window-visibility',
   ])
 })
 
-test('启动：11 个订阅都早于 loadUsers / loadSessions（否则事件会丢）', () => {
+test('启动：12 个订阅都早于 loadUsers / loadSessions（否则事件会丢）', () => {
   const lastListen = h.bootLog.map((e) => e.cmd).lastIndexOf('plugin:event|listen')
   const firstUsers = h.bootLog.findIndex((e) => e.cmd === 'get_users')
   const firstSessions = h.bootLog.findIndex((e) => e.cmd === 'list_sessions')

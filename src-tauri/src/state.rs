@@ -540,6 +540,89 @@ impl AppState {
         diag_to(&self.data_dir, line);
     }
 
+    /// 按 scope 追加一行诊断日志（`data_dir/logs/<scope>.log`）。
+    ///
+    /// 与 `diag` 的分工：`diag` 是**线路**诊断，只在 `--log` 下才写；
+    /// 这里写的是「用户报的那类偶发问题在线上到底怎么走的」，默认**始终开启**，
+    /// 不受 `--log` 影响 —— 偶发问题的现场不会恰好开着调试日志，等用户复现了
+    /// 再让他加参数重跑，问题就又不出现了。同一 scope 固定写同一个文件，
+    /// 便于用户把 `logs/notify.log` 整份发回来。
+    pub fn diag_scope(&self, scope: &str, detail: &str) {
+        scope_log_to(&self.data_dir, scope, detail);
+    }
+}
+
+/* ---------- 分 scope 的诊断日志（默认开启，供线上取证） ---------- */
+
+/// 单个 scope 日志的上限：超过就轮转一次（当前 → .log.1），最多两份。
+/// 定这个量级是因为它只为「最近发生了什么」留证据：256KB 够装约几千行通知决策，
+/// 再大就变成给用户塞垃圾。
+pub const SCOPE_LOG_MAX_BYTES: u64 = 256 * 1024;
+
+/// 一行 detail 的上限：诊断行要能被 `grep`/`tail` 一眼看完，也防止把
+/// 一整个 JSON 或很长的错误串灌进文件。超了截断（并标注截断）。
+pub const SCOPE_LOG_MAX_DETAIL_CHARS: usize = 512;
+
+/// 把 scope 名收敛成安全的文件名段：只留小写字母/数字/下划线/减号。
+/// 调用方传的是代码里的常量（notify 等），这里做的是「不信任输入」的下限保护 ——
+/// 万一哪天后端把外部字符串当 scope 传进来，也不能写穿数据目录。
+pub fn sanitize_scope(scope: &str) -> String {
+    let s: String = scope
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_' || *c == '-')
+        .take(32)
+        .collect();
+    if s.is_empty() {
+        "app".into()
+    } else {
+        s
+    }
+}
+
+/// 写一行分 scope 日志。**失败一律吞掉**：诊断日志是取证手段，不能反过来让
+/// 主流程失败（磁盘满、目录只读、文件被安全软件锁住都属于「没法写」）。
+pub fn scope_log_to(data_dir: &std::path::Path, scope: &str, detail: &str) {
+    use std::io::Write;
+    // 全局串行：多个线程同时 append 同一个文件时，靠这一把锁保证
+    // 「一轮转 + 一写入」不交错（单次 append 本身在 Linux 上也是原子的，
+    // 但轮转的 rename 与随后的写入必须成对）。
+    static SCOPE_LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = match SCOPE_LOG_LOCK.lock() {
+        Ok(g) => g,
+        Err(_) => return, // 锁中毒：宁可丢一条日志，也不 panic
+    };
+
+    let dir = data_dir.join("logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join(format!("{}.log", sanitize_scope(scope)));
+    let rotated = dir.join(format!("{}.log.1", sanitize_scope(scope)));
+
+    let detail = {
+        let mut d: String = detail.chars().take(SCOPE_LOG_MAX_DETAIL_CHARS).collect();
+        // 换行会把「一行一条」的结构破坏掉（detail 里有错误串时很可能带换行）
+        d = d.replace(['\n', '\r'], " ");
+        if d.chars().count() >= SCOPE_LOG_MAX_DETAIL_CHARS {
+            d.push('…');
+        }
+        d
+    };
+    let line = format!("{} {}\n", now_secs(), detail.trim_end());
+
+    // 超过上限先轮转：当前文件改名成 .log.1（覆盖旧的那份），再写新的一行。
+    // 「256KB × 2 份」= 当前 + 上一次，总量有界。
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() >= SCOPE_LOG_MAX_BYTES {
+            let _ = std::fs::rename(&path, &rotated);
+        }
+    }
+
+    // 一次 write_all + O_APPEND：整行要么全在、要么不在，不会出现半行
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 /// 写一行线路诊断（`data_dir/diag.log`）。自由函数：`AppState` 与 trust 组都要写，
@@ -3009,6 +3092,79 @@ mod tests {
         st.diag("should-not-appear-2");
         let content2 = std::fs::read_to_string(st.data_dir.join("diag.log")).unwrap();
         assert!(!content2.contains("should-not-appear-2"), "关闭后不应再写");
+    }
+
+    /// 分 scope 的取证日志：**默认开启**（不受 --log 影响）、按 scope 分文件、
+    /// 超上限轮转成 .log.1（总量 256KB × 2 份有界）、不写穿数据目录。
+    ///
+    /// 这些性质决定了它能不能用来取证：「偶发几条不弹通知」只能靠事后翻
+    /// logs/notify.log，如果它跟着 --log 一起关着，现场就永远没有证据。
+    #[test]
+    fn scope_log_is_on_by_default_and_rotates() {
+        use super::{sanitize_scope, scope_log_to, SCOPE_LOG_MAX_BYTES};
+
+        let st = temp_state("scopelog");
+        std::fs::create_dir_all(&st.data_dir).unwrap();
+        // 显式关掉 --log：scope 日志不该受它影响
+        set_log_enabled(false);
+        st.diag_scope("notify", "notified key=10.0.0.9 pkt=101");
+        let path = st.data_dir.join("logs/notify.log");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("notified key=10.0.0.9 pkt=101"),
+            "--log 关着也要写：{content}"
+        );
+        // 一行一条 + 时间戳前缀
+        let line = content.lines().next().unwrap();
+        let ts = line.split(' ').next().unwrap();
+        assert!(ts.parse::<i64>().is_ok(), "行首是 unix 秒：{line}");
+
+        // 换行不能把「一行一条」结构破坏掉（错误串里常带换行符）
+        st.diag_scope("notify", "failed err=a\nb\r\nc");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.lines().count() == 2, "换行被压平：{content}");
+        assert!(content.contains("err=a b  c"), "{content}");
+
+        // 超上限轮转：当前 → .log.1，最多两份
+        let rotated = st.data_dir.join("logs/notify.log.1");
+        let big = "x".repeat(super::SCOPE_LOG_MAX_DETAIL_CHARS);
+        for _ in 0..1000 {
+            st.diag_scope("notify", &big);
+            if rotated.exists() {
+                break;
+            }
+        }
+        assert!(rotated.exists(), "超过 256KB 要轮转出 .log.1");
+        assert!(
+            std::fs::metadata(&path).unwrap().len() <= SCOPE_LOG_MAX_BYTES + 4096,
+            "轮转后当前文件回到上限之内"
+        );
+        assert!(
+            !st.data_dir.join("logs/notify.log.2").exists(),
+            "只保留两份（当前 + 一份旧的）"
+        );
+
+        // detail 超长要截断（不能让一条日志吃掉整个文件）
+        st.diag_scope("notify", &"y".repeat(4096));
+        let last = std::fs::read_to_string(&path).unwrap();
+        let last_line = last.lines().last().unwrap();
+        assert!(
+            last_line.chars().count() <= super::SCOPE_LOG_MAX_DETAIL_CHARS + 32,
+            "超长 detail 要截断：{} 字符",
+            last_line.chars().count()
+        );
+
+        // scope 名不能写穿数据目录
+        assert_eq!(sanitize_scope("../../etc/passwd"), "etcpasswd");
+        assert_eq!(sanitize_scope(""), "app");
+        assert_eq!(sanitize_scope("Notify_Input-1"), "notify_input-1");
+        scope_log_to(&st.data_dir, "../x", "escape-attempt");
+        assert!(
+            st.data_dir.join("logs/x.log").exists(),
+            "sanitize 后仍落在 logs/ 里"
+        );
+
+        let _ = std::fs::remove_dir_all(&st.data_dir);
     }
 
     #[test]

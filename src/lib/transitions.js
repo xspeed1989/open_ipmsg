@@ -15,6 +15,7 @@
  *   { type: 'mark_read',      key, pkts }        // 入站已读回执
  *   { type: 'mark_out_read',  key, pkts }        // 本地把出站消息翻成已读（不发包）
  *   { type: 'notify',         key, msg }         // 弹系统通知（标题/正文由 store 渲染）
+ *   { type: 'diag',           scope, detail }    // 追加一行诊断日志（取证用，见 ADR-0008）
  *   { type: 'reload_people' }                    // 重拉在线用户与会话列表
  *   { type: 'open_chat',      key, logLabel }    // 切会话 + 窗口置前
  */
@@ -83,9 +84,17 @@ export function markChatRead(state, key) {
   return pkts
 }
 
-/** 会话可见（打开着且窗口聚焦）→ 收到的消息视为已读，不必进未读 */
+/**
+ * 会话可见（打开着、窗口真在屏幕上、且窗口聚焦）→ 收到的消息视为已读，不必进未读。
+ *
+ * 三个条件缺一不可，其中 windowVisible 来自**后端**的 window-visibility 事件：
+ * 「隐藏到托盘」不保证产生 blur 事件（GTK 关窗到托盘时往往没有），只凭焦点推断
+ * 就会停在「窗口藏着、状态却自称可见」的假状态，把这个会话的消息整条吞掉
+ * —— 既不标未读、也不弹通知（用户看到的就是「消息在聊天里能看，通知没弹」）。
+ * 宁可多弹一条通知，也不能把该提醒的消息吞掉，所以这里对「可见」取最保守的定义。
+ */
 export function isChatVisible(state, key) {
-  return state.activeKey === key && state.windowFocused
+  return state.activeKey === key && state.windowVisible && state.windowFocused
 }
 
 /* ---------------- 事件表 ---------------- */
@@ -120,6 +129,7 @@ export function applyEvent(state, event, payload) {
         : { effects: [] }
     case 'window-focus': return onWindowFocus(state)
     case 'window-blur': return onWindowBlur(state)
+    case 'window-visibility': return onWindowVisibility(state, payload)
     default: return { effects: [] }
   }
 }
@@ -127,7 +137,10 @@ export function applyEvent(state, event, payload) {
 /* ---------------- 各事件的迁移 ---------------- */
 
 function onMsgIn(state, { key, msg, resend } = {}) {
-  if (!key || !msg) return { effects: [] }
+  // 每次通知决策都留一行证据（logs/notify.log）：这个缺陷偶发到没法稳定复现，
+  // 用户报「又有几条没弹」时只能靠现场日志判断当时走了哪条分支。
+  // 只记 key / 包号 / 时间 / 正文长度 —— 正文本身是隐私，不进日志。
+  if (!key || !msg) return { effects: [diagNotify('skipped:no-msg', key, msg)] }
   // 对端「延迟发送」会以相同包号反复重发：不算新消息，不重复计未读、不重复通知
   const isRebroadcast = resend
     || (state.chats[key]?.msgs || []).some((m) => m.dir === 'in' && m.pkt === msg.pkt)
@@ -147,14 +160,30 @@ function onMsgIn(state, { key, msg, resend } = {}) {
     }
   }
   if (isChatVisible(state, key)) {
+    // 可见 → 当已读处理，不打扰用户（这条也要记：它正是「通知被吞」的头号嫌疑）
+    effects.push(diagNotify('skipped:chat-visible', key, msg))
     const pkts = markChatRead(state, key)
     if (pkts.length) effects.push({ type: 'mark_read', key, pkts })
-  } else if (!isRebroadcast) {
+  } else if (isRebroadcast) {
+    // 同包号重投：不重复计未读、不重复通知
+    effects.push(diagNotify('skipped:rebroadcast', key, msg))
+  } else {
     state.unread[key] = (state.unread[key] || 0) + 1
     state.unreadTs[key] = msg.ts || Math.floor(Date.now() / 1000)
     effects.push({ type: 'notify', key, msg })
+    effects.push(diagNotify('notified', key, msg))
   }
   return { effects }
+}
+
+/** 「该不该弹通知」的判定证据（实现是 store 的 diag effect） */
+function diagNotify(decision, key, msg) {
+  const len = typeof msg?.text === 'string' ? msg.text.length : 0
+  return {
+    type: 'diag',
+    scope: 'notify',
+    detail: `${decision} key=${key || '-'} pkt=${msg?.pkt ?? '-'} ts=${msg?.ts ?? '-'} len=${len}`,
+  }
 }
 
 function onMsgOut(state, { key, msg } = {}) {
@@ -229,5 +258,17 @@ function onWindowFocus(state) {
 
 function onWindowBlur(state) {
   state.windowFocused = false
+  return { effects: [] }
+}
+
+/**
+ * 后端报「主窗口在不在屏幕上」。隐藏时必须连 windowFocused 一起清掉：
+ * 隐藏不保证伴随 blur（见 isChatVisible），两个字段各自独立更新就会漏掉
+ * 「藏着但自称聚焦」这种组合。显示时不反过来置 focused —— 那是焦点事件的活，
+ * 提前置 true 会在窗口还没真正拿到焦点时把消息标成已读。
+ */
+function onWindowVisibility(state, { visible } = {}) {
+  state.windowVisible = !!visible
+  if (!visible) state.windowFocused = false
   return { effects: [] }
 }
