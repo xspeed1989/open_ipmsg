@@ -82,6 +82,11 @@ export const setUnread = (total) => invoke(WIRE.cmd.set_unread, { total })
 export const notifyMessage = (key, title, body, lang) =>
   invoke(WIRE.cmd.notify_message, { key, title, body, lang })
 
+/** 追加一行诊断日志（<data_dir>/logs/<scope>.log，默认开启、不受 --log 影响）。
+ *  给不可复现的问题留现场：调用方传 scope + 一行 detail，**不要传消息正文** */
+export const diagLog = (scope, detail) =>
+  invoke(WIRE.cmd.diag_log, { scope, detail })
+
 /** 读系统剪贴板里的文件列表（Linux 下 webview 拿不到，走原生 GTK 剪贴板） */
 export const clipboardFilePaths = () => invoke(WIRE.cmd.clipboard_file_paths)
 
@@ -224,6 +229,8 @@ export const EVT = {
   msgUnlocked: WIRE.evt['msg-unlocked'],
   /** 对端不在通知文（GETABSENCEINFO 应答） */
   absenceInfo: WIRE.evt['absence-info'],
+  /** 主窗口是否真的在屏幕上（后端每次 hide/show 都发；前端据此决定能否吞通知） */
+  windowVisibility: WIRE.evt['window-visibility'],
   // 下面两个是**窗口间**事件（遮罩窗口 emitToMain → 主窗口 listen），不经过后端，
   // 所以不在 wire.rs 的真源里
   /** 截图确认：遮罩窗口 → 主窗口，进入待发送列表 */

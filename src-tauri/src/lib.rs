@@ -49,12 +49,46 @@ static EXIT_INFO: OnceLock<(Arc<AppState>, u16)> = OnceLock::new();
 /// 首次隐藏到托盘时提示一次
 static HIDE_NOTIFIED: AtomicBool = AtomicBool::new(false);
 
-fn show_main_window(app: &tauri::AppHandle) {
+/// 把「主窗口现在是否真的在屏幕上」这一后端事实推给前端。
+///
+/// 为什么不让前端自己推断：前端只知道焦点事件（tauri://focus / blur）。但
+/// 「隐藏」不保证产生 blur（GTK 关掉窗口到托盘时常常没有），于是前端会停在
+/// 「窗口藏着、状态却自称聚焦」的假状态，把这个会话的消息整条吞掉（标已读 +
+/// 不弹通知）—— 用户看到的就是「消息在聊天里能看、通知没弹」。窗口动作全在
+/// 后端发生，所以可见性也必须由后端告知。
+///
+/// 每次 hide/show 都发一次（不去重）：这是状态同步，不是变化流 —— 漏一次
+/// 就可能永久停在错的那一侧，宁可多发。
+fn emit_window_visibility<R: tauri::Runtime>(app: &tauri::AppHandle<R>, visible: bool) {
+    use tauri::Emitter;
+    // 顺带留证据：出问题时能看出「吞通知那一刻窗口到底是不是可见」
+    if let Some(st) = app.try_state::<SharedState>() {
+        st.diag_scope(
+            "window",
+            &format!(
+                "visibility visible={}",
+                if visible { "true" } else { "false" }
+            ),
+        );
+    }
+    let _ = app.emit(wire::evt::WINDOW_VISIBILITY, visibility_payload(visible));
+}
+
+/// window-visibility 的 payload。单独成函数是为了让测试能直接断言
+/// 「字段名与 wire.rs 的声明一致」（键名手抄就会漂，见 wire 的 fields 声明）。
+fn visibility_payload(visible: bool) -> Value {
+    json!({ "visible": visible })
+}
+
+fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
+    // 收尾必须是 visible=true：hide→show 是同一次用户意图，中途停 false 就会
+    // 把之后所有通知都吞掉（raise_main_window 的 Wayland 重映射正是这种两连击）
+    emit_window_visibility(app, true);
 }
 
 /// 把主窗口带到最前并聚焦（托盘/通知唤起统一走这里）。
@@ -70,10 +104,25 @@ fn show_main_window(app: &tauri::AppHandle) {
 pub(crate) fn raise_main_window(app: &tauri::AppHandle) {
     #[cfg(target_os = "linux")]
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        if let Some(w) = app.get_webview_window("main") {
-            if w.is_visible().unwrap_or(false) {
-                let _ = w.hide();
-            }
+        hide_then_show(app);
+        return;
+    }
+    show_main_window(app);
+}
+
+/// Wayland 重映射：可见的窗口先 hide 再 show（理由见 raise_main_window 的长注释）。
+///
+/// 抽成独立函数是为了能在 MockRuntime 上验证「两发事件、且以 visible=true 收尾」——
+/// 停在 false 就等于把之后所有通知都吞掉，这个不变量值得有一条测试盯着。
+/// 非 Linux 平台没有调用点，所以那边允许 dead_code。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn hide_then_show<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(w) = app.get_webview_window("main") {
+        if w.is_visible().unwrap_or(false) {
+            let _ = w.hide();
+            // 先如实报「藏起来了」，紧接着 show_main_window 会报回 true。
+            // 两发都发是为了让前端状态与窗口同步跟住，而不是只在最后一次收敛。
+            emit_window_visibility(app, false);
         }
     }
     show_main_window(app);
@@ -976,6 +1025,80 @@ fn linux_notify_action_ids() -> Vec<&'static str> {
     vec!["default", "open"]
 }
 
+/// 单次发送的上限。
+///
+/// `show()` 是同步的 DBus / WinRT 调用：通知守护进程正忙（quickshell 启动中、
+/// 系统负载高、DBus 排队）时它可能很久不返回。以前这条命令在命令线程上直接
+/// 调用它，守护进程一慢就把线程占住，后续消息的通知全排在它后面 ——
+/// 用户看到的就是「有几条完全不弹通知」。5s 是「人眼已觉得该弹了」的量级，
+/// 超过就按失败处理（记日志 + 重试一次），不让调用方无限等。
+pub(crate) const NOTIFY_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 一次发送的结果：成功带上通知 id（便于和守护进程日志对账），失败带上原因。
+pub(crate) type SendOutcome = Result<String, String>;
+
+/// 在独立线程里跑一次发送，最多等 `timeout`。
+///
+/// 为什么必须是独立线程 + 超时：阻塞调用本身没法中断，能做的只是**不等它**。
+/// 超时后这个函数立刻返回错误，那个线程自己会结束；通知若随后仍然发出来，
+/// 也不影响正确性（点击回调照样挂着，只是我们不再关心它的结果）。
+/// 发送器作为参数传进来，是为了让测试注入假实现 —— 真发一次 DBus 通知会弹到
+/// 跑测试那台机器的屏幕上，而且 CI 上根本没有通知守护进程。
+pub(crate) fn send_blocking_with_timeout<F>(timeout: std::time::Duration, send: F) -> SendOutcome
+where
+    F: FnOnce() -> SendOutcome + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel::<SendOutcome>(1);
+    if let Err(e) = std::thread::Builder::new()
+        .name("notify-send".into())
+        .spawn(move || {
+            // 接收端可能已因超时走掉：send 失败是预期内的，忽略
+            let _ = tx.send(send());
+        })
+    {
+        return Err(format!("通知线程启动失败: {e}"));
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(format!("timeout:{}ms", timeout.as_millis()))
+        }
+        // 发送线程在回话前就没了（panic）：同样是失败，不能当成没发生
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("发送线程异常退出".into()),
+    }
+}
+
+/// 带重试的发送：失败再试一次，并把结果写进 `logs/notify.log`。
+///
+/// 重试的理由不是「一定能修好」（DBus 失败通常不会自己好），而是这一类偶发失败里
+/// 相当一部分是**瞬时**的：守护进程刚被拉起、会话总线短暂抖动。多试一次成本
+/// 极低（只发生在失败路径上），换回一条真正弹出来的通知。
+/// 日志只记 key / id / 错误串 —— **不记标题与正文**，那是用户的消息内容。
+pub(crate) fn send_with_retry<F>(st: Option<&AppState>, key: &str, mut make_sender: F) -> SendOutcome
+where
+    F: FnMut() -> Box<dyn FnOnce() -> SendOutcome + Send>,
+{
+    let mut last: SendOutcome = Err("未尝试".into());
+    for attempt in 1..=2 {
+        let send = make_sender();
+        last = send_blocking_with_timeout(NOTIFY_SEND_TIMEOUT, send);
+        match &last {
+            Ok(id) => {
+                if let Some(st) = st {
+                    st.diag_scope("notify", &format!("shown id={id} key={key} attempt={attempt}"));
+                }
+                return last;
+            }
+            Err(e) => {
+                if let Some(st) = st {
+                    st.diag_scope("notify", &format!("failed key={key} attempt={attempt} err={e}"));
+                }
+            }
+        }
+    }
+    last
+}
+
 /// Linux 原生「可点击」消息通知：点击通知（正文或「打开」按钮）→ 前端收到
 /// open-chat 事件 → 弹出主窗口并切到对应会话。
 ///
@@ -989,79 +1112,165 @@ fn linux_notify_action_ids() -> Vec<&'static str> {
 /// 一致（都用 app identifier），系统里显示为同一个应用。点正文时回调参数是 `None`
 /// （与 Linux 的 default 动作对应），带按钮时才是按钮的 action 串。
 /// macOS 的通知仍由前端走插件 —— 那边没有等价的点击回调。
+///
+/// 命令本身是 `async` + `spawn_blocking`：发送是阻塞调用，以前它直接占住命令线程，
+/// 守护进程一慢就把后面所有通知堵住。现在调用方立刻拿到控制权，发送在阻塞线程池里
+/// 跑，并且每次尝试都有 5s 上限（见 send_with_retry）。
 #[tauri::command]
-fn notify_message(
+async fn notify_message(
     app: tauri::AppHandle,
     key: String,
     title: String,
     body: String,
     lang: String,
 ) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
+    let st = app.try_state::<SharedState>().map(|s| s.inner().clone());
+    let sender = new_notify_sender(&app, &key, &title, &body, &lang);
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
-        let label = ui_str(&lang, "打开", "Open");
-        let mut n = notify_rust::Notification::new();
-        n.appname("Open IPMsg")
-            .icon("open-ipmsg")
-            .summary(&title)
-            .body(&body);
-        // default 必须在：见 linux_notify_action_ids 的注释
-        for id in linux_notify_action_ids() {
-            n.action(id, &label);
-        }
-        let handle = n.show().map_err(|e| format!("通知发送失败: {e}"))?;
-        oim_log!("[notify] shown id={} key={}", handle.id(), key);
-        // wait_for_action 会阻塞到通知被点击或关闭（守护进程超时/手动关掉也会
-        // 触发关闭信号），放独立线程等，避免占住 tokio 的 blocking 线程池。
-        // 点击通知 = raise_main_window（Wayland 重映射置前）+ 通知前端切会话。
-        std::thread::spawn(move || {
-            handle.wait_for_action(|action| {
-                oim_log!("[notify] clicked action={action} key={key}");
-                if action == "default" || action == "open" {
-                    let app2 = app.clone();
-                    let key2 = key.clone();
-                    let _ = app.run_on_main_thread(move || {
-                        raise_main_window(&app2);
-                        use tauri::Emitter;
-                        // payload 用 JSON 对象（与 msg-in 等事件一致）：字符串裸
-                        // payload 在事件桥里的序列化路径未经受验证，对象模式最稳
-                        let _ = app2.emit(wire::evt::OPEN_CHAT, json!({"key": key2}));
-                    });
-                }
-            });
+        let key_for_log = key.clone();
+        let st2 = st.clone();
+        // 结果不在调用方这里等：发送失败已经写进 logs/notify.log，前端不该为它卡住
+        tauri::async_runtime::spawn_blocking(move || {
+            let _ = send_with_retry(st2.as_deref(), &key_for_log, sender);
         });
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let app_id = app.config().identifier.clone();
-        let (app2, key2) = (app.clone(), key.clone());
-        tauri_winrt_notification::Toast::new(&app_id)
-            .title(&title)
-            .text1(&body)
-            // 与 Linux 一样给一个「打开」按钮；点正文（回调参数 None）与点按钮（"open"）
-            // 走同一段处理，不必区分
-            .add_button(&ui_str(&lang, "打开", "Open"), "open")
-            .on_activated(move |action| {
-                oim_log!("[notify] clicked action={action:?} key={key2}");
-                let (app3, key3) = (app2.clone(), key2.clone());
-                let app4 = app3.clone(); // run_on_main_thread 的闭包不能再捕获 app3 本身
-                let _ = app3.run_on_main_thread(move || {
-                    raise_main_window(&app4);
-                    use tauri::Emitter;
-                    // 与 Linux 同一条路：payload 用 JSON 对象，事件桥最稳
-                    let _ = app4.emit(wire::evt::OPEN_CHAT, json!({"key": key3}));
-                });
-                Ok(())
-            })
-            .show()
-            .map_err(|e| format!("通知发送失败: {e}"))?;
-        oim_log!("[notify] shown key={} (windows toast)", key);
+        Ok(())
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        let _ = (&app, &key, &title, &body, &lang);
+        // 其他平台前端走插件发通知，不会调这条命令；记一笔便于排查误用时
+        let _ = (st, sender, &key, &title, &body);
+        Ok(())
     }
-    Ok(())
+}
+
+/// 造一个「发一次通知」的闭包工厂：每次尝试都要重新造（Notification 被 show 消费）。
+/// 平台差异全收在这里，命令本体只管调度、超时与日志。
+#[cfg(target_os = "linux")]
+fn new_notify_sender(
+    app: &tauri::AppHandle,
+    key: &str,
+    title: &str,
+    body: &str,
+    lang: &str,
+) -> impl FnMut() -> Box<dyn FnOnce() -> SendOutcome + Send> {
+    let (app, key, title, body) = (app.clone(), key.to_string(), title.to_string(), body.to_string());
+    let label = ui_str(lang, "打开", "Open");
+    move || {
+        let (app, key, title, body, label) = (
+            app.clone(),
+            key.clone(),
+            title.clone(),
+            body.clone(),
+            label.clone(),
+        );
+        Box::new(move || {
+            let mut n = notify_rust::Notification::new();
+            n.appname("Open IPMsg")
+                .icon("open-ipmsg")
+                .summary(&title)
+                .body(&body);
+            // default 必须在：见 linux_notify_action_ids 的注释
+            for id in linux_notify_action_ids() {
+                n.action(id, &label);
+            }
+            let handle = n.show().map_err(|e| format!("通知发送失败: {e}"))?;
+            let id = handle.id();
+            oim_log!("[notify] shown id={} key={}", id, key);
+            // wait_for_action 会阻塞到通知被点击或关闭（守护进程超时/手动关掉也会
+            // 触发关闭信号），放独立线程等，避免占住 tokio 的 blocking 线程池。
+            // 点击通知 = raise_main_window（Wayland 重映射置前）+ 通知前端切会话。
+            std::thread::spawn(move || {
+                handle.wait_for_action(|action| {
+                    oim_log!("[notify] clicked action={action} key={key}");
+                    if action == "default" || action == "open" {
+                        let app2 = app.clone();
+                        let key2 = key.clone();
+                        let _ = app.run_on_main_thread(move || {
+                            raise_main_window(&app2);
+                            use tauri::Emitter;
+                            // payload 用 JSON 对象（与 msg-in 等事件一致）：字符串裸
+                            // payload 在事件桥里的序列化路径未经受验证，对象模式最稳
+                            let _ = app2.emit(wire::evt::OPEN_CHAT, json!({"key": key2}));
+                        });
+                    }
+                });
+            });
+            Ok(id.to_string())
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn new_notify_sender(
+    app: &tauri::AppHandle,
+    key: &str,
+    title: &str,
+    body: &str,
+    lang: &str,
+) -> impl FnMut() -> Box<dyn FnOnce() -> SendOutcome + Send> {
+    let app_id = app.config().identifier.clone();
+    let (app, key, title, body) = (app.clone(), key.to_string(), title.to_string(), body.to_string());
+    let label = ui_str(lang, "打开", "Open");
+    move || {
+        let (app, key, title, body, label, app_id) = (
+            app.clone(),
+            key.clone(),
+            title.clone(),
+            body.clone(),
+            label.clone(),
+            app_id.clone(),
+        );
+        Box::new(move || {
+            let (app2, key2) = (app.clone(), key.clone());
+            tauri_winrt_notification::Toast::new(&app_id)
+                .title(&title)
+                .text1(&body)
+                // 与 Linux 一样给一个「打开」按钮；点正文（回调参数 None）与点按钮（"open"）
+                // 走同一段处理，不必区分
+                .add_button(&label, "open")
+                .on_activated(move |action| {
+                    oim_log!("[notify] clicked action={action:?} key={key2}");
+                    let (app3, key3) = (app2.clone(), key2.clone());
+                    let app4 = app3.clone(); // run_on_main_thread 的闭包不能再捕获 app3 本身
+                    let _ = app3.run_on_main_thread(move || {
+                        raise_main_window(&app4);
+                        use tauri::Emitter;
+                        // 与 Linux 同一条路：payload 用 JSON 对象，事件桥最稳
+                        let _ = app4.emit(wire::evt::OPEN_CHAT, json!({"key": key3}));
+                    });
+                    Ok(())
+                })
+                .show()
+                .map_err(|e| format!("通知发送失败: {e}"))?;
+            oim_log!("[notify] shown key={} (windows toast)", key);
+            // WinRT 的 toast 不给通知 id，用固定标记让日志形状与 Linux 一致
+            Ok("windows-toast".to_string())
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn new_notify_sender(
+    _app: &tauri::AppHandle,
+    _key: &str,
+    _title: &str,
+    _body: &str,
+    _lang: &str,
+) -> impl FnMut() -> Box<dyn FnOnce() -> SendOutcome + Send> {
+    move || Box::new(|| Ok("unsupported".to_string()))
+}
+
+/// 前端诊断日志：把一行「通知决策 / 窗口可见性」追加到 <data_dir>/logs/<scope>.log。
+///
+/// 这是给**不可复现**的问题留现场用的：用户下次说「又有几条没弹通知」时，
+/// logs/notify.log 里能直接看到当时的判定（notified / skipped:chat-visible /
+/// skipped:rebroadcast / skipped:no-msg）与后端发送结果，不用再靠猜。
+/// 所以它默认开启、不受 `--log` 影响 —— 现场不会恰好开着调试参数。
+/// 正文与标题一律不记（隐私），前端只传 key / 包号 / 判定，后端只补长度与结果。
+#[tauri::command]
+fn diag_log(st: State<'_, SharedState>, scope: String, detail: String) {
+    st.diag_scope(&scope, &detail);
 }
 
 /// 读系统剪贴板里的位图（截图后粘贴用）。
@@ -1297,6 +1506,107 @@ mod tests {
         );
         assert_eq!(file_uri_to_path("http://example.com/a"), None);
         assert_eq!(file_uri_to_path("file://"), None);
+    }
+
+    /// 主窗口 hide/show 必须发 window-visibility，且 hide→show 最终停在 visible=true。
+    ///
+    /// 这条盯的是「卡在 false」：窗口藏起来是前端唯一允许吞通知的理由，一旦
+    /// 重映射（Wayland 的 hide→show 两连击）停在 false，之后所有通知都会被
+    /// 标已读吞掉 —— 用户报的「偶发几条完全不弹」正是这个形状。
+    /// 用 MockRuntime 起一个真 App（不建真窗口、不碰显示器），事件走真 emit 链路。
+    #[test]
+    fn hide_then_show_emits_visibility_ending_true() {
+        use super::{hide_then_show, visibility_payload, wire};
+        use tauri::Listener;
+
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let _webview =
+            tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let sink = seen.clone();
+        app.listen(wire::evt::WINDOW_VISIBILITY, move |e| {
+            let v: serde_json::Value = serde_json::from_str(e.payload()).unwrap();
+            sink.lock().unwrap().push(v["visible"].as_bool().unwrap());
+        });
+
+        hide_then_show(app.handle());
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen, vec![false, true], "hide→show 要两发，且以 true 收尾");
+
+        // payload 只有一个键，且键名就是 wire.rs 声明的那一个（手抄键名会漂）
+        let payload = visibility_payload(true);
+        let keys: Vec<&str> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(keys, wire::fields::WINDOW_VISIBILITY.to_vec());
+    }
+
+    /// 发送超时必须按失败返回，不能把调用方挂住。
+    ///
+    /// 假发送器睡 300ms、上限 50ms：要验证的是「不等」，所以这里不需要 DBus，
+    /// 也不该往跑测试那台机器的屏幕上弹真通知。
+    #[test]
+    fn notify_send_times_out_without_blocking_caller() {
+        use super::send_blocking_with_timeout;
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let out = send_blocking_with_timeout(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok("late-id".to_string())
+        });
+        let spent = t0.elapsed();
+        assert_eq!(out, Err("timeout:50ms".to_string()));
+        assert!(spent < Duration::from_millis(250), "调用方不能被慢发送拖住: {spent:?}");
+    }
+
+    /// 失败要重试一次并把两次结果都写进 logs/notify.log（成功则记 shown）。
+    #[test]
+    fn notify_retries_once_and_logs_each_attempt() {
+        use super::{send_with_retry, AppState, SendOutcome};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("oim-notify-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let st = AppState::new(dir.clone());
+
+        // 1) 两次都失败：调用两次，日志里两条 failed、attempt 递增
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let out: SendOutcome = send_with_retry(Some(&st), "10.0.0.9", move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            Box::new(|| Err("dbus down".to_string()))
+        });
+        assert_eq!(out, Err("dbus down".to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "失败只重试一次（共两次）");
+
+        let log = std::fs::read_to_string(dir.join("logs/notify.log")).unwrap();
+        assert!(log.contains("failed key=10.0.0.9 attempt=1 err=dbus down"), "{log}");
+        assert!(log.contains("failed key=10.0.0.9 attempt=2 err=dbus down"), "{log}");
+
+        // 2) 第一次就成功：只调用一次，记 shown 带 id
+        let c2 = calls.clone();
+        let before = calls.load(Ordering::SeqCst);
+        let out = send_with_retry(Some(&st), "10.0.0.8", move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+            Box::new(|| Ok("42".to_string()))
+        });
+        assert_eq!(out, Ok("42".to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst) - before, 1, "成功后不再重试");
+
+        let log = std::fs::read_to_string(dir.join("logs/notify.log")).unwrap();
+        assert!(log.contains("shown id=42 key=10.0.0.8 attempt=1"), "{log}");
+        // 隐私：日志里不能出现标题/正文（这里只验证格式，不接受任意自由文本）
+        assert!(!log.contains("10.0.0.9\n"), "一行一条，不能把 key 后面的内容换行塞进去");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 通知动作里必须有 default：缺了它，Omarchy（quickshell）/ GNOME 下点通知不会
@@ -1986,6 +2296,9 @@ pub fn run() {
             // 关闭窗口 → 最小化到托盘；真正退出走托盘菜单
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
+                // 关窗到托盘 = 隐藏：必须让前端知道（hide 不保证有 blur 事件，
+                // 前端若仍认为自己可见，就会把该会话的消息标已读且不弹通知）
+                emit_window_visibility(window.app_handle(), false);
                 api.prevent_close();
                 if !HIDE_NOTIFIED.swap(true, Ordering::Relaxed) {
                     use tauri_plugin_notification::NotificationExt;
@@ -2025,6 +2338,7 @@ pub fn run() {
             clipboard_image,
             set_unread,
             notify_message,
+            diag_log,
             download_file,
             local_files_exist,
             read_image_data,

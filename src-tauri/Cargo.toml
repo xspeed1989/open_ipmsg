@@ -130,6 +130,12 @@ macos-private-api = ["tauri/macos-private-api"]
 [patch.crates-io]
 tray-icon = { path = "vendor/tray-icon" }
 
+[dev-dependencies]
+# 单元测试用 tauri 官方的 MockRuntime：真 App、真事件链路，但不建真窗口、不碰
+# 显示器。窗口可见性（window-visibility）是「后端事实」，只能在这一层验证
+# 它真的被发出去、且 hide→show 以 true 收尾 —— 纯函数测不到 emit 有没有接线。
+tauri = { version = "2.11", features = ["test"] }
+
 [profile.release]
 strip = true
 lto = true

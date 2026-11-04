@@ -67,6 +67,10 @@ export const store = reactive({
   emojiCacheFiles: [],
   lastTs: {}, // key -> 最后消息时间戳
   windowFocused: true, // 主窗口是否聚焦（决定是否弹通知/自动已读）
+  // 主窗口是否真的在屏幕上（后端 window-visibility 事件给出的事实）。
+  // 不能只靠 windowFocused 推断：隐藏到托盘不保证有 blur 事件，
+  // 那样会停在「窗口藏着、状态却自称可见」的假状态，把消息吞掉
+  windowVisible: true,
 })
 
 /* ---------------- 工具函数 ---------------- */
@@ -331,20 +335,53 @@ export async function markReadFor(key) {
 /* ---------------- 系统通知 ---------------- */
 
 async function notify(key, title, body) {
-  try {
-    // Linux/Windows：走原生可点击通知（点击通知 → open-chat 事件 → 弹窗切到对应会话）。
-    // 两边的原生通知都无需权限申请，绕开插件的权限检查直接发；
-    // macOS 仍走下面的插件路径（没有等价的点击回调）。
-    if (/linux|windows/i.test(navigator.userAgent)) {
-      await ipc.notifyMessage(key, title, body, store.config?.lang || '')
-      return
+  // Linux/Windows：走原生可点击通知（点击通知 → open-chat 事件 → 弹窗切到对应会话）。
+  // 两边的原生通知都无需权限申请，绕开插件的权限检查直接发；
+  // macOS 仍走下面的插件路径（没有等价的点击回调）。
+  if (/linux|windows/i.test(navigator.userAgent)) {
+    // 失败重试一次：这条 IPC 只是「帮我发通知」的转发，失败多半是瞬间的
+    // （后端刚启动、序列化抖动），再试一次的成本远低于用户漏看一条消息。
+    // 两次都失败就必须留证据 —— 否则「偶发不弹通知」永远无法事后归因；
+    // 这条错误也不许吞掉不吭声（旧实现只 console.error，用户和开发者都看不见）。
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        await ipc.notifyMessage(key, title, body, store.config?.lang || '')
+        return
+      } catch (e) {
+        diagLog(
+          'notify',
+          (attempt === 1 ? 'notify-ipc-retry key=' : 'notify-ipc-failed key=') +
+            key +
+            ' err=' +
+            errText(e)
+        )
+        if (attempt === 2) console.error('notify failed', e)
+      }
     }
+    return
+  }
+  try {
     let granted = await isPermissionGranted()
     if (!granted) granted = (await requestPermission()) === 'granted'
     if (granted) sendNotification({ title, body })
   } catch (e) {
     console.error('notify failed', e)
   }
+}
+
+/** 错误串收敛成一个日志字段（换行会破坏「一行一条」，后端还会再截断一次） */
+function errText(e) {
+  return String(e?.message ?? e ?? '').replace(/\s+/g, ' ').slice(0, 200)
+}
+
+/**
+ * 追加一行诊断日志到 <data_dir>/logs/<scope>.log（见 docs/adr/0008）。
+ *
+ * 这是给**不可复现**的问题留现场的手段，所以：失败绝对不抛（诊断不能反过来
+ * 变成新的故障点），也不 await（日志慢一点不该拖住消息处理）。
+ */
+export function diagLog(scope, detail) {
+  ipc.diagLog(scope, detail).catch(() => {})
 }
 
 /** 消息预览文本（通知用） */
@@ -685,6 +722,8 @@ async function runEffects(effects) {
       }
     } else if (e.type === 'notify') {
       notify(e.key, displayName(e.key), previewText(e.msg))
+    } else if (e.type === 'diag') {
+      diagLog(e.scope, e.detail)
     } else if (e.type === 'reload_people') {
       loadUsers()
       loadSessions()
@@ -745,6 +784,9 @@ export async function boot() {
   await ipc.listenEvent(ipc.EVT.msgRecalled, (p) => dispatchEvent('msg-recalled', p))
   await ipc.listenEvent(ipc.EVT.msgUnlocked, (p) => dispatchEvent('msg-unlocked', p))
   await ipc.listenEvent(ipc.EVT.absenceInfo, (p) => dispatchEvent('absence-info', p))
+  // 窗口可见性是**后端事实**（所有 hide/show 都在后端发生）：只靠 tauri 的
+  // focus/blur 推断会漏掉「隐藏到托盘不产生 blur」这种情况
+  await ipc.listenEvent(ipc.EVT.windowVisibility, (p) => dispatchEvent('window-visibility', p))
 
   // 未读总数变化 → 托盘图标在「有新消息（红点角标）」与「无消息」之间切换
   watch(

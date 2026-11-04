@@ -17,6 +17,7 @@ export const WIRE = {
     'open-chat': 'open-chat',
     'open-unread': 'open-unread',
     'users-updated': 'users-updated',
+    'window-visibility': 'window-visibility',
   },
   /** 命令名（#[tauri::command] 的线上名字），键即线上名 */
   cmd: {
@@ -37,6 +38,7 @@ export const WIRE = {
     clipboard_image: 'clipboard_image',
     set_unread: 'set_unread',
     notify_message: 'notify_message',
+    diag_log: 'diag_log',
     download_file: 'download_file',
     local_files_exist: 'local_files_exist',
     read_image_data: 'read_image_data',
@@ -82,5 +84,6 @@ export const WIRE = {
     'open-chat': ['key'],
     'open-unread': [],
     'users-updated': [],
+    'window-visibility': ['visible'],
   },
 };

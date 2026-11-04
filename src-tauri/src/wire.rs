@@ -40,6 +40,7 @@ wire_names!(
     OPEN_CHAT => "open-chat",
     OPEN_UNREAD => "open-unread",
     USERS_UPDATED => "users-updated",
+    WINDOW_VISIBILITY => "window-visibility",
 );
 
 wire_names!(
@@ -62,6 +63,7 @@ wire_names!(
     CLIPBOARD_IMAGE => "clipboard_image",
     SET_UNREAD => "set_unread",
     NOTIFY_MESSAGE => "notify_message",
+    DIAG_LOG => "diag_log",
     DOWNLOAD_FILE => "download_file",
     LOCAL_FILES_EXIST => "local_files_exist",
     READ_IMAGE_DATA => "read_image_data",
@@ -117,6 +119,9 @@ pub mod fields {
     pub const OPEN_CHAT: &[&str] = &["key"];
     /// `users-updated` 只表示「列表变了」，不带字段
     pub const USERS_UPDATED: &[&str] = &[];
+    /// `window-visibility`：主窗口此刻是否真的摆在屏幕上（由后端窗口动作给出，
+    /// 不是前端从焦点事件推断的）
+    pub const WINDOW_VISIBILITY: &[&str] = &["visible"];
 }
 
 /// 事件名 → payload 字段声明（产物生成与对照测试共用一张表）。
@@ -133,6 +138,7 @@ pub fn declared_fields(event: &str) -> Option<&'static [&'static str]> {
         evt::OPEN_UNREAD => fields::OPEN_UNREAD,
         evt::OPEN_CHAT => fields::OPEN_CHAT,
         evt::USERS_UPDATED => fields::USERS_UPDATED,
+        evt::WINDOW_VISIBILITY => fields::WINDOW_VISIBILITY,
         _ => return None,
     })
 }
