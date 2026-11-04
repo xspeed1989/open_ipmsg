@@ -130,11 +130,17 @@ macos-private-api = ["tauri/macos-private-api"]
 [patch.crates-io]
 tray-icon = { path = "vendor/tray-icon" }
 
-[dev-dependencies]
-# 单元测试用 tauri 官方的 MockRuntime：真 App、真事件链路，但不建真窗口、不碰
-# 显示器。窗口可见性（window-visibility）是「后端事实」，只能在这一层验证
-# 它真的被发出去、且 hide→show 以 true 收尾 —— 纯函数测不到 emit 有没有接线。
-tauri = { version = "2.11", features = ["test"] }
+# 本 crate **不声明任何 dev-dependency**，也请不要为了单测给 tauri 打开 `test` 特性
+# （典型写法：在这个位置再声明一次 tauri 并挂上 test 特性）：dev-dependency 的特性会
+# 与同名普通依赖（上面的 [dependencies] tauri）**特性合并**，于是 debug 测试二进制里的
+# tauri 也带上 test 特性。在 Windows 上这不只是多编点代码 ——
+# v0.1.18 的 CI 就是这么挂的：测试进程根本没起来，
+#   error: test failed … open_ipmsg_lib-<hash>.exe (exit code: 0xc0000139, STATUS_ENTRYPOINT_NOT_FOUND)
+# Linux/Arch 不受影响（同一提交两个 job 全绿），所以本地绿了不代表没坏。
+# 窗口可见性的那两个不变量改用不需要该特性的接缝验证（见 src/lib.rs 的
+# visibility_frames 纯函数 + push_visibility_frames 发射点）：
+#   1) hide→show 的帧序列必须是 [false, true]（以 true 收尾，否则之后的通知全被吞掉）；
+#   2) 帧确实被 emit、事件名与 payload 键名仍等于 wire::evt / wire::fields 的声明。
 
 [profile.release]
 strip = true
