@@ -25,14 +25,14 @@
 | SENDMSG | 0x20 | 发送消息 | ✅ 文本/附件/加密/分段/离线入队 |
 | RECVMSG | 0x21 | 送达确认 | ✅ 对 SENDCHECKOPT 必回，进制双写兜底 |
 | READMSG | 0x30 | 已读通知 | ✅ 收发双向已实现 |
-| DELMSG | 0x31 | 封书破弃通知（消息删除/撤回告知） | ✅ 撤回消息（UI 右键）双向闭环 |
+| DELMSG | 0x31 | 封书破弃通知（消息删除/撤回告知） | ✅ 撤回我方发出的任意消息（UI 右键）；附件消息另配合 RELEASEFILES，双向闭环 |
 | ANSREADMSG | 0x32 | READMSG 带 READCHECKOPT 时的确认 | ✅ 入站按 READMSG 语义处理 |
 | GETINFO | 0x40 | 取版本信息 | ✅ 应答 SENDINFO |
 | SENDINFO | 0x41 | 版本信息应答 | ✅ 构造/发出；入站仅记录不展示 |
 | GETABSENCEINFO | 0x50 | 取不在通知文 | ✅ 应答 SENDABSENCEINFO（AUTORET） |
 | SENDABSENCEINFO | 0x51 | 回送不在通知文 | ✅ 缓存+事件推送前端 |
 | GETFILEDATA | 0x60 | TCP 取文件 | ✅ 流式/断点/解密/多方言 |
-| RELEASEFILES | 0x61 | 放弃接收释放槽 | ✅ |
+| RELEASEFILES | 0x61 | 放弃接收释放槽 | ✅ 收端据包号释放槽；发端撤回附件消息时主动发出（ADR-0010） |
 | GETDIRFILES | 0x62 | TCP 取目录树 | ✅ **双向已实现**（发送 collect_dir_ops/serve_dir_stream，接收 download_dir_task/fetch_dir_tree） |
 | DIRFILES_AUTH | 0x63 | 密码保护目录传输 | ⚠️ 常量已定义；官方 Win 客户端预留未实现，密码保护走 PASSWORDOPT 消息级 |
 | DIRFILES_AUTHRET | 0x64 | 密码目录应答 | ⚠️ 常量已定义（同上） |

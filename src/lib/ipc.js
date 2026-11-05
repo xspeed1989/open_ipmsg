@@ -37,7 +37,7 @@ export const refreshUsers = () => invoke(WIRE.cmd.refresh_users)
 /** 不在模式开关（BR_ABSENCE + ABSENCEOPT；text 为空保留现值） */
 export const setAbsence = (on, text) => invoke(WIRE.cmd.set_absence, { on, text })
 
-/** 撤回我方发出的某条文本消息（DELMSG） */
+/** 撤回我方发出的某条消息（DELMSG；附件另有 RELEASEFILES） */
 export const recallMessage = (key, pkt) => invoke(WIRE.cmd.recall_message, { key, pkt })
 
 /** 广播群发（BROADCASTOPT 同报） */

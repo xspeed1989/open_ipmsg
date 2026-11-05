@@ -452,7 +452,8 @@ export async function sendClipboardImage(b64, mime, text = '') {
 
 /* ---------------- 撤回 / 开封 / 不在 / 广播 / 群发 ---------------- */
 
-/** 撤回我方发出的文本消息（DELMSG）：本地记录标记 recalled，气泡替换占位 */
+/** 撤回我方发出的消息（DELMSG；附件消息另发 RELEASEFILES 并撤销本机附件槽）：
+ *  本地记录标记 recalled，气泡整条替换成占位 */
 export async function recallMsg(key, pkt) {
   await ipc.recallMessage(key, pkt)
   const chat = store.chats[key]
