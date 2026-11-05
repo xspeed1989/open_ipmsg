@@ -13,7 +13,7 @@ import { parseFileUris, highlightParts } from '../lib/text'
 import { computePopupPosition } from '../lib/popup'
 import { isSealedEnvelope, isPasswordEnvelope, showsSealTag } from '../lib/secret'
 import { composeReplyBody, quotePreview } from '../lib/reply'
-import { recalledEditState } from '../lib/recall'
+import { canRecall, canReedit, recalledEditState } from '../lib/recall'
 import { deliveryState } from '../lib/receipts'
 import { forwardPayload, mergeForward } from '../lib/forward'
 import { groupPayload, sendToEach } from '../lib/groupsend'
@@ -1351,9 +1351,12 @@ watch(
       <div v-for="v in viewList" :key="v.id">
         <div v-if="v.kind === 'day'" class="day-sep"><span>{{ v.label }}</span></div>
 
+        <!-- 已撤回优先于任何内容渲染：正文、附件卡片、图片/WebM 内联预览
+             都在 msg-row 里，这一支挡在它前面，所以撤回后气泡整条换成占位。
+             「重新编辑」只对文本有意义（附件没有正文可恢复），由 canReedit 判定。 -->
         <div v-else-if="v.m.recalled" class="recall-notice" :data-pkt="v.m.pkt">
           <span>{{ t(v.m.dir === 'out' ? 'chat.recalledSelf' : 'chat.recalledPeer') }}</span>
-          <button v-if="v.m.dir === 'out'" class="recall-edit" @click.stop="reeditRecalled(v.m)">
+          <button v-if="canReedit(v.m)" class="recall-edit" @click.stop="reeditRecalled(v.m)">
             {{ t('chat.reedit') }}
           </button>
         </div>
@@ -1539,7 +1542,7 @@ watch(
         <button v-if="canAddToEmoji(ctxMenu.msg)" class="ctx-item" @click="addMsgToEmoji">
           {{ t('emoji.addToEmoji') }}
         </button>
-        <button v-if="ctxMenu.msg?.dir === 'out' && ctxMenu.msg?.kind === 'text' && !ctxMenu.msg?.recalled"
+        <button v-if="canRecall(ctxMenu.msg, { broadcast: isBroadcast })"
           class="ctx-item danger" @click="startRecall">{{ t('chat.recall') }}</button>
         <button class="ctx-item" @click="enterSelMode">{{ t('chat.multiSelect') }}</button>
       </template>

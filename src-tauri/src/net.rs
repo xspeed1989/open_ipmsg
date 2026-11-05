@@ -3097,10 +3097,28 @@ pub async fn mark_read_and_receipt(ctx: &NetCtx, key: &str, pkts: &[u32]) -> Res
 
 /* ================= 撤回 / 广播 / 群发 / 开封解锁 / 不在信息 ================= */
 
-/// 撤回我方发出的某条消息（DELMSG，官方封书破弃语义的扩展用途）：
-/// 向对端发 DELMSG(原包号)，并把本地记录标记为「已撤回」。
+/// 撤回我方发出的某条消息（DELMSG，官方封书破弃语义的扩展用途）。
+///
+/// 能撤回什么：我方发出的、任何类型（文本 / 文件 / 图片 / 贴图 / 表情 / 文件夹）
+/// 且未撤回的消息。附件消息额外做两件事，让它「真的取不到」：
+///
+/// 1. 先撤销**本机**的附件槽（`release_packets`）—— 对端之后再来 GETFILEDATA
+///    就查不到槽，连接直接断开、零字节；
+/// 2. 再给对端发 RELEASEFILES(原包号)：告诉对方这几个槽不会再有数据，
+///    别再排队/续传（收端 releasefiles 按包号释放槽，正是给这种场景留的入口）；
+/// 3. 最后才发 DELMSG，让对端把气泡换成「对方撤回了一条消息」。
+///
+/// 顺序是刻意的：先撤槽、后通知。反过来（先 DELMSG）会给对端留一个时间窗，
+/// 在收到撤回之前抢先把文件取走。
+///
+/// **撤不回什么**（协议事实，别在界面上承诺）：已经下载到对端的文件收不回来，
+/// 对端从本地复制/转存/截图的内容也收不回来。DELMSG 只是一个「请把这条标记为
+/// 已撤回」的礼貌通知，官方客户端甚至可以忽略它。详见 docs/adr/0010。
+///
+/// 广播信箱不支持撤回：一次发给多人，DELMSG 只能逐个会话发，广播地址上也没有
+/// 会话可回执，所以直接拒绝而不是「看起来成功、其实一个人都没撤回」。
 pub async fn recall_message(ctx: &NetCtx, key: &str, pkt: u32) -> Result<(), String> {
-    // 只允许撤回我方发出的文本消息（附件消息撤回后对端无法再取，禁止）
+    // 只允许撤回我方发出的消息（对端的消息要由对端自己撤回）
     let rec = ctx.st.history.find_history_any(key, pkt);
     let Some(rec) = rec else {
         return Err("E_RECALL_NOT_FOUND|找不到该消息".into());
@@ -3108,26 +3126,52 @@ pub async fn recall_message(ctx: &NetCtx, key: &str, pkt: u32) -> Result<(), Str
     if rec.get("dir").and_then(|v| v.as_str()) != Some("out") {
         return Err("E_RECALL_NOT_MINE|只能撤回自己发出的消息".into());
     }
-    let kind = rec.get("kind").and_then(|v| v.as_str()).unwrap_or("text");
-    if kind != "text" {
-        return Err("E_RECALL_HAS_FILES|附件消息不支持撤回（对方可能已开始下载）".into());
+    // 广播：一次发给多人，没有单一对端可发 DELMSG/RELEASEFILES，撤回语义不成立
+    if key == crate::state::BROADCAST_SESSION_KEY || rec["broadcast"].as_bool() == Some(true) {
+        return Err(
+            "E_RECALL_BROADCAST|广播消息不支持撤回（一次发给多人，无法逐一通知）".into(),
+        );
     }
-    let peer = ctx.st.peers.get(key);
-    if let Some(peer) = peer {
-        if let Some(target) = peer_addr(&peer) {
-            let cfg = ctx.st.config();
-            let mut p = proto::Packet::new(cmd::DELMSG);
-            p.extra = pkt.to_string().into_bytes();
-            let bytes = p.encode(&my_user(&cfg), &my_host());
+    // 附件消息（文件/图片/贴图/表情/文件夹）落库的 kind 统一是 "file"
+    let is_file = rec.get("kind").and_then(|v| v.as_str()) == Some("file");
+    let target = ctx.st.peers.get(key).and_then(|peer| peer_addr(&peer));
+
+    // 1) 先拆掉我方自己的取件通道。
+    //    ack_retry / ack_pending 必须在这里做：出站消息还挂在「等待送达确认」或
+    //    「离线待投递」队列里时，几秒后那次重发会把附件槽重新登记回来
+    //    （retry_pending_for / flush_pending_for 都会 offer_slot），
+    //    于是「撤回」变成「过一会儿又能下载」。
+    let _ = ctx.st.outbox.ack_retry(key, pkt);
+    let _ = ctx.st.outbox.ack_pending(key, pkt);
+    if is_file {
+        // 该包号下的全部附件槽一起撤（一条消息可能有多个附件/一个文件夹）
+        ctx.st.transfer.release_packets(&[pkt]);
+    }
+
+    if let Some(target) = target {
+        let cfg = ctx.st.config();
+        // 2) 通知对端「这些槽不再提供数据」：它那边排队中的取件可以就此作废，
+        //    而不是等到连接被我们关掉才发现取不到（已取走的部分仍然收不回）
+        if is_file {
+            let mut r = proto::Packet::new(cmd::RELEASEFILES);
+            // 包号按十进制写；收端 id_candidates 十进制/十六进制都试，
+            // 与 GETFILEDATA 请求行的宽容度保持一致（不新造进制约定）
+            r.extra = pkt.to_string().into_bytes();
+            let bytes = r.encode(&my_user(&cfg), &my_host());
             let _ = ctx.sock.send_to(&bytes, target).await;
         }
+        // 3) 撤回通知本身
+        let mut p = proto::Packet::new(cmd::DELMSG);
+        p.extra = pkt.to_string().into_bytes();
+        let bytes = p.encode(&my_user(&cfg), &my_host());
+        let _ = ctx.sock.send_to(&bytes, target).await;
     }
+
+    // 对端离线也要落到「已撤回」：本地语义是「我撤回了」，不是「对端确认收到撤回」。
+    // 重复撤回是幂等操作（前端已撤回的消息不再给入口，这里只兜住并发/旧界面）。
     ctx.st.history.update_history_pkt(key, pkt, |r| {
         r["recalled"] = json!(true);
     });
-    // 撤回后无需重发/回执跟踪
-    let _ = ctx.st.outbox.ack_retry(key, pkt);
-    let _ = ctx.st.outbox.ack_pending(key, pkt);
     ctx.st
         .emit(wire::evt::MSG_RECALLED, json!({"key": key, "pkt": pkt, "peer": ""}));
     Ok(())
@@ -7734,6 +7778,298 @@ mod tests {
             request.ends_with(format!(":{pkt_no}: 10 :0\n").as_bytes()),
             "GETFILEDATA must echo the advertised raw ID bytes: {:?}",
             String::from_utf8_lossy(&request)
+        );
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    /* ============ 撤回：文本之外的消息也要真的撤得回 ============ */
+
+    /// 某个包号下是否还有本机的附件槽（serve_getfile 就是靠它决定发不发数据）
+    fn slot_alive(st: &AppState, pkt: u32) -> bool {
+        let keys = st.transfer.slot_keys_preview(64);
+        keys.iter().any(|(p, _)| *p == pkt)
+    }
+
+    /// 真的走一遍 serve_getfile：把一条明文取文件请求喂给本机服务端，读回内容。
+    /// 槽已释放时 serve_getfile 在 lookup_slot 未命中处直接 return（连接关闭、零字节），
+    /// 所以「读到 0 字节」就是「对端再也取不到这份文件」的线上证据。
+    async fn fetch_via_serve_getfile(
+        ctx: &NetCtx,
+        pkt: u32,
+        file_id: u32,
+        command: u32,
+    ) -> Vec<u8> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let (client, srv) = tokio::join!(
+            async { TcpStream::connect(target).await.unwrap() },
+            async { listener.accept().await.unwrap() }
+        );
+        let mut client = client;
+        // 与 open_transfer 的明文请求同形：头部五段 + extra = pkt:id:offset + 换行
+        let request = format!("1:1:me:host:{command}:{pkt}:{file_id}:0\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+        super::serve_getfile(ctx, srv.0, srv.1).await;
+        let mut got = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut got)).await;
+        got
+    }
+
+    /// 造一个「在线 + 有历史」的发送场景，返回 (pkt, 附件条目 id 列表)
+    async fn send_file_message(
+        ctx: &NetCtx,
+        st: &AppState,
+        peer: &std::net::UdpSocket,
+        key: &str,
+        path: &std::path::Path,
+        text: &str,
+    ) -> (u32, Vec<u32>) {
+        register_loopback_peer(st, peer.local_addr().unwrap().port());
+        let recs = super::send_message_multi_opts(
+            ctx,
+            key,
+            text,
+            vec![path.to_string_lossy().into_owned()],
+            MsgSendOpts::default(),
+        )
+        .await
+        .expect("发送附件消息");
+        let rec = &recs[0];
+        assert_eq!(rec["kind"], "file", "带附件的消息落库 kind 必须是 file");
+        let pkt = rec["pkt"].as_u64().unwrap() as u32;
+        let ids = rec["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_u64().unwrap() as u32)
+            .collect();
+        // 撤回前的正常投递确实发生了：假对端先收到一条带附件公告（FILEATTACHOPT）的 SENDMSG
+        let first = recv_test_packets(peer);
+        assert!(
+            first.iter().any(|p| p.command & 0xff == crate::protocol::cmd::SENDMSG
+                && p.command & crate::protocol::opt::FILEATTACHOPT != 0),
+            "撤回前应先发出带附件公告的 SENDMSG，实际：{first:?}"
+        );
+        // 清掉首投（SENDMSG / GETPUBKEY 之类）产生的报文，后面的断言只看撤回阶段
+        let _ = recv_test_packets(peer);
+        (pkt, ids)
+    }
+
+    /// ① 文本消息撤回照旧（回归）：只发 DELMSG，不发 RELEASEFILES。
+    #[tokio::test]
+    async fn recall_text_message_sends_only_delmsg() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("recall-text").await;
+        register_loopback_peer(&st, peer.local_addr().unwrap().port());
+        let rec = super::send_message(&ctx, "127.0.0.1", "要撤回的文字", vec![])
+            .await
+            .expect("发送文本");
+        let pkt = rec["pkt"].as_u64().unwrap() as u32;
+        let _ = recv_test_packets(&peer);
+
+        super::recall_message(&ctx, "127.0.0.1", pkt)
+            .await
+            .expect("文本撤回");
+        let sent = recv_test_packets(&peer);
+        let delmsg: Vec<_> = sent
+            .iter()
+            .filter(|p| p.command & 0xff == crate::protocol::cmd::DELMSG)
+            .collect();
+        assert_eq!(delmsg.len(), 1, "撤回要发一条 DELMSG");
+        assert_eq!(delmsg[0].extra, pkt.to_string().into_bytes());
+        assert!(
+            !sent
+                .iter()
+                .any(|p| p.command & 0xff == crate::protocol::cmd::RELEASEFILES),
+            "文本消息没有附件槽，不该发 RELEASEFILES"
+        );
+        let after = st.history.find_history_any("127.0.0.1", pkt).unwrap();
+        assert_eq!(after["recalled"], true, "本地记录必须标成已撤回");
+        assert!(
+            !st.outbox
+                .retry_for("127.0.0.1")
+                .iter()
+                .any(|i| i.pkt == pkt),
+            "撤回后不能再挂在送达重发队列里"
+        );
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    /// ② 文件消息撤回：先释放本机附件槽 → 再发 RELEASEFILES → 最后 DELMSG。
+    /// 释放的判据不是「内部状态改了」，而是「对端真的取不到字节」：
+    /// 撤回前请求能拿到文件内容，撤回后同一条请求读到 0 字节。
+    #[tokio::test]
+    async fn recall_file_message_releases_slot_then_notifies_peer() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("recall-file").await;
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let path = data_dir.join("report.txt");
+        std::fs::write(&path, b"hello-recall").unwrap();
+
+        let (pkt, ids) =
+            send_file_message(&ctx, &st, &peer, "127.0.0.1", &path, "附件要撤回").await;
+        assert_eq!(ids.len(), 1, "一条附件消息一个条目");
+        let fid = ids[0];
+        assert!(slot_alive(&st, pkt), "刚发出时槽必须在（对端随时可能来取）");
+
+        // 撤回前：对端能取到内容（证明下面的「取不到」不是测试环境本身取不到）
+        let before = fetch_via_serve_getfile(&ctx, pkt, fid, crate::protocol::cmd::GETFILEDATA)
+            .await;
+        assert_eq!(before, b"hello-recall", "撤回前必须能取到文件内容");
+
+        super::recall_message(&ctx, "127.0.0.1", pkt)
+            .await
+            .expect("附件撤回");
+
+        // 顺序：RELEASEFILES 必须早于 DELMSG（先断掉取件通道，再通知撤回）
+        let sent = recv_test_packets(&peer);
+        let reindex = sent
+            .iter()
+            .position(|p| p.command & 0xff == crate::protocol::cmd::RELEASEFILES)
+            .expect("附件撤回必须发 RELEASEFILES 让对方丢掉待取清单");
+        let delindex = sent
+            .iter()
+            .position(|p| p.command & 0xff == crate::protocol::cmd::DELMSG)
+            .expect("撤回必须发 DELMSG");
+        assert!(
+            reindex < delindex,
+            "必须先 RELEASEFILES 再 DELMSG，实际顺序：{sent:?}"
+        );
+        assert_eq!(sent[reindex].extra, pkt.to_string().into_bytes());
+        assert_eq!(sent[delindex].extra, pkt.to_string().into_bytes());
+
+        // 本机槽已释放 → 对端再取就是零字节
+        assert!(!slot_alive(&st, pkt), "撤回后该包号的附件槽必须全部撤销");
+        let after = fetch_via_serve_getfile(&ctx, pkt, fid, crate::protocol::cmd::GETFILEDATA)
+            .await;
+        assert!(
+            after.is_empty(),
+            "撤回后再取必须拿不到数据，实际拿到 {} 字节",
+            after.len()
+        );
+
+        let rec = st.history.find_history_any("127.0.0.1", pkt).unwrap();
+        assert_eq!(rec["recalled"], true);
+        assert!(
+            !st.outbox
+                .retry_for("127.0.0.1")
+                .iter()
+                .any(|i| i.pkt == pkt),
+            "撤回后若还挂在重发队列，几秒后会把槽重新登记回来"
+        );
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    /// ③ 文件夹（dir_entry）同样能撤回：槽释放 + RELEASEFILES + DELMSG，
+    /// 且撤回后 GETDIRFILES 也取不到目录树。
+    #[tokio::test]
+    async fn recall_folder_message_releases_dir_slot() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("recall-dir").await;
+        let folder = data_dir.join("待撤回的文件夹");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("a.txt"), b"inside").unwrap();
+
+        let (pkt, ids) =
+            send_file_message(&ctx, &st, &peer, "127.0.0.1", &folder, "文件夹要撤回").await;
+        let fid = ids[0];
+        let rec = st.history.find_history_any("127.0.0.1", pkt).unwrap();
+        assert_eq!(rec["files"][0]["dir_entry"], true, "落库要标出这是文件夹");
+        assert!(slot_alive(&st, pkt));
+
+        let before =
+            fetch_via_serve_getfile(&ctx, pkt, fid, crate::protocol::cmd::GETDIRFILES).await;
+        assert!(!before.is_empty(), "撤回前目录流必须能取到");
+
+        super::recall_message(&ctx, "127.0.0.1", pkt)
+            .await
+            .expect("文件夹撤回");
+
+        let sent = recv_test_packets(&peer);
+        assert!(sent
+            .iter()
+            .any(|p| p.command & 0xff == crate::protocol::cmd::RELEASEFILES));
+        assert!(sent
+            .iter()
+            .any(|p| p.command & 0xff == crate::protocol::cmd::DELMSG));
+        assert!(!slot_alive(&st, pkt), "目录槽也必须撤销");
+        let after = fetch_via_serve_getfile(&ctx, pkt, fid, crate::protocol::cmd::GETDIRFILES).await;
+        assert!(after.is_empty(), "撤回后目录树不该再发得出去");
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    /// ④ 广播信箱不支持撤回：返回专用错误码，且不发任何报文、不改记录。
+    #[tokio::test]
+    async fn recall_broadcast_is_rejected_with_dedicated_code() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("recall-broadcast").await;
+        let pkt = 660001u32;
+        st.history.log_record(
+            crate::state::BROADCAST_SESSION_KEY,
+            &json!({"dir": "out", "kind": "text", "text": "全体注意", "files": [],
+                    "ts": now_secs(), "pkt": pkt, "broadcast": true,
+                    "peer": {"key": crate::state::BROADCAST_SESSION_KEY}, "rcpt": false,
+                    "read": false, "delivered": false, "secret": false, "locked": false}),
+        );
+        let err = super::recall_message(&ctx, crate::state::BROADCAST_SESSION_KEY, pkt)
+            .await
+            .expect_err("广播不能撤回");
+        assert!(
+            err.starts_with("E_RECALL_BROADCAST|"),
+            "广播撤回要返回专用错误码，实际：{err}"
+        );
+        assert_eq!(
+            st.history
+                .find_history_any(crate::state::BROADCAST_SESSION_KEY, pkt)
+                .unwrap()["recalled"]
+                .as_bool(),
+            None,
+            "被拒绝的撤回不能改动记录"
+        );
+        assert!(recv_test_packets(&peer).is_empty(), "拒绝时不该发出任何报文");
+
+        // 记录上带 broadcast 标记的同样拒绝（历史导入的旧记录可能不在广播信箱里）
+        let lone = 660002u32;
+        st.history.log_record(
+            "127.0.0.1",
+            &json!({"dir": "out", "kind": "text", "text": "x", "files": [], "ts": now_secs(),
+                    "pkt": lone, "broadcast": true, "peer": {"key": "127.0.0.1"}}),
+        );
+        let err = super::recall_message(&ctx, "127.0.0.1", lone)
+            .await
+            .expect_err("带 broadcast 标记的记录也不能撤回");
+        assert!(err.starts_with("E_RECALL_BROADCAST|"), "实际：{err}");
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    /// ⑤ 对端掉线时撤回不报错：本地照样标 recalled、槽照样释放（只是没人收报文）。
+    /// 这条最容易漏：撤回是「我的意图」，不该依赖对方在线。
+    #[tokio::test]
+    async fn recall_while_peer_offline_still_marks_and_releases() {
+        let (ctx, st, peer, data_dir) = encipdict_test_ctx("recall-offline").await;
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let path = data_dir.join("gone.txt");
+        std::fs::write(&path, b"bye").unwrap();
+
+        let (pkt, ids) =
+            send_file_message(&ctx, &st, &peer, "127.0.0.1", &path, "对方随后掉线").await;
+        assert!(slot_alive(&st, pkt));
+        // 对端掉线：从在线表里摘掉
+        st.peers.remove_peer("127.0.0.1");
+        assert!(st.peers.get("127.0.0.1").is_none());
+
+        super::recall_message(&ctx, "127.0.0.1", pkt)
+            .await
+            .expect("对端离线时撤回不该报错");
+
+        assert_eq!(
+            st.history.find_history_any("127.0.0.1", pkt).unwrap()["recalled"],
+            true,
+            "本地语义是「我撤回了」，不等对端确认"
+        );
+        assert!(!slot_alive(&st, pkt), "离线也要释放附件槽");
+        let after = fetch_via_serve_getfile(&ctx, pkt, ids[0], crate::protocol::cmd::GETFILEDATA)
+            .await;
+        assert!(after.is_empty(), "离线撤回后再取同样取不到");
+        assert!(
+            recv_test_packets(&peer).is_empty(),
+            "对方不在线，不该有任何报文发出"
         );
         let _ = std::fs::remove_dir_all(data_dir);
     }
