@@ -31,7 +31,7 @@ pub use state::{AppState, Config, PeerInfo};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use tauri::{
     menu::{MenuBuilder, MenuItem},
@@ -46,7 +46,12 @@ pub(crate) type SharedState = Arc<AppState>;
 pub(crate) type SharedCtx = Arc<net::NetCtx>;
 
 static EXIT_INFO: OnceLock<(Arc<AppState>, u16)> = OnceLock::new();
-/// 首次隐藏到托盘时提示一次
+/// 本进程是否已经弹过「已最小化到托盘」的系统通知。
+///
+/// 只守**系统通知**这一路：它依赖通知守护进程，有的桌面（quickshell 未起、
+/// 通知被静音）根本弹不出来，所以不能让它当唯一的关窗反馈 —— 每次关窗都另有
+/// 托盘提示态与 tooltip 兜底（见 blink_tray_hint / tray_tip_text）。
+/// 托盘菜单「显示托盘提示」会把它复位，用户想再看一次随时能看。
 static HIDE_NOTIFIED: AtomicBool = AtomicBool::new(false);
 
 /// 把「主窗口现在是否真的在屏幕上」这一后端事实推给前端。
@@ -107,8 +112,16 @@ where
 }
 
 /// 把帧序列接到 Tauri 的 emit 与 state 的诊断日志上（生产路径）。
+///
+/// 顺带维护托盘 tooltip 的「已最小化」措辞：**可见性事实是唯一真源**，
+/// 所以复位也挂在这里 —— 托盘唤起、全局热键、前端自己 show 全都经过它，
+/// 挂在某个具体 show 调用点上必漏（漏了就是「窗口开着、tooltip 却说已最小化」）。
 fn emit_visibility_frames<R: tauri::Runtime>(app: &tauri::AppHandle<R>, frames: &[bool]) {
     use tauri::Emitter;
+    // 以最后一帧为准（不变量：序列总以真实目标状态收尾）
+    if let Some(&visible) = frames.last() {
+        set_tray_hidden(app, !visible);
+    }
     push_visibility_frames(
         frames,
         |event, payload| {
@@ -144,6 +157,9 @@ fn bring_main_window_up<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
+    // tooltip 恢复默认不在这里：这条函数也是 Wayland 重映射的路径，托盘措辞
+    // 统一跟着可见性事实走（hide_then_show 收尾会 emit visible=true），见
+    // emit_visibility_frames —— 挂在具体 show 调用点上必漏第三条路（前端自己 show）。
 }
 
 fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
@@ -877,6 +893,14 @@ mod linux_tray {
                     ..Default::default()
                 }
                 .into(),
+                // 重弹「已最小化到托盘」提示并复位守卫：与回退托盘的 menu 同名项
+                // 共用 show_tray_hint_again，两条托盘路径行为一致
+                StandardItem {
+                    label: super::ui_str(&self.lang, "显示托盘提示", "Show tray hint"),
+                    activate: Box::new(|t: &mut Self| super::show_tray_hint_again(&t.app)),
+                    ..Default::default()
+                }
+                .into(),
                 MenuItem::Separator,
                 StandardItem {
                     label: super::ui_str(&self.lang, "退出", "Quit"),
@@ -1011,22 +1035,302 @@ fn set_tray_icon(app: &tauri::AppHandle, img: &'static tauri::image::Image<'stat
     });
 }
 
+/// 托盘悬停提示的文案（纯函数，便于单测钉住措辞与未读数两个维度）。
+///
+/// 隐藏态必须说清「程序还在、双击能回来」：用户关窗后看不见任何窗口，
+/// 如果 tooltip 仍是默认的应用名，他会以为程序退出了 —— 这正是不依赖
+/// 通知守护进程的那一路可感知反馈（系统通知每个进程只弹一次）。
+fn tray_tip_text(lang: &str, total: u32, hidden: bool) -> String {
+    let title = format!("Open IPMsg v{}", env!("CARGO_PKG_VERSION"));
+    let unread = if total > 0 {
+        Some(if lang.eq_ignore_ascii_case("en") {
+            format!("{total} unread")
+        } else {
+            format!("{total} 条未读")
+        })
+    } else {
+        None
+    };
+    match (hidden, unread) {
+        (false, None) => title,
+        (false, Some(u)) => format!("{title} · {u}"),
+        (true, None) => ui_str(
+            lang,
+            "Open IPMsg（已最小化，双击打开）",
+            "Open IPMsg (minimized, double-click to open)",
+        ),
+        // 隐藏 + 未读：两个信息都要在 —— 先说程序还在，再说有多少条
+        (true, Some(u)) => {
+            if lang.eq_ignore_ascii_case("en") {
+                format!("Open IPMsg (minimized, double-click to open) · {u}")
+            } else {
+                format!("Open IPMsg（已最小化，双击打开）· {u}")
+            }
+        }
+    }
+}
+
+/// 托盘当前是否处于「主窗口已隐藏」这一档措辞。
+///
+/// set_unread 每次未读变化都会重写 tooltip，它必须知道该用哪一档措辞，
+/// 否则一条新消息就会把「已最小化」提示覆盖回应用名。
+static TRAY_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// 最近一次 set_unread 报告的未读总数（复位提示态时要还原成正确的 tooltip）。
+static TRAY_UNREAD: AtomicU32 = AtomicU32::new(0);
+
+/// 设置「窗口隐藏」这一档措辞并立刻刷新 tooltip。
+fn set_tray_hidden<R: tauri::Runtime>(app: &tauri::AppHandle<R>, hidden: bool) {
+    TRAY_HIDDEN.store(hidden, Ordering::SeqCst);
+    let lang = app
+        .try_state::<SharedState>()
+        .map(|st| st.config().lang)
+        .unwrap_or_default();
+    let tip = tray_tip_text(&lang, TRAY_UNREAD.load(Ordering::SeqCst), hidden);
+    set_tray_tooltip(app, &tip);
+}
+
+/// 写 tooltip（Tauri 托盘 + Linux 自实现的 SNI 托盘两条路各写一次）。
+///
+/// 为什么两个分支都写：Linux 上真实生效的是 SNI（libappindicator 的
+/// set_tooltip 是空实现，见 linux_tray 模块头），非 Linux 走 Tauri 托盘。
+fn set_tray_tooltip<R: tauri::Runtime>(app: &tauri::AppHandle<R>, tip: &str) {
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_tooltip(Some(tip));
+    }
+    #[cfg(target_os = "linux")]
+    if linux_tray::is_active() {
+        linux_tray::update(false, tip.to_string());
+    }
+}
+
+/// 一次关窗提示态闪几下（纯数据，单测用来对账循环次数）。
+/// 2 次 ≈ 2.4s：够被眼睛捕捉到，又不至于让人以为「程序在闹脾气」。
+pub(crate) const TRAY_HINT_BLINKS: u32 = 2;
+
+/// 提示态的序号：新关窗进来就 +1，旧循环发现序号变了立刻退出。
+///
+/// 为什么要序号而不是一个 bool：连续关两次窗时，若不加这个，两轮循环会同时
+/// 跑、交替翻转帧，图标就一直闪个不停（看起来像未读）。
+static TRAY_HINT_GEN: AtomicU32 = AtomicU32::new(0);
+
+/// 「关窗已发生」的托盘提示态：让图标闪几下再回到正常帧。
+///
+/// 这是不依赖通知守护进程的第二路反馈 —— 系统通知每个进程只弹一次，而且可能
+/// 被桌面静音/吞掉，但托盘图标本体一定在那儿。**复用未读的帧切换接口
+/// （set_tray_frame）**，不另造一套托盘绘制：托盘帧本来就只有「正常 / 透明」
+/// 两种，闪一下的含义与未读时一样是「看我一眼」。
+fn blink_tray_hint(app: &tauri::AppHandle) {
+    // 未读闪烁已经在跑了：图标本来就在闪，再叠一个循环只会互相打断帧
+    if FLASHING.load(Ordering::SeqCst) {
+        return;
+    }
+    let gen = TRAY_HINT_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let live = || TRAY_HINT_GEN.load(Ordering::SeqCst) == gen;
+        for _ in 0..TRAY_HINT_BLINKS {
+            if !live() {
+                return;
+            }
+            set_tray_frame(&app2, true);
+            tokio::time::sleep(std::time::Duration::from_millis(FLASH_INTERVAL_MS)).await;
+            if !live() {
+                return;
+            }
+            set_tray_frame(&app2, false);
+            tokio::time::sleep(std::time::Duration::from_millis(FLASH_INTERVAL_MS)).await;
+        }
+        // 收尾一定回到正常帧：停在透明帧上等于图标消失
+        set_tray_frame(&app2, false);
+    });
+}
+
+/// 托盘菜单「显示托盘提示」：复位守卫并重弹那条通知（用户想再看一次时用）。
+///
+/// 「复位 + 重弹」抽成纯函数 `tray_hint_from_menu` 是因为它正是本项要交付的
+/// 用户可见行为：复位必须先于重弹（否则重弹又被守卫吞掉），重弹必须走与
+/// 首次关窗同一条通道（否则用户点出来的提示与真·提示长得不一样）。
+fn show_tray_hint_again(app: &tauri::AppHandle) {
+    tray_hint_from_menu(&HIDE_NOTIFIED, || send_tray_hint_notification(app));
+    if let Some(st) = app.try_state::<SharedState>() {
+        st.diag_scope("notify", HINT_REQUESTED_FROM_MENU);
+    }
+}
+
+/// 菜单点了之后做的那两件事（守卫注入，便于单测断言顺序与复位）。
+///
+/// 顺序是硬要求：先复位再重弹。反过来的话这一发通知会遇到「已提示过」的守卫，
+/// 用户点了菜单却什么都没有 —— 那正是本次要修的那种「静默」。
+pub(crate) fn tray_hint_from_menu<F>(guard: &AtomicBool, resend: F)
+where
+    F: FnOnce(),
+{
+    guard.store(false, Ordering::SeqCst);
+    resend();
+}
+
+/// 托盘提示通知在日志里的 key：与消息通知的「对端 IP」区分开，grep 一眼能捞。
+pub(crate) const TRAY_HINT_KEY: &str = "tray-hint";
+/// 「守卫已消耗」这一行的唯一出处（测试按它断言，避免两处手抄漂移）。
+pub(crate) const HINT_SKIPPED_ALREADY: &str = "hint skipped:already-notified";
+/// 菜单点过之后留的证据行。
+pub(crate) const HINT_REQUESTED_FROM_MENU: &str = "hint requested:from-menu";
+
+/// 关窗这一刻该发通知还是只记账 —— 守卫的**唯一**判定处（纯函数，可测）。
+///
+/// 抽出来是因为「第一次弹、之后静默」正是用户报的那个行为，而它写在
+/// 窗口事件闭包里就没法验证；放在这里，两次关窗的差异由单测直接钉住。
+pub(crate) fn claim_hide_hint(guard: &AtomicBool) -> bool {
+    guard.swap(true, Ordering::SeqCst)
+}
+
+/// 守卫已消耗（本进程已经提示过）：**不发通知**，只留一行证据。
+///
+/// 这里刻意不接受发送器 —— 「跳过时不碰发送器」因此是类型层面的事实，
+/// 不需要靠测试去数调用次数：测试机上绝不能弹出真通知。
+pub(crate) fn log_hint_skipped(st: Option<&AppState>) -> String {
+    if let Some(st) = st {
+        st.diag_scope("notify", HINT_SKIPPED_ALREADY);
+    }
+    HINT_SKIPPED_ALREADY.to_string()
+}
+
+/// 真的发一次关窗提示，并把结果记成 `hint shown` / `hint failed:<err>`。
+///
+/// 失败不静默是本次改动的一半目的：以前 `let _ = ...show()` 让「守卫已消耗」
+/// 与「发送失败」在日志里长得一模一样，用户报「没提示」时无从判断。
+pub(crate) fn log_hint_send<F>(st: Option<&AppState>, make_sender: F) -> String
+where
+    F: FnMut() -> Box<dyn FnOnce() -> SendOutcome + Send>,
+{
+    let line = match send_with_retry(st, TRAY_HINT_KEY, make_sender) {
+        Ok(_) => "hint shown".to_string(),
+        Err(e) => format!("hint failed:{e}"),
+    };
+    if let Some(st) = st {
+        st.diag_scope("notify", &line);
+    }
+    line
+}
+
+/// 发一次「已最小化到托盘」的系统通知，并把结果写进 logs/notify.log。
+///
+/// 走的是 notify_message 那条已证明可用的通道（notify-rust 直发 DBus，注册
+/// default 动作）。**不复用它的 key 语义**：那条路点击后要「打开某个会话」，
+/// 这里没有会话可跳，所以用专用 key（TRAY_HINT_KEY），点击只唤起主窗口。
+/// 决策与留痕全在 log_hint_send：这里是「真发送」的那一层薄壳。
+fn send_tray_hint_notification(app: &tauri::AppHandle) {
+    let lang = app
+        .try_state::<SharedState>()
+        .map(|st| st.config().lang)
+        .unwrap_or_default();
+    let st = app.try_state::<SharedState>().map(|s| s.inner().clone());
+    let body = ui_str(
+        &lang,
+        "已最小化到托盘：双击托盘图标可打开主窗口，右键菜单可退出",
+        "Minimized to tray: double-click the tray icon to open, right-click to quit",
+    );
+    let sender = new_hint_sender(app, &body, &lang);
+    // 与 notify_message 同一条调度方式：发送是阻塞 DBus/WinRT 调用，不占调用线程
+    tauri::async_runtime::spawn_blocking(move || {
+        // 到这一步守卫已经放行（调用方只在首次关窗/菜单复位后进来）
+        log_hint_send(st.as_deref(), sender);
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn new_hint_sender(
+    app: &tauri::AppHandle,
+    body: &str,
+    lang: &str,
+) -> impl FnMut() -> Box<dyn FnOnce() -> SendOutcome + Send> {
+    let (app, body) = (app.clone(), body.to_string());
+    let label = ui_str(lang, "打开", "Open");
+    move || {
+        let (app, body, label) = (app.clone(), body.clone(), label.clone());
+        Box::new(move || {
+            let mut n = notify_rust::Notification::new();
+            n.appname("Open IPMsg")
+                .icon("open-ipmsg")
+                .summary("Open IPMsg")
+                .body(&body);
+            for id in linux_notify_action_ids() {
+                n.action(id, &label);
+            }
+            let handle = n.show().map_err(|e| format!("通知发送失败: {e}"))?;
+            let id = handle.id();
+            // 点击这条提示没有会话可跳，只把窗口拉起来
+            std::thread::spawn(move || {
+                handle.wait_for_action(|action| {
+                    oim_log!("[notify] clicked action={} key={}", action, TRAY_HINT_KEY);
+                    if action == "default" || action == "open" {
+                        let app2 = app.clone();
+                        let _ = app.run_on_main_thread(move || raise_main_window(&app2));
+                    }
+                });
+            });
+            Ok(id.to_string())
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn new_hint_sender(
+    app: &tauri::AppHandle,
+    body: &str,
+    _lang: &str,
+) -> impl FnMut() -> Box<dyn FnOnce() -> SendOutcome + Send> {
+    let app_id = app.config().identifier.clone();
+    let (app, body) = (app.clone(), body.to_string());
+    move || {
+        let (app, body, app_id) = (app.clone(), body.clone(), app_id.clone());
+        Box::new(move || {
+            let app2 = app.clone();
+            tauri_winrt_notification::Toast::new(&app_id)
+                .title("Open IPMsg")
+                .text1(&body)
+                .on_activated(move |_action| {
+                    let app3 = app2.clone();
+                    let _ = app2.run_on_main_thread(move || raise_main_window(&app3));
+                    Ok(())
+                })
+                .show()
+                .map_err(|e| format!("通知发送失败: {e}"))?;
+            Ok("tray-hint-toast".to_string())
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn new_hint_sender(
+    _app: &tauri::AppHandle,
+    _body: &str,
+    _lang: &str,
+) -> impl FnMut() -> Box<dyn FnOnce() -> SendOutcome + Send> {
+    // 这个平台没有可点击通知的通道：报 Err 而不是假装成功 —— 日志里必须出现
+    // hint failed:…，否则又是一次「没提示但看不出为什么」的静默
+    move || Box::new(|| Err("当前平台没有可点击通知的通道".to_string()))
+}
 /// 按未读总数更新托盘：有未读就让图标闪烁（图标 ↔ 透明），读完立刻停。
 #[tauri::command]
 async fn set_unread(app: tauri::AppHandle, total: u32) -> Result<(), String> {
+    TRAY_UNREAD.store(total, Ordering::SeqCst);
     let title = format!("Open IPMsg v{}", env!("CARGO_PKG_VERSION"));
     let tip = if total > 0 {
         format!("{title} · {total} 条未读")
     } else {
-        title
+        title.clone()
     };
-    if let Some(tray) = app.tray_by_id("main-tray") {
-        let _ = tray.set_tooltip(Some(&tip));
-    }
-    #[cfg(target_os = "linux")]
-    if linux_tray::is_active() {
-        linux_tray::update(false, tip.clone());
-    }
+    // 托盘提示按「窗口是否隐藏」分档：隐藏时一条新消息也必须说清「双击打开」，
+    // 不能被这里的默认措辞覆盖回去
+    let lang = app
+        .try_state::<SharedState>()
+        .map(|st| st.config().lang)
+        .unwrap_or_default();
+    set_tray_tooltip(
+        &app,
+        &tray_tip_text(&lang, total, TRAY_HIDDEN.load(Ordering::SeqCst)),
+    );
     // 窗口标题也带上未读数：最小化后在任务栏/窗口列表里一眼能看到
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.set_title(&tip);
@@ -1739,6 +2043,156 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 关窗提示的守卫：第一次返回「没提示过」，之后恒为「提示过」。
+    ///
+    /// 用户报的正是这个形状 —— 一个常驻后台的 IM 每天只弹一次，之后就永远
+    /// 静默，用户会以为程序退出了。守卫本身保留（不刷屏是产品判断），但
+    /// 「第二次是跳过而不是再弹」必须是可测的事实，而不是埋在窗口闭包里。
+    #[test]
+    fn hide_hint_is_claimed_only_once() {
+        use super::claim_hide_hint;
+        use std::sync::atomic::AtomicBool;
+
+        let guard = AtomicBool::new(false);
+        assert!(!claim_hide_hint(&guard), "第一次关窗要弹通知");
+        for i in 0..3 {
+            assert!(claim_hide_hint(&guard), "第 {} 次之后都要跳过", i + 2);
+        }
+    }
+
+    /// ① 首次关窗：记 hint shown（走真发送器假实现，不弹真通知）。
+    #[test]
+    fn hint_first_close_logs_shown() {
+        use super::{log_hint_send, AppState, HINT_SKIPPED_ALREADY, TRAY_HINT_KEY};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("oim-hint-shown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let st = AppState::new(dir.clone());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let line = log_hint_send(Some(&st), move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            Box::new(|| Ok("17".to_string()))
+        });
+        assert_eq!(line, "hint shown");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "成功不再重试");
+
+        let log = std::fs::read_to_string(dir.join("logs/notify.log")).unwrap();
+        // send_with_retry 记的「发送结果」+ 这里记的「关窗提示结论」各一行
+        assert!(log.contains(&format!("shown id=17 key={TRAY_HINT_KEY}")), "{log}");
+        assert!(log.contains("hint shown"), "{log}");
+        // 「跳过」那一行不能出现（否则现场对不上）
+        assert!(!log.contains(HINT_SKIPPED_ALREADY), "{log}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ② 第二次关窗：记 skipped:already-notified，且**一次发送都不尝试**。
+    ///
+    /// 「不尝试」是硬要求：测试机上真弹通知会污染跑测试的人的桌面，而且
+    /// 守卫一旦漏放行，这条断言立刻就红。
+    #[test]
+    fn hint_second_close_logs_skipped_without_sending() {
+        use super::{log_hint_skipped, AppState, HINT_SKIPPED_ALREADY};
+
+        let dir = std::env::temp_dir().join(format!("oim-hint-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let st = AppState::new(dir.clone());
+
+        // 这条路径的签名里没有发送器：跳过时「不可能发送」是类型层面的事实
+        let line = log_hint_skipped(Some(&st));
+        assert_eq!(line, HINT_SKIPPED_ALREADY);
+
+        let log = std::fs::read_to_string(dir.join("logs/notify.log")).unwrap();
+        assert!(log.contains(HINT_SKIPPED_ALREADY), "{log}");
+        assert!(!log.contains("hint shown"), "{log}");
+        assert!(!log.contains("hint failed"), "{log}");
+        // 没有任何发送尝试的痕迹（send_with_retry 成功/失败都会留行）
+        assert!(!log.contains("key=tray-hint"), "{log}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ③ 发送失败：记 hint failed:<err>，不 panic、不吞掉错误串。
+    #[test]
+    fn hint_failure_is_logged_not_swallowed() {
+        use super::{log_hint_send, AppState, TRAY_HINT_KEY};
+
+        let dir = std::env::temp_dir().join(format!("oim-hint-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let st = AppState::new(dir.clone());
+
+        // 两次都失败（send_with_retry 会重试一次）
+        let line = log_hint_send(Some(&st), || Box::new(|| Err("dbus down".to_string())));
+        assert_eq!(line, "hint failed:dbus down");
+
+        let log = std::fs::read_to_string(dir.join("logs/notify.log")).unwrap();
+        assert!(log.contains("hint failed:dbus down"), "{log}");
+        // 两次尝试都留痕（与 send_with_retry 的既有格式一致）
+        assert!(log.contains(&format!("failed key={TRAY_HINT_KEY} attempt=1")), "{log}");
+        assert!(log.contains(&format!("failed key={TRAY_HINT_KEY} attempt=2")), "{log}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ④ 托盘菜单「显示托盘提示」：复位守卫并重弹一次。
+    ///
+    /// 顺序必须是「先复位、再重弹」—— 反过来这发通知会撞上刚置为 true 的守卫，
+    /// 用户点了菜单却什么都没有，那正是本次要修的静默。
+    #[test]
+    fn tray_menu_hint_resets_guard_then_resends() {
+        use super::{claim_hide_hint, tray_hint_from_menu};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let guard = AtomicBool::new(true); // 正常使用中早已被消耗
+        let resends = Arc::new(AtomicUsize::new(0));
+        let seen_in_resend = Arc::new(AtomicBool::new(true));
+        let (r, seen) = (resends.clone(), seen_in_resend.clone());
+        let g = &guard;
+        tray_hint_from_menu(g, move || {
+            r.fetch_add(1, Ordering::SeqCst);
+            // 重弹的那一刻守卫必须已经复位（否则重弹路径会被判成「已提示过」）
+            seen.store(g.load(Ordering::SeqCst), Ordering::SeqCst);
+        });
+
+        assert_eq!(resends.load(Ordering::SeqCst), 1, "菜单点一次重弹一次");
+        assert!(!seen_in_resend.load(Ordering::SeqCst), "重弹前守卫必须已复位");
+        // 复位之后的下一次关窗重新走「首次」分支
+        assert!(!claim_hide_hint(&guard), "复位后第一次关窗要再弹");
+    }
+
+    /// 托盘 tooltip：隐藏态必须说「已最小化 / 双击打开」，未读数两条信息都要在。
+    ///
+    /// 这是每个进程都只有一次的「系统通知」之外、每次关窗都存在的反馈之一。
+    #[test]
+    fn tray_tip_mentions_minimized_only_when_hidden() {
+        use super::{tray_tip_text, TRAY_HINT_BLINKS, HINT_REQUESTED_FROM_MENU};
+
+        let title = format!("Open IPMsg v{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(tray_tip_text("zh-CN", 0, false), title);
+        assert!(tray_tip_text("zh-CN", 2, false).contains("2 条未读"));
+
+        let zh = tray_tip_text("zh-CN", 0, true);
+        assert!(zh.contains("已最小化"), "{zh}");
+        assert!(zh.contains("双击打开"), "{zh}");
+        // 隐藏时默认措辞不许出现在 tooltip 里（那正是「以为程序退出了」的来源）
+        assert!(!zh.contains("v0.1"), "{zh}");
+
+        let zh_unread = tray_tip_text("zh-CN", 3, true);
+        assert!(zh_unread.contains("已最小化") && zh_unread.contains("3 条未读"), "{zh_unread}");
+
+        let en = tray_tip_text("en", 0, true);
+        assert!(en.contains("minimized") && en.contains("double-click"), "{en}");
+        assert!(tray_tip_text("en", 4, true).contains("4 unread"));
+
+        // 闪几下是有上限的（不能变成一直闪 = 看起来像未读）
+        assert!((1..=10).contains(&TRAY_HINT_BLINKS), "提示态要有限次: {TRAY_HINT_BLINKS}");
+        assert_eq!(HINT_REQUESTED_FROM_MENU, "hint requested:from-menu");
+    }
     /// 通知动作里必须有 default：缺了它，Omarchy（quickshell）/ GNOME 下点通知不会
     /// 发出 ActionInvoked，只会被当成「点了条没有动作的消息」静默丢掉。
     #[test]
@@ -2366,6 +2820,16 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
+            // 「显示托盘提示」：重弹一次「已最小化到托盘」通知并复位守卫。
+            // 有了它，「每个进程只弹一次」对用户就不再是无解的 —— 想再看一遍
+            // 从托盘菜单点一下即可，不用重启程序。
+            let hint_item = MenuItem::with_id(
+                &handle,
+                "tray-hint",
+                ui_str(&ui_lang, "显示托盘提示", "Show tray hint"),
+                true,
+                None::<&str>,
+            )?;
             let quit_item = MenuItem::with_id(
                 &handle,
                 "quit",
@@ -2374,7 +2838,7 @@ pub fn run() {
                 None::<&str>,
             )?;
             let menu = MenuBuilder::new(&handle)
-                .items(&[&show_item, &refresh_item, &quit_item])
+                .items(&[&show_item, &refresh_item, &hint_item, &quit_item])
                 .build()?;
 
             let refresh_ctx = ctx.clone();
@@ -2392,6 +2856,8 @@ pub fn run() {
                             net::announce(&c).await;
                         });
                     }
+                    // 与 SNI 托盘（linux_tray）菜单里的同名项走同一个函数
+                    "tray-hint" => show_tray_hint_again(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -2430,23 +2896,23 @@ pub fn run() {
                 // 前端若仍认为自己可见，就会把该会话的消息标已读且不弹通知）
                 emit_window_visibility(window.app_handle(), false);
                 api.prevent_close();
-                if !HIDE_NOTIFIED.swap(true, Ordering::Relaxed) {
-                    use tauri_plugin_notification::NotificationExt;
-                    let lang = window
-                        .app_handle()
-                        .state::<SharedState>()
-                        .config()
-                        .lang;
-                    let _ = window
-                        .notification()
-                        .builder()
-                        .title("Open IPMsg")
-                        .body(ui_str(
-                            &lang,
-                            "已最小化到托盘：双击托盘图标可打开主窗口，右键菜单可退出",
-                            "Minimized to tray: double-click the tray icon to open, right-click to quit",
-                        ))
-                        .show();
+                let app = window.app_handle();
+
+                // 每次关窗都给**不依赖通知守护进程**的反馈：托盘图标闪几下
+                // （tooltip 的「已最小化」措辞已由上面那发 visibility 顺带改好 ——
+                // 可见性是唯一真源，不在这里再写一份）。系统通知可能被桌面静音/
+                // 吞掉，这两样一定看得见 —— 用户「以为程序退出了」才是真正的代价。
+                blink_tray_hint(app);
+
+                // 系统通知仍只在本进程第一次关窗时弹（避免常驻 IM 刷屏），
+                // 但三种情形各留一行日志：以前 let _ = show() 把它们抹成一样，
+                // 用户报「没提示」时无法区分「守卫已消耗」还是「发送失败」。
+                // 判定只走 claim_hide_hint（单测钉住「第一次弹、之后只记账」）
+                if claim_hide_hint(&HIDE_NOTIFIED) {
+                    let st = app.try_state::<SharedState>();
+                    log_hint_skipped(st.as_ref().map(|s| &**s.inner()));
+                } else {
+                    send_tray_hint_notification(app);
                 }
             }
         })
