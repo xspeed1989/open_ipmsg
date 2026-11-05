@@ -51,6 +51,14 @@ function submit() {
   closeModal(m.kind === 'prompt' ? input.value : true)
 }
 
+/** 提示里的入口（如「所在文件夹」）：先关掉这条提示，再执行回调。
+ *  入口本身用 @click.stop，否则冒泡到 .toast 的「点哪儿都关」会把它一起吃掉 */
+function runToastAction(item) {
+  const run = item?.action?.run
+  dismissToast(item.id)
+  if (typeof run === 'function') run()
+}
+
 function onKeydown(e) {
   if (!dialog.modal) return
   if (e.key === 'Escape') {
@@ -80,6 +88,14 @@ const isMultiline = (text) => String(text ?? '').includes('\n')
           @click="dismissToast(item.id)"
         >
           <span class="toast-text">{{ item.text }}</span>
+          <button
+            v-if="item.action"
+            class="toast-action"
+            type="button"
+            @click.stop="runToastAction(item)"
+          >
+            {{ item.action.text }}
+          </button>
         </div>
       </div>
     </Teleport>
@@ -177,6 +193,21 @@ const isMultiline = (text) => String(text ?? '').includes('\n')
   white-space: pre-wrap;
   word-break: break-word;
   user-select: text;
+}
+/* 提示里的可点入口（如「所在文件夹」）：跟随强调色，单独一行，像链接而不像按钮 */
+.toast-action {
+  display: block;
+  margin-top: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--c-accent);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.toast-action:hover {
+  text-decoration: underline;
 }
 @keyframes toast-in {
   from {

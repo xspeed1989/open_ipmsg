@@ -93,6 +93,8 @@ wire_names!(
     SHOT_OVERLAY_READY => "shot_overlay_ready",
     SHOT_IMAGE => "shot_image",
     CLOSE_SHOT_OVERLAYS => "close_shot_overlays",
+    SHOT_PICTURES_DIR => "shot_pictures_dir",
+    SHOT_LIST_DIR => "shot_list_dir",
     SAVE_SHOT_PNG => "save_shot_png",
     COPY_IMAGE_TO_CLIPBOARD => "copy_image_to_clipboard",
 );

@@ -203,7 +203,14 @@ export const shotImage = (session, index) => invoke(WIRE.cmd.shot_image, { sessi
 /** 关闭全部遮罩窗口并释放会话缓存（幂等） */
 export const closeShotOverlays = (session) => invoke(WIRE.cmd.close_shot_overlays, { session })
 
-/** 把确认后的 PNG 另存为文件 */
+/** 系统的图片根目录（绝对路径）。前端在它下面拼截图子目录，绝不自己拼 ~：
+ *  ~ 在别的进程里不展开，会写进一个真叫 ~ 的目录 */
+export const shotPicturesDir = () => invoke(WIRE.cmd.shot_pictures_dir)
+
+/** 截图目录里已有的文件名（目录还不存在时为 []，写盘时自动创建） */
+export const shotListDir = (dir) => invoke(WIRE.cmd.shot_list_dir, { dir })
+
+/** 把 PNG 写到 path（后端用 create_new：同名文件已存在时抛 E_SAVE_EXISTS，不会覆盖） */
 export const saveShotPng = (b64, path) => invoke(WIRE.cmd.save_shot_png, { b64, path })
 
 /** 把 PNG 写进系统剪贴板（Linux 后端 GTK；其他平台返回 PLUGIN 由前端插件兜底） */

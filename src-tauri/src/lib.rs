@@ -2964,6 +2964,8 @@ pub fn run() {
             screenshot::shot_overlay_ready,
             screenshot::shot_image,
             screenshot::close_shot_overlays,
+            screenshot::shot_pictures_dir,
+            screenshot::shot_list_dir,
             screenshot::save_shot_png,
             screenshot::copy_image_to_clipboard
         ])

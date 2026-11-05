@@ -129,6 +129,47 @@ test('toast 锚定在聊天记录区顶端居中，不靠窗口坐标硬算', ()
   assert.match(app, /toast-area="chat"/, '主窗口要显式指定聊天区落点（图片窗口用默认的整窗）')
 })
 
+test('截图遮罩里不得出现原生文件对话框（Wayland 上的遮罩必须只走应用内交互）', () => {
+  // **为什么这条要单独守**：上面那条规则把 plugin-dialog 的 open/save 列为
+  // 「保留项」（它们确实是系统级能力），于是遮罩窗口从它上面弹原生保存框这件事
+  // 漏网了 —— 而遮罩恰恰是唯一不能用的地方：
+  //
+  // 遮罩是整屏、无边框、置顶的 Wayland 表面。从它上面挂原生 GTK 模态框时，合成器
+  // 会把对话框另开成一个顶层窗口，真机（Hyprland）表现是：
+  //   · hyprctl clients 里确实多出一个「Save File」窗口，
+  //   · 但它不参与合成/不被画面捕获（grim 拍不到），
+  //   · 用户看到的是「对话框不可见 + 整层遮罩消失 + 只剩活桌面」。
+  // 用户的原话就是「截图的时候编辑的时候，截图图层会消失」。
+  //
+  // 所以：遮罩这一侧只允许应用内交互（toast / 自绘 UI）。保存走
+  // 「后端给图片目录 → 前端拼固定文件名 → 直写」；真要「另存为」，从主窗口
+  // （或图片查看器那种普通窗口）发起，parent 是主窗口，不在遮罩里弹。
+  const overlay = stripComments(
+    readFileSync(new URL('components/ScreenshotOverlay.vue', srcDir), 'utf8')
+  )
+  const banned = [
+    { re: /@tauri-apps\/plugin-dialog/, msg: '遮罩里不得引 plugin-dialog（原生模态会让遮罩消失）' },
+    { re: /\bsaveDialog\s*\(/, msg: '遮罩里不得调用 saveDialog' },
+    { re: /\bopenDialog\s*\(/, msg: '遮罩里不得调用 openDialog' },
+  ]
+  const hits = []
+  for (const { re, msg } of banned) {
+    overlay.split('\n').forEach((line, i) => {
+      if (re.test(line)) hits.push(`components/ScreenshotOverlay.vue:${i + 1} ${msg}\n    ${line.trim().slice(0, 90)}`)
+    })
+  }
+  assert.deepEqual(hits, [], `遮罩窗口里出现原生文件对话框：\n  ${hits.join('\n  ')}`)
+
+  // 保存现在靠应用内 toast 回执，所以遮罩这个独立窗口也得挂自己的 DialogHost
+  const text = readFileSync(new URL('components/ScreenshotOverlay.vue', srcDir), 'utf8')
+  assert.match(
+    text,
+    /<DialogHost\b[^>]*\/>/,
+    '遮罩窗口只有这一个组件，toast 需要自己的 DialogHost 宿主才画得出来'
+  )
+  assert.match(text, /@contextmenu\.prevent\.stop/, 'toast 宿主必须吞掉右键：否则冒泡到遮罩的 cancel')
+})
+
 test('script setup 里不得裸用 prop 名（构建期不报错，运行时才炸）', () => {
   // 真踩过：defineProps 没接返回值就在 computed 里写 toastArea，vite build 照过，
   // 浏览器里一渲染就 ReferenceError，整个宿主组件空白

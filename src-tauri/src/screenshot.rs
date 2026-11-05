@@ -1195,12 +1195,79 @@ pub async fn close_shot_overlays(
     Ok(())
 }
 
+/* 截图落盘：目录 / 列名 / 写入 */
+
+/// 系统的图片根目录（**不猜 `~`**）。
+///
+/// 位置记在 `~/.config/user-dirs.dirs` 的 XDG_PICTURES_DIR 里，用户可能改成任何
+/// 绝对路径；`dirs::picture_dir()` 读的就是它。取不到（精简容器里没这项）时退回
+/// `~/Pictures` —— 那是同一份约定里的出厂默认值。前端只拿这个结果拼子目录，
+/// 绝不自己拼 `~`：`~` 在别的进程里不会展开，写盘会造出一个真叫 `~` 的目录。
+fn pictures_base() -> Result<std::path::PathBuf, String> {
+    dirs::picture_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Pictures")))
+        .ok_or_else(|| {
+            "E_SAVE_FAILED|找不到图片目录（既没有 XDG 图片目录，也没有 home）".to_string()
+        })
+}
+
+/// 列出目录里已有的文件名；目录不存在 → 空列表（不是错误）。
+fn list_names(dir: &str) -> Result<Vec<String>, String> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => Ok(entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("E_SAVE_FAILED|{e}")),
+    }
+}
+
+/// 只在文件**不存在**时写入（父目录缺了就先建）。
+///
+/// 用 `create_new` 而不是 `fs::write`：后者会默默覆盖同名文件。截图文件名只精确
+/// 到秒，连拍两张就可能撞名，覆盖掉上一张就是丢数据。撞名（AlreadyExists）回
+/// `E_SAVE_EXISTS`，前端据此换 `-2`/`-3` 再试 —— 所以这里只负责「不覆盖」，
+/// 排名字在 `src/lib/shotSave.js`（纯函数，node 侧有单测）。
+fn write_new_file(path: &str, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("E_SAVE_FAILED|{e}"))?;
+        }
+    }
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(format!("E_SAVE_EXISTS|{path}"));
+        }
+        Err(e) => return Err(format!("E_SAVE_FAILED|{e}")),
+    };
+    std::io::Write::write_all(&mut f, bytes).map_err(|e| format!("E_SAVE_FAILED|{e}"))
+}
+
+/// 图片根目录（绝对路径）：前端在它下面拼「OpenIPMsg 截图」子目录
+#[tauri::command]
+pub async fn shot_pictures_dir() -> Result<String, String> {
+    Ok(pictures_base()?.to_string_lossy().into_owned())
+}
+
+/// 截图目录里已有的文件名：前端据此避让重名（目录不存在时为空，会由写盘时创建）
+#[tauri::command]
+pub async fn shot_list_dir(dir: String) -> Result<Vec<String>, String> {
+    list_names(&dir)
+}
+
+/// 把 PNG 写到 path（不覆盖已有文件，见 `write_new_file`）
 #[tauri::command]
 pub async fn save_shot_png(b64: String, path: String) -> Result<(), String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
         .map_err(|e| format!("图片数据非法: {e}"))?;
-    std::fs::write(&path, bytes).map_err(|e| format!("E_SAVE_FAILED|{e}"))
+    write_new_file(&path, &bytes)
 }
 
 /// 把 PNG 写进系统剪贴板（Linux 走 GTK：与现有 clipboard_image 读路径对称）
@@ -1440,5 +1507,30 @@ mod tests {
         }];
         assert!(monitor_at(&mons, 0).is_ok());
         assert_eq!(monitor_at(&mons, 3).unwrap_err().code(), "CAPTURE_FAILED");
+    }
+
+    #[test]
+    fn write_new_file_never_clobbers_and_creates_parent() {
+        let dir = std::env::temp_dir().join(format!("oim-shot-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 目标子目录还不存在：写盘要顺带建出来（截图目录是首次保存时才出生的）
+        let nested = dir.join("OpenIPMsg 截图");
+        let p = nested.join("a.png");
+        let ps = p.to_string_lossy().into_owned();
+
+        write_new_file(&ps, b"one").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"one");
+
+        // 同名再写一次：必须被拒（E_SAVE_EXISTS），旧内容一个字节都不许变
+        let err = write_new_file(&ps, b"two").unwrap_err();
+        assert!(err.starts_with("E_SAVE_EXISTS|"), "实际：{err}");
+        assert_eq!(std::fs::read(&p).unwrap(), b"one", "已有文件被覆盖了");
+
+        // 列名能看见刚写的那个；目录不存在时是空列表而不是错误
+        let names = list_names(&nested.to_string_lossy()).unwrap();
+        assert_eq!(names, vec!["a.png".to_string()]);
+        assert!(list_names(&dir.join("nope").to_string_lossy()).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

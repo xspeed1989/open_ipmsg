@@ -37,6 +37,32 @@ test('toast：duration 为 0 时不自动消失（错误提示需要用户自己
   resetDialogs()
 })
 
+test('toast：带 action 的提示会留到用户点掉（否则入口一闪就没）', async () => {
+  resetDialogs()
+  let ran = 0
+  const id = toast('已保存到「OpenIPMsg 截图」', { action: { text: '所在文件夹', run: () => ran++ } })
+  const item = dialog.toasts.find((t) => t.id === id)
+  assert.equal(item.action.text, '所在文件夹')
+  // 没显式给 duration 时不自动消失：不然用户还没来得及点就没了
+  await new Promise((r) => setTimeout(r, 15))
+  assert.equal(dialog.toasts.length, 1, '带入口的提示不应自动消失')
+
+  // 普通 toast 不变：默认仍会自动消失
+  resetDialogs()
+  toast('普通提示')
+  await new Promise((r) => setTimeout(r, 15))
+  assert.equal(dialog.toasts.length, 1, '默认时长内还在')
+  resetDialogs()
+})
+
+test('toast：action 只接受 { text, run }，run 不是函数就当没有入口', () => {
+  resetDialogs()
+  const id = toast('x', { action: { text: '入口', run: 'not-a-function' } })
+  const item = dialog.toasts.find((t) => t.id === id)
+  assert.equal(item.action, undefined)
+  resetDialogs()
+})
+
 test('confirm：确定 / 取消分别落定 true / false', async () => {
   resetDialogs()
   const yes = confirm('删除这条会话？')
