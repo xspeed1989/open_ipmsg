@@ -78,6 +78,7 @@ const zh = {
   'err.E_READ_FAILED': '读取失败：{e}',
   'err.E_FILE_MISSING': '图片文件不存在（可能已被移动或删除）',
   'err.E_SAVE_FAILED': '保存失败：{e}',
+  'err.E_SAVE_EXISTS': '同名文件已存在，已换一个文件名重试',
   'err.E_CLIPBOARD_FAILED': '读取剪贴板失败：{e}',
   'err.E_CLIPBOARD_TIMEOUT': '读取剪贴板超时：{e}',
   'err.E_VIEWER_OPEN_FAILED': '打开图片窗口失败：{e}',
@@ -371,6 +372,10 @@ const zh = {
   'shot.tool.move': '移动/调整选区', 'shot.tool.rect': '矩形', 'shot.tool.ellipse': '椭圆',
   'shot.tool.arrow': '箭头', 'shot.tool.pen': '画笔', 'shot.tool.text': '文字', 'shot.tool.mosaic': '马赛克',
   'shot.undo': '撤销',
+  // 保存落盘（固定目录 + 应用内提示，遮罩不关）
+  'shot.savedTo': '已保存到「{dir}」：{name}',
+  'shot.reveal': '所在文件夹',
+  'shot.saveFailed': '截图保存失败',
   // ---- 转发/引用（发送文本里的本地标记） ----
   'forward.noContent': '没有可转发的内容',
   'forward.notDownloaded': '「{name}」尚未下载，无法转发',
@@ -443,6 +448,7 @@ const en = {
   'err.E_READ_FAILED': 'Read failed: {e}',
   'err.E_FILE_MISSING': 'Image file is missing (moved or deleted)',
   'err.E_SAVE_FAILED': 'Save failed: {e}',
+  'err.E_SAVE_EXISTS': 'A file with that name already exists; tried another name',
   'err.E_CLIPBOARD_FAILED': 'Clipboard read failed: {e}',
   'err.E_CLIPBOARD_TIMEOUT': 'Clipboard read timed out: {e}',
   'err.E_VIEWER_OPEN_FAILED': 'Failed to open the image window: {e}',
@@ -735,6 +741,10 @@ const en = {
   'shot.tool.move': 'Move/resize selection', 'shot.tool.rect': 'Rectangle', 'shot.tool.ellipse': 'Ellipse',
   'shot.tool.arrow': 'Arrow', 'shot.tool.pen': 'Pen', 'shot.tool.text': 'Text', 'shot.tool.mosaic': 'Mosaic',
   'shot.undo': 'Undo',
+  // Save to a fixed folder with an in-app toast; the overlay stays open
+  'shot.savedTo': 'Saved to "{dir}": {name}',
+  'shot.reveal': 'Show in folder',
+  'shot.saveFailed': 'Failed to save the screenshot',
   // ---- 转发/引用（发送文本里的本地标记） ----
   'forward.noContent': 'Nothing to forward',
   'forward.notDownloaded': '"{name}" hasn\'t been downloaded yet and can\'t be forwarded',

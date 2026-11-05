@@ -68,6 +68,8 @@ export const WIRE = {
     shot_overlay_ready: 'shot_overlay_ready',
     shot_image: 'shot_image',
     close_shot_overlays: 'close_shot_overlays',
+    shot_pictures_dir: 'shot_pictures_dir',
+    shot_list_dir: 'shot_list_dir',
     save_shot_png: 'save_shot_png',
     copy_image_to_clipboard: 'copy_image_to_clipboard',
   },

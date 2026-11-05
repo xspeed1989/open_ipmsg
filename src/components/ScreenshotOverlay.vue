@@ -1,14 +1,24 @@
 <script setup>
 // 截图遮罩窗口：底图 + 变暗挖洞 + 拖拽选区 + 标注层（矩形/椭圆/箭头/画笔/文字/马赛克）。
-// 「确认/复制/另存为」在这里把选区 + 标注合成 PNG 导出（确认/复制回主窗口，另存为落盘）。
+// 「确认/复制/保存」在这里把选区 + 标注合成 PNG 导出（确认/复制回主窗口，保存直接落盘）。
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import * as ipc from '../lib/ipc'
 import {
   rectFromDrag, clampRect, canConfirm, hitTestHandle, resizeRect, moveRect, nudgeRect,
   cssRectToImageRect, toolbarPlacement, mosaicBlocks, arrowHead, pushUndo, cursorFor,
 } from '../lib/shot'
 import { t } from '../lib/i18n'
-import { save as saveDialog } from '@tauri-apps/plugin-dialog'
+import { toast } from '../lib/dialog'
+import { describeError, errorCode } from '../lib/errors'
+import { SHOT_DIR_NAME, shotsDir, shotFileName, joinPath, baseNameOf, freeName } from '../lib/shotSave'
+import DialogHost from './DialogHost.vue'
+
+// 这里**故意不引** @tauri-apps/plugin-dialog：遮罩是整屏、无边框、置顶的 Wayland
+// 表面，从它上面挂原生 GTK 保存框，合成器会把对话框另开成一个顶层窗口 ——
+// 真机表现是「对话框看不见 + 遮罩整层消失 + 只剩活桌面」（v0.1.17 的保存按钮就
+// 是这么坏的）。保存改成「直接写进固定目录 + 应用内 toast」。契约测试：
+// scripts/no-native-dialogs.test.mjs「遮罩窗口里不得出现原生文件对话框」。
 
 const boot = window.__OIM_SHOT__ || {}
 const qs = new URLSearchParams(location.search)
@@ -514,21 +524,67 @@ async function copyOnly() {
   }
 }
 
-/** 保存：不关闭遮罩，方便继续调整后再发 */
+/** 保存：不关闭遮罩，方便继续调整后再发。
+ *
+ *  落点固定（图片目录 / 「OpenIPMsg 截图」），**不弹原生保存框**：见文件头的说明。
+ *  目录由后端给（它读 XDG_PICTURES_DIR，可能是用户改过的任意路径，前端拼 `~` 是猜），
+ *  命名与重名避让在 lib/shotSave.js（纯函数，有 node 单测）。
+ */
 async function saveAs() {
   if (!canOk.value || busy.value) return
   errMsg.value = ''
   busy.value = true
   try {
     const { b64 } = compositeB64()
-    const base = `screenshot-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')}.png`
-    const path = await saveDialog({ defaultPath: base, filters: [{ name: 'PNG', extensions: ['png'] }] })
-    if (!path) return
-    await ipc.saveShotPng(b64, path)
+    const dir = shotsDir(await ipc.shotPicturesDir())
+    const name = shotFileName(new Date())
+    const path = await saveShotWithDedupe(b64, dir, name)
+    const shown = baseNameOf(path)
+    // 用 toast 而不是模态：遮罩是整屏置顶窗口，模态会把正在调整的选区盖住；
+    // toast 不夺焦点，保存完还能接着画
+    toast(t('shot.savedTo', { dir: SHOT_DIR_NAME, name: shown }), {
+      action: { text: t('shot.reveal'), run: () => revealShot(path) },
+    })
   } catch (e) {
-    errMsg.value = String(e?.message || e)
+    errMsg.value = describeError(e, 'shot.saveFailed')
   } finally {
     busy.value = false
+  }
+}
+
+/** 写盘：先按已有文件名排一个不撞名的，撞了（E_SAVE_EXISTS）再往后排。
+ *
+ *  为什么要有第二道避让：列目录与写盘之间有时间窗，另一个窗口/进程可能正好占了
+ *  这个名字。后端用 create_new 写，撞上就报 E_SAVE_EXISTS —— 重排即可，不覆盖。
+ */
+async function saveShotWithDedupe(b64, dir, name) {
+  let taken = []
+  try {
+    taken = (await ipc.shotListDir(dir)) || []
+  } catch {
+    // 列目录失败不算致命：可能是目录还不存在（后端读不到就当空列表），
+    // 真正的写盘错误留给下面这步报出来
+    taken = []
+  }
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const candidate = joinPath(dir, freeName(name, taken))
+    try {
+      await ipc.saveShotPng(b64, candidate)
+      return candidate
+    } catch (e) {
+      if (errorCode(e) !== 'E_SAVE_EXISTS') throw e
+      taken = [...taken, baseNameOf(candidate)]
+    }
+  }
+  throw new Error('E_SAVE_EXISTS|重名过多')
+}
+
+/** 「所在文件夹」：在文件管理器里选中这张图（opener 的 reveal 权限 capabilities 里已给） */
+async function revealShot(path) {
+  try {
+    await revealItemInDir(path)
+  } catch (e) {
+    toast(describeError(e, 'shot.saveFailed'), { kind: 'error' })
   }
 }
 
@@ -654,6 +710,14 @@ onUnmounted(() => {
       @keydown.ctrl.z.stop @keydown.meta.z.stop @blur="commitText" />
     <div v-if="!sel && !errMsg && painted" class="tip">{{ t('shot.tip') }}</div>
     <div v-if="errMsg" class="error">{{ errMsg }}</div>
+    <!-- 应用内 toast 的宿主（遮罩窗口只有这一个组件，得自己挂一份）。
+         包一层拦事件：否则点提示会冒泡成「开始拖新选区」，右键还会触发
+         .shot-root 上的 @contextmenu.prevent="cancel" 把整次截图取消掉 -->
+    <div class="shot-toast-host"
+      @pointerdown.stop @pointermove.stop @pointerup.stop @click.stop
+      @contextmenu.prevent.stop @wheel.stop>
+      <DialogHost />
+    </div>
   </div>
 </template>
 

@@ -20,7 +20,8 @@ export const MAX_TOASTS = 4
 export const TOAST_MS = 3200
 
 export const dialog = reactive({
-  /** [{ id, text, kind }]，kind: 'info' | 'error' */
+  /** [{ id, text, kind, action? }]，kind: 'info' | 'error'；
+   *  action: { text, run } —— 提示里的一个可点入口（如「所在文件夹」） */
   toasts: [],
   /** 当前模态：{ id, kind, text, okLabel?, cancelLabel?, danger?, password?, placeholder?, resolve } */
   modal: null,
@@ -29,12 +30,24 @@ export const dialog = reactive({
 let seq = 0
 const timers = new Map()
 
-/** 轻提示：进队列并定时消失，返回 id（可手动 dismissToast） */
-export function toast(text, { kind = 'info', duration = TOAST_MS } = {}) {
+/**
+ * 轻提示：进队列并定时消失，返回 id（可手动 dismissToast）。
+ *
+ * `action` 可选：`{ text, run }`，在提示里渲染成一个可点的入口（如「所在文件夹」）。
+ * 为什么放在 toast 里而不是弹模态：截图遮罩是整屏置顶的特殊窗口，一弹模态就会
+ * 盖住并打断正在调整的选区；toast 不夺焦点，用户想接着画就接着画。
+ * 带 action 的提示默认改成 `duration: 0`（不自动消失）—— 否则话还没读完就没了，
+ * 用户根本来不及点那个入口。
+ */
+export function toast(text, { kind = 'info', duration, action = null } = {}) {
   const id = ++seq
-  dialog.toasts.push({ id, text: String(text ?? ''), kind })
+  const item = { id, text: String(text ?? ''), kind }
+  const hasAction = !!action && typeof action.run === 'function'
+  if (hasAction) item.action = { text: String(action.text ?? ''), run: action.run }
+  dialog.toasts.push(item)
   while (dialog.toasts.length > MAX_TOASTS) dismissToast(dialog.toasts[0].id)
-  if (duration > 0) timers.set(id, setTimeout(() => dismissToast(id), duration))
+  const ms = duration === undefined ? (hasAction ? 0 : TOAST_MS) : duration
+  if (ms > 0) timers.set(id, setTimeout(() => dismissToast(id), ms))
   return id
 }
 
