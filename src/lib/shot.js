@@ -184,3 +184,32 @@ export function toolbarPlacement(sel, win, bar, gap = 8) {
   const x = Math.min(Math.max(0, sel.x), Math.max(0, win.w - bar.w))
   return { x, y, flip }
 }
+
+/**
+ * 选区之外的压暗区域，拆成四条边缘带（上/下/左/右）。
+ *
+ * 为什么不用 `.dim` 上的 `box-shadow: 0 0 0 9999px`：那会在合成器里撑出一块上万
+ * 像素量级的离屏表面。WebKitGTK + Wayland + NVIDIA 上实测会出问题（整层偶发不
+ * 刷新 / 露出脏像素 / 遮罩像整个消失），而四条带子的面积上限就是窗口本身，没有
+ * 超大表面。纯函数，便于单测。
+ *
+ * 宽或高为 0 的带子不返回（选区贴边时那一条本就不需要）。
+ *
+ * @param {{x:number,y:number,w:number,h:number}} sel 选区（CSS 像素）
+ * @param {{w:number,h:number}} win 窗口尺寸（CSS 像素）
+ * @returns {Array<{key:string,x:number,y:number,w:number,h:number}>}
+ */
+export function dimBands(sel, win) {
+  if (!sel || !win || !win.w || !win.h) return []
+  const x0 = Math.max(0, sel.x)
+  const y0 = Math.max(0, sel.y)
+  const x1 = Math.min(win.w, sel.x + sel.w)
+  const y1 = Math.min(win.h, sel.y + sel.h)
+  const midH = Math.max(0, y1 - y0)
+  return [
+    { key: 'top', x: 0, y: 0, w: win.w, h: Math.max(0, y0) },
+    { key: 'bottom', x: 0, y: y1, w: win.w, h: Math.max(0, win.h - y1) },
+    { key: 'left', x: 0, y: y0, w: Math.max(0, x0), h: midH },
+    { key: 'right', x: x1, y: y0, w: Math.max(0, win.w - x1), h: midH },
+  ].filter((b) => b.w > 0 && b.h > 0)
+}
