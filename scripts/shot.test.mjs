@@ -4,10 +4,53 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import {
   rectFromDrag, clampRect, canConfirm, hitTestHandle,
-  resizeRect, moveRect, nudgeRect,
+  resizeRect, moveRect, nudgeRect, dimBands,
 } from '../src/lib/shot.js'
 
 const B = { x: 0, y: 0, w: 100, h: 80 }
+
+/* 压暗带：四条边、面积有界（不允许再退回 9999px 的 box-shadow 大表面） */
+test('四条压暗带正好铺满选区之外，互不重叠', () => {
+  const bands = dimBands({ x: 40, y: 20, w: 30, h: 20 }, { w: 100, h: 80 })
+  const area = bands.reduce((s, b) => s + b.w * b.h, 0)
+  assert.equal(area, 100 * 80 - 30 * 20, '带子面积 = 窗口 - 选区')
+  // 左上角、右下角都应落在某条带子里（不是空洞）
+  assert.ok(bands.some((b) => 0 >= b.x && 0 >= b.y && 0 < b.w && 0 < b.h))
+  assert.ok(bands.some((b) => b.x <= b.w + b.x && b.y + b.h <= 80 && b.x <= 99))
+})
+
+test('选区贴着窗口边时省略宽度为 0 的带子', () => {
+  const bands = dimBands({ x: 0, y: 0, w: 100, h: 80 }, { w: 100, h: 80 })
+  assert.deepEqual(bands, [], '整窗选中 = 不需要任何压暗带')
+  const left = dimBands({ x: 0, y: 10, w: 50, h: 20 }, { w: 100, h: 80 })
+  assert.ok(!left.some((b) => b.key === 'left'), '选区贴左边就没有左侧带')
+  assert.ok(left.some((b) => b.key === 'right'), '右侧带仍在')
+})
+
+test('没有选区/没有窗口尺寸时返回空（不给渲染层造 0 面积元素）', () => {
+  assert.deepEqual(dimBands(null, { w: 100, h: 80 }), [])
+  assert.deepEqual(dimBands({ x: 1, y: 1, w: 1, h: 1 }, { w: 0, h: 0 }), [])
+  assert.deepEqual(dimBands({ x: 1, y: 1, w: 1, h: 1 }, null), [])
+})
+
+test('遮罩里有 100ms 保活计时器，且卸载时清掉（不然关掉遮罩还在跑）', () => {
+  const src = readFileSync(new URL('../src/components/ScreenshotOverlay.vue', import.meta.url), 'utf8')
+  assert.match(src, /setInterval\([\s\S]{0,160}?100\s*\)/, '要有 100ms 保活计时器')
+  assert.match(src, /clearInterval\(tickTimer\)/, '卸载时必须 clearInterval')
+  // 保活的视觉变化必须是「肉眼无差」的量级：alpha 不超过 0.01
+  const alphas = [...src.matchAll(/rgba\(0,\s*0,\s*0,\s*(0\.0+\d+)\)/g)].map((m) => Number(m[1]))
+  assert.ok(alphas.some((a) => a <= 0.01), `保活用的是极小 alpha，实际：${alphas}`)
+})
+
+test('遮罩里不许再出现超大 box-shadow（会撑出离屏大表面）', () => {
+  const raw = readFileSync(new URL('../src/components/ScreenshotOverlay.vue', import.meta.url), 'utf8')
+  // 注释里会提到这条历史（解释为什么不能那么写），所以先剥注释再匹配
+  const src = raw
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+  assert.ok(!/box-shadow:\s*0\s+0\s+0\s+\d{3,}px/.test(src), '压暗必须用四条边缘带，不能用 9999px 阴影挖洞')
+})
 
 test('拖拽两个方向都得到归一化矩形', () => {
   assert.deepEqual(rectFromDrag({ x: 10, y: 20 }, { x: 40, y: 60 }, B), { x: 10, y: 20, w: 30, h: 40 })

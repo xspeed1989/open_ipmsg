@@ -7,6 +7,7 @@ import * as ipc from '../lib/ipc'
 import {
   rectFromDrag, clampRect, canConfirm, hitTestHandle, resizeRect, moveRect, nudgeRect,
   cssRectToImageRect, toolbarPlacement, mosaicBlocks, arrowHead, pushUndo, cursorFor,
+  dimBands,
 } from '../lib/shot'
 import { t } from '../lib/i18n'
 import { toast } from '../lib/dialog'
@@ -26,6 +27,9 @@ const session = boot.session || qs.get('session') || ''
 const index = Number(boot.index ?? qs.get('i') ?? 0)
 
 const root = ref(null)
+/* 100ms 保活刻度：见 onMounted 里的注释。只在这一层存在期间跑（遮罩关闭即销毁）。 */
+const tickValue = ref(0)
+let tickTimer = null
 const baseCanvas = ref(null)
 const annoCanvas = ref(null)   // 标注层：与窗口同尺寸的独立 canvas（Task 9 合成时贴到选区上）
 const img = ref(null)          // 已解码的整幅图像（Image 对象）
@@ -58,6 +62,9 @@ const selStyle = computed(() => {
   if (!s) return { display: 'none' }
   return { left: s.x + 'px', top: s.y + 'px', width: s.w + 'px', height: s.h + 'px' }
 })
+
+/** 选区之外的压暗带（四条边，不用超大 box-shadow：理由见 lib/shot.js dimBands） */
+const bands = computed(() => dimBands(sel.value, winRect.value))
 
 const sizeLabel = computed(() => {
   const s = sel.value
@@ -618,6 +625,14 @@ onMounted(() => {
   load()
   window.addEventListener('keydown', onKeydown)
   window.addEventListener('resize', onResize)
+  // 100ms 保活：WebKitGTK + Wayland + NVIDIA 上，遮罩这种「几乎全透明、内容基本不变」
+  // 的窗口会撞上合成粘滞 —— 一帧没提交上去，合成器就一直显示上一帧（脏像素）甚至
+  // 整层不刷新，用户看到的是「遮罩闪没了/露桌面」。每 100ms 让一个不可见元素换一次
+  // 极小 alpha（0.003 ↔ 0.004，肉眼无差），保证总有新提交进来。
+  // 只在遮罩存在期间跑，窗口关闭即组件卸载，不会留下常驻开销。
+  tickTimer = window.setInterval(() => {
+    tickValue.value = tickValue.value ? 0 : 1
+  }, 100)
 })
 // 工具栏元素与它的宽度都随工具/选区变化：等 DOM 落地后重新量一次，再夹位置
 onMounted(() => nextTick(measureBar))
@@ -625,6 +640,10 @@ watch([tool, blockSize, sel], () => nextTick(measureBar))
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('resize', onResize)
+  if (tickTimer !== null) {
+    clearInterval(tickTimer)
+    tickTimer = null
+  }
 })
 </script>
 
@@ -644,15 +663,23 @@ onUnmounted(() => {
          （选区之外的标注和底图一起被压暗） -->
     <canvas ref="annoCanvas" class="anno"></canvas>
     <!-- 还没有选区时整屏压暗（微信行为：进入截图态立刻有反馈）；
-         有选区后改用 box-shadow 挖洞，只暗选区之外。
+         有选区后改用四条边缘带压暗，只暗选区之外。
          `painted` 之前不画：底图没上来时这一层会先把整屏压暗（透明窗上就是
          「桌面忽然暗一下」），那正是要修的闪烁 -->
     <div v-if="!sel && painted" class="dim-full"></div>
-    <div v-else class="dim" :style="selStyle">
-      <div class="frame"></div>
+    <template v-else>
+      <!-- 压暗 = 四条边缘带（上/下/左/右），不用 `box-shadow: 0 0 0 9999px` 挖洞：
+           那会在合成器里撑出一块上万像素的离屏表面，WebKitGTK+Wayland+NVIDIA 上
+           会让整层偶发不刷新/露脏像素（也就是「遮罩像整个消失」）。带子的面积上限
+           就是窗口本身。 -->
+      <div v-for="b in bands" :key="b.key" class="band"
+        :style="{ left: b.x + 'px', top: b.y + 'px', width: b.w + 'px', height: b.h + 'px' }"></div>
+      <div class="dim" :style="selStyle">
+        <div class="frame"></div>
       <div class="size" v-if="sel">{{ sizeLabel }}</div>
       <span v-for="h in ['nw','n','ne','e','se','s','sw','w']" :key="h" :class="['handle', h]"></span>
-    </div>
+      </div>
+    </template>
     <div v-if="sel" ref="barRef" class="toolbar" :style="barStyle" @pointerdown.stop @pointerup.stop>
       <button v-for="tl in TOOLS" :key="tl" :class="{ on: tool === tl }" :title="t('shot.tool.' + tl)"
         @click="tool = tl">
@@ -710,6 +737,9 @@ onUnmounted(() => {
       @keydown.ctrl.z.stop @keydown.meta.z.stop @blur="commitText" />
     <div v-if="!sel && !errMsg && painted" class="tip">{{ t('shot.tip') }}</div>
     <div v-if="errMsg" class="error">{{ errMsg }}</div>
+    <!-- 保活元素：见 onMounted 里 100ms 计时器的注释。肉眼不可见、不吃事件 -->
+    <div class="keepalive"
+      :style="{ backgroundColor: tickValue ? 'rgba(0,0,0,0.003)' : 'rgba(0,0,0,0.004)' }"></div>
     <!-- 应用内 toast 的宿主（遮罩窗口只有这一个组件，得自己挂一份）。
          包一层拦事件：否则点提示会冒泡成「开始拖新选区」，右键还会触发
          .shot-root 上的 @contextmenu.prevent="cancel" 把整次截图取消掉 -->
@@ -745,16 +775,30 @@ onUnmounted(() => {
   left: 0;
   top: 0;
 }
-/* 变暗用「挖洞」实现：选区那一块不盖黑罩，靠超大 box-shadow 覆盖其余区域。
-   比每帧重绘底图便宜得多（GPU 合成），拖拽 100% 跟手。 */
+/* 变暗用四条边缘带实现：选区那一块不盖黑罩，其余区域由 .band 覆盖。
+   与「每帧重绘底图」相比仍是纯合成，拖拽 100% 跟手；但面积有界（不超过窗口）。 */
 .dim-full {
   position: absolute;
   inset: 0;
   background: rgba(0, 0, 0, 0.45);
 }
+/* 选区之外的四条压暗带（几何在 lib/shot.js dimBands）。
+   曾经是 `.dim` 上的 `box-shadow: 0 0 0 9999px`：一块上万像素的离屏表面，
+   WebKitGTK+Wayland+NVIDIA 上会让整层偶发不刷新/露脏像素，看起来就是遮罩消失。 */
+.keepalive {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  /* 只在背景色上变一点点 alpha 逼合成器提交新帧，不参与命中测试、不遮内容 */
+  will-change: background-color;
+}
+.band {
+  position: absolute;
+  background: rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
 .dim {
   position: absolute;
-  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
   outline: 1px solid rgba(255, 255, 255, 0.9);
 }
 .frame {
