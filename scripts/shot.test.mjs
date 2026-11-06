@@ -33,6 +33,15 @@ test('没有选区/没有窗口尺寸时返回空（不给渲染层造 0 面积�
   assert.deepEqual(dimBands({ x: 1, y: 1, w: 1, h: 1 }, null), [])
 })
 
+test('遮罩里有 100ms 保活计时器，且卸载时清掉（不然关掉遮罩还在跑）', () => {
+  const src = readFileSync(new URL('../src/components/ScreenshotOverlay.vue', import.meta.url), 'utf8')
+  assert.match(src, /setInterval\([\s\S]{0,160}?100\s*\)/, '要有 100ms 保活计时器')
+  assert.match(src, /clearInterval\(tickTimer\)/, '卸载时必须 clearInterval')
+  // 保活的视觉变化必须是「肉眼无差」的量级：alpha 不超过 0.01
+  const alphas = [...src.matchAll(/rgba\(0,\s*0,\s*0,\s*(0\.0+\d+)\)/g)].map((m) => Number(m[1]))
+  assert.ok(alphas.some((a) => a <= 0.01), `保活用的是极小 alpha，实际：${alphas}`)
+})
+
 test('遮罩里不许再出现超大 box-shadow（会撑出离屏大表面）', () => {
   const raw = readFileSync(new URL('../src/components/ScreenshotOverlay.vue', import.meta.url), 'utf8')
   // 注释里会提到这条历史（解释为什么不能那么写），所以先剥注释再匹配

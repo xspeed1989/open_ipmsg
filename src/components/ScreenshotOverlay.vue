@@ -27,6 +27,9 @@ const session = boot.session || qs.get('session') || ''
 const index = Number(boot.index ?? qs.get('i') ?? 0)
 
 const root = ref(null)
+/* 100ms 保活刻度：见 onMounted 里的注释。只在这一层存在期间跑（遮罩关闭即销毁）。 */
+const tickValue = ref(0)
+let tickTimer = null
 const baseCanvas = ref(null)
 const annoCanvas = ref(null)   // 标注层：与窗口同尺寸的独立 canvas（Task 9 合成时贴到选区上）
 const img = ref(null)          // 已解码的整幅图像（Image 对象）
@@ -622,6 +625,14 @@ onMounted(() => {
   load()
   window.addEventListener('keydown', onKeydown)
   window.addEventListener('resize', onResize)
+  // 100ms 保活：WebKitGTK + Wayland + NVIDIA 上，遮罩这种「几乎全透明、内容基本不变」
+  // 的窗口会撞上合成粘滞 —— 一帧没提交上去，合成器就一直显示上一帧（脏像素）甚至
+  // 整层不刷新，用户看到的是「遮罩闪没了/露桌面」。每 100ms 让一个不可见元素换一次
+  // 极小 alpha（0.003 ↔ 0.004，肉眼无差），保证总有新提交进来。
+  // 只在遮罩存在期间跑，窗口关闭即组件卸载，不会留下常驻开销。
+  tickTimer = window.setInterval(() => {
+    tickValue.value = tickValue.value ? 0 : 1
+  }, 100)
 })
 // 工具栏元素与它的宽度都随工具/选区变化：等 DOM 落地后重新量一次，再夹位置
 onMounted(() => nextTick(measureBar))
@@ -629,6 +640,10 @@ watch([tool, blockSize, sel], () => nextTick(measureBar))
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('resize', onResize)
+  if (tickTimer !== null) {
+    clearInterval(tickTimer)
+    tickTimer = null
+  }
 })
 </script>
 
@@ -722,6 +737,9 @@ onUnmounted(() => {
       @keydown.ctrl.z.stop @keydown.meta.z.stop @blur="commitText" />
     <div v-if="!sel && !errMsg && painted" class="tip">{{ t('shot.tip') }}</div>
     <div v-if="errMsg" class="error">{{ errMsg }}</div>
+    <!-- 保活元素：见 onMounted 里 100ms 计时器的注释。肉眼不可见、不吃事件 -->
+    <div class="keepalive"
+      :style="{ backgroundColor: tickValue ? 'rgba(0,0,0,0.003)' : 'rgba(0,0,0,0.004)' }"></div>
     <!-- 应用内 toast 的宿主（遮罩窗口只有这一个组件，得自己挂一份）。
          包一层拦事件：否则点提示会冒泡成「开始拖新选区」，右键还会触发
          .shot-root 上的 @contextmenu.prevent="cancel" 把整次截图取消掉 -->
@@ -767,6 +785,13 @@ onUnmounted(() => {
 /* 选区之外的四条压暗带（几何在 lib/shot.js dimBands）。
    曾经是 `.dim` 上的 `box-shadow: 0 0 0 9999px`：一块上万像素的离屏表面，
    WebKitGTK+Wayland+NVIDIA 上会让整层偶发不刷新/露脏像素，看起来就是遮罩消失。 */
+.keepalive {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  /* 只在背景色上变一点点 alpha 逼合成器提交新帧，不参与命中测试、不遮内容 */
+  will-change: background-color;
+}
 .band {
   position: absolute;
   background: rgba(0, 0, 0, 0.45);
